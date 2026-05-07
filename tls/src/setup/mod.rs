@@ -189,7 +189,10 @@ fn maybe_filter_provider(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::{CaConfig, CertKeyPair, ClientCertMode, TlsVersion, test_utils::gen_test_certs};
+    use crate::{
+        CaConfig, CertKeyPair, ClientCertMode, TlsVersion,
+        test_utils::{ensure_crypto_provider, gen_test_certs},
+    };
 
     #[test]
     fn build_server_config_single_cert() {
@@ -252,6 +255,7 @@ mod tests {
 
     #[test]
     fn build_server_config_mtls_require() {
+        ensure_crypto_provider();
         let server = gen_test_certs();
         let tls = ListenerTls {
             certificates: vec![CertKeyPair {

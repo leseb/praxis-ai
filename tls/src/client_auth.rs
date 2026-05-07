@@ -101,10 +101,11 @@ fn load_ca_root_store(ca_path: &str) -> Result<RootCertStore, TlsError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::test_utils::gen_ca_file;
+    use crate::test_utils::{ensure_crypto_provider, gen_ca_file};
 
     #[test]
     fn build_client_verifier_require_with_valid_ca() {
+        ensure_crypto_provider();
         let ca = gen_ca_file();
         let ca_path = ca.ca_path.to_str().expect("ca path should be valid UTF-8");
 
@@ -118,6 +119,7 @@ mod tests {
 
     #[test]
     fn build_client_verifier_request_with_valid_ca() {
+        ensure_crypto_provider();
         let ca = gen_ca_file();
         let ca_path = ca.ca_path.to_str().expect("ca path should be valid UTF-8");
 
@@ -131,6 +133,7 @@ mod tests {
 
     #[test]
     fn build_client_verifier_none_mode_returns_error() {
+        ensure_crypto_provider();
         let ca = gen_ca_file();
         let ca_path = ca.ca_path.to_str().expect("ca path should be valid UTF-8");
 

@@ -100,7 +100,11 @@ fn ca_from_cached(cached: &praxis_tls::CachedCaCerts) -> Vec<pingora_core::utils
     cached
         .der_certs()
         .iter()
-        .map(|der| pingora_core::utils::tls::WrappedX509::parse(der.clone()))
+        .filter_map(|der| {
+            pingora_core::utils::tls::WrappedX509::parse(der.clone())
+                .inspect_err(|e| tracing::warn!("failed to parse cached CA cert: {e}"))
+                .ok()
+        })
         .collect()
 }
 

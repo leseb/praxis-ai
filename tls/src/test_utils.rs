@@ -8,6 +8,22 @@ use std::path::PathBuf;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
 
 // -----------------------------------------------------------------------------
+// Crypto Provider
+// -----------------------------------------------------------------------------
+
+/// Install a process-wide default [`CryptoProvider`] for tests.
+///
+/// When `cargo test --workspace` enables both `aws-lc-rs` and `ring`
+/// features, rustls cannot auto-detect a provider. This function
+/// installs one explicitly. It is idempotent: if a provider is
+/// already installed the call is a no-op.
+///
+/// [`CryptoProvider`]: rustls::crypto::CryptoProvider
+pub(crate) fn ensure_crypto_provider() {
+    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+}
+
+// -----------------------------------------------------------------------------
 // Test Certificate Types
 // -----------------------------------------------------------------------------
 

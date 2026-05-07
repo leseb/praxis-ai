@@ -50,9 +50,9 @@ http = "1.4.0"
 nix = "0.24.3"
 notify = "7.0.0"
 # Temporary fork: custom ServerConfig (PR #726) + WrappedX509::parse() for per-cluster CA.
-pingora-core = { version = "0.8.0", git = "https://github.com/praxis-proxy/pingora.git", rev = "514d06b852e731848fd36574da9fcdaee101ccb4", features = ["rustls"] }
-pingora-http = { version = "0.8.0", git = "https://github.com/praxis-proxy/pingora.git", rev = "514d06b852e731848fd36574da9fcdaee101ccb4" }
-pingora-proxy = { version = "0.8.0", git = "https://github.com/praxis-proxy/pingora.git", rev = "514d06b852e731848fd36574da9fcdaee101ccb4", features = ["rustls"] }
+pingora-core = { version = "0.8.0", git = "https://github.com/praxis-proxy/pingora.git", rev = "2e452af034fb23a9cd57ec808e7d374037c0d664", features = ["rustls"] }
+pingora-http = { version = "0.8.0", git = "https://github.com/praxis-proxy/pingora.git", rev = "2e452af034fb23a9cd57ec808e7d374037c0d664" }
+pingora-proxy = { version = "0.8.0", git = "https://github.com/praxis-proxy/pingora.git", rev = "2e452af034fb23a9cd57ec808e7d374037c0d664", features = ["rustls"] }
 percent-encoding = "2.3.2"
 praxis-proto = { version = "0.1.0", path = "filter/proto", package = "praxis-proxy-proto" }
 prost = "0.14.3"
