@@ -77,6 +77,9 @@ use crate::{
 ///
 /// [`StreamBuffer`]: crate::BodyMode::StreamBuffer
 pub struct JsonBodyFieldFilter {
+    /// Maximum body size for `StreamBuffer` mode.
+    max_body_bytes: usize,
+
     /// Field-to-header mappings: `(json_field_name, header_name)`.
     pub(crate) mappings: Vec<(String, String)>,
 }
@@ -111,8 +114,12 @@ impl JsonBodyFieldFilter {
     /// [`FilterError`]: crate::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: JsonBodyFieldConfig = parse_filter_config("json_body_field", config)?;
+        let max_body_bytes = cfg.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES);
         let mappings = build_mappings(cfg)?;
-        Ok(Box::new(Self { mappings }))
+        Ok(Box::new(Self {
+            max_body_bytes,
+            mappings,
+        }))
     }
 }
 
@@ -128,7 +135,7 @@ impl HttpFilter for JsonBodyFieldFilter {
 
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
-            max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+            max_bytes: Some(self.max_body_bytes),
         }
     }
 

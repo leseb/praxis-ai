@@ -105,7 +105,14 @@ impl CompressionConfig {
     /// ```
     pub fn matches_content_type(&self, content_type: &str) -> bool {
         let lower = content_type.to_ascii_lowercase();
-        self.content_types.iter().any(|pattern| lower.starts_with(pattern))
+        self.content_types.iter().any(|pattern| {
+            lower.starts_with(pattern)
+                && (pattern.ends_with('/')
+                    || !lower
+                        .as_bytes()
+                        .get(pattern.len())
+                        .is_some_and(u8::is_ascii_alphanumeric))
+        })
     }
 
     /// Returns `true` if the response body is large enough to warrant

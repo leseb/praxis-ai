@@ -24,7 +24,19 @@ pub(super) fn validate_health_check(
     validate_health_check_type(hc, cluster_name)?;
     validate_health_check_timing(hc, cluster_name)?;
     validate_health_check_thresholds(hc, cluster_name)?;
+    validate_expected_status(hc, cluster_name)?;
     validate_passive_thresholds(hc, cluster_name)
+}
+
+/// Reject `expected_status` values outside the valid HTTP range.
+fn validate_expected_status(hc: &crate::config::HealthCheckConfig, cluster_name: &str) -> Result<(), ProxyError> {
+    if !(100..=599).contains(&hc.expected_status) {
+        return Err(ProxyError::Config(format!(
+            "cluster '{cluster_name}': health check expected_status must be 100..=599, got {}",
+            hc.expected_status
+        )));
+    }
+    Ok(())
 }
 
 /// Reject unsupported health check types.

@@ -52,6 +52,7 @@ fuzz_target!(|data: &str| {
             branch_iterations: std::collections::HashMap::new(),
             client_addr: None,
             cluster: None,
+            downstream_tls: false,
             executed_filter_indices: Vec::new(),
             extra_request_headers: Vec::new(),
             filter_metadata: std::collections::HashMap::new(),

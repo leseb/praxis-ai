@@ -439,19 +439,10 @@ clusters:
   - name: backend
     endpoints: ["10.0.0.2:80"]
 "#;
-    let config = Config::from_yaml(yaml).unwrap();
-    assert_eq!(
-        config.clusters.len(),
-        2,
-        "both duplicate cluster entries should survive parsing"
-    );
-    assert_eq!(
-        &*config.clusters[0].name, "backend",
-        "first cluster should be named 'backend'"
-    );
-    assert_eq!(
-        &*config.clusters[1].name, "backend",
-        "second cluster should be named 'backend'"
+    let err = Config::from_yaml(yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate cluster name"),
+        "duplicate cluster names should be rejected: {err}"
     );
 }
 

@@ -40,7 +40,39 @@ use crate::{
 ///
 /// [`FilterError`]: crate::FilterError
 pub fn parse_filter_config<T: DeserializeOwned>(name: &str, config: &serde_yaml::Value) -> Result<T, FilterError> {
-    serde_yaml::from_value(config.clone()).map_err(|e| -> FilterError { format!("{name}: {e}").into() })
+    let cleaned = strip_structural_keys(config);
+    serde_yaml::from_value(cleaned).map_err(|e| -> FilterError { format!("{name}: {e}").into() })
+}
+
+/// Remove [`FilterEntry`] structural keys that leak through
+/// `#[serde(flatten)]` into the filter config `Value`.
+///
+/// Without this, filter configs using `#[serde(deny_unknown_fields)]`
+/// would reject keys like `filter`, `conditions`, etc. that belong
+/// to the entry wrapper, not the filter's own config.
+///
+/// [`FilterEntry`]: praxis_core::config::FilterEntry
+fn strip_structural_keys(config: &serde_yaml::Value) -> serde_yaml::Value {
+    const STRUCTURAL: &[&str] = &[
+        "branch_chains",
+        "conditions",
+        "failure_mode",
+        "filter",
+        "name",
+        "response_conditions",
+    ];
+
+    let Some(mapping) = config.as_mapping() else {
+        return config.clone();
+    };
+
+    let filtered = mapping
+        .iter()
+        .filter(|(k, _)| !k.as_str().is_some_and(|key| STRUCTURAL.contains(&key)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    serde_yaml::Value::Mapping(filtered)
 }
 
 // -----------------------------------------------------------------------------

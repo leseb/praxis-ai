@@ -97,7 +97,16 @@ pub struct Rejection {
 
 impl Rejection {
     /// Create a rejection with the given status code.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `code` is outside the valid HTTP status range
+    /// (100..=599).
     pub fn status(code: u16) -> Self {
+        assert!(
+            (100..=599).contains(&code),
+            "HTTP status code must be 100..=599, got {code}"
+        );
         Self {
             status: code,
             headers: Vec::new(),
@@ -139,6 +148,30 @@ mod tests {
         assert_eq!(r.status, 404, "status should match constructor arg");
         assert!(r.headers.is_empty(), "headers should default to empty");
         assert!(r.body.is_none(), "body should default to None");
+    }
+
+    #[test]
+    fn rejection_status_boundary_100() {
+        let r = Rejection::status(100);
+        assert_eq!(r.status, 100, "100 is a valid HTTP status");
+    }
+
+    #[test]
+    fn rejection_status_boundary_599() {
+        let r = Rejection::status(599);
+        assert_eq!(r.status, 599, "599 is a valid HTTP status");
+    }
+
+    #[test]
+    #[should_panic(expected = "HTTP status code must be 100..=599")]
+    fn rejection_status_zero_panics() {
+        let _r = Rejection::status(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "HTTP status code must be 100..=599")]
+    fn rejection_status_600_panics() {
+        let _r = Rejection::status(600);
     }
 
     #[test]

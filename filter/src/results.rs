@@ -140,7 +140,7 @@ fn validate_result_value(value: &str) -> Result<(), FilterError> {
         let len = value.len();
         return Err(format!("result value must not exceed {MAX_VALUE_LEN} bytes, got {len}").into());
     }
-    if value.bytes().any(|b| b < 0x20 && b != 0x09) {
+    if value.bytes().any(|b| (b < 0x20 && b != 0x09) || b == 0x7F) {
         return Err("result value must not contain control characters".into());
     }
     Ok(())
@@ -317,6 +317,16 @@ mod tests {
     fn accept_value_with_tab() {
         let mut rs = FilterResultSet::new();
         assert!(rs.set("key", "col1\tcol2").is_ok(), "value with tab should be accepted");
+    }
+
+    #[test]
+    fn reject_value_with_del() {
+        let mut rs = FilterResultSet::new();
+        let err = rs.set("key", "before\x7Fafter").unwrap_err();
+        assert!(
+            err.to_string().contains("control characters"),
+            "value with DEL (0x7F) should be rejected: {err}"
+        );
     }
 
     #[test]

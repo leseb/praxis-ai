@@ -287,9 +287,7 @@ fn spawn_health_check_tasks(
             .expect("health check runtime");
         rt.block_on(async {
             praxis_protocol::http::pingora::health::runner::spawn_health_checks(&clusters, &registry, &shutdown);
-            tokio::signal::ctrl_c().await.ok();
-            info!("ctrl_c received, cancelling health check tasks");
-            shutdown.cancel();
+            shutdown.cancelled().await;
         });
     });
 }

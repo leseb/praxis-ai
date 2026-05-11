@@ -118,8 +118,6 @@ filter_chains:
       - filter: ip_acl
         allow:
           - "::1/128"
-        deny:
-          - "::/0"
       - filter: router
         routes:
           - path_prefix: "/"

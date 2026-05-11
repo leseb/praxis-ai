@@ -5,11 +5,13 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::Deserialize;
 
 use crate::{
     FilterAction, FilterError,
     body::{BodyAccess, BodyMode},
     builtins::JsonBodyFieldFilter,
+    factory::parse_filter_config,
     filter::{HttpFilter, HttpFilterContext},
 };
 
@@ -19,6 +21,24 @@ use crate::{
 
 /// Default header name for the promoted model value.
 const DEFAULT_HEADER: &str = "X-Model";
+
+// -----------------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------------
+
+/// Deserialized YAML config for the model-to-header filter.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelToHeaderConfig {
+    /// Header name for the promoted model value.
+    #[serde(default = "default_header")]
+    header: String,
+}
+
+/// Default header name.
+fn default_header() -> String {
+    DEFAULT_HEADER.to_owned()
+}
 
 // -----------------------------------------------------------------------------
 // ModelToHeaderFilter
@@ -67,7 +87,8 @@ impl ModelToHeaderFilter {
     /// assert_eq!(filter.name(), "model_to_header");
     /// ```
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let header = config.get("header").and_then(|v| v.as_str()).unwrap_or(DEFAULT_HEADER);
+        let cfg: ModelToHeaderConfig = parse_filter_config("model_to_header", config)?;
+        let header = &cfg.header;
 
         let mut inner_config = serde_yaml::Mapping::new();
         inner_config.insert(

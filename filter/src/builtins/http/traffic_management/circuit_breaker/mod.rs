@@ -154,14 +154,17 @@ impl HttpFilter for CircuitBreakerFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let is_failure = ctx.response_header.as_ref().is_some_and(|r| r.status.is_server_error());
+        let is_success = ctx
+            .response_header
+            .as_ref()
+            .is_some_and(|r| !r.status.is_server_error());
 
-        if is_failure {
-            warn!(cluster = %cluster_name, "recording upstream failure");
-            breaker.record_failure();
-        } else {
+        if is_success {
             debug!(cluster = %cluster_name, "recording upstream success");
             breaker.record_success();
+        } else {
+            warn!(cluster = %cluster_name, "recording upstream failure");
+            breaker.record_failure();
         }
 
         Ok(FilterAction::Continue)

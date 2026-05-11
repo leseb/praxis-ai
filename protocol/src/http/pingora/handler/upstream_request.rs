@@ -96,7 +96,7 @@ pub(crate) fn apply_rewritten_path(req: &mut RequestHeader, ctx: &mut PingoraReq
         ));
     }
 
-    if uri.path().split('/').any(|seg| seg == "..") {
+    if uri.path().split('/').any(is_traversal_segment) {
         return Err(pingora_core::Error::explain(
             pingora_core::ErrorType::InternalError,
             format!("rewritten path contains '..' traversal: {new_path}"),
@@ -106,6 +106,34 @@ pub(crate) fn apply_rewritten_path(req: &mut RequestHeader, ctx: &mut PingoraReq
     debug!(rewritten_path = %new_path, "applying path rewrite to upstream request");
     req.set_uri(uri);
     Ok(())
+}
+
+/// Check if a path segment is a `..` traversal, including
+/// percent-encoded variants (`%2e%2e`, `.%2e`, `%2e.`, etc.).
+#[allow(clippy::indexing_slicing, reason = "bounds checked by i + 2 < b.len()")]
+fn is_traversal_segment(seg: &str) -> bool {
+    if seg == ".." {
+        return true;
+    }
+    let mut dots = 0u8;
+    let mut i = 0;
+    let b = seg.as_bytes();
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && b[i + 1].eq_ignore_ascii_case(&b'2')
+            && b[i + 2].eq_ignore_ascii_case(&b'e')
+        {
+            dots += 1;
+            i += 3;
+        } else if b[i] == b'.' {
+            dots += 1;
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    dots == 2
 }
 
 // -----------------------------------------------------------------------------
@@ -545,6 +573,46 @@ mod tests {
             req.uri.path(),
             "/api/..config",
             "segment containing '..' as prefix should be allowed"
+        );
+    }
+
+    #[test]
+    fn apply_rewritten_path_rejects_percent_encoded_traversal() {
+        let mut req = RequestHeader::build("GET", b"/original", None).unwrap();
+        let mut ctx = PingoraRequestCtx::default();
+        ctx.rewritten_path = Some("/api/%2e%2e/admin".to_owned());
+
+        assert!(
+            apply_rewritten_path(&mut req, &mut ctx).is_err(),
+            "percent-encoded '..' (%2e%2e) should be rejected"
+        );
+    }
+
+    #[test]
+    fn apply_rewritten_path_rejects_mixed_encoded_traversal() {
+        let mut req = RequestHeader::build("GET", b"/original", None).unwrap();
+        let mut ctx = PingoraRequestCtx::default();
+        ctx.rewritten_path = Some("/api/.%2e/admin".to_owned());
+
+        assert!(
+            apply_rewritten_path(&mut req, &mut ctx).is_err(),
+            "mixed-encoded '..' (.%2e) should be rejected"
+        );
+    }
+
+    #[test]
+    fn is_traversal_segment_variants() {
+        assert!(is_traversal_segment(".."), "literal '..' is traversal");
+        assert!(is_traversal_segment("%2e%2e"), "fully encoded is traversal");
+        assert!(is_traversal_segment("%2E%2E"), "uppercase encoded is traversal");
+        assert!(is_traversal_segment(".%2e"), "mixed dot+encoded is traversal");
+        assert!(is_traversal_segment("%2e."), "mixed encoded+dot is traversal");
+        assert!(!is_traversal_segment("..config"), "'..config' is not traversal");
+        assert!(!is_traversal_segment("."), "single dot is not traversal");
+        assert!(!is_traversal_segment(""), "empty is not traversal");
+        assert!(
+            !is_traversal_segment("%2e%2e%2e"),
+            "triple encoded dot is not traversal"
         );
     }
 

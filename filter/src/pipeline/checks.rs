@@ -23,17 +23,17 @@ const REWRITE_FILTERS: &[&str] = &["path_rewrite", "url_rewrite"];
 // -----------------------------------------------------------------------------
 
 /// LB without a preceding router.
-#[allow(clippy::indexing_slicing, reason = "position() is within bounds")]
+#[allow(clippy::indexing_slicing, reason = "enumeration bounds")]
 pub(super) fn check_lb_without_router(names: &[&str], errors: &mut Vec<String>) {
-    if let Some(lb_pos) = names.iter().position(|n| *n == "load_balancer") {
-        let has_router_before = names[..lb_pos].contains(&"router");
-        if !has_router_before {
+    for (i, name) in names.iter().enumerate() {
+        if *name == "load_balancer" && !names[..i].contains(&"router") {
             errors.push(
                 "load_balancer without a preceding router \
                  filter; requests will fail with \
                  'no cluster selected'"
                     .to_owned(),
             );
+            return;
         }
     }
 }

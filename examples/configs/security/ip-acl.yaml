@@ -1,8 +1,10 @@
 # IP Access Control List (ACL)
 #
 # Allow or deny requests by source IP/CIDR. When `allow` is set,
-# only matching IPs are permitted. `allow` takes precedence over
-# `deny`. Both IPv4 and IPv6 CIDR ranges are supported.
+# only matching IPs are permitted (implicit deny-all). Use `deny`
+# to block specific IPs while allowing everything else. Both
+# IPv4 and IPv6 CIDR ranges are supported. Configuring both
+# `allow` and `deny` is rejected as an error.
 #
 # Usage:
 #   cargo run -p praxis -- -c examples/configs/security/ip-acl.yaml
@@ -21,7 +23,7 @@ filter_chains:
   - name: main
     filters:
       - filter: ip_acl
-        allow: # demo allowlist; restrict to your CIDRs
+        allow:
           # IPv4 loopback
           - "127.0.0.0/8"
           # IPv4 ranges
@@ -32,11 +34,6 @@ filter_chains:
           - "fd00::/8"
           # IPv6 documentation prefix (RFC 3849)
           - "2001:db8::/32"
-        deny:
-          # IPv4 catch-all
-          - "0.0.0.0/0"
-          # IPv6 catch-all
-          - "::/0"
 
       - filter: router
         routes:

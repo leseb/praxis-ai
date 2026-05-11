@@ -51,12 +51,15 @@ pub(super) fn validate_listener_timeouts(listener: &Listener) -> Result<(), Prox
         ("tcp_idle_timeout_ms", listener.tcp_idle_timeout_ms),
         ("downstream_read_timeout_ms", listener.downstream_read_timeout_ms),
     ] {
-        if let Some(v) = value
-            && v > MAX_TIMEOUT_MS
-        {
-            return Err(ProxyError::Config(format!(
-                "listener '{name}': {field} ({v} ms) exceeds maximum ({MAX_TIMEOUT_MS} ms / 1 hour)"
-            )));
+        if let Some(v) = value {
+            if v == 0 {
+                return Err(ProxyError::Config(format!("listener '{name}': {field} must be > 0")));
+            }
+            if v > MAX_TIMEOUT_MS {
+                return Err(ProxyError::Config(format!(
+                    "listener '{name}': {field} ({v} ms) exceeds maximum ({MAX_TIMEOUT_MS} ms / 1 hour)"
+                )));
+            }
         }
     }
 
@@ -149,6 +152,26 @@ filter_chains:
       - filter: static_response
 "#;
         Config::from_yaml(yaml).unwrap();
+    }
+
+    #[test]
+    fn reject_zero_downstream_read_timeout() {
+        let yaml = r#"
+listeners:
+  - name: web
+    address: "0.0.0.0:8080"
+    downstream_read_timeout_ms: 0
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("must be > 0"),
+            "zero timeout should be rejected: {err}"
+        );
     }
 
     #[test]

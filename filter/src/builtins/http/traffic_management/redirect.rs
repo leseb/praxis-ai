@@ -146,10 +146,15 @@ impl HttpFilter for RedirectFilter {
 
 /// Expand `${path}` and `${query}` placeholders in the location template.
 ///
+/// The path is normalized before substitution to prevent open
+/// redirects via crafted paths like `//evil.com`. Normalization
+/// collapses double slashes and resolves `.`/`..` segments.
+///
 /// `${query}` includes the `?` prefix when a query string is present,
 /// and expands to an empty string when absent.
 fn expand_location(template: &str, path: &str, query: Option<&str>) -> String {
-    let result = template.replace("${path}", path);
+    let safe_path = crate::builtins::http::transformation::path_sanitize::normalize_rewritten_path(path);
+    let result = template.replace("${path}", &safe_path);
     let query_with_prefix = query.map_or(String::new(), |q| format!("?{q}"));
     result.replace("${query}", &query_with_prefix)
 }
@@ -248,6 +253,30 @@ mod tests {
     }
 
     #[test]
+    fn expand_location_double_slash_path_normalized() {
+        let result = expand_location("https://example.com${path}", "//evil.com/foo", None);
+        assert_eq!(
+            result, "https://example.com/evil.com/foo",
+            "double-slash path should be collapsed to prevent open redirect"
+        );
+    }
+
+    #[test]
+    fn expand_location_triple_slash_path_normalized() {
+        let result = expand_location("https://example.com${path}", "///evil.com", None);
+        assert_eq!(
+            result, "https://example.com/evil.com",
+            "triple-slash path should be collapsed"
+        );
+    }
+
+    #[test]
+    fn expand_location_traversal_in_path_normalized() {
+        let result = expand_location("https://example.com${path}", "/a/../b", None);
+        assert_eq!(result, "https://example.com/b", "path traversal should be resolved");
+    }
+
+    #[test]
     fn expand_location_no_placeholders() {
         let result = expand_location("https://other.com/fixed", "/ignored", Some("ignored=true"));
         assert_eq!(result, "https://other.com/fixed", "no placeholders should pass through");
@@ -260,9 +289,12 @@ mod tests {
     }
 
     #[test]
-    fn expand_location_empty_path() {
+    fn expand_location_empty_path_normalizes_to_slash() {
         let result = expand_location("https://example.com${path}", "", None);
-        assert_eq!(result, "https://example.com", "empty path should expand to nothing");
+        assert_eq!(
+            result, "https://example.com/",
+            "empty path should normalize to / for safety"
+        );
     }
 
     #[test]

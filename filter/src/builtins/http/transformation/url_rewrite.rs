@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use percent_encoding::{AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str};
 use regex::Regex;
 use serde::Deserialize;
 use tracing::{debug, trace};
@@ -333,21 +333,26 @@ fn compile_add_query_params(value: &serde_yaml::Value) -> Result<Operation, Filt
 // -----------------------------------------------------------------------------
 
 /// Remove named parameters from a query string.
+///
+/// Keys from the query string are percent-decoded before
+/// comparison so that `%66oo` matches a `remove` entry of `foo`.
 fn strip_params(qs: &str, remove: &HashSet<String>) -> String {
     qs.split('&')
         .filter(|pair| {
             let key = pair.split('=').next().unwrap_or("");
-            !remove.contains(key)
+            let decoded = percent_decode_str(key).decode_utf8_lossy();
+            !remove.contains(decoded.as_ref())
         })
         .collect::<Vec<_>>()
         .join("&")
 }
 
-/// Append key-value pairs to a query string, percent-encoding values.
+/// Append key-value pairs to a query string, percent-encoding
+/// both keys and values.
 ///
 /// Uses [`percent_encoding::utf8_percent_encode`] with a set that
-/// encodes characters unsafe in query values: space, `"`, `#`, `&`,
-/// `+`, and `=`.
+/// encodes characters unsafe in query components: space, `"`, `#`,
+/// `&`, `+`, and `=`.
 ///
 /// [`percent_encoding::utf8_percent_encode`]: percent_encoding::utf8_percent_encode
 fn append_params(qs: &str, pairs: &[(String, String)]) -> String {
@@ -358,7 +363,7 @@ fn append_params(qs: &str, pairs: &[(String, String)]) -> String {
         if !result.is_empty() {
             result.push('&');
         }
-        result.push_str(k);
+        result.push_str(&utf8_percent_encode(k, QUERY_VALUE_ENCODE_SET).to_string());
         result.push('=');
         result.push_str(&utf8_percent_encode(v, QUERY_VALUE_ENCODE_SET).to_string());
     }

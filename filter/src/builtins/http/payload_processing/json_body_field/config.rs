@@ -50,6 +50,10 @@ pub(super) struct JsonBodyFieldConfig {
 
     /// Multi-field: list of field-to-header mappings.
     pub fields: Option<Vec<JsonBodyFieldMapping>>,
+
+    /// Maximum request body size in bytes for `StreamBuffer` mode.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
 }
 
 // -----------------------------------------------------------------------------

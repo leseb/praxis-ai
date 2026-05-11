@@ -19,6 +19,7 @@ use crate::{
 
 /// Deserialized YAML config for the static response filter.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StaticResponseConfig {
     /// HTTP status code to return.
     status: u16,
@@ -85,6 +86,10 @@ impl StaticResponseFilter {
     /// [`FilterError`]: crate::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: StaticResponseConfig = parse_filter_config("static_response", config)?;
+
+        if !(100..=599).contains(&cfg.status) {
+            return Err(format!("static_response: status must be 100..=599, got {}", cfg.status).into());
+        }
 
         Ok(Box::new(Self {
             status: cfg.status,

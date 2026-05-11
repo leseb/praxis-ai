@@ -33,8 +33,6 @@ filter_chains:
       - filter: ip_acl
         allow:
           - "127.0.0.0/8"
-        deny:
-          - "0.0.0.0/0"
       - filter: router
         routes:
           - path_prefix: "/api/"
@@ -128,8 +126,6 @@ filter_chains:
       - filter: ip_acl
         allow:
           - "127.0.0.0/8"
-        deny:
-          - "0.0.0.0/0"
       - filter: router
         routes:
           - path_prefix: "/"
@@ -194,8 +190,6 @@ filter_chains:
       - filter: ip_acl
         allow:
           - "127.0.0.0/8"
-        deny:
-          - "0.0.0.0/0"
   - name: locked_acl
     filters:
       - filter: ip_acl
@@ -235,8 +229,6 @@ filter_chains:
       - filter: ip_acl
         allow:
           - "127.0.0.1/32"
-        deny:
-          - "0.0.0.0/0"
       - filter: router
         routes:
           - path_prefix: "/"
@@ -276,8 +268,6 @@ filter_chains:
       - filter: ip_acl
         allow:
           - "127.0.0.0/8"
-        deny:
-          - "0.0.0.0/0"
       - filter: request_id
       - filter: access_log
       - filter: router

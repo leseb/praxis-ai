@@ -431,6 +431,24 @@ async fn on_response_records_499_as_success() {
 }
 
 #[tokio::test]
+async fn on_response_no_header_records_failure() {
+    let filter = make_filter(1, 9999);
+    let req = crate::test_utils::make_request(http::Method::GET, "/");
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some(Arc::from("backend"));
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut ctx2 = crate::test_utils::make_filter_context(&req);
+    ctx2.cluster = Some(Arc::from("backend"));
+    let action = filter.on_request(&mut ctx2).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(r) if r.status == 503),
+        "missing response header (connection failure) should trip the circuit"
+    );
+}
+
+#[tokio::test]
 async fn clusters_are_isolated() {
     let filter = make_two_cluster_filter(1, 9999);
     let req = crate::test_utils::make_request(http::Method::GET, "/");

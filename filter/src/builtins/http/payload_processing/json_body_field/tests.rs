@@ -561,6 +561,7 @@ async fn non_json_body_continues() {
 /// Build a single-mapping filter for testing.
 fn make_filter(field: &str, header: &str) -> JsonBodyFieldFilter {
     JsonBodyFieldFilter {
+        max_body_bytes: super::config::DEFAULT_MAX_BODY_BYTES,
         mappings: vec![(field.to_owned(), header.to_owned())],
     }
 }
@@ -568,6 +569,7 @@ fn make_filter(field: &str, header: &str) -> JsonBodyFieldFilter {
 /// Build a multi-mapping filter for testing.
 fn make_multi_filter(mappings: &[(&str, &str)]) -> JsonBodyFieldFilter {
     JsonBodyFieldFilter {
+        max_body_bytes: super::config::DEFAULT_MAX_BODY_BYTES,
         mappings: mappings
             .iter()
             .map(|(f, h)| ((*f).to_owned(), (*h).to_owned()))

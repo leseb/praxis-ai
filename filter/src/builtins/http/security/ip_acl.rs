@@ -50,8 +50,6 @@ struct IpAclConfig {
 /// allow:
 ///   - "10.0.0.0/8"
 ///   - "192.168.0.0/16"
-/// deny:
-///   - "0.0.0.0/0"
 /// ```
 ///
 /// # Example
@@ -60,10 +58,7 @@ struct IpAclConfig {
 /// use praxis_filter::IpAclFilter;
 ///
 /// let yaml: serde_yaml::Value = serde_yaml::from_str(
-///     r#"
-/// allow: ["10.0.0.0/8"]
-/// deny: ["0.0.0.0/0"]
-/// "#,
+///     r#"allow: ["10.0.0.0/8"]"#,
 /// )
 /// .unwrap();
 /// let filter = IpAclFilter::from_config(&yaml).unwrap();
@@ -103,6 +98,12 @@ impl IpAclFilter {
             .map(|s| CidrRange::parse(s))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| -> FilterError { format!("ip_acl: {e}").into() })?;
+
+        if !allow.is_empty() && !deny.is_empty() {
+            return Err(
+                "ip_acl: both allow and deny lists configured; deny list is ignored when allow list is present".into(),
+            );
+        }
 
         Ok(Box::new(Self { allow, deny }))
     }
@@ -198,6 +199,13 @@ mod tests {
 
     #[test]
     fn from_config_parses() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(r#"allow: ["10.0.0.0/8"]"#).unwrap();
+        let filter = IpAclFilter::from_config(&yaml).unwrap();
+        assert_eq!(filter.name(), "ip_acl", "filter name should be ip_acl");
+    }
+
+    #[test]
+    fn from_config_rejects_both_allow_and_deny() {
         let yaml: serde_yaml::Value = serde_yaml::from_str(
             r#"
 allow: ["10.0.0.0/8"]
@@ -205,8 +213,11 @@ deny: ["0.0.0.0/0"]
 "#,
         )
         .unwrap();
-        let filter = IpAclFilter::from_config(&yaml).unwrap();
-        assert_eq!(filter.name(), "ip_acl", "filter name should be ip_acl");
+        let err = IpAclFilter::from_config(&yaml).err().expect("should fail");
+        assert!(
+            err.to_string().contains("both allow and deny"),
+            "should reject both allow and deny: {err}"
+        );
     }
 
     #[tokio::test]

@@ -50,13 +50,4 @@ pub(super) fn extract_fields(
 // Control Character Validation
 // -----------------------------------------------------------------------------
 
-/// Check whether a string contains control characters (0x00..0x1F
-/// or 0x7F DEL) other than horizontal tab (0x09).
-///
-/// ```ignore
-/// # use praxis_filter::JsonBodyFieldFilter;
-/// // This function is internal; tested via filter behavior.
-/// ```
-pub(super) fn contains_control_chars(s: &str) -> bool {
-    s.bytes().any(|b| (b < 0x20 && b != 0x09) || b == 0x7F)
-}
+pub(super) use crate::builtins::http::payload_processing::json_rpc::contains_control_chars;

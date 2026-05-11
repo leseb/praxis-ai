@@ -161,9 +161,21 @@ impl HttpFilterContext<'_> {
     /// Write a durable metadata value that persists across all phases.
     ///
     /// Keys should use dot-prefix namespacing
-    /// (e.g. `mcp.method`, `a2a.task_id`).
+    /// (e.g. `mcp.method`, `a2a.task_id`). Keys are limited to
+    /// 64 bytes and values to 256 bytes to bound per-request
+    /// memory growth.
     pub fn set_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.filter_metadata.insert(key.into(), value.into());
+        let key = key.into();
+        let value = value.into();
+        if key.is_empty() || key.len() > 64 {
+            tracing::warn!(key_len = key.len(), "metadata key rejected (must be 1-64 bytes)");
+            return;
+        }
+        if value.len() > 256 {
+            tracing::warn!(key = %key, value_len = value.len(), "metadata value rejected (max 256 bytes)");
+            return;
+        }
+        self.filter_metadata.insert(key, value);
     }
 
     /// Upgrade the request body delivery mode for this request.

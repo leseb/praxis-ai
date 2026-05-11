@@ -26,15 +26,25 @@ fn deny_all_blocks_loopback() {
 }
 
 #[test]
-fn allow_loopback_with_deny_all() {
+fn allow_loopback_permits_request() {
     let backend_port = start_backend("ok");
     let proxy_port = free_port();
-    let yaml = acl_yaml(proxy_port, backend_port, &["127.0.0.0/8"], &["0.0.0.0/0"]);
+    let yaml = acl_yaml(proxy_port, backend_port, &["127.0.0.0/8"], &[]);
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let (status, _) = http_get(proxy.addr(), "/", None);
-    assert_eq!(status, 200, "allow 127.0.0.0/8 must override deny-all");
+    assert_eq!(status, 200, "allow 127.0.0.0/8 should permit loopback");
+}
+
+#[test]
+#[should_panic(expected = "both allow and deny")]
+fn reject_config_with_both_allow_and_deny() {
+    let backend_port = start_backend("ok");
+    let proxy_port = free_port();
+    let yaml = acl_yaml(proxy_port, backend_port, &["127.0.0.0/8"], &["0.0.0.0/0"]);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let _proxy = start_proxy(&config);
 }
 
 #[test]

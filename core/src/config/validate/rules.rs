@@ -3,7 +3,10 @@
 
 //! Top-level configuration validation orchestration.
 
-use std::path::{Component, Path};
+use std::{
+    collections::HashSet,
+    path::{Component, Path},
+};
 
 use tracing::warn;
 
@@ -51,11 +54,27 @@ impl Config {
             ));
         }
 
+        validate_cluster_names(&self.clusters)?;
         validate_clusters(&self.clusters, &self.insecure_options)?;
         validate_upstream_ca_file(self.runtime.upstream_ca_file.as_deref())?;
 
         Ok(())
     }
+}
+
+// -----------------------------------------------------------------------------
+// Cluster Name Validation
+// -----------------------------------------------------------------------------
+
+/// Reject duplicate cluster names.
+fn validate_cluster_names(clusters: &[crate::config::Cluster]) -> Result<(), ProxyError> {
+    let mut seen = HashSet::new();
+    for cluster in clusters {
+        if !seen.insert(&cluster.name) {
+            return Err(ProxyError::Config(format!("duplicate cluster name '{}'", cluster.name)));
+        }
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -313,6 +332,31 @@ listeners:
             config.listeners[0].protocol,
             ProtocolKind::Tcp,
             "protocol should be Tcp"
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_cluster_names() {
+        let yaml = r#"
+listeners:
+  - name: web
+    address: "0.0.0.0:80"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+        status: 200
+clusters:
+  - name: backend
+    endpoints: ["10.0.0.1:80"]
+  - name: backend
+    endpoints: ["10.0.0.2:80"]
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate cluster name 'backend'"),
+            "should reject duplicate cluster names: {err}"
         );
     }
 

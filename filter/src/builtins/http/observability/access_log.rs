@@ -8,10 +8,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use tracing::info;
 
 use crate::{
     FilterAction, FilterError,
+    factory::parse_filter_config,
     filter::{HttpFilter, HttpFilterContext},
 };
 
@@ -47,6 +49,24 @@ pub struct AccessLogFilter {
 }
 
 // -----------------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------------
+
+/// Deserialized YAML config for the access log filter.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccessLogConfig {
+    /// Fraction of requests to log (0.0, 1.0]. Defaults to 1.0.
+    #[serde(default = "default_sample_rate")]
+    sample_rate: f64,
+}
+
+/// Default sample rate: log every request.
+fn default_sample_rate() -> f64 {
+    1.0
+}
+
+// -----------------------------------------------------------------------------
 // Construction
 // -----------------------------------------------------------------------------
 
@@ -59,13 +79,10 @@ impl AccessLogFilter {
     ///
     /// [`FilterError`]: crate::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let sample_rate: f64 = match config.get("sample_rate") {
-            Some(v) => v.as_f64().ok_or("access_log: sample_rate must be a number")?,
-            None => 1.0,
-        };
+        let cfg: AccessLogConfig = parse_filter_config("access_log", config)?;
 
-        if sample_rate <= 0.0 || sample_rate > 1.0 {
-            return Err(format!("access_log: sample_rate must be in (0.0, 1.0], got {sample_rate}").into());
+        if cfg.sample_rate <= 0.0 || cfg.sample_rate > 1.0 {
+            return Err(format!("access_log: sample_rate must be in (0.0, 1.0], got {}", cfg.sample_rate).into());
         }
 
         #[allow(
@@ -73,7 +90,7 @@ impl AccessLogFilter {
             clippy::cast_sign_loss,
             reason = "sample rate truncation"
         )]
-        let sample_every = (1.0 / sample_rate).round() as u64;
+        let sample_every = (1.0 / cfg.sample_rate).round() as u64;
 
         Ok(Box::new(Self {
             sample_every,
@@ -146,7 +163,7 @@ fn truncate_u128(v: u128) -> u64 {
 /// Returns [`Cow::Borrowed`] when the input contains no control
 /// characters (the common case for HTTP paths).
 fn sanitize_for_log(s: &str) -> Cow<'_, str> {
-    if !s.bytes().any(|b| b.is_ascii_control()) {
+    if !s.chars().any(char::is_control) {
         return Cow::Borrowed(s);
     }
 
@@ -242,7 +259,20 @@ mod tests {
     fn from_config_rejects_non_numeric_sample_rate() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("sample_rate: abc").unwrap();
         let err = AccessLogFilter::from_config(&yaml).err().expect("should fail");
-        assert!(err.to_string().contains("must be a number"), "got: {err}");
+        assert!(
+            err.to_string().contains("invalid type"),
+            "serde should reject non-numeric sample_rate: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_field() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("sampl_rate: 0.5").unwrap();
+        let err = AccessLogFilter::from_config(&yaml).err().expect("should fail");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "typo should be rejected by deny_unknown_fields: {err}"
+        );
     }
 
     #[test]
@@ -325,6 +355,29 @@ mod tests {
     fn sanitize_returns_owned_for_dirty_paths() {
         let result = sanitize_for_log("/path\ninjected");
         assert!(matches!(result, Cow::Owned(_)), "dirty paths should return Cow::Owned");
+    }
+
+    #[test]
+    fn sanitize_strips_del_character() {
+        assert_eq!(
+            sanitize_for_log("/path\x7Fhere"),
+            "/pathhere",
+            "DEL (0x7F) should be stripped"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_c1_control_characters() {
+        assert_eq!(
+            sanitize_for_log("/path\u{0080}injected"),
+            "/pathinjected",
+            "C1 control U+0080 should be stripped"
+        );
+        assert_eq!(
+            sanitize_for_log("/path\u{009F}injected"),
+            "/pathinjected",
+            "C1 control U+009F should be stripped"
+        );
     }
 
     #[tokio::test]
