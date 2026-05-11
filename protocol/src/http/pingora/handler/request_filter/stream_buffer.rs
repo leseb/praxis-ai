@@ -101,10 +101,12 @@ pub(super) async fn pre_read_body(
     // `is_body_done()` returns true after pre-read and Pingora never
     // calls `request_body_filter`, leaving the pre-read body stranded.
     //
-    // Limitation: Pingora's retry buffer is capped at 64 KiB
-    // (`BODY_BUF_LIMIT` in pingora-core). Bodies exceeding that limit
-    // are silently truncated and will not be forwarded to upstream.
-    // Tracked for an upstream fix: https://github.com/praxis-proxy/praxis/issues/75
+    // Pingora's retry buffer is capped at 64 KiB (`BODY_BUF_LIMIT`).
+    // The initial request body is forwarded correctly via
+    // `pre_read_body` in `request_body_filter`, but retries replay
+    // from the 64 KiB buffer. `handle_connect_failure` disables
+    // retries when `request_body_bytes` exceeds `RETRY_BODY_LIMIT`
+    // to prevent truncated retry payloads.
     session.downstream_session.enable_retry_buffering();
 
     let mut buffer = BodyBuffer::new(max_bytes);
