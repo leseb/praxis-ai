@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working in this repository.
+This file provides guidance to Claude Code
+(claude.ai/code) when working with code in this
+repository.
 
 ## Requirements
 
@@ -12,23 +14,38 @@ Guidance for Claude Code when working in this repository.
 ## Quick Reference
 
 ```console
-make build          # workspace build (includes benches)
-make test           # all tests
+make build          # workspace build (includes benches + fuzz)
+make test           # all tests (downloads h2spec if needed)
 make fmt            # format with nightly rustfmt
-make lint           # clippy + nightly fmt check
+make lint           # clippy + nightly fmt check + xtask lint-deps
+make doc            # rustdoc with -D warnings, including private items
 make audit          # cargo audit + cargo deny check
+make coverage-check # fail if line coverage < 90%
 make container      # container image build
 cargo run -p praxis # run the proxy
 ```
 
-Run a single test or suite:
+Run a single test:
 
 ```console
 cargo test -p praxis-tests-integration --test suite -- test_name
 make test-integration V=1   # with --nocapture
 ```
 
-See `docs/development.md` for the full command reference and dev tool usage.
+Individual test suites:
+
+```console
+make test-unit          # core, filter, protocol, server
+make test-schema        # config parsing + example validation
+make test-integration   # end-to-end filter and proxy tests
+make test-conformance   # RFC conformance (h2spec, HTTP semantics)
+make test-security      # request smuggling, header injection
+make test-resilience    # load, failure recovery, throughput
+make test-smoke         # quick startup and round-trip sanity
+```
+
+See `docs/development.md` for the full command
+reference and dev tool usage.
 
 ## Architecture
 
@@ -36,15 +53,37 @@ See `docs/architecture.md` for the full design.
 
 **Crate dependency flow:**
 
-```console
+```text
 server -> protocol -> filter -> core -> tls
 ```
 
-- **server**: binary entry point, config loading, protocol registration
-- **core**: configuration (YAML/serde), error types, health state, server runtime
-- **filter**: `HttpFilter` and `TcpFilter` traits, pipeline engine, all built-in filters
-- **protocol**: `Protocol` trait, HTTP and TCP/TLS backends
-- **tls**: TLS configuration types, SNI resolution (including wildcards), cert hot-reload
+- **server** (`praxis`): binary entry point, config
+  loading, pipeline resolution, hot-reload watcher
+- **core** (`praxis-core`): YAML config (serde),
+  validation, error types, health state, KV store
+  registry, `PingoraServerRuntime`
+- **filter** (`praxis-filter`): `HttpFilter` and
+  `TcpFilter` traits, pipeline engine, condition
+  evaluation, body access/buffering, all built-in
+  filter implementations, `FilterRegistry`
+- **protocol** (`praxis-protocol`): `Protocol` trait,
+  Pingora HTTP/TCP adapters, health check probes,
+  admin endpoints
+- **tls** (`praxis-tls`): TLS config types, SNI
+  resolution (including wildcards), cert loading
+- **proto** (`praxis-proto`): vendored Envoy ext_proc
+  protobuf definitions (opt-in `ext-proc` feature)
+
+**Test crates** (under `tests/`):
+
+- `tests/utils`: shared test harness (`free_port`,
+  `start_backend`, `start_proxy_with_registry`)
+- `tests/schema`: config parsing and example validation
+- `tests/integration`: end-to-end filter and proxy tests
+- `tests/conformance`: RFC conformance (h2spec)
+- `tests/security`: request smuggling, header injection
+- `tests/resilience`: load, failure recovery
+- `tests/smoke`: quick startup round-trip
 
 ## Conventions
 
@@ -53,10 +92,12 @@ guide. Key points:
 
 - `#![deny(unsafe_code)]` in all crates
 - All items (public and private) require `///` doc
-  comments; enforced by `missing_docs` lint
+  comments; enforced by `missing_docs` and
+  `missing_docs_in_private_items` lints
 - Comments answer "why?", never "what?"; use
   `tracing` for runtime narration
-- Prefer `to_owned()` over `to_string()` for `&str` to `String`
+- Prefer `to_owned()` over `to_string()` for
+  `&str` to `String`
 - Use inline format args: `format!("{var}")`
 - Use let-chains, `is_some_and()`, `strip_prefix()`
 - Reference-style rustdoc links, not inline
@@ -64,8 +105,36 @@ guide. Key points:
   (e.g. "avoids allocation", "zero-copy", "cheap
   clone"). Correct memory use is expected; it does
   not need narration.
-- Do not create re-export-only files. Import directly
-  from the source module. No `pub use` shim files.
+- Do not create re-export-only files. Import
+  directly from the source module.
+- Pre-computed numeric literals with trailing
+  comments for human-readable meaning
+- Use enums, not strings, for fixed value sets
+  in config; `#[serde(deny_unknown_fields)]` on
+  config structs; `#[serde(try_from)]` for
+  constrained numerics; `#[serde(default)]`
+  instead of `Option<T>` with `unwrap_or`.
+  See `docs/conventions.md` "Type Design".
+  (e.g. `10_485_760; // 10 MiB`)
+
+## Workspace Lints
+
+The workspace enforces an extensive lint policy in
+`Cargo.toml` under `[workspace.lints.rust]` and
+`[workspace.lints.clippy]`. Key constraints:
+
+- `#[clippy::unwrap_used]` is denied; use `?` or
+  explicit error handling
+- `clippy::too_many_lines` and
+  `clippy::cognitive_complexity` are denied
+- All cast operations (`cast_lossless`,
+  `cast_possible_truncation`, etc.) are denied
+- `clippy::dbg_macro`, `print_stdout`,
+  `print_stderr` are denied
+- `missing_assert_message` is denied: every
+  `assert!` needs a message string
+- `clippy::str_to_string` is denied: use
+  `to_owned()` for `&str` to `String`
 
 ## File Ordering
 
@@ -112,10 +181,14 @@ See `docs/extensions.md` for the full guide.
 1. Create module under
    `filter/src/builtins/<protocol>/<category>/`
 2. Implement `HttpFilter` or `TcpFilter` with a
-   `from_config` factory
+   `from_config` factory (`fn(&serde_yaml::Value)
+   -> Result<Box<dyn HttpFilter>, FilterError>`)
 3. Register in `filter/src/registry.rs`
-4. Add unit tests, doctests, example config, and
-   integration test
+4. Add unit tests and doctests
+5. Add example config in `examples/configs/<category>/`
+6. Add functional integration test in
+   `tests/integration/tests/suite/examples/`
+7. Update `examples/README.md`
 
 ## Adding a Protocol
 
@@ -151,7 +224,22 @@ Filters live under
 `filter/src/builtins/<protocol>/<category>/`.
 See `docs/filters.md` for the full filter reference.
 
+Categories: `ai`, `observability`,
+`payload_processing`, `security`,
+`traffic_management`, `transformation` (HTTP);
+`observability`, `traffic_management` (TCP).
+
 Example configs: `examples/configs/<category>/`.
+
+## Dynamic Config Reload
+
+Praxis swaps filter pipelines at runtime without
+restarting. Each handler holds
+`Arc<ArcSwap<FilterPipeline>>`; a file watcher
+(500ms debounce) monitors the config file, validates,
+rebuilds pipelines, and swaps atomically. Listener
+topology, protocol type, and TLS toggle changes
+cannot be applied dynamically (logged as warnings).
 
 ## CI Workflows
 
