@@ -66,12 +66,32 @@ struct UrlRewriteConfig {
 }
 
 /// A single rewrite operation in deserialized form.
+///
+/// Each YAML list entry contains exactly one operation key:
+///
+/// ```yaml
+/// operations:
+///   - regex_replace:
+///       pattern: "^/old/(.*)"
+///       replacement: "/new/$1"
+///   - strip_query_params: [debug]
+///   - add_query_params:
+///       version: "2"
+/// ```
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OperationConfig {
-    /// A keyed operation: `regex_replace`, `strip_query_params`,
-    /// or `add_query_params`.
-    Map(BTreeMap<String, serde_yaml::Value>),
+#[serde(deny_unknown_fields)]
+struct OperationConfig {
+    /// Regex-based path replacement.
+    #[serde(default)]
+    regex_replace: Option<serde_yaml::Value>,
+
+    /// Remove named query parameters.
+    #[serde(default)]
+    strip_query_params: Option<serde_yaml::Value>,
+
+    /// Append query parameters.
+    #[serde(default)]
+    add_query_params: Option<serde_yaml::Value>,
 }
 
 // -----------------------------------------------------------------------------
@@ -270,30 +290,38 @@ fn apply_strip<'a>(query: Option<Cow<'a, str>>, names: &HashSet<String>) -> Opti
 
 /// Compile raw operation configs into executable operations.
 fn compile_operations(configs: Vec<OperationConfig>) -> Result<Vec<Operation>, FilterError> {
-    let mut ops = Vec::with_capacity(configs.len());
-    for config in configs {
-        let OperationConfig::Map(map) = config;
-        if map.len() > 1 {
-            return Err(format!(
-                "url_rewrite: each operations entry must contain exactly one operation, \
-                 found {}: {:?}. Split into separate list entries to control ordering.",
-                map.len(),
-                map.keys().collect::<Vec<_>>()
-            )
-            .into());
-        }
-        for (key, value) in map {
-            match key.as_str() {
-                "regex_replace" => ops.push(compile_regex_replace(&value)?),
-                "strip_query_params" => ops.push(compile_strip_query_params(&value)?),
-                "add_query_params" => ops.push(compile_add_query_params(&value)?),
-                other => {
-                    return Err(format!("url_rewrite: unknown operation '{other}'").into());
-                },
-            }
-        }
+    configs.into_iter().map(compile_single_operation).collect()
+}
+
+/// Compile one [`OperationConfig`] into an executable [`Operation`].
+fn compile_single_operation(config: OperationConfig) -> Result<Operation, FilterError> {
+    match config {
+        OperationConfig {
+            regex_replace: Some(v),
+            strip_query_params: None,
+            add_query_params: None,
+        } => compile_regex_replace(&v),
+        OperationConfig {
+            regex_replace: None,
+            strip_query_params: Some(v),
+            add_query_params: None,
+        } => compile_strip_query_params(&v),
+        OperationConfig {
+            regex_replace: None,
+            strip_query_params: None,
+            add_query_params: Some(v),
+        } => compile_add_query_params(&v),
+        OperationConfig {
+            regex_replace: None,
+            strip_query_params: None,
+            add_query_params: None,
+        } => Err("url_rewrite: empty operation entry".into()),
+        _ => Err(
+            "url_rewrite: each operations entry must contain exactly one operation; \
+             split into separate list entries"
+                .into(),
+        ),
     }
-    Ok(ops)
 }
 
 /// Compile a `regex_replace` operation from its YAML value.
@@ -914,11 +942,9 @@ operations:
         )
         .unwrap();
         let result = UrlRewriteFilter::from_config(&config);
-        assert!(result.is_err(), "unknown operation should return error");
-        let err = result.err().unwrap();
         assert!(
-            err.to_string().contains("unknown operation"),
-            "error should mention unknown operation, got: {err}"
+            result.is_err(),
+            "unknown operation should be rejected by deny_unknown_fields"
         );
     }
 
@@ -1020,7 +1046,7 @@ operations:
     }
 
     #[test]
-    fn multiple_keys_in_one_operation_map_rejected() {
+    fn multiple_keys_in_one_operation_entry_rejected() {
         let config = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 operations:
@@ -1032,12 +1058,7 @@ operations:
         )
         .expect("valid yaml");
         let result = UrlRewriteFilter::from_config(&config);
-        assert!(result.is_err(), "multi-key operation map should be rejected");
-        let err = result.err().unwrap();
-        assert!(
-            err.to_string().contains("exactly one operation"),
-            "error should mention single operation: {err}"
-        );
+        assert!(result.is_err(), "multi-key operation entry should be rejected by serde");
     }
 
     #[tokio::test]
