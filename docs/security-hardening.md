@@ -21,8 +21,8 @@ ambiguous configuration:
   path).
 - TLS certificate and key paths reject directory
   traversal (`..`).
-- Health check targets reject loopback and cloud
-  metadata addresses (SSRF protection).
+- Health check targets reject loopback, link-local,
+  and cloud metadata addresses (SSRF protection).
 - Root execution (UID 0) rejected by default.
 - Supply chain audited via `cargo audit` and
   `cargo deny`.
