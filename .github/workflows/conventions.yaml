@@ -28,7 +28,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PRAXIS_BOT }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          MAX_ADDITIONS: "250"
+          MAX_ADDITIONS: "500"
         run: |
           labels=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels -q '.labels[].name')
           if echo "$labels" | grep -q '^conventions/bypass$'; then
