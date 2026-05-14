@@ -90,8 +90,8 @@ async fn read_body(session: &mut ServerSession) -> Result<String, Response<Vec<u
         }
         buf.extend_from_slice(&chunk);
     }
-    String::from_utf8(buf).map_err(|_| {
-        warn!("KV admin request body is not valid UTF-8");
+    String::from_utf8(buf).map_err(|e| {
+        warn!(error = %e, "KV admin request body is not valid UTF-8");
         json_response(400, br#"{"error":"request body is not valid UTF-8"}"#)
     })
 }
