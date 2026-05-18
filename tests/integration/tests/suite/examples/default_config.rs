@@ -21,7 +21,10 @@ const DEFAULT_CONFIG: &str = praxis_core::config::DEFAULT_CONFIG;
 #[test]
 fn default_config_root_returns_200() {
     let proxy_port = free_port();
-    let yaml = DEFAULT_CONFIG.replace("0.0.0.0:8080", &format!("127.0.0.1:{proxy_port}"));
+    let admin_port = free_port();
+    let yaml = DEFAULT_CONFIG
+        .replace("0.0.0.0:8080", &format!("127.0.0.1:{proxy_port}"))
+        .replace("127.0.0.1:9901", &format!("127.0.0.1:{admin_port}"));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
     let (status, body) = http_get(proxy.addr(), "/", None);
@@ -34,7 +37,10 @@ fn default_config_root_returns_200() {
 #[test]
 fn default_config_other_path_returns_404() {
     let proxy_port = free_port();
-    let yaml = DEFAULT_CONFIG.replace("0.0.0.0:8080", &format!("127.0.0.1:{proxy_port}"));
+    let admin_port = free_port();
+    let yaml = DEFAULT_CONFIG
+        .replace("0.0.0.0:8080", &format!("127.0.0.1:{proxy_port}"))
+        .replace("127.0.0.1:9901", &format!("127.0.0.1:{admin_port}"));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
     let (status, body) = http_get(proxy.addr(), "/anything", None);
