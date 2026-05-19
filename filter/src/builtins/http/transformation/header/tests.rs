@@ -481,6 +481,138 @@ async fn from_config_empty_accepts_request_set_and_remove() {
     );
 }
 
+#[tokio::test]
+async fn request_add_stacks_with_existing_header() {
+    let filter = make_header_filter(
+        r#"request_add:
+  - name: x-trace-id
+    value: hop-2"#,
+    );
+    let mut req = crate::test_utils::make_request(http::Method::GET, "/");
+    req.headers
+        .insert("x-trace-id", http::HeaderValue::from_static("hop-1"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.extra_request_headers.is_empty(),
+        "stacking should use request_headers_to_set, not extra_request_headers"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set.len(),
+        1,
+        "should produce exactly one set operation for the combined value"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[0].0.as_str(),
+        "x-trace-id",
+        "set header name should match"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[0].1.to_str().unwrap(),
+        "hop-1,hop-2",
+        "stacked value should be existing,new with comma separator"
+    );
+}
+
+#[tokio::test]
+async fn request_add_stacks_existing_but_not_fresh() {
+    let filter = make_header_filter(
+        r#"request_add:
+  - name: x-existing
+    value: appended
+  - name: x-fresh
+    value: brand-new"#,
+    );
+    let mut req = crate::test_utils::make_request(http::Method::GET, "/");
+    req.headers
+        .insert("x-existing", http::HeaderValue::from_static("original"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(
+        ctx.request_headers_to_set.len(),
+        1,
+        "only the stacked header should be in request_headers_to_set"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[0].1.to_str().unwrap(),
+        "original,appended",
+        "existing header should be comma-combined"
+    );
+}
+
+#[tokio::test]
+async fn request_add_fresh_header_uses_extra_headers() {
+    let filter = make_header_filter(
+        r#"request_add:
+  - name: x-fresh
+    value: brand-new"#,
+    );
+    let req = crate::test_utils::make_request(http::Method::GET, "/");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "non-existing header should not stack"
+    );
+    assert_eq!(ctx.extra_request_headers.len(), 1, "should go to extra_request_headers");
+    assert_eq!(ctx.extra_request_headers[0].0, "x-fresh", "header name should match");
+    assert_eq!(ctx.extra_request_headers[0].1, "brand-new", "header value should match");
+}
+
+#[tokio::test]
+async fn request_add_non_visible_ascii_existing_falls_back() {
+    let filter = make_header_filter(
+        r#"request_add:
+  - name: x-opaque
+    value: appended"#,
+    );
+    let mut req = crate::test_utils::make_request(http::Method::GET, "/");
+    req.headers
+        .insert("x-opaque", http::HeaderValue::from_bytes(b"\x80\x81binary").unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "non-visible-ASCII existing value should prevent stacking"
+    );
+    assert_eq!(
+        ctx.extra_request_headers.len(),
+        1,
+        "should fall back to extra_request_headers when existing value is not valid str"
+    );
+}
+
+#[tokio::test]
+async fn request_add_set_order_preserved_with_stacking() {
+    let filter = make_header_filter(
+        r#"request_set:
+  - name: x-mode
+    value: override
+request_add:
+  - name: x-trace
+    value: second"#,
+    );
+    let mut req = crate::test_utils::make_request(http::Method::GET, "/");
+    req.headers.insert("x-trace", http::HeaderValue::from_static("first"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(
+        ctx.request_headers_to_set.len(),
+        2,
+        "should have one set and one stacked add"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[0].0.as_str(),
+        "x-mode",
+        "set operation should come first (set runs before add)"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[1].1.to_str().unwrap(),
+        "first,second",
+        "stacked add should come second with combined value"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

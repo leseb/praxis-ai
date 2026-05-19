@@ -181,12 +181,25 @@ impl HttpFilter for HeaderFilter {
             trace!(header = %name, "removing request header");
             ctx.request_headers_to_remove.push(name.clone());
         }
+
         for (name, value) in &self.request_set {
             trace!(header = %name, "setting request header");
             ctx.request_headers_to_set.push((name.clone(), value.clone()));
         }
+
         for (name, value) in &self.request_add {
             trace!(header = %name, "adding request header");
+            if let Some(existing) = ctx.request.headers.get(name.as_str())
+                && let Ok(existing_str) = existing.to_str()
+                && let Ok(hdr_name) = http::header::HeaderName::from_bytes(name.as_bytes())
+            {
+                let combined = format!("{existing_str},{value}");
+                if let Ok(combined_val) = http::header::HeaderValue::from_str(&combined) {
+                    ctx.request_headers_to_set.push((hdr_name, combined_val));
+                    continue;
+                }
+            }
+
             ctx.extra_request_headers
                 .push((Cow::Owned(name.clone()), value.clone()));
         }
