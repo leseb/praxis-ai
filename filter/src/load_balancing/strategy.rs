@@ -65,3 +65,160 @@ pub(crate) fn build_strategy(lb_strategy: &LoadBalancerStrategy, endpoints: Vec<
         },
     }
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use praxis_core::config::ConsistentHashOpts;
+
+    use super::*;
+
+    #[test]
+    fn build_strategy_round_robin() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Simple(SimpleStrategy::RoundRobin),
+            make_endpoints(),
+        );
+        assert!(
+            matches!(strategy, Strategy::RoundRobin(_)),
+            "SimpleStrategy::RoundRobin should produce Strategy::RoundRobin"
+        );
+    }
+
+    #[test]
+    fn build_strategy_least_connections() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Simple(SimpleStrategy::LeastConnections),
+            make_endpoints(),
+        );
+        assert!(
+            matches!(strategy, Strategy::LeastConnections(_)),
+            "SimpleStrategy::LeastConnections should produce Strategy::LeastConnections"
+        );
+    }
+
+    #[test]
+    fn build_strategy_consistent_hash() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Parameterised(ParameterisedStrategy::ConsistentHash(ConsistentHashOpts {
+                header: Some("X-Session".to_owned()),
+            })),
+            make_endpoints(),
+        );
+        assert!(
+            matches!(strategy, Strategy::ConsistentHash(_)),
+            "ParameterisedStrategy::ConsistentHash should produce Strategy::ConsistentHash"
+        );
+    }
+
+    #[test]
+    fn release_round_robin_is_noop() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Simple(SimpleStrategy::RoundRobin),
+            make_endpoints(),
+        );
+        strategy.release("10.0.0.1:80");
+    }
+
+    #[test]
+    fn release_consistent_hash_is_noop() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Parameterised(ParameterisedStrategy::ConsistentHash(ConsistentHashOpts {
+                header: None,
+            })),
+            make_endpoints(),
+        );
+        strategy.release("10.0.0.1:80");
+    }
+
+    #[test]
+    fn release_least_connections_decrements() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Simple(SimpleStrategy::LeastConnections),
+            make_endpoints(),
+        );
+        strategy.select(None, None);
+        if let Strategy::LeastConnections(ref lc) = strategy {
+            let before = lc.counters["10.0.0.1:80"].load(Ordering::Relaxed);
+            strategy.release("10.0.0.1:80");
+            let after = lc.counters["10.0.0.1:80"].load(Ordering::Relaxed);
+            assert_eq!(
+                after,
+                before.saturating_sub(1),
+                "release should decrement in-flight counter"
+            );
+        } else {
+            panic!("expected LeastConnections variant");
+        }
+    }
+
+    #[test]
+    fn select_round_robin_returns_some() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Simple(SimpleStrategy::RoundRobin),
+            make_endpoints(),
+        );
+        assert!(
+            strategy.select(None, None).is_some(),
+            "RoundRobin select should return Some with healthy endpoints"
+        );
+    }
+
+    #[test]
+    fn select_least_connections_returns_some() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Simple(SimpleStrategy::LeastConnections),
+            make_endpoints(),
+        );
+        assert!(
+            strategy.select(None, None).is_some(),
+            "LeastConnections select should return Some with healthy endpoints"
+        );
+    }
+
+    #[test]
+    fn select_consistent_hash_returns_some() {
+        let strategy = build_strategy(
+            &LoadBalancerStrategy::Parameterised(ParameterisedStrategy::ConsistentHash(ConsistentHashOpts {
+                header: None,
+            })),
+            make_endpoints(),
+        );
+        assert!(
+            strategy.select(Some("/path"), None).is_some(),
+            "ConsistentHash select should return Some with healthy endpoints"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Build a two-endpoint list for strategy tests.
+    fn make_endpoints() -> Vec<WeightedEndpoint> {
+        vec![
+            WeightedEndpoint {
+                address: Arc::from("10.0.0.1:80"),
+                index: 0,
+                weight: 1,
+            },
+            WeightedEndpoint {
+                address: Arc::from("10.0.0.2:80"),
+                index: 1,
+                weight: 1,
+            },
+        ]
+    }
+}

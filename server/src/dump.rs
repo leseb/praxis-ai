@@ -451,4 +451,41 @@ filter_chains:
             "non-sensitive fields must remain: {yaml}"
         );
     }
+
+    #[test]
+    fn redact_credential_values_no_clusters_key() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        config.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("header".to_owned()),
+            serde_yaml::Value::String("Authorization".to_owned()),
+        );
+        redact_credential_values(&mut config);
+        assert!(
+            !config
+                .as_mapping()
+                .unwrap()
+                .contains_key(serde_yaml::Value::String("clusters".to_owned())),
+            "config without clusters key should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn redact_credential_values_non_sequence_clusters() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        config.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("clusters".to_owned()),
+            serde_yaml::Value::String("not-a-sequence".to_owned()),
+        );
+        redact_credential_values(&mut config);
+        let clusters = config
+            .as_mapping()
+            .unwrap()
+            .get(serde_yaml::Value::String("clusters".to_owned()))
+            .unwrap();
+        assert_eq!(
+            clusters.as_str(),
+            Some("not-a-sequence"),
+            "non-sequence clusters value should remain unchanged"
+        );
+    }
 }
