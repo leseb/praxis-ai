@@ -35,4 +35,8 @@ coverage.json
 # Docs are markdown only
 docs/**/
 !docs/
+!docs/architecture/
+!docs/developing/
+!docs/filters/
+!docs/operating/
 !docs/proposals/
