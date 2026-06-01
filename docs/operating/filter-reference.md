@@ -60,15 +60,19 @@ Strategies:
 
 - `round_robin` (default): cycles through endpoints
 - `least_connections`: picks endpoint with fewest active
-  requests
+  requests (O(N) scan)
+- `p2c`: samples two random endpoints, picks the less
+  loaded one (O(1), near-optimal distribution)
 - `consistent_hash`: hashes a request header (or URI path
   as fallback) to pin requests to stable endpoints
 
 Example configs: [weighted-load-balancing.yaml],
-[least-connections.yaml], [session-affinity.yaml].
+[least-connections.yaml], [p2c.yaml],
+[session-affinity.yaml].
 
 [weighted-load-balancing.yaml]: ../../examples/configs/traffic-management/weighted-load-balancing.yaml
 [least-connections.yaml]: ../../examples/configs/traffic-management/least-connections.yaml
+[p2c.yaml]: ../../examples/configs/traffic-management/p2c.yaml
 [session-affinity.yaml]: ../../examples/configs/traffic-management/session-affinity.yaml
 
 Cluster-level options: `connection_timeout_ms`,
