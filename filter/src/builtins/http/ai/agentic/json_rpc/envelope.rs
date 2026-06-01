@@ -16,10 +16,13 @@ use super::config::{BatchPolicy, InvalidJsonRpcBehavior, JsonRpcConfig};
 pub(crate) enum JsonRpcKind {
     /// Request with id (expects response).
     Request,
+
     /// Notification without id (no response expected).
     Notification,
+
     /// Response with id and result/error.
     Response,
+
     /// Batch array of requests/notifications/responses.
     Batch,
 }
@@ -41,12 +44,16 @@ impl JsonRpcKind {
 pub(crate) enum JsonRpcIdKind {
     /// String id.
     String,
+
     /// Integer id (i64/u64).
     Integer,
+
     /// Numeric id (f64).
     Number,
+
     /// Null id.
     Null,
+
     /// Missing id (notification).
     Missing,
 }

@@ -27,6 +27,7 @@ pub(crate) enum InvalidA2aBehavior {
     /// Reject non-A2A input with HTTP 400.
     #[default]
     Reject,
+
     /// Continue processing without A2A metadata.
     Continue,
 }

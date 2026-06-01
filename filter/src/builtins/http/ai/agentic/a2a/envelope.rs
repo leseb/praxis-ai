@@ -57,10 +57,11 @@ pub(crate) enum A2aFamily {
     /// Message methods: `SendMessage`, `SendStreamingMessage`.
     Message,
 
-    /// Task methods: `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`.
+    /// Task methods: `GetTask`, `ListTasks`, `CancelTask`,
+    /// `SubscribeToTask`.
     Task,
 
-    /// Push notification methods: Create/Get/List/DeleteTaskPushNotificationConfig.
+    /// Push notification config methods.
     PushNotification,
 
     /// Agent card methods: `GetExtendedAgentCard`.
