@@ -3053,8 +3053,13 @@ fn list_input_items_scalar_input_normalized_to_message_item() {
     assert_eq!(page.data.len(), 1, "string input should produce one message item");
     assert_eq!(
         page.data[0],
-        json!({"type": "message", "role": "user", "content": "Hello"}),
-        "string input should be normalized to a user message item per the ItemResource schema"
+        json!({
+            "id": "msg_resp_test_input_0",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}]
+        }),
+        "string input should be normalized to a user message resource"
     );
     assert!(!page.has_more);
 }
@@ -3630,8 +3635,21 @@ async fn get_input_items_with_scalar_input() {
     );
     assert_eq!(
         body["data"][0],
-        json!({"type": "message", "role": "user", "content": "hello world"}),
-        "string input should be normalized to a user message item"
+        json!({
+            "id": "msg_resp_scalar_input_0",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello world"}]
+        }),
+        "string input should be normalized to a user message resource"
+    );
+    assert_eq!(
+        body["first_id"], "msg_resp_scalar_input_0",
+        "first_id should use the synthetic message id"
+    );
+    assert_eq!(
+        body["last_id"], "msg_resp_scalar_input_0",
+        "last_id should use the synthetic message id"
     );
 }
 

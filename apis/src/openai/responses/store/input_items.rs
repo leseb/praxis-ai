@@ -99,7 +99,7 @@ pub struct InputItemPage {
 /// Returns [`StoreError::InvalidInput`] if the cursor is malformed
 /// or overflows while calculating the page window.
 pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<InputItemPage, StoreError> {
-    let mut items = normalize_input_items(&record.input);
+    let mut items = normalize_input_items(record);
     if params.order == Order::Descending {
         items.reverse();
     }
@@ -135,22 +135,31 @@ pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<
 /// value verbatim (`"Hello"`, `null`, or an `ItemResource[]` array).
 /// The `/v1/responses/{id}/input_items` endpoint returns
 /// `ItemResource[]`, so this function applies the same
-/// normalization as [`append_stored_input_items`] in the store
-/// filter: string input becomes a user message item, null input
-/// yields an empty list, and arrays/objects pass through as-is.
-///
-/// [`append_stored_input_items`]: super::filter
-fn normalize_input_items(input: &serde_json::Value) -> Vec<serde_json::Value> {
-    match input {
+/// resource shape as the public API: string input becomes a
+/// synthetic user message resource, null input yields an empty list,
+/// and arrays/objects pass through as-is.
+fn normalize_input_items(record: &ResponseRecord) -> Vec<serde_json::Value> {
+    match &record.input {
         serde_json::Value::Null => vec![],
-        serde_json::Value::String(text) => vec![serde_json::json!({
-            "type": "message",
-            "role": "user",
-            "content": text
-        })],
+        serde_json::Value::String(text) => vec![scalar_input_item(&record.id, text)],
         serde_json::Value::Array(arr) => arr.clone(),
         other => vec![other.clone()],
     }
+}
+
+/// Build a public input message resource for scalar create input.
+fn scalar_input_item(response_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("msg_{response_id}_input_0"),
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": text
+            }
+        ]
+    })
 }
 
 /// Resolve an `after` cursor to the offset where the next page starts.
