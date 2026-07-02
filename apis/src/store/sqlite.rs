@@ -594,57 +594,6 @@ fn row_to_conversation_item_record(row: &sqlx::sqlite::SqliteRow) -> Result<Conv
     })
 }
 
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
-
-#[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_url_short_form() {
-        assert!(is_memory_database_url("sqlite::memory:"));
-    }
-
-    #[test]
-    fn memory_url_slash_form() {
-        assert!(is_memory_database_url("sqlite://:memory:"));
-    }
-
-    #[test]
-    fn memory_url_query_param() {
-        assert!(is_memory_database_url("sqlite:///test.db?mode=memory"));
-    }
-
-    #[test]
-    fn memory_url_query_param_not_first() {
-        assert!(is_memory_database_url("sqlite:///test.db?cache=shared&mode=memory"));
-    }
-
-    #[test]
-    fn memory_url_whitespace_trimmed() {
-        assert!(is_memory_database_url("  sqlite::memory:  "));
-    }
-
-    #[test]
-    fn file_url_is_not_memory() {
-        assert!(!is_memory_database_url("sqlite:///path/to/db.sqlite"));
-    }
-
-    #[test]
-    fn file_url_with_mode_rwc_is_not_memory() {
-        assert!(!is_memory_database_url("sqlite:///test.db?mode=rwc"));
-    }
-
-    #[test]
-    fn empty_url_is_not_memory() {
-        assert!(!is_memory_database_url(""));
-    }
-}
-
 /// Convert a sqlx row to a [`ConversationRecord`].
 fn row_to_conversation_record(row: &sqlx::sqlite::SqliteRow) -> Result<ConversationRecord, StoreError> {
     let messages_json: String = row
@@ -667,4 +616,58 @@ fn row_to_conversation_record(row: &sqlx::sqlite::SqliteRow) -> Result<Conversat
         metadata: serde_json::from_str(&metadata_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
         messages: serde_json::from_str(&messages_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
     })
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_url_short_form() {
+        assert!(is_memory_database_url("sqlite::memory:"), "short-form memory URL should be detected");
+    }
+
+    #[test]
+    fn memory_url_slash_form() {
+        assert!(is_memory_database_url("sqlite://:memory:"), "slash-form memory URL should be detected");
+    }
+
+    #[test]
+    fn memory_url_query_param() {
+        assert!(is_memory_database_url("sqlite:///test.db?mode=memory"), "mode=memory query param should be detected");
+    }
+
+    #[test]
+    fn memory_url_query_param_not_first() {
+        assert!(
+            is_memory_database_url("sqlite:///test.db?cache=shared&mode=memory"),
+            "mode=memory should be detected even when not the first query param"
+        );
+    }
+
+    #[test]
+    fn memory_url_whitespace_trimmed() {
+        assert!(is_memory_database_url("  sqlite::memory:  "), "leading/trailing whitespace should be trimmed");
+    }
+
+    #[test]
+    fn file_url_is_not_memory() {
+        assert!(!is_memory_database_url("sqlite:///path/to/db.sqlite"), "file-backed URL should not be detected as memory");
+    }
+
+    #[test]
+    fn file_url_with_mode_rwc_is_not_memory() {
+        assert!(!is_memory_database_url("sqlite:///test.db?mode=rwc"), "mode=rwc should not be detected as memory");
+    }
+
+    #[test]
+    fn empty_url_is_not_memory() {
+        assert!(!is_memory_database_url(""), "empty URL should not be detected as memory");
+    }
 }
