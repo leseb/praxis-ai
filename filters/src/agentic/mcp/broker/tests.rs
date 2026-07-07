@@ -633,15 +633,12 @@ servers:
         catalog[0].input_schema["properties"]["city"]["type"], "string",
         "input_schema should preserve property types"
     );
-    // Verify routing fields via Debug to avoid triggering dead_code for
-    // fields that exist only for future tools/call backend dispatch.
-    let debug = format!("{:?}", catalog[0]);
-    assert!(
-        debug.contains("weather-mcp"),
+    assert_eq!(
+        catalog[0].cluster, "weather-mcp",
         "cluster should be preserved in catalog entry"
     );
-    assert!(
-        debug.contains("/backend/mcp"),
+    assert_eq!(
+        catalog[0].backend_path, "/backend/mcp",
         "backend_path should be preserved in catalog entry"
     );
 }

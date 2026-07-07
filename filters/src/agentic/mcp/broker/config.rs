@@ -496,8 +496,6 @@ fn build_catalog_entry(server: &McpServerConfig, tool: &ToolConfig) -> CatalogTo
 mod tests {
     use super::*;
 
-    // ---- CacheScope ----
-
     #[test]
     fn cache_scope_default_is_public() {
         assert_eq!(CacheScope::default(), CacheScope::Public);
@@ -526,8 +524,6 @@ mod tests {
         assert!(serde_yaml::from_str::<CacheScope>("shared").is_err());
     }
 
-    // ---- InvalidToolPolicy ----
-
     #[test]
     fn invalid_tool_policy_default_is_reject_server() {
         assert_eq!(InvalidToolPolicy::default(), InvalidToolPolicy::RejectServer);
@@ -544,8 +540,6 @@ mod tests {
             InvalidToolPolicy::FilterOut,
         );
     }
-
-    // ---- ToolConfig serde ----
 
     #[test]
     fn tool_config_minimal() {
@@ -574,8 +568,6 @@ schema:
         assert!(serde_yaml::from_str::<ToolConfig>(yaml).is_err());
     }
 
-    // ---- McpServerConfig serde ----
-
     #[test]
     fn server_config_defaults() {
         let yaml = "name: s\ncluster: c";
@@ -590,8 +582,6 @@ schema:
         let yaml = "name: s\ncluster: c\nbogus: true";
         assert!(serde_yaml::from_str::<McpServerConfig>(yaml).is_err());
     }
-
-    // ---- McpBrokerConfig serde ----
 
     #[test]
     fn broker_config_minimal_deserializes() {
@@ -611,8 +601,6 @@ schema:
     fn broker_config_rejects_unknown_fields() {
         assert!(serde_yaml::from_str::<McpBrokerConfig>("bogus: true").is_err());
     }
-
-    // ---- validate_schema_object edge cases ----
 
     #[test]
     fn schema_properties_must_be_object() {
@@ -691,8 +679,6 @@ schema:
         assert!(err.contains("required must be an array of strings"), "{err}");
     }
 
-    // ---- validate_tool_schemas ----
-
     #[test]
     fn tool_with_no_schema_is_valid() {
         let tool = ToolConfig {
@@ -725,8 +711,6 @@ schema:
         };
         assert!(validate_tool_schemas(&tool).is_err());
     }
-
-    // ---- build_catalog_entry ----
 
     #[test]
     fn catalog_entry_without_prefix() {
@@ -780,16 +764,12 @@ schema:
         );
     }
 
-    // ---- default_input_schema ----
-
     #[test]
     fn default_schema_is_closed_object() {
         let schema = default_input_schema();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
     }
-
-    // ---- validate_path ----
 
     #[test]
     fn path_valid_simple() {
@@ -836,8 +816,6 @@ schema:
         let err = validate_path("test", "/bad path").unwrap_err();
         assert!(err.to_string().contains("not a valid URI"));
     }
-
-    // ---- validate_unique_server_names ----
 
     #[test]
     fn unique_server_names_pass() {
@@ -900,8 +878,6 @@ schema:
         assert!(validate_unique_server_names(&[]).is_ok());
     }
 
-    // ---- validate_server_clusters ----
-
     #[test]
     fn empty_cluster_name_fails() {
         let servers = vec![McpServerConfig {
@@ -914,8 +890,6 @@ schema:
         let err = validate_server_clusters(&servers).unwrap_err();
         assert!(err.to_string().contains("cluster must not be empty"));
     }
-
-    // ---- validate_tool_names ----
 
     #[test]
     fn empty_tool_name_fails() {
@@ -959,8 +933,6 @@ schema:
         }];
         assert!(validate_tool_names(&servers).is_ok());
     }
-
-    // ---- validate_unique_exposed_names ----
 
     #[test]
     fn duplicate_exposed_names_fail() {
@@ -1010,8 +982,6 @@ schema:
         assert!(validate_unique_exposed_names(&[]).is_ok());
     }
 
-    // ---- validate_cache_fields_for_profile ----
-
     #[test]
     fn current_profile_rejects_cache_scope() {
         let cfg: McpBrokerConfig = serde_yaml::from_str("cache_scope: public").unwrap();
@@ -1037,8 +1007,6 @@ schema:
         let cfg: McpBrokerConfig = serde_yaml::from_str("{}").unwrap();
         assert!(validate_cache_fields_for_profile(ProtocolProfile::Current, &cfg).is_ok());
     }
-
-    // ---- validate_versions ----
 
     #[test]
     fn validate_versions_empty_supported_rejected() {
@@ -1090,8 +1058,6 @@ schema:
             .is_ok()
         );
     }
-
-    // ---- build_config integration ----
 
     #[test]
     fn build_config_minimal() {
