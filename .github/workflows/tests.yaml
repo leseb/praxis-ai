@@ -9,7 +9,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   merge_group:
     branches: [main]
   workflow_dispatch:
@@ -19,12 +19,6 @@ on:
         required: false
         type: boolean
         default: false
-      praxis_ref:
-        description: "Praxis core git ref to test against (default: main)"
-        required: false
-        type: string
-        default: "main"
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -42,19 +36,10 @@ jobs:
 
   lint:
     runs-on: ubuntu-24.04
-    continue-on-error: ${{ contains(github.event.pull_request.labels.*.name, 'praxis-known-issue') }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Clone Praxis core (path dependency)
-        uses: ./.github/actions/clone-praxis
-        with:
-          ref: ${{ inputs.praxis_ref || 'main' }}
-
-      - name: Patch Praxis dependencies
-        uses: ./.github/actions/patch-praxis
 
       - name: Install nightly Rust (for rustfmt)
         uses: ./.github/actions/install-nightly-rust
@@ -91,19 +76,10 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
-    continue-on-error: ${{ contains(github.event.pull_request.labels.*.name, 'praxis-known-issue') }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Clone Praxis core (path dependency)
-        uses: ./.github/actions/clone-praxis
-        with:
-          ref: ${{ inputs.praxis_ref || 'main' }}
-
-      - name: Patch Praxis dependencies
-        uses: ./.github/actions/patch-praxis
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
