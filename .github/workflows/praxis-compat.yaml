@@ -70,7 +70,7 @@ jobs:
         run: |
           cargo test -p praxis-ai-apis --features praxis-main
           cargo test -p praxis-ai-filters --features praxis-main
-          cargo test -p praxis-ai-proxy
+          cargo test -p praxis-ai-proxy --features praxis-main
 
       - name: Schema tests
         run: make test-schema
