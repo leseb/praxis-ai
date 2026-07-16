@@ -681,6 +681,8 @@ fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
             kind: None,
             method: None,
         },
+        #[cfg(feature = "praxis-main")]
+        max_batch_size: 100,
         max_body_bytes,
         on_invalid: OnInvalidBehavior::Continue,
     }
