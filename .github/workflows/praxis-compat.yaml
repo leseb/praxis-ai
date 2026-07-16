@@ -49,7 +49,7 @@ jobs:
         uses: ./.github/actions/patch-praxis
 
       - name: Update lockfile for patched dependencies
-        run: cargo update --workspace
+        run: cargo update
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
