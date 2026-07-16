@@ -104,7 +104,10 @@ clusters:
 "#;
     let err = Config::from_yaml(yaml).unwrap_err();
     #[cfg(feature = "praxis-main")]
-    assert!(err.to_string().contains("sni must be a valid DNS hostname"), "got: {err}");
+    assert!(
+        err.to_string().contains("sni must be a valid DNS hostname"),
+        "got: {err}"
+    );
     #[cfg(not(feature = "praxis-main"))]
     assert!(err.to_string().contains("sni is empty"), "got: {err}");
 }
@@ -133,7 +136,10 @@ clusters:
     );
     let err = Config::from_yaml(&yaml).unwrap_err();
     #[cfg(feature = "praxis-main")]
-    assert!(err.to_string().contains("sni must be a valid DNS hostname"), "got: {err}");
+    assert!(
+        err.to_string().contains("sni must be a valid DNS hostname"),
+        "got: {err}"
+    );
     #[cfg(not(feature = "praxis-main"))]
     assert!(err.to_string().contains("exceeds 253 characters"), "got: {err}");
 }
@@ -162,7 +168,10 @@ clusters:
     );
     let err = Config::from_yaml(&yaml).unwrap_err();
     #[cfg(feature = "praxis-main")]
-    assert!(err.to_string().contains("sni must be a valid DNS hostname"), "got: {err}");
+    assert!(
+        err.to_string().contains("sni must be a valid DNS hostname"),
+        "got: {err}"
+    );
     #[cfg(not(feature = "praxis-main"))]
     assert!(err.to_string().contains("invalid label length"), "got: {err}");
 }
@@ -187,7 +196,10 @@ clusters:
 "#;
     let err = Config::from_yaml(yaml).unwrap_err();
     #[cfg(feature = "praxis-main")]
-    assert!(err.to_string().contains("sni must be a valid DNS hostname"), "got: {err}");
+    assert!(
+        err.to_string().contains("sni must be a valid DNS hostname"),
+        "got: {err}"
+    );
     #[cfg(not(feature = "praxis-main"))]
     assert!(err.to_string().contains("invalid label length"), "got: {err}");
 }
@@ -212,7 +224,10 @@ clusters:
 "#;
     let err = Config::from_yaml(yaml).unwrap_err();
     #[cfg(feature = "praxis-main")]
-    assert!(err.to_string().contains("sni must be a valid DNS hostname"), "got: {err}");
+    assert!(
+        err.to_string().contains("sni must be a valid DNS hostname"),
+        "got: {err}"
+    );
     #[cfg(not(feature = "praxis-main"))]
     assert!(err.to_string().contains("invalid characters"), "got: {err}");
 }
