@@ -5,7 +5,7 @@
 VERSION          ?= $(shell perl -ne 'print $$1 if /^version\s*=\s*"(.+)"/' Cargo.toml)
 IMAGE            ?= praxis-ai
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
-OPENAI_CONFORMANCE_ARGS ?= --implementation-spec docs/conformance/openai-conversations-implementation-openapi.yaml
+OPENAI_CONFORMANCE_ARGS ?=
 V                ?=
 
 ifneq ($(V),)

@@ -10,9 +10,11 @@
 mod config;
 mod filter;
 mod handlers;
+pub mod openapi;
 mod validate;
 
 pub use filter::OpenaiConversationsFilter;
+pub use openapi::implementation_openapi_json;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]

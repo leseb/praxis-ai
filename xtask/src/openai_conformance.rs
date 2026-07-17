@@ -23,6 +23,9 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 /// Default source for OpenAI's published `OpenAPI` spec.
 const DEFAULT_OPENAI_SPEC: &str = "https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml";
 
+/// Stable label for the generated Praxis implementation spec.
+const GENERATED_IMPLEMENTATION_SPEC_SOURCE: &str = "generated:praxis-ai-apis/openai/conversations";
+
 /// HTTP method keys that may appear under an `OpenAPI` path item.
 const HTTP_METHODS: &[&str] = &["delete", "get", "head", "options", "patch", "post", "put", "trace"];
 
@@ -61,7 +64,8 @@ pub(crate) struct Args {
     #[arg(long)]
     list_missing: bool,
 
-    /// Local implementation `OpenAPI` spec to compare with `oasdiff`.
+    /// Override the generated local implementation `OpenAPI` spec used for
+    /// `oasdiff`.
     #[arg(long)]
     implementation_spec: Option<String>,
 
@@ -78,7 +82,7 @@ pub(crate) struct Args {
     fail_under: Option<f64>,
 
     /// Exit non-zero when `oasdiff` exact-operation percentage is below this
-    /// value. Requires `--implementation-spec`.
+    /// value.
     #[arg(long, value_name = "PERCENT")]
     fail_oasdiff_under: Option<f64>,
 }
@@ -107,7 +111,7 @@ pub(crate) fn run(args: &Args) {
 
     if let Some(threshold) = args.fail_oasdiff_under {
         let Some(oasdiff) = &result.oasdiff else {
-            eprintln!("--fail-oasdiff-under requires --implementation-spec");
+            eprintln!("openai-conformance failed: oasdiff report was not generated");
             std::process::exit(1);
         };
         if oasdiff.conformance_percent() < threshold {
@@ -151,13 +155,11 @@ fn run_inner(args: &Args) -> Result<CoverageReport, String> {
         args.include_beta,
     );
 
-    if let Some(implementation_spec) = &args.implementation_spec {
-        report.oasdiff = Some(run_scoped_oasdiff(
-            &args.openai_spec,
-            implementation_spec,
-            &report.considered,
-        )?);
-    }
+    report.oasdiff = Some(run_scoped_oasdiff(
+        &args.openai_spec,
+        args.implementation_spec.as_deref(),
+        &report.considered,
+    )?);
 
     Ok(report)
 }
@@ -710,16 +712,16 @@ fn repo_root() -> PathBuf {
 /// Run `oasdiff` against the selected reference spec.
 fn run_scoped_oasdiff(
     openai_source: &str,
-    implementation_source: &str,
+    implementation_source: Option<&str>,
     considered: &[SpecOperation],
 ) -> Result<OasdiffReport, String> {
     let openai_reference = materialize_spec(openai_source)?;
-    let implementation = materialize_spec(implementation_source)?;
+    let implementation = materialize_implementation_spec(implementation_source)?;
 
     let mut missing = BTreeSet::new();
     let mut drifted = BTreeMap::new();
 
-    let conversations_diff = run_oasdiff_diff(openai_reference.path(), implementation.path(), "Conversations")?;
+    let conversations_diff = run_oasdiff_diff(openai_reference.path(), implementation.file.path(), "Conversations")?;
     collect_oasdiff_operation_status(
         &conversations_diff,
         OperationScope::Conversations,
@@ -729,17 +731,49 @@ fn run_scoped_oasdiff(
     );
 
     Ok(build_oasdiff_report(
-        implementation_source,
+        &implementation.source,
         considered,
         missing,
         drifted,
     ))
 }
 
+/// Materialized spec plus a stable report source label.
+struct MaterializedSpec {
+    /// User-facing source label.
+    source: String,
+
+    /// Temporary spec file consumed by `oasdiff`.
+    file: NamedTempFile,
+}
+
+/// Materialize the implementation spec for `oasdiff`.
+fn materialize_implementation_spec(source: Option<&str>) -> Result<MaterializedSpec, String> {
+    if let Some(source) = source {
+        return Ok(MaterializedSpec {
+            source: source.to_owned(),
+            file: materialize_spec(source)?,
+        });
+    }
+
+    let content = praxis_ai_apis::openai::conversations_openapi_json()
+        .map_err(|e| format!("failed to generate Conversations implementation OpenAPI spec: {e}"))?;
+    let file = materialize_spec_content(GENERATED_IMPLEMENTATION_SPEC_SOURCE, &content, ".json")?;
+    Ok(MaterializedSpec {
+        source: GENERATED_IMPLEMENTATION_SPEC_SOURCE.to_owned(),
+        file,
+    })
+}
+
 /// Write a URL or local spec source to a temporary file for `oasdiff`.
 fn materialize_spec(source: &str) -> Result<NamedTempFile, String> {
     let content = read_spec(source)?;
     let suffix = spec_suffix(source);
+    materialize_spec_content(source, &content, suffix)
+}
+
+/// Write spec content to a temporary file for `oasdiff`.
+fn materialize_spec_content(source: &str, content: &str, suffix: &str) -> Result<NamedTempFile, String> {
     let mut file = TempFileBuilder::new()
         .suffix(suffix)
         .tempfile()

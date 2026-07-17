@@ -20,7 +20,7 @@ pub(crate) mod sse;
 pub(crate) mod translation;
 pub(crate) mod url_security;
 
-pub use conversations::OpenaiConversationsFilter;
+pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
 pub use responses::{
     DocExtractFilter, FileResolveFilter, McpDispatchFilter, McpToolResolveFilter, ModelRewriteFilter,
     OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter, ResponsesFormatFilter, ToolParseFilter,

@@ -17,10 +17,10 @@
   "overall_conformance": {
     "basis": "oasdiff",
     "total_operations": 8,
-    "conformant_operations_count": 0,
+    "conformant_operations_count": 1,
     "missing_operations_count": 0,
-    "drifted_operations_count": 8,
-    "conformance_percent": 0.0
+    "drifted_operations_count": 7,
+    "conformance_percent": 12.5
   },
   "operation_coverage": {
     "total_operations": 8,
@@ -213,55 +213,37 @@
   },
   "oasdiff": {
     "enabled": true,
-    "implementation_source": "docs/conformance/openai-conversations-implementation-openapi.yaml",
+    "implementation_source": "generated:praxis-ai-apis/openai/conversations",
     "total_operations": 8,
-    "conformant_operations_count": 0,
+    "conformant_operations_count": 1,
     "missing_operations_count": 0,
-    "drifted_operations_count": 8,
+    "drifted_operations_count": 7,
     "request_drift_operations_count": 5,
-    "response_drift_operations_count": 8,
+    "response_drift_operations_count": 7,
     "other_drift_operations_count": 0,
-    "conformance_percent": 0.0,
+    "conformance_percent": 12.5,
     "by_area": [
       {
         "area": "Conversations",
         "total": 8,
-        "conformant": 0,
+        "conformant": 1,
         "missing": 0,
-        "drifted": 8,
+        "drifted": 7,
         "request_drifted": 5,
-        "response_drifted": 8,
+        "response_drifted": 7,
         "other_drifted": 0,
-        "conformance_percent": 0.0
+        "conformance_percent": 12.5
       }
     ],
     "fixes_required": {
       "summary": {
-        "operations_to_fix": 8,
+        "operations_to_fix": 7,
         "missing_operations": 0,
         "request_drift_operations": 5,
-        "response_drift_operations": 8,
+        "response_drift_operations": 7,
         "other_drift_operations": 0
       },
       "by_operation": [
-        {
-          "operation": {
-            "method": "DELETE",
-            "path": "/conversations/{conversation_id}",
-            "operation": "DELETE /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.200.content.application/json.schema.properties.object.default.from",
-                "responses.200.content.application/json.schema.properties.object.default.to"
-              ]
-            }
-          ]
-        },
         {
           "operation": {
             "method": "DELETE",
@@ -277,10 +259,8 @@
                 "responses.200.content.application/json.schema.properties.created_at.format.from",
                 "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-                "responses.200.content.application/json.schema.properties.object.default.from",
-                "responses.200.content.application/json.schema.properties.object.default.to"
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
               ]
             }
           ]
@@ -300,10 +280,8 @@
                 "responses.200.content.application/json.schema.properties.created_at.format.from",
                 "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-                "responses.200.content.application/json.schema.properties.object.default.from",
-                "responses.200.content.application/json.schema.properties.object.default.to"
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
               ]
             }
           ]
@@ -320,7 +298,13 @@
               "kind": "request_parameters",
               "summary": "Add or align OpenAI request parameters in the implementation spec and handler behavior.",
               "detail_paths": [
-                "parameters.deleted.query"
+                "parameters.deleted.query",
+                "parameters.query.limit.schema.format.from",
+                "parameters.query.limit.schema.format.to",
+                "parameters.query.limit.schema.default.from",
+                "parameters.query.limit.schema.default.to",
+                "parameters.query.limit.schema.min.from",
+                "parameters.query.limit.schema.min.to"
               ]
             },
             {
@@ -329,10 +313,9 @@
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
                 "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-                "responses.200.content.application/json.schema.properties.data.items.type.added",
-                "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.from",
-                "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.to",
-                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
+                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
+                "responses.200.content.application/json.schema.properties.object.default.from",
+                "responses.200.content.application/json.schema.properties.object.default.to"
               ]
             }
           ]
@@ -358,9 +341,6 @@
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
                 "responses.200.content.application/json.schema.oneOf.deleted",
-                "responses.200.content.application/json.schema.type.added",
-                "responses.200.content.application/json.schema.additionalPropertiesAllowed.from",
-                "responses.200.content.application/json.schema.additionalPropertiesAllowed.to",
                 "responses.200.content.application/json.schema.discriminatorDiff.deleted"
               ]
             }
@@ -378,13 +358,15 @@
               "kind": "request_body_schema",
               "summary": "Align the request body schema with the OpenAI spec.",
               "detail_paths": [
+                "requestBody.required.from",
+                "requestBody.required.to",
                 "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
                 "requestBody.content.application/json.schema.properties.items.type.added",
                 "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
                 "requestBody.content.application/json.schema.properties.items.maxItems.from",
                 "requestBody.content.application/json.schema.properties.items.maxItems.to",
                 "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
-                "requestBody.content.application/json.schema.properties.metadata.anyOf.added",
+                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
                 "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
               ]
             },
@@ -396,10 +378,8 @@
                 "responses.200.content.application/json.schema.properties.created_at.format.from",
                 "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-                "responses.200.content.application/json.schema.properties.object.default.from",
-                "responses.200.content.application/json.schema.properties.object.default.to"
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
               ]
             }
           ]
@@ -416,8 +396,11 @@
               "kind": "request_body_schema",
               "summary": "Align the request body schema with the OpenAI spec.",
               "detail_paths": [
+                "requestBody.required.from",
+                "requestBody.required.to",
                 "requestBody.content.application/json.schema.required.deleted",
-                "requestBody.content.application/json.schema.properties.metadata.anyOf.modified"
+                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
+                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
               ]
             },
             {
@@ -428,10 +411,8 @@
                 "responses.200.content.application/json.schema.properties.created_at.format.from",
                 "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-                "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-                "responses.200.content.application/json.schema.properties.object.default.from",
-                "responses.200.content.application/json.schema.properties.object.default.to"
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
               ]
             }
           ]
@@ -458,9 +439,6 @@
               "detail_paths": [
                 "requestBody.content.application/json.schema.type.added",
                 "requestBody.content.application/json.schema.properties.items.items.oneOf.deleted",
-                "requestBody.content.application/json.schema.properties.items.items.type.added",
-                "requestBody.content.application/json.schema.properties.items.items.additionalPropertiesAllowed.from",
-                "requestBody.content.application/json.schema.properties.items.items.additionalPropertiesAllowed.to",
                 "requestBody.content.application/json.schema.properties.items.items.discriminatorDiff.deleted"
               ]
             },
@@ -470,10 +448,9 @@
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
                 "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-                "responses.200.content.application/json.schema.properties.data.items.type.added",
-                "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.from",
-                "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.to",
-                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
+                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
+                "responses.200.content.application/json.schema.properties.object.default.from",
+                "responses.200.content.application/json.schema.properties.object.default.to"
               ]
             }
           ]
@@ -482,22 +459,6 @@
     },
     "missing_operations": [],
     "drifted_operations": [
-      {
-        "operation": {
-          "method": "DELETE",
-          "path": "/conversations/{conversation_id}",
-          "operation": "DELETE /conversations/{conversation_id}"
-        },
-        "has_request_drift": false,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [],
-        "response_details": [
-          "responses.200.content.application/json.schema.properties.object.default.from",
-          "responses.200.content.application/json.schema.properties.object.default.to"
-        ],
-        "other_details": []
-      },
       {
         "operation": {
           "method": "DELETE",
@@ -512,10 +473,8 @@
           "responses.200.content.application/json.schema.properties.created_at.format.from",
           "responses.200.content.application/json.schema.properties.created_at.format.to",
           "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-          "responses.200.content.application/json.schema.properties.object.default.from",
-          "responses.200.content.application/json.schema.properties.object.default.to"
+          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
         ],
         "other_details": []
       },
@@ -533,10 +492,8 @@
           "responses.200.content.application/json.schema.properties.created_at.format.from",
           "responses.200.content.application/json.schema.properties.created_at.format.to",
           "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-          "responses.200.content.application/json.schema.properties.object.default.from",
-          "responses.200.content.application/json.schema.properties.object.default.to"
+          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
         ],
         "other_details": []
       },
@@ -550,14 +507,19 @@
         "has_response_drift": true,
         "has_other_drift": false,
         "request_details": [
-          "parameters.deleted.query"
+          "parameters.deleted.query",
+          "parameters.query.limit.schema.format.from",
+          "parameters.query.limit.schema.format.to",
+          "parameters.query.limit.schema.default.from",
+          "parameters.query.limit.schema.default.to",
+          "parameters.query.limit.schema.min.from",
+          "parameters.query.limit.schema.min.to"
         ],
         "response_details": [
           "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-          "responses.200.content.application/json.schema.properties.data.items.type.added",
-          "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.from",
-          "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.to",
-          "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
+          "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
+          "responses.200.content.application/json.schema.properties.object.default.from",
+          "responses.200.content.application/json.schema.properties.object.default.to"
         ],
         "other_details": []
       },
@@ -575,9 +537,6 @@
         ],
         "response_details": [
           "responses.200.content.application/json.schema.oneOf.deleted",
-          "responses.200.content.application/json.schema.type.added",
-          "responses.200.content.application/json.schema.additionalPropertiesAllowed.from",
-          "responses.200.content.application/json.schema.additionalPropertiesAllowed.to",
           "responses.200.content.application/json.schema.discriminatorDiff.deleted"
         ],
         "other_details": []
@@ -592,23 +551,23 @@
         "has_response_drift": true,
         "has_other_drift": false,
         "request_details": [
+          "requestBody.required.from",
+          "requestBody.required.to",
           "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
           "requestBody.content.application/json.schema.properties.items.type.added",
           "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
           "requestBody.content.application/json.schema.properties.items.maxItems.from",
           "requestBody.content.application/json.schema.properties.items.maxItems.to",
           "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
-          "requestBody.content.application/json.schema.properties.metadata.anyOf.added",
+          "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
           "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
         ],
         "response_details": [
           "responses.200.content.application/json.schema.properties.created_at.format.from",
           "responses.200.content.application/json.schema.properties.created_at.format.to",
           "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-          "responses.200.content.application/json.schema.properties.object.default.from",
-          "responses.200.content.application/json.schema.properties.object.default.to"
+          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
         ],
         "other_details": []
       },
@@ -622,17 +581,18 @@
         "has_response_drift": true,
         "has_other_drift": false,
         "request_details": [
+          "requestBody.required.from",
+          "requestBody.required.to",
           "requestBody.content.application/json.schema.required.deleted",
-          "requestBody.content.application/json.schema.properties.metadata.anyOf.modified"
+          "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
+          "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
         ],
         "response_details": [
           "responses.200.content.application/json.schema.properties.created_at.format.from",
           "responses.200.content.application/json.schema.properties.created_at.format.to",
           "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.from",
-          "responses.200.content.application/json.schema.properties.metadata.additionalPropertiesAllowed.to",
-          "responses.200.content.application/json.schema.properties.object.default.from",
-          "responses.200.content.application/json.schema.properties.object.default.to"
+          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
         ],
         "other_details": []
       },
@@ -649,17 +609,13 @@
           "parameters.deleted.query",
           "requestBody.content.application/json.schema.type.added",
           "requestBody.content.application/json.schema.properties.items.items.oneOf.deleted",
-          "requestBody.content.application/json.schema.properties.items.items.type.added",
-          "requestBody.content.application/json.schema.properties.items.items.additionalPropertiesAllowed.from",
-          "requestBody.content.application/json.schema.properties.items.items.additionalPropertiesAllowed.to",
           "requestBody.content.application/json.schema.properties.items.items.discriminatorDiff.deleted"
         ],
         "response_details": [
           "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-          "responses.200.content.application/json.schema.properties.data.items.type.added",
-          "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.from",
-          "responses.200.content.application/json.schema.properties.data.items.additionalPropertiesAllowed.to",
-          "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
+          "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
+          "responses.200.content.application/json.schema.properties.object.default.from",
+          "responses.200.content.application/json.schema.properties.object.default.to"
         ],
         "other_details": []
       }
