@@ -95,6 +95,9 @@ pub(super) fn accumulate_response_object(
         {
             object.insert("usage".to_owned(), state.usage.clone());
         }
+        if let Some(Value::Array(output)) = response.get("output") {
+            output.clone_into(&mut state.output_items);
+        }
         state.response_object = response;
         had_prior_usage
     };
