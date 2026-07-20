@@ -96,7 +96,7 @@ pub(super) fn accumulate_response_object(
             object.insert("usage".to_owned(), state.usage.clone());
         }
         if let Some(Value::Array(output)) = response.get("output") {
-            output.clone_into(&mut state.output_items);
+            *state.output_items_mut() = output.clone();
         }
         state.response_object = response;
         had_prior_usage
@@ -136,7 +136,7 @@ fn handle_output_item_added(ctx: &mut HttpFilterContext<'_>, payload: &Value) {
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
 
     if let Some(item) = payload.get("item") {
-        state.output_items.push(item.clone());
+        state.output_items_mut().push(item.clone());
     }
 }
 
@@ -152,7 +152,7 @@ fn handle_output_item_done(ctx: &mut HttpFilterContext<'_>, payload: &Value) {
         .get("output_index")
         .and_then(Value::as_u64)
         .and_then(|v| usize::try_from(v).ok())
-        && let Some(slot) = state.output_items.get_mut(idx)
+        && let Some(slot) = state.output_items_mut().get_mut(idx)
     {
         item.clone_into(slot);
         return;
@@ -160,7 +160,7 @@ fn handle_output_item_done(ctx: &mut HttpFilterContext<'_>, payload: &Value) {
 
     if let Some(id) = item.get("id").and_then(Value::as_str)
         && let Some(existing) = state
-            .output_items
+            .output_items_mut()
             .iter_mut()
             .find(|i| i.get("id").and_then(Value::as_str) == Some(id))
     {
@@ -168,7 +168,7 @@ fn handle_output_item_done(ctx: &mut HttpFilterContext<'_>, payload: &Value) {
         return;
     }
 
-    state.output_items.push(item.clone());
+    state.output_items_mut().push(item.clone());
 }
 
 /// Append a function-call argument delta to the running buffer.
@@ -209,20 +209,23 @@ fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut
         .or(accumulated)
         .unwrap_or_default();
 
-    let Some(item) = find_output_item_mut(&mut state.output_items, payload) else {
-        warn!(
-            key,
-            "dropping function-call arguments.done without matching output item"
-        );
-        return;
-    };
+    let tool_call = {
+        let Some(item) = find_output_item_mut(state.output_items_mut(), payload) else {
+            warn!(
+                key,
+                "dropping function-call arguments.done without matching output item"
+            );
+            return;
+        };
 
-    let Some(tool_call) = complete_function_call_item(item, &arguments) else {
-        warn!(
-            key,
-            "dropping function-call arguments.done for non-function output item"
-        );
-        return;
+        let Some(tool_call) = complete_function_call_item(item, &arguments) else {
+            warn!(
+                key,
+                "dropping function-call arguments.done for non-function output item"
+            );
+            return;
+        };
+        tool_call
     };
 
     upsert_tool_call(&mut state.tool_calls, tool_call);
