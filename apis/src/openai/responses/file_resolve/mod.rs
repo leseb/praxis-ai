@@ -140,6 +140,7 @@ impl FileResolveFilter {
             api_base_url: validated.files_api_url.clone(),
             callout_config: CalloutConfig {
                 failure_mode: FailureMode::Closed,
+                max_response_bytes: validated.max_body_bytes,
                 timeout_ms: validated.timeout_ms,
                 status_on_error: 502,
                 ..CalloutConfig::default()
