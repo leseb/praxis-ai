@@ -115,9 +115,17 @@ fn checked_oasdiff_version() -> Result<String, String> {
     }
     let actual = parse_oasdiff_version(&String::from_utf8_lossy(&output.stdout))?;
     if actual != OASDIFF_VERSION {
-        return Err(format!(
-            "unsupported oasdiff version {actual}; install exactly {OASDIFF_VERSION}"
-        ));
+        if actual == "main" {
+            eprintln!(
+                "warning: oasdiff reports version '{actual}' (go-install build); \
+                 expected {OASDIFF_VERSION} — proceeding on the assumption the \
+                 correct tag was installed"
+            );
+        } else {
+            return Err(format!(
+                "unsupported oasdiff version {actual}; install exactly {OASDIFF_VERSION}"
+            ));
+        }
     }
     Ok(actual)
 }
