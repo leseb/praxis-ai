@@ -14,7 +14,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-schema test-integration \
-	openai-conformance test-openai-conformance \
+	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
@@ -78,6 +78,9 @@ test-integration:
 
 openai-conformance:
 	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
+
+check-openai-conformance-reference:
+	cargo xtask openai-conformance-reference --check
 
 test-openai-conformance: openai-conformance
 
@@ -172,7 +175,8 @@ help:
 	@echo "  test-unit            unit tests (providers, filters, server)"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
-	@echo "  openai-conformance   compare Conversations coverage with OpenAI's OpenAPI spec"
+	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
+	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint                 clippy + rustfmt + separator width + filter docs check"

@@ -41,6 +41,8 @@ docs/**/
 !docs/
 !docs/architecture/
 !docs/conformance/
+!docs/conformance/**/
+!docs/conformance/**
 !docs/developing/
 !docs/filters/
 !docs/filters/http/

@@ -77,6 +77,9 @@ enum Command {
 
     /// Compare Conversations coverage with OpenAI's `OpenAPI` spec.
     OpenaiConformance(openai_conformance::Args),
+
+    /// Refresh or verify the pinned complete OpenAI reference.
+    OpenaiConformanceReference(openai_conformance::ReferenceArgs),
 }
 
 // -----------------------------------------------------------------------------
@@ -97,6 +100,7 @@ fn main() {
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),
         Command::OpenaiConformance(args) => openai_conformance::run(&args),
+        Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),
     }
 }
 

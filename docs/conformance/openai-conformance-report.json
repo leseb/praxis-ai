@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "scope": {
     "areas": [
       "Conversations"
@@ -7,22 +7,25 @@
     "include_deprecated": false,
     "include_beta": false
   },
-  "sources": [
+  "reference": {
+    "source": "docs/conformance/specs/openai-openapi.yaml",
+    "source_sha256": "0bf136e5f8e135a04f4b4bda93c13e75d83e98954da48ccb1e3b4b080b47b068",
+    "upstream": {
+      "repository": "https://github.com/openai/openai-openapi",
+      "revision": "db3e53198a66732cfe161339ea63bf36fc0137ad",
+      "path": "openapi.yaml",
+      "source_sha256": "0bf136e5f8e135a04f4b4bda93c13e75d83e98954da48ccb1e3b4b080b47b068"
+    }
+  },
+  "area_projections": [
     {
+      "area_id": "conversations",
       "area": "Conversations",
-      "source": "https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml",
+      "projection_sha256": "8c613541c92f2df0fd2f3a424fd067adceb737d5d0dfe1916ed19dc52ff61421",
       "operations": 8
     }
   ],
-  "overall_conformance": {
-    "basis": "oasdiff",
-    "total_operations": 8,
-    "conformant_operations_count": 1,
-    "missing_operations_count": 0,
-    "drifted_operations_count": 7,
-    "conformance_percent": 12.5
-  },
-  "operation_coverage": {
+  "capability_coverage": {
     "total_operations": 8,
     "covered_operations_count": 8,
     "missing_operations_count": 0,
@@ -42,8 +45,20 @@
     ],
     "by_mode": [
       {
+        "mode": "passthrough",
+        "operations": 0
+      },
+      {
+        "mode": "inspect",
+        "operations": 0
+      },
+      {
+        "mode": "transform",
+        "operations": 0
+      },
+      {
         "mode": "local",
-        "covered": 8
+        "operations": 8
       }
     ],
     "covered_operations": [
@@ -64,7 +79,7 @@
           "operation": "DELETE /conversations/{conversation_id}",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:210: Handle `DELETE /v1/conversations/{id}` — delete a conversation."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::DeleteConversation"
         }
       },
       {
@@ -84,7 +99,7 @@
           "operation": "DELETE /conversations/{conversation_id}/items/{item_id}",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:383: Handle `DELETE /v1/conversations/{id}/items/{item_id}` — delete one item."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::DeleteConversationItem"
         }
       },
       {
@@ -104,7 +119,7 @@
           "operation": "GET /conversations/{conversation_id}",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:128: Handle `GET /v1/conversations/{id}` — retrieve a conversation."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::GetConversation"
         }
       },
       {
@@ -124,7 +139,7 @@
           "operation": "GET /conversations/{conversation_id}/items",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:316: Handle `GET /v1/conversations/{id}/items` — list items."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::ListConversationItems"
         }
       },
       {
@@ -144,7 +159,7 @@
           "operation": "GET /conversations/{conversation_id}/items/{item_id}",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:358: Handle `GET /v1/conversations/{id}/items/{item_id}` — retrieve one item."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::GetConversationItem"
         }
       },
       {
@@ -164,7 +179,7 @@
           "operation": "POST /conversations",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:66: Handle `POST /v1/conversations` — create a new conversation."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::CreateConversation"
         }
       },
       {
@@ -184,7 +199,7 @@
           "operation": "POST /conversations/{conversation_id}",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:151: Handle `POST /v1/conversations/{id}` — update a conversation."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::UpdateConversation"
         }
       },
       {
@@ -204,40 +219,250 @@
           "operation": "POST /conversations/{conversation_id}/items",
           "area": "Conversations",
           "mode": "local",
-          "evidence": "apis/src/openai/conversations/handlers.rs:242: Handle `POST /v1/conversations/{id}/items` — create items."
+          "evidence": "praxis_ai_apis::openai::conversations_operation_specs::CreateConversationItems"
         }
       }
     ],
     "missing_operations": [],
-    "local_support_claims_outside_selected_specs": []
+    "claims_outside_reference": []
   },
-  "oasdiff": {
+  "owned_contract_conformance": {
     "enabled": true,
-    "implementation_source": "generated:praxis-ai-apis/openai/conversations",
-    "total_operations": 8,
-    "conformant_operations_count": 1,
-    "missing_operations_count": 0,
-    "drifted_operations_count": 7,
-    "request_drift_operations_count": 5,
-    "response_drift_operations_count": 7,
-    "other_drift_operations_count": 0,
-    "conformance_percent": 12.5,
-    "by_area": [
+    "applicable_modes": [
+      "transform",
+      "local"
+    ],
+    "tool": {
+      "name": "oasdiff",
+      "version": "1.23.0",
+      "external_refs": false,
+      "flatten_path_parameters": true,
+      "excluded_elements": [
+        "description",
+        "examples",
+        "extensions",
+        "summary",
+        "title"
+      ]
+    },
+    "areas": [
       {
+        "area_id": "conversations",
         "area": "Conversations",
-        "total": 8,
-        "conformant": 1,
-        "missing": 0,
-        "drifted": 7,
-        "request_drifted": 5,
-        "response_drifted": 7,
-        "other_drifted": 0,
-        "conformance_percent": 12.5
+        "implementation_source": "generated:praxis-ai-apis/openai/conversations",
+        "operation_contracts": {
+          "total": 8,
+          "exact": 1,
+          "missing": 0,
+          "drifted": 7,
+          "request_drifted": 5,
+          "response_drifted": 7,
+          "other_drifted": 0,
+          "exact_percent": 12.5,
+          "missing_operations": [],
+          "drifted_operations": [
+            {
+              "operation": {
+                "method": "DELETE",
+                "path": "/conversations/{conversation_id}/items/{item_id}",
+                "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
+              },
+              "has_request_drift": false,
+              "has_response_drift": true,
+              "has_other_drift": false,
+              "request_details": [],
+              "response_details": [
+                "responses.200.content.application/json.schema.properties.metadata.type.added",
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
+              ],
+              "other_details": []
+            },
+            {
+              "operation": {
+                "method": "GET",
+                "path": "/conversations/{conversation_id}",
+                "operation": "GET /conversations/{conversation_id}"
+              },
+              "has_request_drift": false,
+              "has_response_drift": true,
+              "has_other_drift": false,
+              "request_details": [],
+              "response_details": [
+                "responses.200.content.application/json.schema.properties.metadata.type.added",
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
+              ],
+              "other_details": []
+            },
+            {
+              "operation": {
+                "method": "GET",
+                "path": "/conversations/{conversation_id}/items",
+                "operation": "GET /conversations/{conversation_id}/items"
+              },
+              "has_request_drift": true,
+              "has_response_drift": true,
+              "has_other_drift": false,
+              "request_details": [
+                "parameters.deleted.query",
+                "parameters.query.limit.schema.format.from",
+                "parameters.query.limit.schema.format.to",
+                "parameters.query.limit.schema.default.from",
+                "parameters.query.limit.schema.default.to",
+                "parameters.query.limit.schema.min.from",
+                "parameters.query.limit.schema.min.to"
+              ],
+              "response_details": [
+                "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
+                "responses.200.content.application/json.schema.properties.data.items.type.added",
+                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
+              ],
+              "other_details": []
+            },
+            {
+              "operation": {
+                "method": "GET",
+                "path": "/conversations/{conversation_id}/items/{item_id}",
+                "operation": "GET /conversations/{conversation_id}/items/{item_id}"
+              },
+              "has_request_drift": true,
+              "has_response_drift": true,
+              "has_other_drift": false,
+              "request_details": [
+                "parameters.deleted.query"
+              ],
+              "response_details": [
+                "responses.200.content.application/json.schema.oneOf.deleted",
+                "responses.200.content.application/json.schema.type.added",
+                "responses.200.content.application/json.schema.discriminatorDiff.deleted"
+              ],
+              "other_details": []
+            },
+            {
+              "operation": {
+                "method": "POST",
+                "path": "/conversations",
+                "operation": "POST /conversations"
+              },
+              "has_request_drift": true,
+              "has_response_drift": true,
+              "has_other_drift": false,
+              "request_details": [
+                "requestBody.required.from",
+                "requestBody.required.to",
+                "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
+                "requestBody.content.application/json.schema.properties.items.type.added",
+                "requestBody.content.application/json.schema.properties.items.maxItems.from",
+                "requestBody.content.application/json.schema.properties.items.maxItems.to",
+                "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
+                "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
+                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
+                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
+              ],
+              "response_details": [
+                "responses.200.content.application/json.schema.properties.metadata.type.added",
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
+              ],
+              "other_details": []
+            },
+            {
+              "operation": {
+                "method": "POST",
+                "path": "/conversations/{conversation_id}",
+                "operation": "POST /conversations/{conversation_id}"
+              },
+              "has_request_drift": true,
+              "has_response_drift": true,
+              "has_other_drift": false,
+              "request_details": [
+                "requestBody.required.from",
+                "requestBody.required.to",
+                "requestBody.content.application/json.schema.required.deleted",
+                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
+                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
+              ],
+              "response_details": [
+                "responses.200.content.application/json.schema.properties.metadata.type.added",
+                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
+              ],
+              "other_details": []
+            },
+            {
+              "operation": {
+                "method": "POST",
+                "path": "/conversations/{conversation_id}/items",
+                "operation": "POST /conversations/{conversation_id}/items"
+              },
+              "has_request_drift": true,
+              "has_response_drift": true,
+              "has_other_drift": false,
+              "request_details": [
+                "parameters.deleted.query",
+                "requestBody.content.application/json.schema.type.added",
+                "requestBody.content.application/json.schema.properties.items.items.oneOf.deleted",
+                "requestBody.content.application/json.schema.properties.items.items.type.added",
+                "requestBody.content.application/json.schema.properties.items.items.discriminatorDiff.deleted"
+              ],
+              "response_details": [
+                "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
+                "responses.200.content.application/json.schema.properties.data.items.type.added",
+                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
+              ],
+              "other_details": []
+            }
+          ]
+        },
+        "inherited_contract": {
+          "exact": false,
+          "details": [
+            "security.deleted",
+            "components.securitySchemes.deleted"
+          ]
+        },
+        "all_exact": false
       }
     ],
+    "operation_contracts": {
+      "total": 8,
+      "exact": 1,
+      "missing": 0,
+      "drifted": 7,
+      "request_drifted": 5,
+      "response_drifted": 7,
+      "other_drifted": 0,
+      "exact_percent": 12.5,
+      "by_area": [
+        {
+          "area": "Conversations",
+          "total": 8,
+          "conformant": 1,
+          "missing": 0,
+          "drifted": 7,
+          "request_drifted": 5,
+          "response_drifted": 7,
+          "other_drifted": 0,
+          "conformance_percent": 12.5
+        }
+      ]
+    },
+    "area_contracts": [
+      {
+        "area": "Conversations",
+        "exact": false,
+        "details": [
+          "security.deleted",
+          "components.securitySchemes.deleted"
+        ]
+      }
+    ],
+    "all_exact": false,
     "fixes_required": {
       "summary": {
         "operations_to_fix": 7,
+        "area_contracts_to_fix": 1,
         "missing_operations": 0,
         "request_drift_operations": 5,
         "response_drift_operations": 7,
@@ -256,8 +481,6 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.200.content.application/json.schema.properties.created_at.format.from",
-                "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
                 "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
                 "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
@@ -277,8 +500,6 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.200.content.application/json.schema.properties.created_at.format.from",
-                "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
                 "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
                 "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
@@ -313,9 +534,8 @@
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
                 "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
-                "responses.200.content.application/json.schema.properties.object.default.from",
-                "responses.200.content.application/json.schema.properties.object.default.to"
+                "responses.200.content.application/json.schema.properties.data.items.type.added",
+                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
               ]
             }
           ]
@@ -341,6 +561,7 @@
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
                 "responses.200.content.application/json.schema.oneOf.deleted",
+                "responses.200.content.application/json.schema.type.added",
                 "responses.200.content.application/json.schema.discriminatorDiff.deleted"
               ]
             }
@@ -362,10 +583,10 @@
                 "requestBody.required.to",
                 "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
                 "requestBody.content.application/json.schema.properties.items.type.added",
-                "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
                 "requestBody.content.application/json.schema.properties.items.maxItems.from",
                 "requestBody.content.application/json.schema.properties.items.maxItems.to",
                 "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
+                "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
                 "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
                 "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
               ]
@@ -375,8 +596,6 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.200.content.application/json.schema.properties.created_at.format.from",
-                "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
                 "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
                 "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
@@ -408,8 +627,6 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.200.content.application/json.schema.properties.created_at.format.from",
-                "responses.200.content.application/json.schema.properties.created_at.format.to",
                 "responses.200.content.application/json.schema.properties.metadata.type.added",
                 "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
                 "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
@@ -439,6 +656,7 @@
               "detail_paths": [
                 "requestBody.content.application/json.schema.type.added",
                 "requestBody.content.application/json.schema.properties.items.items.oneOf.deleted",
+                "requestBody.content.application/json.schema.properties.items.items.type.added",
                 "requestBody.content.application/json.schema.properties.items.items.discriminatorDiff.deleted"
               ]
             },
@@ -448,176 +666,55 @@
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
                 "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
-                "responses.200.content.application/json.schema.properties.object.default.from",
-                "responses.200.content.application/json.schema.properties.object.default.to"
+                "responses.200.content.application/json.schema.properties.data.items.type.added",
+                "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted"
+              ]
+            }
+          ]
+        }
+      ],
+      "by_area": [
+        {
+          "area": "Conversations",
+          "fixes": [
+            {
+              "area": "area",
+              "kind": "inherited_contract",
+              "summary": "Align global or inherited OpenAPI contract fields with the OpenAI spec.",
+              "detail_paths": [
+                "security.deleted",
+                "components.securitySchemes.deleted"
               ]
             }
           ]
         }
       ]
-    },
-    "missing_operations": [],
-    "drifted_operations": [
+    }
+  },
+  "runtime_verification": {
+    "all_passed": true,
+    "areas": [
       {
-        "operation": {
-          "method": "DELETE",
-          "path": "/conversations/{conversation_id}/items/{item_id}",
-          "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-        },
-        "has_request_drift": false,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [],
-        "response_details": [
-          "responses.200.content.application/json.schema.properties.created_at.format.from",
-          "responses.200.content.application/json.schema.properties.created_at.format.to",
-          "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
+        "area": "Conversations",
+        "modes": [
+          "local"
         ],
-        "other_details": []
-      },
-      {
-        "operation": {
-          "method": "GET",
-          "path": "/conversations/{conversation_id}",
-          "operation": "GET /conversations/{conversation_id}"
-        },
-        "has_request_drift": false,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [],
-        "response_details": [
-          "responses.200.content.application/json.schema.properties.created_at.format.from",
-          "responses.200.content.application/json.schema.properties.created_at.format.to",
-          "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-        ],
-        "other_details": []
-      },
-      {
-        "operation": {
-          "method": "GET",
-          "path": "/conversations/{conversation_id}/items",
-          "operation": "GET /conversations/{conversation_id}/items"
-        },
-        "has_request_drift": true,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [
-          "parameters.deleted.query",
-          "parameters.query.limit.schema.format.from",
-          "parameters.query.limit.schema.format.to",
-          "parameters.query.limit.schema.default.from",
-          "parameters.query.limit.schema.default.to",
-          "parameters.query.limit.schema.min.from",
-          "parameters.query.limit.schema.min.to"
-        ],
-        "response_details": [
-          "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-          "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
-          "responses.200.content.application/json.schema.properties.object.default.from",
-          "responses.200.content.application/json.schema.properties.object.default.to"
-        ],
-        "other_details": []
-      },
-      {
-        "operation": {
-          "method": "GET",
-          "path": "/conversations/{conversation_id}/items/{item_id}",
-          "operation": "GET /conversations/{conversation_id}/items/{item_id}"
-        },
-        "has_request_drift": true,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [
-          "parameters.deleted.query"
-        ],
-        "response_details": [
-          "responses.200.content.application/json.schema.oneOf.deleted",
-          "responses.200.content.application/json.schema.discriminatorDiff.deleted"
-        ],
-        "other_details": []
-      },
-      {
-        "operation": {
-          "method": "POST",
-          "path": "/conversations",
-          "operation": "POST /conversations"
-        },
-        "has_request_drift": true,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [
-          "requestBody.required.from",
-          "requestBody.required.to",
-          "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
-          "requestBody.content.application/json.schema.properties.items.type.added",
-          "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
-          "requestBody.content.application/json.schema.properties.items.maxItems.from",
-          "requestBody.content.application/json.schema.properties.items.maxItems.to",
-          "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
-          "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
-          "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
-        ],
-        "response_details": [
-          "responses.200.content.application/json.schema.properties.created_at.format.from",
-          "responses.200.content.application/json.schema.properties.created_at.format.to",
-          "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-        ],
-        "other_details": []
-      },
-      {
-        "operation": {
-          "method": "POST",
-          "path": "/conversations/{conversation_id}",
-          "operation": "POST /conversations/{conversation_id}"
-        },
-        "has_request_drift": true,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [
-          "requestBody.required.from",
-          "requestBody.required.to",
-          "requestBody.content.application/json.schema.required.deleted",
-          "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
-          "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
-        ],
-        "response_details": [
-          "responses.200.content.application/json.schema.properties.created_at.format.from",
-          "responses.200.content.application/json.schema.properties.created_at.format.to",
-          "responses.200.content.application/json.schema.properties.metadata.type.added",
-          "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-          "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-        ],
-        "other_details": []
-      },
-      {
-        "operation": {
-          "method": "POST",
-          "path": "/conversations/{conversation_id}/items",
-          "operation": "POST /conversations/{conversation_id}/items"
-        },
-        "has_request_drift": true,
-        "has_response_drift": true,
-        "has_other_drift": false,
-        "request_details": [
-          "parameters.deleted.query",
-          "requestBody.content.application/json.schema.type.added",
-          "requestBody.content.application/json.schema.properties.items.items.oneOf.deleted",
-          "requestBody.content.application/json.schema.properties.items.items.discriminatorDiff.deleted"
-        ],
-        "response_details": [
-          "responses.200.content.application/json.schema.properties.data.items.oneOf.deleted",
-          "responses.200.content.application/json.schema.properties.data.items.discriminatorDiff.deleted",
-          "responses.200.content.application/json.schema.properties.object.default.from",
-          "responses.200.content.application/json.schema.properties.object.default.to"
-        ],
-        "other_details": []
+        "status": "passed",
+        "command": "cargo test -p praxis-ai-apis conformance_conversations_",
+        "checks": [
+          {
+            "kind": "route_dispatch",
+            "evidence": "openai::conversations::tests::conformance_conversations_routes_match_runtime_registry"
+          },
+          {
+            "kind": "success_response_contract",
+            "evidence": "openai::conversations::tests::conformance_conversations_success_payloads_match_generated_response_schemas"
+          },
+          {
+            "kind": "schema_check_sensitivity",
+            "evidence": "openai::conversations::tests::conformance_conversations_generated_schema_check_rejects_wrong_discriminator"
+          }
+        ]
       }
     ]
   }

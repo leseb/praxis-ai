@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Generated `OpenAPI` description for local Conversations endpoints.
+//! Generated `OpenAPI` description for locally owned Conversations operations.
 
-#![allow(dead_code, reason = "schema-only marker functions and types")]
-#![expect(
-    clippy::large_stack_frames,
-    reason = "utoipa macro-generated schema builders allocate large temporary values"
-)]
+use utoipa::openapi::OpenApi;
 
-use std::collections::BTreeMap;
-
-use serde_json::{Value, json};
-use utoipa::{OpenApi, ToSchema};
+use super::routes::operation_specs;
+use crate::openai::operation;
 
 /// Generate the local Conversations implementation `OpenAPI` document as
 /// pretty JSON.
@@ -22,269 +16,122 @@ use utoipa::{OpenApi, ToSchema};
 /// Returns an error if the generated `OpenAPI` document cannot be serialized
 /// as JSON.
 pub fn implementation_openapi_json() -> Result<String, serde_json::Error> {
-    let mut spec = serde_json::to_value(ConversationsOpenApi::openapi())?;
-    normalize_discriminator_property(&mut spec, "ConversationResource", "conversation");
-    normalize_discriminator_property(&mut spec, "DeletedConversationResource", "conversation.deleted");
-    normalize_discriminator_property(&mut spec, "ConversationItemList", "list");
-    serde_json::to_string_pretty(&spec)
+    serde_json::to_string_pretty(&implementation_openapi())
 }
 
-/// Normalize generated one-variant enum component refs into OpenAI's inline
-/// string enum + default shape.
-fn normalize_discriminator_property(spec: &mut Value, schema: &str, value: &str) {
-    let Some(property) = spec
-        .pointer_mut(&format!("/components/schemas/{schema}/properties/object"))
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-
-    property.clear();
-    property.insert("type".to_owned(), json!("string"));
-    property.insert("enum".to_owned(), json!([value]));
-    property.insert("default".to_owned(), json!(value));
+/// Build the local Conversations implementation document from the operation
+/// registry and its bound runtime contract types.
+fn implementation_openapi() -> OpenApi {
+    operation::implementation_openapi(
+        "Praxis AI OpenAI Conversations implementation",
+        "0.1.0",
+        "Conversations",
+        operation_specs().iter().map(|spec| &spec.definition),
+    )
 }
 
-/// Local Conversations implementation `OpenAPI` document.
-#[derive(OpenApi)]
-#[openapi(
-    info(title = "Praxis AI OpenAI Conversations implementation", version = "0.1.0"),
-    paths(
-        create_conversation,
-        get_conversation,
-        update_conversation,
-        delete_conversation,
-        create_conversation_items,
-        list_conversation_items,
-        get_conversation_item,
-        delete_conversation_item,
-    ),
-    components(schemas(
-        CreateConversationRequest,
-        UpdateConversationRequest,
-        CreateConversationItemsRequest,
-        ConversationResource,
-        DeletedConversationResource,
-        ConversationItemList,
-        ConversationItem,
-        ConversationObject,
-        DeletedConversationObject,
-        ListObject,
-        ItemOrder,
-    )),
-    tags((name = "Conversations"))
-)]
-struct ConversationsOpenApi;
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use std::collections::BTreeSet;
 
-/// Create a conversation.
-#[utoipa::path(
-    post,
-    path = "/conversations",
-    tag = "Conversations",
-    request_body(content = CreateConversationRequest, content_type = "application/json"),
-    responses((status = 200, description = "OK", body = ConversationResource))
-)]
-fn create_conversation() {}
+    use serde_json::Value;
 
-/// Get a conversation.
-#[utoipa::path(
-    get,
-    path = "/conversations/{conversation_id}",
-    tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "The ID of the conversation to retrieve.")),
-    responses((status = 200, description = "OK", body = ConversationResource))
-)]
-fn get_conversation() {}
+    use super::*;
 
-/// Update a conversation.
-#[utoipa::path(
-    post,
-    path = "/conversations/{conversation_id}",
-    tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "The ID of the conversation to update.")),
-    request_body(content = UpdateConversationRequest, content_type = "application/json"),
-    responses((status = 200, description = "OK", body = ConversationResource))
-)]
-fn update_conversation() {}
+    #[test]
+    fn generated_operations_come_from_owned_registry_entries() {
+        let openapi = implementation_openapi();
+        let generated = openapi
+            .paths
+            .paths
+            .iter()
+            .flat_map(|(path, item)| {
+                [
+                    ("GET", item.get.as_ref()),
+                    ("POST", item.post.as_ref()),
+                    ("DELETE", item.delete.as_ref()),
+                ]
+                .into_iter()
+                .filter_map(move |(method, operation)| operation.map(|_| (method, path.as_str())))
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = operation_specs()
+            .iter()
+            .filter(|spec| spec.owned_contract().is_some() && spec.mode.owns_contract())
+            .map(|spec| (spec.method, spec.spec_path))
+            .collect::<BTreeSet<_>>();
 
-/// Delete a conversation.
-#[utoipa::path(
-    delete,
-    path = "/conversations/{conversation_id}",
-    tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "The ID of the conversation to delete.")),
-    responses((status = 200, description = "OK", body = DeletedConversationResource))
-)]
-fn delete_conversation() {}
+        assert_eq!(generated, expected);
+    }
 
-/// Create conversation items.
-#[utoipa::path(
-    post,
-    path = "/conversations/{conversation_id}/items",
-    tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "The ID of the conversation to add the items to.")),
-    request_body(content = CreateConversationItemsRequest, content_type = "application/json"),
-    responses((status = 200, description = "OK", body = ConversationItemList))
-)]
-fn create_conversation_items() {}
+    #[test]
+    fn every_generated_component_reference_resolves() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
+        let mut references = Vec::new();
+        collect_component_references(&document, &mut references);
+        assert!(!references.is_empty());
 
-/// List conversation items.
-#[utoipa::path(
-    get,
-    path = "/conversations/{conversation_id}/items",
-    tag = "Conversations",
-    params(
-        ("conversation_id" = String, Path, description = "The ID of the conversation to list items for."),
-        ("limit" = Option<u32>, Query, description = "Maximum number of items to return."),
-        ("order" = Option<ItemOrder>, Query, description = "Sort order for returned items."),
-        ("after" = Option<String>, Query, description = "Item ID to list after.")
-    ),
-    responses((status = 200, description = "OK", body = ConversationItemList))
-)]
-fn list_conversation_items() {}
+        for reference in references {
+            let pointer = reference.strip_prefix('#').unwrap();
+            assert!(
+                document.pointer(pointer).is_some(),
+                "generated OpenAPI reference does not resolve: {reference}"
+            );
+        }
+    }
 
-/// Get one conversation item.
-#[utoipa::path(
-    get,
-    path = "/conversations/{conversation_id}/items/{item_id}",
-    tag = "Conversations",
-    params(
-        ("conversation_id" = String, Path, description = "The ID of the conversation that contains the item."),
-        ("item_id" = String, Path, description = "The ID of the item to retrieve.")
-    ),
-    responses((status = 200, description = "OK", body = ConversationItem))
-)]
-fn get_conversation_item() {}
+    #[test]
+    fn generated_components_preserve_runtime_contract_constraints() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
 
-/// Delete one conversation item.
-#[utoipa::path(
-    delete,
-    path = "/conversations/{conversation_id}/items/{item_id}",
-    tag = "Conversations",
-    params(
-        ("conversation_id" = String, Path, description = "The ID of the conversation that contains the item."),
-        ("item_id" = String, Path, description = "The ID of the item to delete.")
-    ),
-    responses((status = 200, description = "OK", body = ConversationResource))
-)]
-fn delete_conversation_item() {}
+        assert_eq!(
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/type"),
+            Some(&Value::String("array".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/CreateConversationItemsRequest/properties/items/type"),
+            Some(&Value::String("array".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/ConversationItem/type"),
+            Some(&Value::String("object".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/ConversationResource/properties/created_at/format"),
+            Some(&Value::String("unixtime".to_owned()))
+        );
+        assert!(
+            document
+                .pointer("/components/schemas/ConversationItemList/properties/object/default")
+                .is_none(),
+            "the list discriminator has no runtime defaulting behavior"
+        );
+        assert!(
+            document.pointer("/paths/~1conversations/post/parameters").is_none(),
+            "parameterless operations should omit the OpenAPI parameters field"
+        );
+    }
 
-/// Request body accepted by `POST /conversations`.
-#[derive(ToSchema)]
-struct CreateConversationRequest {
-    /// Optional metadata map accepted by the local implementation.
-    metadata: Option<Metadata>,
-
-    /// Optional initial items to add to the conversation.
-    #[schema(max_items = 20)]
-    items: Option<Vec<ConversationItem>>,
-}
-
-/// Request body accepted by `POST /conversations/{conversation_id}`.
-#[derive(ToSchema)]
-struct UpdateConversationRequest {
-    /// Optional replacement metadata.
-    metadata: Option<Metadata>,
-}
-
-/// Request body accepted by `POST /conversations/{conversation_id}/items`.
-#[derive(ToSchema)]
-struct CreateConversationItemsRequest {
-    /// Items to create.
-    #[schema(max_items = 20)]
-    items: Vec<ConversationItem>,
-}
-
-/// Metadata object accepted by the local implementation.
-type Metadata = BTreeMap<String, String>;
-
-/// Local conversation response object.
-#[derive(ToSchema)]
-struct ConversationResource {
-    /// Conversation ID.
-    id: String,
-
-    /// Object discriminator.
-    #[schema(default = "conversation")]
-    object: ConversationObject,
-
-    /// Creation timestamp.
-    #[schema(format = Int64)]
-    created_at: i64,
-
-    /// Conversation metadata.
-    metadata: Metadata,
-}
-
-/// Delete conversation response object.
-#[derive(ToSchema)]
-struct DeletedConversationResource {
-    /// Conversation ID.
-    id: String,
-
-    /// Object discriminator.
-    #[schema(default = "conversation.deleted")]
-    object: DeletedConversationObject,
-
-    /// Whether the object was deleted.
-    deleted: bool,
-}
-
-/// Conversation item list response object.
-#[derive(ToSchema)]
-struct ConversationItemList {
-    /// Object discriminator.
-    #[schema(default = "list")]
-    object: ListObject,
-
-    /// Conversation items.
-    data: Vec<ConversationItem>,
-
-    /// Whether more items are available.
-    has_more: bool,
-
-    /// First item ID in this page.
-    first_id: String,
-
-    /// Last item ID in this page.
-    last_id: String,
-}
-
-/// Opaque conversation item object stored by the local implementation.
-#[derive(ToSchema)]
-struct ConversationItem;
-
-/// Conversation object discriminator.
-#[derive(ToSchema)]
-#[schema(rename_all = "snake_case")]
-enum ConversationObject {
-    /// Conversation resource.
-    Conversation,
-}
-
-/// Deleted conversation object discriminator.
-#[derive(ToSchema)]
-enum DeletedConversationObject {
-    /// Deleted conversation resource.
-    #[schema(rename = "conversation.deleted")]
-    ConversationDeleted,
-}
-
-/// List object discriminator.
-#[derive(ToSchema)]
-#[schema(rename_all = "snake_case")]
-enum ListObject {
-    /// List resource.
-    List,
-}
-
-/// Supported item list ordering.
-#[derive(ToSchema)]
-#[schema(rename_all = "snake_case")]
-enum ItemOrder {
-    /// Oldest item first.
-    Asc,
-
-    /// Newest item first.
-    Desc,
+    fn collect_component_references<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+                    && reference.starts_with("#/components/schemas/")
+                {
+                    references.push(reference);
+                }
+                for value in object.values() {
+                    collect_component_references(value, references);
+                }
+            },
+            Value::Array(values) => {
+                for value in values {
+                    collect_component_references(value, references);
+                }
+            },
+            _ => {},
+        }
+    }
 }
