@@ -39,7 +39,7 @@ See the [complete feature overview](docs/features.md) and
 Clients keep their provider-native protocols while Praxis AI classifies,
 transforms, and routes traffic through one policy-driven gateway.
 
-![Animated Praxis AI architecture: OpenAI, Anthropic, and agent traffic flows through classification, transformation, and routing to upstream model providers and MCP services, with response storage shown as a supporting gateway dependency.](assets/praxis-ai-architecture.svg)
+![Praxis AI architecture](assets/praxis-ai-architecture.svg)
 
 ## Quick start
 
@@ -57,7 +57,7 @@ curl http://127.0.0.1:8080/
 ```
 
 ```json
-{"status": "ok", "server": "praxis-ai"}
+{"status": "ok", "server": "praxis"}
 ```
 
 Ready to connect a backend? Follow the [quickstart](docs/quickstart.md), or
