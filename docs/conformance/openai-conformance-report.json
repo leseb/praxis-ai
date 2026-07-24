@@ -700,7 +700,7 @@
           "local"
         ],
         "status": "passed",
-        "command": "cargo test -p praxis-ai-apis conformance_conversations_",
+        "command": "cargo test -p praxis-ai-apis --lib conformance_conversations_ -- --show-output",
         "checks": [
           {
             "kind": "route_dispatch",
