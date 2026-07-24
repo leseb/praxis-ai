@@ -423,12 +423,15 @@ impl OasdiffAreaStats {
 
 /// One runtime verification check executed by the report generator.
 #[derive(Clone, Debug)]
-pub(super) struct RuntimeVerificationCheck {
+pub(crate) struct RuntimeVerificationCheck {
     /// Stable check category.
-    pub(super) kind: &'static str,
+    pub(crate) kind: &'static str,
 
     /// Fully qualified test evidence.
-    pub(super) evidence: &'static str,
+    pub(crate) evidence: &'static str,
+
+    /// Exact sentinel line emitted by the test on success.
+    pub(crate) success_sentinel: &'static str,
 }
 
 /// Runtime verification declaration for one area.

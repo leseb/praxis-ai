@@ -26,6 +26,7 @@ pub use routes::{ConversationOperation, ConversationOperationSpec, operation_spe
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::print_stdout,
     clippy::too_many_lines,
     reason = "tests"
 )]

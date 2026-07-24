@@ -3106,6 +3106,7 @@ fn conformance_conversations_routes_match_runtime_registry() {
             operation.method,
         );
     }
+    println!("PRAXIS_CONFORMANCE_OK conversations route_dispatch");
 }
 
 #[tokio::test]
@@ -3128,6 +3129,7 @@ async fn conformance_conversations_success_payloads_match_generated_response_sch
             .unwrap_or_else(|| panic!("missing runtime success payload for {}", operation.label()));
         assert_matches_schema(&spec, &format!("{} response", operation.label()), &schema, payload);
     }
+    println!("PRAXIS_CONFORMANCE_OK conversations success_response_contract");
 }
 
 #[test]
@@ -3147,6 +3149,7 @@ fn conformance_conversations_generated_schema_check_rejects_wrong_discriminator(
         !schema_matches_value(&spec, schema, &invalid),
         "schema check must reject a response with the wrong object discriminator"
     );
+    println!("PRAXIS_CONFORMANCE_OK conversations schema_check_sensitivity");
 }
 
 // -----------------------------------------------------------------------------

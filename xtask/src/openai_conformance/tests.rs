@@ -9,10 +9,11 @@ use super::{
     Args,
     area::{CONFORMANCE_AREAS, CONVERSATIONS_SCOPE, OPENAI_REFERENCE_SPEC},
     coverage::calculate_coverage,
+    find_missing_sentinels,
     json_report::report_json,
     model::{
         CoverageMode, OasdiffAreaDrift, OasdiffAreaReport, OasdiffOperationDrift, OperationKey, ReferenceSourceReport,
-        SpecOperation, SpecSourceReport, SupportedOperation, percent,
+        RuntimeVerificationCheck, SpecOperation, SpecSourceReport, SupportedOperation, percent,
     },
     oasdiff::{
         OASDIFF_VERSION, build_oasdiff_report, collect_oasdiff_operation_status, operation_drift_from_diff,
@@ -727,4 +728,53 @@ fn complete_pinned_spec_projects_conversations_and_future_files_areas() {
 
     assert_eq!(parse_openapi_operations(&conversations).unwrap().len(), 8);
     assert_eq!(parse_openapi_operations(&files).unwrap().len(), 5);
+}
+
+// -----------------------------------------------------------------------------
+// Sentinel verification unit tests
+// -----------------------------------------------------------------------------
+
+const TEST_CHECKS: &[RuntimeVerificationCheck] = &[
+    RuntimeVerificationCheck {
+        kind: "alpha",
+        evidence: "test::alpha",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK area alpha",
+    },
+    RuntimeVerificationCheck {
+        kind: "beta",
+        evidence: "test::beta",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK area beta",
+    },
+];
+
+#[test]
+fn sentinel_exact_line_match_passes() {
+    let stdout = "other output\nPRAXIS_CONFORMANCE_OK area alpha\nPRAXIS_CONFORMANCE_OK area beta\n";
+    assert!(find_missing_sentinels(stdout, TEST_CHECKS).is_empty());
+}
+
+#[test]
+fn sentinel_missing_sentinel_detected() {
+    let stdout = "other output\nPRAXIS_CONFORMANCE_OK area alpha\n";
+    let missing = find_missing_sentinels(stdout, TEST_CHECKS);
+    assert_eq!(missing, vec!["PRAXIS_CONFORMANCE_OK area beta"]);
+}
+
+#[test]
+fn sentinel_partial_substring_not_accepted() {
+    let stdout = "prefix PRAXIS_CONFORMANCE_OK area alpha suffix\nPRAXIS_CONFORMANCE_OK area beta\n";
+    let missing = find_missing_sentinels(stdout, TEST_CHECKS);
+    assert_eq!(missing, vec!["PRAXIS_CONFORMANCE_OK area alpha"]);
+}
+
+#[test]
+fn sentinel_empty_output_reports_all_missing() {
+    let missing = find_missing_sentinels("", TEST_CHECKS);
+    assert_eq!(missing.len(), 2);
+}
+
+#[test]
+fn sentinel_leading_trailing_whitespace_trimmed() {
+    let stdout = "  PRAXIS_CONFORMANCE_OK area alpha  \n\tPRAXIS_CONFORMANCE_OK area beta\t\n";
+    assert!(find_missing_sentinels(stdout, TEST_CHECKS).is_empty());
 }

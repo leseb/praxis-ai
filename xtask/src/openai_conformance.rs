@@ -34,7 +34,9 @@ mod tests;
 use area::{ApiArea, CONFORMANCE_AREAS, OPENAI_REFERENCE_MANIFEST, OPENAI_REFERENCE_SPEC};
 use coverage::calculate_coverage;
 use json_report::write_json_report;
-use model::{CoverageReport, ReferenceSourceReport, RuntimeVerificationArea, RuntimeVerificationStatus};
+use model::{
+    CoverageReport, ReferenceSourceReport, RuntimeVerificationArea, RuntimeVerificationCheck, RuntimeVerificationStatus,
+};
 use oasdiff::run_scoped_oasdiff;
 use print::print_report;
 pub(crate) use reference::{Args as ReferenceArgs, run as run_reference};
@@ -214,51 +216,53 @@ fn run_inner(args: &Args) -> Result<CoverageReport, String> {
     Ok(report)
 }
 
+/// Check whether every declared sentinel appears as an exact trimmed line.
+pub(crate) fn find_missing_sentinels<'a>(stdout: &str, checks: &'a [RuntimeVerificationCheck]) -> Vec<&'a str> {
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    checks
+        .iter()
+        .filter(|check| !lines.contains(&check.success_sentinel))
+        .map(|check| check.success_sentinel)
+        .collect()
+}
+
 /// Execute the focused runtime contract checks for each selected area.
-#[expect(clippy::too_many_lines, reason = "command execution and evidence validation")]
 fn run_runtime_verifications(areas: &[&ApiArea]) -> Vec<RuntimeVerificationArea> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     areas
         .iter()
-        .map(|area| {
-            let status = match Command::new(&cargo).args(area.runtime_test_args).output() {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let missing = area
-                        .runtime_checks
-                        .iter()
-                        .filter(|check| !stdout.contains(check.evidence))
-                        .map(|check| check.evidence)
-                        .collect::<Vec<_>>();
-                    if missing.is_empty() {
-                        RuntimeVerificationStatus::Passed
-                    } else {
-                        eprintln!(
-                            "runtime verification command omitted declared tests: {}",
-                            missing.join(", ")
-                        );
-                        RuntimeVerificationStatus::Failed
-                    }
-                },
-                Ok(output) => {
-                    eprintln!("runtime verification failed: {}", area.runtime_test_command);
-                    eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
-                    eprintln!("{}", String::from_utf8_lossy(&output.stderr).trim());
-                    RuntimeVerificationStatus::Failed
-                },
-                Err(error) => {
-                    eprintln!("failed to run {}: {error}", area.runtime_test_command);
-                    RuntimeVerificationStatus::Failed
-                },
-            };
-            RuntimeVerificationArea {
-                area: area.scope.label,
-                command: area.runtime_test_command,
-                checks: area.runtime_checks,
-                status,
-            }
+        .map(|area| RuntimeVerificationArea {
+            area: area.scope.label,
+            command: area.runtime_test_command,
+            checks: area.runtime_checks,
+            status: run_area_checks(&cargo, area),
         })
         .collect()
+}
+
+/// Run the focused test command for one area and check sentinels.
+fn run_area_checks(cargo: &OsString, area: &ApiArea) -> RuntimeVerificationStatus {
+    match Command::new(cargo).args(area.runtime_test_args).output() {
+        Ok(output) if output.status.success() => {
+            let missing = find_missing_sentinels(&String::from_utf8_lossy(&output.stdout), area.runtime_checks);
+            if missing.is_empty() {
+                RuntimeVerificationStatus::Passed
+            } else {
+                eprintln!("runtime verification missing sentinels: {}", missing.join(", "));
+                RuntimeVerificationStatus::Failed
+            }
+        },
+        Ok(output) => {
+            eprintln!("runtime verification failed: {}", area.runtime_test_command);
+            eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr).trim());
+            RuntimeVerificationStatus::Failed
+        },
+        Err(error) => {
+            eprintln!("failed to run {}: {error}", area.runtime_test_command);
+            RuntimeVerificationStatus::Failed
+        },
+    }
 }
 
 /// Resolve requested area IDs against the static registry.

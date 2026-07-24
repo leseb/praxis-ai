@@ -17,14 +17,17 @@ const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
     RuntimeVerificationCheck {
         kind: "route_dispatch",
         evidence: "openai::conversations::tests::conformance_conversations_routes_match_runtime_registry",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations route_dispatch",
     },
     RuntimeVerificationCheck {
         kind: "success_response_contract",
         evidence: "openai::conversations::tests::conformance_conversations_success_payloads_match_generated_response_schemas",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations success_response_contract",
     },
     RuntimeVerificationCheck {
         kind: "schema_check_sensitivity",
         evidence: "openai::conversations::tests::conformance_conversations_generated_schema_check_rejects_wrong_discriminator",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations schema_check_sensitivity",
     },
 ];
 
@@ -58,8 +61,16 @@ pub(super) const CONFORMANCE_AREAS: &[ApiArea] = &[ApiArea {
     implementation_source: "generated:praxis-ai-apis/openai/conversations",
     implementation_spec: conversations_implementation_spec,
     supported_operations: conversations_supported_operations,
-    runtime_test_command: "cargo test -p praxis-ai-apis conformance_conversations_",
-    runtime_test_args: &["test", "-p", "praxis-ai-apis", "conformance_conversations_"],
+    runtime_test_command: "cargo test -p praxis-ai-apis --lib conformance_conversations_ -- --show-output",
+    runtime_test_args: &[
+        "test",
+        "-p",
+        "praxis-ai-apis",
+        "--lib",
+        "conformance_conversations_",
+        "--",
+        "--show-output",
+    ],
     runtime_checks: CONVERSATIONS_RUNTIME_CHECKS,
 }];
 
