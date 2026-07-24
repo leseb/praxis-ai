@@ -9,9 +9,18 @@ mod server;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
 pub use praxis_core::logging::init_tracing;
+pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, run_server_with_registry};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
 /// Built-in fallback configuration branded for praxis-ai.
 const DEFAULT_CONFIG: &str = include_str!("default.yaml");
+
+// -----------------------------------------------------------------------------
+// Configuration Loading
+// -----------------------------------------------------------------------------
 
 /// Load configuration from an explicit path, falling back to
 /// `praxis.yaml` in the working directory, then the praxis-ai
@@ -28,7 +37,6 @@ pub fn load_config(
 ) -> Result<praxis_core::config::Config, praxis_core::errors::ProxyError> {
     praxis_core::config::Config::load(explicit_path, DEFAULT_CONFIG)
 }
-pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, run_server_with_registry};
 
 // -----------------------------------------------------------------------------
 // External Filter Discovery
@@ -222,6 +230,10 @@ mod tests {
         assert!(
             !config.listeners.is_empty(),
             "AI default config should define at least one listener"
+        );
+        assert_eq!(
+            config.listeners[0].name, "default",
+            "AI default config listener name should be 'default'"
         );
     }
 }
