@@ -94,9 +94,9 @@ impl PostgresResponseStore {
     /// `items_table`, when provided, enables the conversation items
     /// table for storing individual conversation entries.
     ///
-    /// `ssl_mode`, when provided, overrides any `sslmode` in the
-    /// URL. When omitted, defaults to [`SslMode::VerifyFull`].
-    /// Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
+    /// `ssl_mode` always overrides any `sslmode` in the URL —
+    /// explicitly when provided, or with the [`SslMode::VerifyFull`]
+    /// default when omitted. Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
     /// with `ssl_root_cert` to verify the server against a custom
     /// CA. Certificate path existence is validated at connection
     /// time, not at construction.
