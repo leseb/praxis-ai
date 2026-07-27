@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-test-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-integration"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3141,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5747,7 +5747,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "nix",
