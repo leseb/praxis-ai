@@ -1814,8 +1814,17 @@ async fn duplicate_label_entries_rejected_at_filter_level() {
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(
+        rejection.status, 400,
+        "duplicate labels must be a 400 client error, not 502"
+    );
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
     assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "duplicate server_label entries should produce a rejection"
+        body_str.contains("duplicate server_label"),
+        "response body should mention the duplicate: {body_str}"
     );
 }

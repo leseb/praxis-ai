@@ -69,6 +69,10 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// into concrete tool definitions by calling `tools/list` on each
 /// upstream MCP server.
 ///
+/// Rejects the request with HTTP 400 before any callouts if two or
+/// more resolvable MCP entries share the same `server_label`
+/// (including entries that differ only by credentials).
+///
 /// # YAML
 ///
 /// ```yaml
