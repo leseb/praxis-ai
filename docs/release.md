@@ -63,6 +63,7 @@ The release workflow produces these tags per run:
 | `sha-<hash>` | `sha-abc1234` | Git commit SHA |
 | `<version>` | `0.1.0` | Full semver (from git tag) |
 | `<major>.<minor>` | `0.1` | Major.minor shorthand |
+| `<major>` | `0` | Major-version shorthand |
 
 The workflow also publishes a `sha-<hash>` tag for traceability.
 
