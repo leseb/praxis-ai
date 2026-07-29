@@ -41,7 +41,6 @@ mod config;
 mod tests;
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -490,7 +489,7 @@ async fn fetch_tools(
 /// or `connector_id` only) are left unchanged for upstream to
 /// handle.
 fn rewrite_request_body(
-    ctx: &mut HttpFilterContext<'_>,
+    _ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     original_bytes: &[u8],
     per_entry: Vec<Vec<serde_json::Value>>,
@@ -525,10 +524,7 @@ fn rewrite_request_body(
         ResolveError::Serialization(e)
     })?;
 
-    let len = serialized.len();
     *body = Some(Bytes::from(serialized));
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
 
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(())
