@@ -83,10 +83,11 @@ local sibling checkout at `../praxis`.
 Follows the same conventions as
 [praxis core](https://github.com/praxis-proxy/praxis).
 See [CONTRIBUTING.md] for the full coding style guide,
-including the PR review process
+including the
+[PR review process](CONTRIBUTING.md#pr-review-process)
 for handling `praxis-bot` automated review comments.
 
-[CONTRIBUTING.md]: https://github.com/praxis-proxy/ai/blob/main/CONTRIBUTING.md#pr-review-process
+[CONTRIBUTING.md]: https://github.com/praxis-proxy/ai/blob/main/CONTRIBUTING.md
 
 ## Git Workflow
 
