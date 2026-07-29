@@ -41,4 +41,4 @@ We use the following severity levels:
 
 We consider security research conducted in good faith to be authorized. We will not pursue legal action
 against researchers who follow this policy and report findings responsibly. In fact, we really appreciate
-the help in making Praxis more secure, thank you for your efforts!
+the help in making Praxis AI more secure, thank you for your efforts!
