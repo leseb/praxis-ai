@@ -157,7 +157,7 @@ impl McpToolResolveFilter {
         debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
 
         let Resolution { per_entry, tool_map } = resolution;
-        rewrite_request_body(ctx, body, &original_bytes, per_entry, &tool_map)?;
+        rewrite_request_body(body, &original_bytes, per_entry, &tool_map)?;
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
@@ -489,7 +489,6 @@ async fn fetch_tools(
 /// or `connector_id` only) are left unchanged for upstream to
 /// handle.
 fn rewrite_request_body(
-    _ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     original_bytes: &[u8],
     per_entry: Vec<Vec<serde_json::Value>>,

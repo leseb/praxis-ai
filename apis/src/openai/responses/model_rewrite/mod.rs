@@ -157,7 +157,7 @@ impl ModelRewriteFilter {
             return Ok(FilterAction::Continue);
         }
 
-        serialize_and_update(ctx, body, &value, &result)
+        serialize_and_update(body, &value, &result)
     }
 }
 
@@ -357,7 +357,6 @@ fn noop_result() -> RewriteResult {
 
 /// Serialize the mutated body and log.
 fn serialize_and_update(
-    _ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     value: &serde_json::Value,
     result: &RewriteResult,

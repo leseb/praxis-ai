@@ -166,13 +166,13 @@ impl HttpFilter for ResponsesProxyFilter {
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-            strip_conversation_field(ctx, body);
+            strip_conversation_field(body);
             debug!("no ResponsesState in extensions, passthrough");
             return Ok(FilterAction::Continue);
         };
 
         if !request_needs_rebuild(state) {
-            strip_conversation_field(ctx, body);
+            strip_conversation_field(body);
             debug!("ResponsesState does not require an outbound rewrite, passthrough");
             return Ok(FilterAction::Continue);
         }
@@ -198,7 +198,7 @@ impl HttpFilter for ResponsesProxyFilter {
 
 /// Defensively strip `conversation` from a passthrough body so it never
 /// leaks to the backend even when no [`ResponsesState`] was produced.
-fn strip_conversation_field(_ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+fn strip_conversation_field(body: &mut Option<Bytes>) {
     let Some(bytes) = body.as_ref() else {
         return;
     };
