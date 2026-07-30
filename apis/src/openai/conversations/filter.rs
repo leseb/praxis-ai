@@ -302,7 +302,9 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        BodyMode::Stream
+        BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        }
     }
 
     fn response_body_mode(&self) -> BodyMode {
