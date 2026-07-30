@@ -1256,14 +1256,11 @@ async fn unmatched_path_continues() {
 }
 
 #[tokio::test]
-async fn post_routes_use_stream_buffer_body_mode() {
+async fn post_routes_upgrade_to_stream_buffer_body_mode() {
     let filter = build_test_filter();
     assert!(
-        matches!(
-            filter.request_body_mode(),
-            BodyMode::StreamBuffer { max_bytes: Some(_) }
-        ),
-        "conversation POST routes require buffered bodies for local handling"
+        matches!(filter.request_body_mode(), BodyMode::Stream),
+        "default body mode should be Stream to avoid buffering unrelated requests"
     );
 
     let req = make_request(Method::POST, "/v1/conversations");
@@ -1274,25 +1271,23 @@ async fn post_routes_use_stream_buffer_body_mode() {
     assert!(matches!(action, FilterAction::Continue));
     assert!(
         matches!(ctx.request_body_mode, BodyMode::StreamBuffer { max_bytes: Some(_) }),
-        "matched POST should keep buffering enabled for request-body handling"
+        "matched POST should upgrade to StreamBuffer for request-body handling"
     );
 }
 
 #[tokio::test]
-async fn unmatched_post_path_continues() {
+async fn unmatched_post_path_stays_streaming() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
+    ctx.request_body_mode = filter.request_body_mode();
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
     assert!(
-        matches!(
-            filter.request_body_mode(),
-            BodyMode::StreamBuffer { max_bytes: Some(_) }
-        ),
-        "body mode declaration is static; unmatched path handling remains a local Continue"
+        matches!(ctx.request_body_mode, BodyMode::Stream),
+        "unmatched path should not upgrade body mode"
     );
 }
 
