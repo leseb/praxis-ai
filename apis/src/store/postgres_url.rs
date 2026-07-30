@@ -15,7 +15,6 @@ use std::{
 };
 
 use percent_encoding::percent_decode_str;
-use praxis_core::connectivity::normalize_mapped_ipv4;
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 
 use crate::openai::url_security::is_non_public_ip;
@@ -207,7 +206,6 @@ fn validate_postgres_ip_target(
     ip: IpAddr,
     allow_private: bool,
 ) -> Result<(), FilterError> {
-    let ip = normalize_mapped_ipv4(ip);
     if !allow_private && is_non_public_ip(&ip) {
         return Err(format!(
             "{filter_name}: database_url {kind} targets a local-sensitive address; \
