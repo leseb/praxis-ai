@@ -3034,6 +3034,7 @@ async fn on_response_armed_for_json_200() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
+    ctx.response_body_mode = filter.response_body_mode();
     set_append_back_metadata(&mut ctx);
 
     let mut resp = make_response();
@@ -3043,6 +3044,26 @@ async fn on_response_armed_for_json_200() {
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(ctx.response_body_mode, BodyMode::StreamBuffer { max_bytes: Some(_) }),
+        "armed append-back should upgrade response body mode to StreamBuffer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_unarmed_keeps_stream_body_mode() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.response_body_mode = filter.response_body_mode();
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(ctx.response_body_mode, BodyMode::Stream),
+        "unarmed response should keep default Stream body mode"
+    );
 }
 
 // -----------------------------------------------------------------------------
