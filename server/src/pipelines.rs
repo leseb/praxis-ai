@@ -509,9 +509,14 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let client = test_client();
-        let pipelines =
-            resolve_pipelines(&config, &registry, &empty_health_registry(), &empty_kv_stores(), &client)
-                .unwrap();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &client,
+        )
+        .unwrap();
         let pipeline = pipelines.get("web").unwrap().load();
         assert!(
             pipeline.subrequest_client().is_some(),
