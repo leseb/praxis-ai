@@ -504,6 +504,21 @@ filter_chains:
         );
     }
 
+    #[test]
+    fn resolve_pipelines_threads_subrequest_client() {
+        let config = valid_config();
+        let registry = FilterRegistry::with_builtins();
+        let client = test_client();
+        let pipelines =
+            resolve_pipelines(&config, &registry, &empty_health_registry(), &empty_kv_stores(), &client)
+                .unwrap();
+        let pipeline = pipelines.get("web").unwrap().load();
+        assert!(
+            pipeline.subrequest_client().is_some(),
+            "pipeline should have subrequest_client set after resolve_pipelines",
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
