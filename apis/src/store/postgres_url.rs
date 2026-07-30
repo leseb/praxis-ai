@@ -370,7 +370,10 @@ mod tests {
     #[test]
     fn rejects_missing_scheme() {
         let err = validate_postgres_database_url(FILTER, "1.2.3.4:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("must start with"));
+        assert!(
+            err.to_string().contains("must start with"),
+            "non-postgres scheme should be rejected"
+        );
     }
 
     #[test]
@@ -386,7 +389,10 @@ mod tests {
     #[test]
     fn rejects_missing_explicit_host() {
         let err = validate_postgres_database_url(FILTER, "postgres:///db", false).unwrap_err();
-        assert!(err.to_string().contains("explicit host"));
+        assert!(
+            err.to_string().contains("explicit host"),
+            "URL without host should be rejected"
+        );
     }
 
     #[test]
@@ -399,13 +405,19 @@ mod tests {
     #[test]
     fn rejects_loopback_ipv4() {
         let err = validate_postgres_database_url(FILTER, "postgres://127.0.0.1:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "IPv4 loopback should be rejected"
+        );
     }
 
     #[test]
     fn rejects_loopback_ipv6() {
         let err = validate_postgres_database_url(FILTER, "postgres://[::1]:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "IPv6 loopback should be rejected"
+        );
     }
 
     #[test]
@@ -419,13 +431,19 @@ mod tests {
     #[test]
     fn rejects_link_local_ipv4() {
         let err = validate_postgres_database_url(FILTER, "postgres://169.254.1.1:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "link-local IPv4 should be rejected"
+        );
     }
 
     #[test]
     fn rejects_unspecified_ipv4() {
         let err = validate_postgres_database_url(FILTER, "postgres://0.0.0.0:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "unspecified IPv4 should be rejected"
+        );
     }
 
     #[test]
@@ -485,13 +503,19 @@ mod tests {
     #[test]
     fn rejects_ipv6_unique_local() {
         let err = validate_postgres_database_url(FILTER, "postgres://[fd00::1]:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "IPv6 unique-local should be rejected"
+        );
     }
 
     #[test]
     fn rejects_ipv6_link_local() {
         let err = validate_postgres_database_url(FILTER, "postgres://[fe80::1]:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "IPv6 link-local should be rejected"
+        );
     }
 
     #[test]
@@ -506,7 +530,10 @@ mod tests {
     #[test]
     fn rejects_ipv4_mapped_loopback() {
         let err = validate_postgres_database_url(FILTER, "postgres://[::ffff:127.0.0.1]:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "IPv4-mapped loopback should be rejected"
+        );
     }
 
     #[test]
@@ -553,13 +580,19 @@ mod tests {
     #[test]
     fn rejects_dns_name() {
         let err = validate_postgres_database_url(FILTER, "postgres://db.example.net:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("DNS name"));
+        assert!(
+            err.to_string().contains("DNS name"),
+            "DNS hostname should be rejected without opt-in"
+        );
     }
 
     #[test]
     fn rejects_localhost() {
         let err = validate_postgres_database_url(FILTER, "postgres://LOCALHOST.:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("localhost"));
+        assert!(
+            err.to_string().contains("localhost"),
+            "localhost hostname should be rejected"
+        );
     }
 
     // -- Query parameter overrides ---------------------------------------------
@@ -568,14 +601,20 @@ mod tests {
     fn rejects_hostaddr_loopback_override() {
         let err =
             validate_postgres_database_url(FILTER, "postgres://1.2.3.4:5432/db?hostaddr=127.0.0.1", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "hostaddr loopback override should be rejected"
+        );
     }
 
     #[test]
     fn rejects_host_loopback_override() {
         let err =
             validate_postgres_database_url(FILTER, "postgres://1.2.3.4:5432/db?host=127.0.0.1", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "host query param loopback override should be rejected"
+        );
     }
 
     #[test]
@@ -603,14 +642,20 @@ mod tests {
     #[test]
     fn rejects_unix_socket() {
         let err = validate_postgres_database_url(FILTER, "postgres:///db?host=/var/run/postgresql", false).unwrap_err();
-        assert!(err.to_string().contains("Unix socket"));
+        assert!(
+            err.to_string().contains("Unix socket"),
+            "Unix socket path should be rejected without opt-in"
+        );
     }
 
     #[test]
     fn rejects_socket_path_traversal_even_with_allow_private() {
         let err =
             validate_postgres_database_url(FILTER, "postgres:///db?host=/var/run/../postgresql", true).unwrap_err();
-        assert!(err.to_string().contains("path traversal"));
+        assert!(
+            err.to_string().contains("path traversal"),
+            "socket path traversal should be rejected even with opt-in"
+        );
     }
 
     // -- allow_private opt-in --------------------------------------------------
@@ -640,7 +685,10 @@ mod tests {
     #[test]
     fn revalidate_rejects_private_ip() {
         let err = revalidate_postgres_host(FILTER, "postgres://10.0.0.1:5432/db", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "revalidation should reject private IP"
+        );
     }
 
     #[test]
@@ -656,7 +704,10 @@ mod tests {
     fn revalidate_rejects_hostaddr_param() {
         let err =
             revalidate_postgres_host(FILTER, "postgres://1.2.3.4:5432/db?hostaddr=192.168.0.1", false).unwrap_err();
-        assert!(err.to_string().contains("local-sensitive"));
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "revalidation should reject private hostaddr param"
+        );
     }
 
     #[test]
@@ -693,14 +744,20 @@ mod tests {
     fn rejects_tls_file_path_traversal() {
         let err = validate_postgres_url_tls_file_params(FILTER, "postgres://1.2.3.4/db?sslrootcert=../../etc/ca.pem")
             .unwrap_err();
-        assert!(err.to_string().contains("path traversal"));
+        assert!(
+            err.to_string().contains("path traversal"),
+            "sslrootcert path traversal should be rejected"
+        );
     }
 
     #[test]
     fn rejects_sslkey_path_traversal() {
         let err = validate_postgres_url_tls_file_params(FILTER, "postgres://1.2.3.4/db?sslkey=../../etc/key.pem")
             .unwrap_err();
-        assert!(err.to_string().contains("path traversal"));
+        assert!(
+            err.to_string().contains("path traversal"),
+            "sslkey path traversal should be rejected"
+        );
     }
 
     #[test]
