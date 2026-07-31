@@ -9,18 +9,6 @@ Web search filter for model-driven `web_search_call` dispatch.
 
 Validates configuration and constructs a search client at startup. At runtime this filter is a passthrough — it does not modify requests or responses. When `tool_dispatch` (#26) and branch re-entrance are available, this filter will execute searches dispatched by the model during the agentic loop.
 
-## Configuration
-
-| Field | Type | Required | Description |
-|-------|------|---------|-------------|
-| `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
-| `api_key` | string (secret) | no | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
-| `default_context_size` | string | no | Default search context size when the client omits it. |
-| `timeout_ms` | integer | no | Callout timeout in milliseconds. |
-| `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
-| `failure_mode` | `closed` \| `open` | no | Failure mode for search callouts. |
-| `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
-
 ## Examples
 
 ### Example 1
