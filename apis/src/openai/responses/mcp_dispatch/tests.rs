@@ -561,8 +561,6 @@ fn content_blocks_to_output_empty_is_empty_string() {
 
 #[test]
 fn content_blocks_to_output_preserves_non_text_losslessly() {
-    // A mix of text and non-text blocks must serialize the full MCP content
-    // array as JSON so no block is dropped. See issue #807.
     let blocks = vec![
         rmcp::model::ContentBlock::text("text content"),
         rmcp::model::ContentBlock::image("base64data", "image/png"),
@@ -575,11 +573,12 @@ fn content_blocks_to_output_preserves_non_text_losslessly() {
     ];
     let output = content_blocks_to_output(&blocks).unwrap();
 
-    // Round-trip proves the representation is lossless: every original block
-    // is recoverable from the serialized output.
     let recovered: Vec<rmcp::model::ContentBlock> =
         serde_json::from_str(&output).expect("output must be valid JSON content array");
-    assert_eq!(recovered, blocks, "serialized output must round-trip without loss");
+    assert_eq!(
+        recovered, blocks,
+        "#807: mixed text/non-text output must round-trip losslessly so no MCP content block is dropped"
+    );
 }
 
 // =========================================================================
@@ -923,8 +922,6 @@ fn process_call_result_multi_text_joins_with_newline() {
 
 #[test]
 fn process_call_result_image_content_is_preserved() {
-    // Regression: a tool returning only an image must not become a
-    // successful call with empty output (data loss). See issue #807.
     let call_result =
         rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::image("base64data", "image/png")]);
     let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}");
@@ -932,7 +929,7 @@ fn process_call_result_image_content_is_preserved() {
     let model_output = result.message["output"].as_str().unwrap();
     assert!(
         !model_output.is_empty(),
-        "image-only result must not produce empty model output"
+        "#807 regression: image-only result must not produce empty model output (data loss)"
     );
     assert!(model_output.contains("base64data"), "image data must be preserved");
     assert!(model_output.contains("image/png"), "image mime type must be preserved");
