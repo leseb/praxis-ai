@@ -1209,10 +1209,6 @@ fn web_search_call_excluded_from_messages_but_persisted() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
 
-    // #808: a hosted web_search_call is not a valid OpenResponses input item,
-    // so it must never enter the backend-bound `messages` vector. The
-    // openai_web_search dispatch consumes `web_search_calls` and appends a
-    // backend-valid function_call/function_call_output bridge instead.
     let msg_types: Vec<&str> = state
         .messages
         .iter()
@@ -1223,7 +1219,6 @@ fn web_search_call_excluded_from_messages_but_persisted() {
         "web_search_call must NOT be forwarded to the backend via messages: {msg_types:?}"
     );
 
-    // It remains queued for dispatch on the next iteration.
     assert!(
         state
             .web_search_calls
@@ -1232,7 +1227,6 @@ fn web_search_call_excluded_from_messages_but_persisted() {
         "web_search_call should be queued in web_search_calls for dispatch"
     );
 
-    // It is still persisted (rehydration canonicalizes it) and surfaced publicly.
     let persisted_types: Vec<&str> = state
         .persisted_messages
         .iter()

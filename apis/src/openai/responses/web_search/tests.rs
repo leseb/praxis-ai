@@ -484,8 +484,6 @@ async fn on_request_body_appends_backend_valid_continuation() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
 
-    // #808: hosted `web_search_call` items are not valid OpenResponses input,
-    // so the backend-bound continuation history must never contain them.
     for scope in [&state.messages, &state.persisted_messages] {
         assert!(
             scope
@@ -495,7 +493,6 @@ async fn on_request_body_appends_backend_valid_continuation() {
         );
     }
 
-    // The model-facing bridge is a `function_call` + `function_call_output` pair.
     let call = state
         .messages
         .iter()
@@ -504,8 +501,6 @@ async fn on_request_body_appends_backend_valid_continuation() {
     assert_eq!(call["name"], "web_search");
     let call_id = call["call_id"].as_str().expect("function_call needs a call_id");
 
-    // #808: the bridge call_id is bounded and never the raw hosted id, which
-    // can exceed the OpenResponses 64-char call_id limit.
     assert!(
         call_id.len() <= 64,
         "bridge call_id must be <= 64 chars, got {}: {call_id}",
@@ -525,9 +520,11 @@ async fn on_request_body_appends_backend_valid_continuation() {
         "search results must reach the model: {text}"
     );
 
-    // The public web_search_call output item is retained for the response only.
     let public = &state.accumulated_output[0];
-    assert_eq!(public["type"], "web_search_call");
+    assert_eq!(
+        public["type"], "web_search_call",
+        "public web_search_call output is retained for the response only"
+    );
     assert_eq!(public["id"], "ws_bridge_1");
 }
 
@@ -668,10 +665,11 @@ fn build_output_item_with_results() {
 
 #[test]
 fn build_tool_result_messages_empty() {
-    // #808: the continuation bridge is a backend-valid function_call pair,
-    // never a hosted web_search_call item.
     let [call, output] = build_tool_result_messages("ws_123", "rust", &[]);
-    assert_eq!(call["type"], "function_call");
+    assert_eq!(
+        call["type"], "function_call",
+        "continuation bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
+    );
     assert_eq!(call["call_id"], "ws_123");
     assert_eq!(call["name"], "web_search");
     assert_eq!(call["arguments"], r#"{"query":"rust"}"#);
