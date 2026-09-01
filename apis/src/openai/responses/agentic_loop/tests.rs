@@ -1183,7 +1183,7 @@ async fn web_search_calls_cleared_on_prepare() {
 }
 
 #[test]
-fn web_search_call_appended_to_messages_and_persisted() {
+fn web_search_call_excluded_from_messages_but_persisted() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -1208,16 +1208,31 @@ fn web_search_call_appended_to_messages_and_persisted() {
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
+    // #808: a hosted web_search_call is not a valid OpenResponses input item,
+    // so it must never enter the backend-bound `messages` vector. The
+    // openai_web_search dispatch consumes `web_search_calls` and appends a
+    // backend-valid function_call/function_call_output bridge instead.
     let msg_types: Vec<&str> = state
         .messages
         .iter()
         .filter_map(|m| m.get("type").and_then(Value::as_str))
         .collect();
     assert!(
-        msg_types.contains(&"web_search_call"),
-        "web_search_call should be in messages: {msg_types:?}"
+        !msg_types.contains(&"web_search_call"),
+        "web_search_call must NOT be forwarded to the backend via messages: {msg_types:?}"
     );
 
+    // It remains queued for dispatch on the next iteration.
+    assert!(
+        state
+            .web_search_calls
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some("ws_1")),
+        "web_search_call should be queued in web_search_calls for dispatch"
+    );
+
+    // It is still persisted (rehydration canonicalizes it) and surfaced publicly.
     let persisted_types: Vec<&str> = state
         .persisted_messages
         .iter()
