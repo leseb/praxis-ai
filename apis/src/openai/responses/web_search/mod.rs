@@ -43,12 +43,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::state::ResponsesState;
-use crate::{
-    openai::responses::error::responses_error_rejection,
-    web_search::{
-        SearchClient, SearchContextSize, SearchOutcome, SearchResult, WebSearchFilterConfig, build_config,
-        format_search_results,
-    },
+use crate::web_search::{
+    SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult, WebSearchFilterConfig,
+    build_config, format_search_results,
 };
 
 // -----------------------------------------------------------------------------
@@ -93,8 +90,6 @@ const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
-/// provider_failure_mode: closed
-/// status_on_error: 502
 /// max_body_bytes: 67108864
 /// ```
 pub struct WebSearchFilter {
@@ -162,26 +157,36 @@ impl WebSearchFilter {
         }))
     }
 
-    /// Execute a single web search call and append results to state.
+    /// Execute a single web search call and append its outcome to state.
+    ///
+    /// A provider failure never rejects the Response. The model instead
+    /// receives a truthful `failed` `web_search_call` plus a bounded failure
+    /// message so the agentic loop can continue.
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         call: &Value,
         context_size: SearchContextSize,
-    ) -> Result<(), FilterAction> {
+    ) {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
         let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
 
         let Some(query) = query else {
             warn!(call_id, "web_search_call missing action.query, skipping");
             append_result(ctx, call_id, "incomplete", "", &[]);
-            return Ok(());
+            return;
         };
 
-        let results = resolve_search_outcome(&self.search_client, query, context_size, call_id, false).await?;
-
-        append_result(ctx, call_id, "completed", query, &results);
-        Ok(())
+        match self.search_client.search(query, Some(context_size)).await {
+            SearchOutcome::Results(results) => append_result(ctx, call_id, "completed", query, &results),
+            SearchOutcome::Failed => {
+                warn!(
+                    call_id,
+                    "web search provider failed; continuing with a failed tool result"
+                );
+                append_failed(ctx, call_id, query);
+            },
+        }
     }
 }
 
@@ -241,9 +246,7 @@ impl HttpFilter for WebSearchFilter {
         debug!(count = calls.len(), "executing pending web search calls");
 
         for call in &calls {
-            if let Err(rejection) = self.execute_single_search(ctx, call, context_size).await {
-                return Ok(rejection);
-            }
+            self.execute_single_search(ctx, call, context_size).await;
         }
 
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -281,55 +284,72 @@ impl HttpFilter for WebSearchFilter {
     }
 }
 
-/// Append search results to [`ResponsesState`].
+/// Append a completed search turn to [`ResponsesState`].
+///
+/// An empty `results` slice is a successful zero-result search: the model
+/// receives `No search results found.` and the public item stays `completed`.
 fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
-    let include_sources = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES));
-
+    let include_sources = include_action_sources(ctx);
     let output_item = build_output_item(call_id, status, query, results, include_sources);
     let tool_result = build_tool_result_message(call_id, results);
+    push_search_turn(ctx, output_item, tool_result);
+}
 
+/// Append a failed `web_search_call` to [`ResponsesState`].
+///
+/// The public output item is marked `status: "failed"` and the model
+/// receives the bounded [`SEARCH_UNAVAILABLE`] message so the agentic loop
+/// continues without exposing provider details to the client.
+fn append_failed(ctx: &mut HttpFilterContext<'_>, call_id: &str, query: &str) {
+    let include_sources = include_action_sources(ctx);
+    let output_item = build_output_item(call_id, "failed", query, &[], include_sources);
+    let tool_result = build_failed_tool_result_message(call_id);
+    push_search_turn(ctx, output_item, tool_result);
+}
+
+/// Whether `action.sources` should be included in output items, per the
+/// `web_search_call.action.sources` include gate.
+fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES))
+}
+
+/// Push a search turn — public output item plus model tool result — into state.
+///
+/// The single clone is required: `messages` and `persisted_messages` are
+/// distinct owners of the tool result.
+fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, tool_result: Value) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.messages.push(tool_result.clone());
         state.persisted_messages.push(tool_result);
-        state.accumulated_output.push(output_item);
+        upsert_output_item(&mut state.accumulated_output, output_item);
     }
+}
+
+/// Replace the accumulated `web_search_call` sharing this id, or append it.
+///
+/// The response phase (`agentic_loop::collect_output_items`) already
+/// accumulated the model's placeholder `web_search_call` for this id. Updating
+/// it in place keeps exactly one public item per call, rather than emitting a
+/// contradictory `completed` + `failed` pair for the same id. When no
+/// placeholder exists (isolated unit contexts), the item is appended.
+fn upsert_output_item(accumulated: &mut Vec<Value>, output_item: Value) {
+    if let Some(id) = output_item.get("id").and_then(Value::as_str)
+        && let Some(slot) = accumulated.iter_mut().find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                && item.get("id").and_then(Value::as_str) == Some(id)
+        })
+    {
+        *slot = output_item;
+        return;
+    }
+    accumulated.push(output_item);
 }
 
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
-
-/// Execute a search and resolve its outcome to a result list.
-///
-/// Returns `Err(FilterAction)` when the search is rejected under
-/// closed failure mode.
-pub(crate) async fn resolve_search_outcome(
-    search_client: &SearchClient,
-    query: &str,
-    context_size: SearchContextSize,
-    call_id: &str,
-    streaming: bool,
-) -> Result<Vec<SearchResult>, FilterAction> {
-    match search_client.search(query, Some(context_size)).await {
-        SearchOutcome::Results(r) => Ok(r),
-        SearchOutcome::Skipped => {
-            warn!(call_id, "search skipped (open failure mode)");
-            Ok(Vec::new())
-        },
-        SearchOutcome::Rejected { status } => {
-            warn!(call_id, status, "search rejected (closed failure mode)");
-            Err(FilterAction::Reject(responses_error_rejection(
-                status,
-                "server_error",
-                "web search provider unavailable",
-                streaming,
-            )))
-        },
-    }
-}
 
 /// Emit a `web_search_call` status update via filter results.
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved for per-call status tracking"))]
@@ -393,6 +413,19 @@ pub(crate) fn build_tool_result_message(call_id: &str, results: &[SearchResult])
         "id": call_id,
         "status": "completed",
         "output": content,
+    })
+}
+
+/// Build a failed tool result message to feed the model.
+///
+/// Carries the bounded [`SEARCH_UNAVAILABLE`] message so the agentic loop
+/// continues without exposing provider details to the client.
+pub(crate) fn build_failed_tool_result_message(call_id: &str) -> Value {
+    serde_json::json!({
+        "type": "web_search_call",
+        "id": call_id,
+        "status": "failed",
+        "output": SEARCH_UNAVAILABLE,
     })
 }
 
