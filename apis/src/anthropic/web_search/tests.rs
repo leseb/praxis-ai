@@ -34,6 +34,7 @@ provider: you
 api_key: test-key
 default_context_size: medium
 base_url: "{base_url}"
+allow_private_base_url: true
 "#,
     ))
     .unwrap();

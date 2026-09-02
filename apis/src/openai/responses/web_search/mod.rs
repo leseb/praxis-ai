@@ -161,11 +161,17 @@ impl WebSearchFilter {
     ///
     /// A provider failure never rejects the Response. The model instead
     /// receives a truthful `failed` `web_search_call` plus a bounded failure
-    /// message so the agentic loop can continue.
+    /// message — bridged as a backend-valid `function_call`/`function_call_output`
+    /// pair — so the agentic loop can continue.
+    ///
+    /// `index` is the call's position within the pending queue. It keeps the
+    /// synthetic bridge `call_id` unique even when the hosted source ids
+    /// collide or are absent (issue #808).
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         call: &Value,
+        index: usize,
         context_size: SearchContextSize,
     ) {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
@@ -173,18 +179,28 @@ impl WebSearchFilter {
 
         let Some(query) = query else {
             warn!(call_id, "web_search_call missing action.query, skipping");
-            append_result(ctx, call_id, "incomplete", "", &[]);
+            let bridge = bridge_call_id(call_id, "", index);
+            let ids = SearchCallIds {
+                public: call_id,
+                bridge: &bridge,
+            };
+            append_result(ctx, &ids, "incomplete", "", &[]);
             return;
         };
 
+        let bridge = bridge_call_id(call_id, query, index);
+        let ids = SearchCallIds {
+            public: call_id,
+            bridge: &bridge,
+        };
         match self.search_client.search(query, Some(context_size)).await {
-            SearchOutcome::Results(results) => append_result(ctx, call_id, "completed", query, &results),
+            SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
             SearchOutcome::Failed => {
                 warn!(
                     call_id,
                     "web search provider failed; continuing with a failed tool result"
                 );
-                append_failed(ctx, call_id, query);
+                append_failed(ctx, &ids, query);
             },
         }
     }
@@ -245,8 +261,8 @@ impl HttpFilter for WebSearchFilter {
         let calls: Vec<Value> = state.web_search_calls.clone();
         debug!(count = calls.len(), "executing pending web search calls");
 
-        for call in &calls {
-            self.execute_single_search(ctx, call, context_size).await;
+        for (index, call) in calls.iter().enumerate() {
+            self.execute_single_search(ctx, call, index, context_size).await;
         }
 
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -284,27 +300,49 @@ impl HttpFilter for WebSearchFilter {
     }
 }
 
+/// Public and bridge identifiers for one appended web-search result.
+///
+/// `public` is the hosted, client-facing `web_search_call.id` retained on the
+/// public output item. `bridge` is the bounded, deterministic id used for the
+/// backend-valid `function_call`/`function_call_output` pair, since the raw
+/// hosted id can exceed the `OpenResponses` 64-character `call_id` limit (issue
+/// #808).
+struct SearchCallIds<'a> {
+    /// Client-facing `web_search_call.id` for the public output item.
+    public: &'a str,
+    /// Bounded, backend-valid id for the synthetic bridge pair.
+    bridge: &'a str,
+}
+
 /// Append a completed search turn to [`ResponsesState`].
 ///
 /// An empty `results` slice is a successful zero-result search: the model
 /// receives `No search results found.` and the public item stays `completed`.
-fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
+fn append_result(
+    ctx: &mut HttpFilterContext<'_>,
+    ids: &SearchCallIds<'_>,
+    status: &str,
+    query: &str,
+    results: &[SearchResult],
+) {
     let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(call_id, status, query, results, include_sources);
-    let tool_result = build_tool_result_message(call_id, results);
-    push_search_turn(ctx, output_item, tool_result);
+    let output_item = build_output_item(ids.public, status, query, results, include_sources);
+    let bridge = build_tool_result_messages(ids.bridge, query, results);
+    push_search_turn(ctx, output_item, bridge);
 }
 
-/// Append a failed `web_search_call` to [`ResponsesState`].
+/// Append a failed search turn to [`ResponsesState`].
 ///
-/// The public output item is marked `status: "failed"` and the model
-/// receives the bounded [`SEARCH_UNAVAILABLE`] message so the agentic loop
-/// continues without exposing provider details to the client.
-fn append_failed(ctx: &mut HttpFilterContext<'_>, call_id: &str, query: &str) {
+/// The public output item is marked `status: "failed"` and the model receives
+/// the bounded [`SEARCH_UNAVAILABLE`] message through a backend-valid
+/// `function_call`/`function_call_output` bridge — never a hosted
+/// `web_search_call`, which is not a valid `OpenResponses` input (issue #808) —
+/// so the agentic loop continues without exposing provider details to the client.
+fn append_failed(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, query: &str) {
     let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(call_id, "failed", query, &[], include_sources);
-    let tool_result = build_failed_tool_result_message(call_id);
-    push_search_turn(ctx, output_item, tool_result);
+    let output_item = build_output_item(ids.public, "failed", query, &[], include_sources);
+    let bridge = build_failed_tool_result_messages(ids.bridge, query);
+    push_search_turn(ctx, output_item, bridge);
 }
 
 /// Whether `action.sources` should be included in output items, per the
@@ -315,14 +353,18 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES))
 }
 
-/// Push a search turn — public output item plus model tool result — into state.
+/// Push a search turn — public output item plus the model-facing bridge pair —
+/// into state.
 ///
-/// The single clone is required: `messages` and `persisted_messages` are
-/// distinct owners of the tool result.
-fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, tool_result: Value) {
+/// `bridge` is the backend-valid `function_call`/`function_call_output` pair.
+/// The per-element clone is required: `messages` and `persisted_messages` are
+/// distinct owners of the bridge messages. The public `output_item` is upserted
+/// so the placeholder accumulated during the response phase is replaced in
+/// place, never duplicated.
+fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2]) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-        state.messages.push(tool_result.clone());
-        state.persisted_messages.push(tool_result);
+        state.messages.extend(bridge.iter().cloned());
+        state.persisted_messages.extend(bridge);
         upsert_output_item(&mut state.accumulated_output, output_item);
     }
 }
@@ -400,33 +442,99 @@ pub(crate) fn build_output_item(
     })
 }
 
-/// Build a tool result message to append to conversation history.
-pub(crate) fn build_tool_result_message(call_id: &str, results: &[SearchResult]) -> Value {
+/// Build the backend-valid continuation for a completed search.
+///
+/// A hosted `web_search_call` item is not a valid `OpenResponses` `input`
+/// type (see issue #808), so the model-facing history bridges the result
+/// through a synthetic `function_call` + `function_call_output` pair —
+/// mirroring [`file_search_callout`](super::file_search_callout). The
+/// public `web_search_call` output item is emitted separately by
+/// [`build_output_item`] and only reaches `accumulated_output`.
+///
+/// `call_id` must be a bounded, backend-valid identifier from
+/// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
+/// 64-character `call_id` limit.
+pub(crate) fn build_tool_result_messages(call_id: &str, query: &str, results: &[SearchResult]) -> [Value; 2] {
     let content = if results.is_empty() {
         "No search results found.".to_owned()
     } else {
         format_search_results(results)
     };
+    let arguments = serde_json::json!({ "query": query }).to_string();
 
-    serde_json::json!({
-        "type": "web_search_call",
-        "id": call_id,
-        "status": "completed",
-        "output": content,
-    })
+    [
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "web_search",
+            "arguments": arguments,
+            "status": "completed",
+        }),
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": content,
+        }),
+    ]
 }
 
-/// Build a failed tool result message to feed the model.
+/// FNV-1a offset basis for deterministic bridge identities.
+const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+
+/// Derive a deterministic, bounded `call_id` for the synthetic bridge.
 ///
-/// Carries the bounded [`SEARCH_UNAVAILABLE`] message so the agentic loop
-/// continues without exposing provider details to the client.
-pub(crate) fn build_failed_tool_result_message(call_id: &str) -> Value {
-    serde_json::json!({
-        "type": "web_search_call",
-        "id": call_id,
-        "status": "failed",
-        "output": SEARCH_UNAVAILABLE,
-    })
+/// A hosted `web_search_call.id` is unbounded, but the synthetic
+/// `function_call` `call_id` must stay within the `OpenResponses`
+/// 64-character limit or a conforming backend rejects the continuation
+/// (issue #808) — mirroring the bounded ids in
+/// [`file_search_callout`](super::file_search_callout).
+///
+/// `index` is the call's position in the pending queue, guaranteeing distinct
+/// ids even when `source_id` values collide or are absent — otherwise multiple
+/// bridges would share one `call_id` and their `function_call_output` pairing
+/// would be ambiguous. The `ws_{index}_{hash:016x}` form is at most 40 bytes.
+pub(crate) fn bridge_call_id(source_id: &str, query: &str, index: usize) -> String {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for part in [source_id, query] {
+        for byte in part.as_bytes().iter().copied().chain(std::iter::once(0xFF)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    format!("ws_{index}_{hash:016x}")
+}
+
+/// Build the backend-valid continuation for a failed search.
+///
+/// Mirrors [`build_tool_result_messages`] but carries the bounded
+/// [`SEARCH_UNAVAILABLE`] notice as the `function_call_output`, so the agentic
+/// loop continues with a truthful failure instead of a fabricated empty result.
+/// A hosted `web_search_call` is not a valid `OpenResponses` input item (issue
+/// #808), so a failure — like a success — must bridge through a synthetic
+/// `function_call` + `function_call_output` pair.
+///
+/// `call_id` must be a bounded, backend-valid identifier from
+/// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
+/// 64-character `call_id` limit.
+pub(crate) fn build_failed_tool_result_messages(call_id: &str, query: &str) -> [Value; 2] {
+    let arguments = serde_json::json!({ "query": query }).to_string();
+
+    [
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "web_search",
+            "arguments": arguments,
+            "status": "completed",
+        }),
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": SEARCH_UNAVAILABLE,
+        }),
+    ]
 }
 
 /// Write the loop control action to filter results.
