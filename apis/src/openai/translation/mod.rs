@@ -302,6 +302,46 @@ mod tests {
     }
 
     #[test]
+    fn scalar_message_content_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": 42}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses message input item field `content` must be a string or array of content parts"
+        );
+    }
+
+    #[test]
+    fn object_message_content_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": {"unexpected": "shape"}}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses message input item field `content` must be a string or array of content parts"
+        );
+    }
+
+    #[test]
+    fn text_content_part_with_non_string_text_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [{"type": "output_text", "text": 42}]}]
+        }));
+
+        assert_eq!(
+            error,
+            "unsupported Responses content part for Chat Completions translation: \
+             text content part requires a string `text` field"
+        );
+    }
+
+    #[test]
     fn unsupported_typed_input_items_are_rejected() {
         let error = super::chat_completions::responses_request_to_chat_request(&json!({
             "model": "gpt-4o-mini",
@@ -967,8 +1007,8 @@ mod tests {
     }
 
     #[test]
-    fn text_parts_without_text_field_are_skipped() {
-        let mapped = map(&json!({
+    fn text_parts_without_text_field_return_error() {
+        let error = map_error(&json!({
             "model": "m",
             "input": [{
                 "role": "user",
@@ -979,7 +1019,11 @@ mod tests {
             }]
         }));
 
-        assert_eq!(mapped["messages"][0]["content"], "valid");
+        assert_eq!(
+            error,
+            "unsupported Responses content part for Chat Completions translation: \
+             text content part requires a string `text` field"
+        );
     }
 
     #[test]

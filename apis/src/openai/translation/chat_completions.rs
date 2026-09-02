@@ -191,6 +191,9 @@ pub(crate) enum TranslationError {
         /// String field whose value had another JSON type.
         field: &'static str,
     },
+    /// A Responses message `content` field is neither a string nor an array of parts.
+    #[error("Responses message input item field `content` must be a string or array of content parts")]
+    InvalidMessageContent,
     /// A Responses input item has no Chat Completions-compatible representation.
     #[error("unsupported Responses input item type for Chat Completions translation: {0}")]
     UnsupportedInputItemType(String),
@@ -576,10 +579,15 @@ fn chat_string_field(value: Option<&Value>) -> Value {
 }
 
 /// Convert `Responses` text content into the most compatible Chat form.
+///
+/// Message content must be a plain string or an array of content parts; any
+/// other JSON type (number, boolean, object, null) has no faithful Chat
+/// Completions representation and fails closed rather than passing through.
 fn convert_input_content(content: &Value) -> Result<Value, TranslationError> {
     match content {
+        Value::String(_) => Ok(content.clone()),
         Value::Array(parts) => convert_input_content_parts(parts),
-        _ => Ok(content.clone()),
+        _ => Err(TranslationError::InvalidMessageContent),
     }
 }
 
@@ -609,7 +617,7 @@ impl ConvertedContentParts {
     /// Push one Responses content part.
     fn push(&mut self, part: &Value) -> Result<(), TranslationError> {
         match part.get("type").and_then(Value::as_str) {
-            Some("input_text" | "output_text" | "text") => self.push_text(part),
+            Some("input_text" | "output_text" | "text") => self.push_text(part)?,
             Some("input_image") => {
                 self.push_non_text(convert_input_image_part(part)?);
             },
@@ -624,11 +632,18 @@ impl ConvertedContentParts {
     }
 
     /// Push a text content part.
-    fn push_text(&mut self, part: &Value) {
-        if let Some(text) = part.get("text").and_then(Value::as_str) {
-            self.text_parts.push(text.to_owned());
-            self.chat_parts.push(json!({"type": "text", "text": text}));
-        }
+    ///
+    /// A supported text part must carry a string `text` field; a missing or
+    /// non-string value fails closed instead of silently contributing nothing.
+    fn push_text(&mut self, part: &Value) -> Result<(), TranslationError> {
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            return Err(TranslationError::UnsupportedContentPart(
+                "text content part requires a string `text` field".to_owned(),
+            ));
+        };
+        self.text_parts.push(text.to_owned());
+        self.chat_parts.push(json!({"type": "text", "text": text}));
+        Ok(())
     }
 
     /// Push a content part that prevents text-only collapse.
