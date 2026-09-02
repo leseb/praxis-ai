@@ -1509,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn response_with_null_content_produces_no_message_output() {
+    fn response_with_null_content_on_completed_is_rejected() {
         let request = json!({"model": "m", "input": "hello"});
         let context = make_response_context(&request);
         let response = json!({
@@ -1520,9 +1520,44 @@ mod tests {
             "choices": [{"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": null}}]
         });
 
-        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
 
-        assert_eq!(mapped["output"], json!([]));
+        assert!(
+            error
+                .to_string()
+                .contains("first choice message has no supported output"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn response_with_null_content_on_incomplete_terminal_is_preserved() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        for (finish_reason, reason) in [("length", "max_output_tokens"), ("content_filter", "content_filter")] {
+            let response = json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [{
+                    "finish_reason": finish_reason,
+                    "index": 0,
+                    "message": {"role": "assistant", "content": null}
+                }]
+            });
+
+            let mapped =
+                super::chat_completions::chat_response_to_response_resource(&response, &context).expect(finish_reason);
+
+            assert_eq!(mapped["status"], "incomplete", "{finish_reason}");
+            assert_eq!(
+                mapped["incomplete_details"],
+                json!({"reason": reason}),
+                "{finish_reason}"
+            );
+            assert_eq!(mapped["output"], json!([]), "{finish_reason}");
+        }
     }
 
     // -------------------------------------------------------------------------

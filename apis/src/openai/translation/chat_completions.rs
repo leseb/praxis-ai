@@ -818,7 +818,12 @@ fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Re
     let has_content = validate_chat_content(message)?;
     let has_refusal = validate_chat_refusal(message)?;
     let has_tool_calls = validate_chat_tool_calls(message, finish_reason)?;
-    if !has_content && !has_refusal && !has_tool_calls {
+    // A completed terminal must carry at least one translatable output; without
+    // one the translator would synthesize a counterfeit `completed` response with
+    // an empty output array. Incomplete terminals (length, content_filter)
+    // truthfully carry empty output, so they are exempt.
+    let has_output = has_content || has_refusal || has_tool_calls;
+    if response_status(finish_reason) == "completed" && !has_output {
         return Err(TranslationError::InvalidChatResponse(
             "first choice message has no supported output",
         ));
@@ -827,14 +832,18 @@ fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Re
 }
 
 /// Validate optional assistant content and report whether it is present.
+///
+/// `null` is treated as absent: the emitter produces no output for it, so
+/// counting it as content would let a completed terminal translate into a
+/// counterfeit success with an empty output array.
 fn validate_chat_content(message: &Map<String, Value>) -> Result<bool, TranslationError> {
     match message.get("content") {
-        Some(Value::Null | Value::String(_)) => Ok(true),
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(_)) => Ok(true),
         Some(Value::Array(parts)) if parts.iter().all(is_supported_text_part) => Ok(true),
         Some(_) => Err(TranslationError::InvalidChatResponse(
             "first choice message contains unsupported content",
         )),
-        None => Ok(false),
     }
 }
 
