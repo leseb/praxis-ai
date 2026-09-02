@@ -1406,7 +1406,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn response_with_no_choices_produces_empty_output() {
+    fn response_with_no_choices_is_rejected() {
         let request = json!({"model": "m", "input": "hello"});
         let context = make_response_context(&request);
         let response = json!({
@@ -1417,13 +1417,13 @@ mod tests {
             "choices": []
         });
 
-        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
 
-        assert_eq!(mapped["output"], json!([]));
+        assert!(error.to_string().contains("choices must contain an object"));
     }
 
     #[test]
-    fn response_without_choices_key_produces_empty_output() {
+    fn response_without_choices_key_is_rejected() {
         let request = json!({"model": "m", "input": "hello"});
         let context = make_response_context(&request);
         let response = json!({
@@ -1433,9 +1433,64 @@ mod tests {
             "model": "m"
         });
 
-        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
 
-        assert_eq!(mapped["output"], json!([]));
+        assert!(error.to_string().contains("choices must be an array"));
+    }
+
+    #[test]
+    fn malformed_first_choices_are_rejected() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let malformed = [
+            (
+                "non-object choice",
+                json!({"choices": [null]}),
+                "choices must contain an object",
+            ),
+            (
+                "missing finish reason",
+                json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+                "first choice must contain a string finish_reason",
+            ),
+            (
+                "unsupported finish reason",
+                json!({
+                    "choices": [{
+                        "finish_reason": "unknown",
+                        "message": {"role": "assistant", "content": "ok"}
+                    }]
+                }),
+                "first choice contains an unsupported finish_reason",
+            ),
+            (
+                "missing message",
+                json!({"choices": [{"finish_reason": "stop"}]}),
+                "first choice must contain a message object",
+            ),
+            (
+                "invalid role",
+                json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "user", "content": "ok"}
+                    }]
+                }),
+                "first choice message must have the assistant role",
+            ),
+            (
+                "missing output",
+                json!({"choices": [{"finish_reason": "stop", "message": {"role": "assistant"}}]}),
+                "first choice message has no supported output",
+            ),
+        ];
+
+        for (case, response, expected) in malformed {
+            let error =
+                super::chat_completions::chat_response_to_response_resource(&response, &context).expect_err(case);
+
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1789,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_missing_function_fields_uses_defaults() {
+    fn tool_call_missing_function_fields_is_rejected() {
         let request = json!({"model": "m", "input": "hello"});
         let context = make_response_context(&request);
         let response = json!({
@@ -1808,10 +1863,13 @@ mod tests {
             }]
         });
 
-        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
 
-        assert_eq!(mapped["output"][0]["name"], "");
-        assert_eq!(mapped["output"][0]["arguments"], "{}");
+        assert!(
+            error
+                .to_string()
+                .contains("message contains an invalid function tool call")
+        );
     }
 
     // -------------------------------------------------------------------------
