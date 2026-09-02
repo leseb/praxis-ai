@@ -166,6 +166,57 @@ fn anthropic_to_openai_transforms_response_body() {
     );
 }
 
+#[test]
+fn anthropic_to_openai_preserves_response_with_malformed_tool_arguments() {
+    let response = serde_json::json!({
+        "id": "chatcmpl-malformed-tool",
+        "object": "chat.completion",
+        "model": "synthetic-malformed-tool-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "not{json"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+    let backend = Backend::fixed(&response.to_string())
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "synthetic-malformed-tool-model",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "Use the weather tool."}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request.to_string()));
+    let client_body: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("preserved response should remain JSON");
+
+    assert_eq!(parse_status(&raw), 200, "upstream status should be preserved");
+    assert_eq!(
+        client_body, response,
+        "failed transformation must preserve the upstream response instead of emitting tool_use"
+    );
+}
+
 fn run_anthropic_to_openai_error(status: u16, response_body: &str, stream: bool) -> (u16, serde_json::Value) {
     let backend = Backend::status(status, response_body)
         .header("content-type", "application/json")
