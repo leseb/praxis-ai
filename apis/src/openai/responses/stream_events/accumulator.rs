@@ -158,6 +158,9 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
     let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
         return;
     };
+    if filter_state.rejected_tool_call_args.contains(&key) {
+        return;
+    }
 
     let buf = filter_state.tool_call_args.entry(key.clone()).or_default();
     if buf.len().saturating_add(delta.len()) > filter_state.max_tool_call_argument_bytes {
@@ -167,6 +170,7 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
             "accumulated tool-call arguments exceed max_tool_call_argument_bytes, dropping"
         );
         filter_state.tool_call_args.remove(&key);
+        filter_state.rejected_tool_call_args.insert(key);
         return;
     }
     buf.push_str(delta);
@@ -174,11 +178,27 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
 
 /// Finalize a function call from the done event's payload and push to `tool_calls`.
 fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut StreamEventsState, payload: &Value) {
-    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-
     let Some(key) = tool_call_key(payload) else {
         return;
     };
+    if filter_state.rejected_tool_call_args.contains(&key) {
+        return;
+    }
+
+    if payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .is_some_and(|arguments| arguments.len() > filter_state.max_tool_call_argument_bytes)
+    {
+        warn!(
+            key,
+            limit = filter_state.max_tool_call_argument_bytes,
+            "completed tool-call arguments exceed max_tool_call_argument_bytes, dropping"
+        );
+        filter_state.tool_call_args.remove(&key);
+        filter_state.rejected_tool_call_args.insert(key);
+        return;
+    }
 
     let accumulated = filter_state.tool_call_args.remove(&key);
     let arguments = payload
@@ -188,6 +208,7 @@ fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut
         .or(accumulated)
         .unwrap_or_default();
 
+    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     let tool_call = {
         let Some(item) = find_output_item_mut(state.output_items_mut(), payload) else {
             warn!(
