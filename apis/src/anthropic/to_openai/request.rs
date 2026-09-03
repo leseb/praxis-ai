@@ -555,8 +555,8 @@ fn convert_tool_definition(tool: &Value) -> Option<Value> {
             warn!(tool_type, "dropping typed Anthropic tool");
             return None;
         },
-        Some(_) => {
-            warn!("dropping Anthropic tool with non-string type");
+        Some(other) => {
+            warn!(?other, "dropping Anthropic tool with non-string type");
             return None;
         },
     }
