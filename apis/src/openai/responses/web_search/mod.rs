@@ -46,7 +46,7 @@ use tracing::{debug, warn};
 use super::state::ResponsesState;
 use crate::web_search::{
     OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
-    build_config, format_search_results,
+    build_config, format_search_results, is_web_search_tool_type,
 };
 
 // -----------------------------------------------------------------------------
@@ -308,10 +308,7 @@ impl HttpFilter for WebSearchFilter {
 fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
     state.tools.iter().find_map(|tool| {
         let tool_type = tool.get("type").and_then(Value::as_str)?;
-        if matches!(
-            tool_type,
-            "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26"
-        ) {
+        if is_web_search_tool_type(tool_type) {
             tool.get("search_context_size").and_then(Value::as_str)
         } else {
             None

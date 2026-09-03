@@ -8,6 +8,8 @@ use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::web_search::is_web_search_tool_type;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -715,14 +717,6 @@ fn build_chat_tools(tools: &[Value]) -> Result<BuiltChatTools, TranslationError>
         value: (!chat_tools.is_empty()).then_some(Value::Array(chat_tools)),
         has_web_search,
     })
-}
-
-/// Return whether a tool discriminator is supported by the local web executor.
-fn is_web_search_tool_type(tool_type: &str) -> bool {
-    matches!(
-        tool_type,
-        "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26"
-    )
 }
 
 /// Reject ambiguous or structurally unusable web-search declarations.
