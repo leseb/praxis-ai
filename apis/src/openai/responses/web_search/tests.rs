@@ -505,8 +505,6 @@ async fn on_request_body_missing_query_produces_incomplete_status() {
         "missing query should produce incomplete status"
     );
 
-    // The model-facing and persisted continuation must describe the malformed
-    // call truthfully, rather than fabricating a successful zero-result search.
     let bridge_call = &state.messages[state.messages.len() - 2];
     assert_eq!(bridge_call["type"], "function_call");
     assert_eq!(bridge_call["arguments"], r#"{}"#);
