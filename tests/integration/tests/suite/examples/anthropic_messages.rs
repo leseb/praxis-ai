@@ -167,7 +167,7 @@ fn anthropic_to_openai_transforms_response_body() {
 }
 
 #[test]
-fn anthropic_to_openai_preserves_response_with_malformed_tool_arguments() {
+fn anthropic_to_openai_returns_api_error_for_malformed_tool_arguments() {
     let response = serde_json::json!({
         "id": "chatcmpl-malformed-tool",
         "object": "chat.completion",
@@ -208,13 +208,54 @@ fn anthropic_to_openai_preserves_response_with_malformed_tool_arguments() {
 
     let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request.to_string()));
     let client_body: serde_json::Value =
-        serde_json::from_str(&parse_body(&raw)).expect("preserved response should remain JSON");
+        serde_json::from_str(&parse_body(&raw)).expect("error envelope should be JSON");
 
     assert_eq!(parse_status(&raw), 200, "upstream status should be preserved");
     assert_eq!(
-        client_body, response,
-        "failed transformation must preserve the upstream response instead of emitting tool_use"
+        client_body["type"], "error",
+        "malformed tool arguments must yield an error envelope"
     );
+    assert_eq!(client_body["error"]["type"], "api_error");
+    assert_eq!(
+        client_body["error"]["message"],
+        "upstream response could not be transformed"
+    );
+    assert!(
+        client_body["request_id"].is_null(),
+        "absent upstream request-id must yield a null request_id"
+    );
+    assert!(
+        client_body.get("choices").is_none() && client_body.get("content").is_none(),
+        "translation failure must not fabricate a tool_use or pass through the raw upstream body"
+    );
+}
+
+#[test]
+fn anthropic_to_openai_replaces_malformed_success_body() {
+    let backend = Backend::fixed("not json")
+        .header("content-type", "application/json")
+        .header("x-request-id", "req_malformed")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request_body = serde_json::json!({
+        "model": "claude-opus-4-8",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "Hello"}],
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request_body.to_string()));
+    let parsed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("fallback response should be JSON");
+
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["type"], "api_error");
+    assert_eq!(parsed["error"]["message"], "upstream response could not be transformed");
+    assert_eq!(parsed["request_id"], "req_malformed");
 }
 
 fn run_anthropic_to_openai_error(status: u16, response_body: &str, stream: bool) -> (u16, serde_json::Value) {

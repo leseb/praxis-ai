@@ -92,7 +92,7 @@ async fn all_inference_fixtures_replay() {
             saw_error_representative = true;
         }
         if scenario_id == MALFORMED_TOOL_ARGUMENTS_SCENARIO && provider == MALFORMED_TOOL_ARGUMENTS_PROVIDER {
-            assert_malformed_tool_arguments_preserved(&report.actual, scenario_id, provider);
+            assert_malformed_tool_arguments_error(&report.actual, scenario_id, provider);
             saw_malformed_tool_arguments = true;
         }
         if provider == NATIVE_ANTHROPIC_PROVIDER && NATIVE_ANTHROPIC_SCENARIOS.contains(&scenario_id) {
@@ -236,28 +236,25 @@ fn assert_synthetic_rate_limit(actual: &WireFixture, scenario_id: &str, provider
     );
 }
 
-fn assert_malformed_tool_arguments_preserved(actual: &WireFixture, scenario_id: &str, provider: &str) {
+fn assert_malformed_tool_arguments_error(actual: &WireFixture, scenario_id: &str, provider: &str) {
     let turn = actual.turns.first().unwrap_or_else(|| {
         panic!("scenario `{scenario_id}` and provider `{provider}` replayed without a turn");
     });
+    let client_expected = json!({
+        "type": "error",
+        "error": {"message": "upstream response could not be transformed", "type": "api_error"},
+        "request_id": null
+    });
     assert_eq!(
         turn.client.response.status, 200,
-        "upstream status changed for scenario `{scenario_id}` and provider `{provider}`"
+        "client status changed for scenario `{scenario_id}` and provider `{provider}`"
     );
-    assert_eq!(
-        turn.client.response.body, turn.upstream.response.body,
-        "failed translation must preserve the upstream response for scenario `{scenario_id}` and provider `{provider}`"
-    );
-    let RecordedBody::Json { value } = &turn.client.response.body else {
-        panic!("scenario `{scenario_id}` and provider `{provider}` must preserve a JSON response");
+    let RecordedBody::Json { value: client } = &turn.client.response.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a client JSON error envelope");
     };
     assert_eq!(
-        value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "not{json",
-        "malformed arguments changed for scenario `{scenario_id}` and provider `{provider}`"
-    );
-    assert!(
-        value.get("content").is_none(),
-        "scenario `{scenario_id}` and provider `{provider}` must not emit an Anthropic tool_use block"
+        client, &client_expected,
+        "malformed tool arguments must convert to an Anthropic api_error envelope for scenario `{scenario_id}` and provider `{provider}`"
     );
 }
 
