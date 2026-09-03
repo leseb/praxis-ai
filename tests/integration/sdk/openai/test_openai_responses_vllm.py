@@ -1088,7 +1088,7 @@ def file_search_chat_proxy(tmp_path_factory, request):
         stderr=subprocess.STDOUT,
     )
     try:
-        _wait_for_proxy(port)
+        _wait_for_proxy(port, proc, log_path)
         started = True
         yield port
     finally:
