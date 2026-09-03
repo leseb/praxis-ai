@@ -124,6 +124,19 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
+    /// Original client tool choice retained when continuation widens the
+    /// provider-visible choice to `auto`.
+    pub original_tool_choice: Option<serde_json::Value>,
+
+    /// Stable creation timestamp for the public response across iterations.
+    pub response_created_at: Option<u64>,
+
+    /// Stable public response ID assigned by request validation.
+    ///
+    /// Stored with canonical state because iterative router steps preserve
+    /// extensions while resetting per-step metadata.
+    pub response_id: Option<String>,
+
     /// Whether provider-visible request fields require outbound serialization.
     pub request_body_rebuild: RequestBodyRebuild,
 
@@ -200,6 +213,9 @@ impl Default for ResponsesState {
             previous_tools: Vec::new(),
             previous_usage: None,
             request_body: serde_json::Value::Null,
+            original_tool_choice: None,
+            response_created_at: None,
+            response_id: None,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
