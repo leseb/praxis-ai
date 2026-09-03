@@ -3,6 +3,7 @@
 
 //! `OpenAI` Responses API translation for Chat Completions-compatible providers.
 
+use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
 use tracing::warn;
@@ -22,6 +23,9 @@ const DEFAULT_TOOL_CHOICE: &str = "auto";
 
 /// Default text format for translated responses.
 const DEFAULT_TEXT_FORMAT: &str = "text";
+
+/// Maximum query length accepted by the synthesized web-search function.
+const WEB_SEARCH_QUERY_MAX_LENGTH: usize = 4_096;
 
 /// Build the default `Responses` text configuration.
 fn default_text_config() -> Value {
@@ -188,6 +192,15 @@ pub(crate) enum TranslationError {
     /// A Responses tool choice has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool_choice type for Chat Completions translation: {0}")]
     UnsupportedToolChoiceType(String),
+    /// A client function would be indistinguishable from synthesized web search.
+    #[error("Responses function tool name `web_search` conflicts with the synthesized web_search function")]
+    WebSearchFunctionNameCollision,
+    /// A web-search definition cannot be executed by the local callout.
+    #[error("invalid Responses web-search tool for Chat Completions translation: {0}")]
+    InvalidWebSearchTool(String),
+    /// A synthesized web-search function call cannot be normalized safely.
+    #[error("invalid synthesized web_search function call: {0}")]
+    InvalidWebSearchCall(&'static str),
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -242,9 +255,11 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
     let tools = overrides
         .tools
         .or_else(|| obj.get("tools").and_then(Value::as_array).map(Vec::as_slice));
-    if let Some(tools) = tools
-        && let Some(tools) = build_chat_tools(tools)?
-    {
+    let BuiltChatTools {
+        value: built_tools,
+        has_web_search,
+    } = tools.map(build_chat_tools).transpose()?.unwrap_or_default();
+    if let Some(tools) = built_tools {
         chat.insert("tools".to_owned(), tools);
         chat.remove("response_format");
     }
@@ -254,7 +269,7 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
         && overrides
             .tool_choice
             .is_some_and(|choice| choice.as_str() == Some("auto"));
-    if !omit_synthesized_default && let Some(tool_choice) = build_chat_tool_choice(tool_choice)? {
+    if !omit_synthesized_default && let Some(tool_choice) = build_chat_tool_choice(tool_choice, has_web_search)? {
         chat.insert("tool_choice".to_owned(), tool_choice);
     }
 
@@ -664,24 +679,168 @@ fn convert_input_file_part(part: &Value) -> Result<Value, TranslationError> {
     }))
 }
 
+/// Chat tool translation plus facts needed to validate `tool_choice`.
+#[derive(Default)]
+struct BuiltChatTools {
+    /// Translated Chat Completions tools, omitted when empty.
+    value: Option<Value>,
+    /// Whether the request declared a valid hosted web-search tool.
+    has_web_search: bool,
+}
+
 /// Build Chat Completions tool definitions from `Responses` tools.
-fn build_chat_tools(tools: &[Value]) -> Result<Option<Value>, TranslationError> {
+fn build_chat_tools(tools: &[Value]) -> Result<BuiltChatTools, TranslationError> {
+    validate_web_search_tools(tools)?;
+
     let mut chat_tools = Vec::new();
+    let mut has_web_search = false;
 
     for tool in tools {
         let Some(tool_obj) = tool.as_object() else {
             continue;
         };
 
-        if tool_obj.get("type").and_then(Value::as_str) == Some("function") {
-            chat_tools.push(convert_function_tool(tool_obj));
-        } else {
-            let tool_type = tool_obj.get("type").and_then(Value::as_str).unwrap_or("unknown");
-            return Err(TranslationError::UnsupportedToolType(tool_type.to_owned()));
+        match tool_obj.get("type").and_then(Value::as_str) {
+            Some("function") => chat_tools.push(convert_function_tool(tool_obj)),
+            Some(tool_type) if is_web_search_tool_type(tool_type) => {
+                chat_tools.push(synthesized_web_search_tool());
+                has_web_search = true;
+            },
+            Some(tool_type) => return Err(TranslationError::UnsupportedToolType(tool_type.to_owned())),
+            None => return Err(TranslationError::UnsupportedToolType("unknown".to_owned())),
         }
     }
 
-    Ok((!chat_tools.is_empty()).then_some(Value::Array(chat_tools)))
+    Ok(BuiltChatTools {
+        value: (!chat_tools.is_empty()).then_some(Value::Array(chat_tools)),
+        has_web_search,
+    })
+}
+
+/// Return whether a tool discriminator is supported by the local web executor.
+fn is_web_search_tool_type(tool_type: &str) -> bool {
+    matches!(
+        tool_type,
+        "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26"
+    )
+}
+
+/// Reject ambiguous or structurally unusable web-search declarations.
+fn validate_web_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
+    let mut web_search_count = 0_usize;
+    let mut has_web_search_function = false;
+
+    for tool in tools.iter().filter_map(Value::as_object) {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") if function_tool_name(tool) == Some("web_search") => {
+                has_web_search_function = true;
+            },
+            Some(tool_type) if is_web_search_tool_type(tool_type) => {
+                web_search_count = web_search_count.saturating_add(1);
+                validate_web_search_tool(tool)?;
+            },
+            _ => {},
+        }
+    }
+
+    if web_search_count > 1 {
+        return Err(TranslationError::InvalidWebSearchTool(
+            "only one web-search tool may be declared".to_owned(),
+        ));
+    }
+    if web_search_count == 1 && has_web_search_function {
+        return Err(TranslationError::WebSearchFunctionNameCollision);
+    }
+
+    Ok(())
+}
+
+/// Return a function name from either Responses or pre-wrapped Chat shape.
+fn function_tool_name(tool: &Map<String, Value>) -> Option<&str> {
+    tool.get("name")
+        .and_then(Value::as_str)
+        .or_else(|| tool.get("function")?.get("name")?.as_str())
+}
+
+/// Validate fields understood by the existing local web-search executor.
+fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), TranslationError> {
+    for field in tool.keys() {
+        if !matches!(field.as_str(), "type" | "search_context_size" | "user_location") {
+            return Err(TranslationError::InvalidWebSearchTool(format!(
+                "field `{field}` is not supported by openai_web_search"
+            )));
+        }
+    }
+
+    if let Some(context_size) = tool.get("search_context_size")
+        && !matches!(context_size.as_str(), Some("low" | "medium" | "high"))
+    {
+        return Err(TranslationError::InvalidWebSearchTool(
+            "search_context_size must be one of low, medium, or high".to_owned(),
+        ));
+    }
+
+    if let Some(user_location) = tool.get("user_location") {
+        validate_web_search_user_location(user_location)?;
+    }
+
+    Ok(())
+}
+
+/// Validate the canonical approximate-location shape retained in state.
+fn validate_web_search_user_location(user_location: &Value) -> Result<(), TranslationError> {
+    let Some(location) = user_location.as_object() else {
+        return Err(TranslationError::InvalidWebSearchTool(
+            "user_location must be an object".to_owned(),
+        ));
+    };
+    for field in location.keys() {
+        if !matches!(field.as_str(), "type" | "city" | "country" | "region" | "timezone") {
+            return Err(TranslationError::InvalidWebSearchTool(format!(
+                "user_location field `{field}` is not supported"
+            )));
+        }
+    }
+    if location.get("type").and_then(Value::as_str) != Some("approximate") {
+        return Err(TranslationError::InvalidWebSearchTool(
+            "user_location.type must be approximate".to_owned(),
+        ));
+    }
+    for field in ["city", "country", "region", "timezone"] {
+        if location
+            .get(field)
+            .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
+        {
+            return Err(TranslationError::InvalidWebSearchTool(format!(
+                "user_location.{field} must be a non-empty string"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build the private Chat Completions representation of hosted web search.
+fn synthesized_web_search_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for up-to-date information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": WEB_SEARCH_QUERY_MAX_LENGTH
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }
+    })
 }
 
 /// Convert a `Responses` function tool to the Chat Completions nested shape.
@@ -703,30 +862,42 @@ fn convert_function_tool(tool: &Map<String, Value>) -> Value {
 }
 
 /// Convert Responses `tool_choice` into Chat Completions-compatible shape.
-fn build_chat_tool_choice(choice: Option<&Value>) -> Result<Option<Value>, TranslationError> {
+fn build_chat_tool_choice(choice: Option<&Value>, has_web_search: bool) -> Result<Option<Value>, TranslationError> {
     let Some(choice) = choice else {
         return Ok(None);
     };
 
-    let tool_choice = match choice {
-        Value::String(_) => Some(choice.clone()),
-        Value::Object(choice_obj) => match choice_obj.get("type").and_then(Value::as_str) {
-            Some("function") => {
-                let mut function = Map::new();
-                copy_field(choice_obj, &mut function, "name");
-                Some(json!({"type": "function", "function": Value::Object(function)}))
-            },
-            Some(other) => return Err(TranslationError::UnsupportedToolChoiceType(other.to_owned())),
-            None => return Err(TranslationError::UnsupportedToolChoiceType("unknown".to_owned())),
-        },
-        _ => {
-            return Err(TranslationError::UnsupportedToolChoiceType(
-                json_type_name(choice).to_owned(),
-            ));
-        },
-    };
+    match choice {
+        Value::String(_) => Ok(Some(choice.clone())),
+        Value::Object(choice_obj) => build_object_tool_choice(choice_obj, has_web_search).map(Some),
+        _ => Err(TranslationError::UnsupportedToolChoiceType(
+            json_type_name(choice).to_owned(),
+        )),
+    }
+}
 
-    Ok(tool_choice)
+/// Convert an object-form Responses tool choice.
+fn build_object_tool_choice(choice: &Map<String, Value>, has_web_search: bool) -> Result<Value, TranslationError> {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("function") if has_web_search && function_tool_name(choice) == Some("web_search") => {
+            Err(TranslationError::InvalidWebSearchTool(
+                "tool_choice for hosted web search must use its hosted tool type".to_owned(),
+            ))
+        },
+        Some("function") => {
+            let mut function = Map::new();
+            copy_field(choice, &mut function, "name");
+            Ok(json!({"type": "function", "function": Value::Object(function)}))
+        },
+        Some(tool_type) if is_web_search_tool_type(tool_type) && has_web_search => {
+            Ok(json!({"type": "function", "function": {"name": "web_search"}}))
+        },
+        Some(tool_type) if is_web_search_tool_type(tool_type) => Err(TranslationError::InvalidWebSearchTool(
+            "web-search tool_choice requires a declared web-search tool".to_owned(),
+        )),
+        Some(other) => Err(TranslationError::UnsupportedToolChoiceType(other.to_owned())),
+        None => Err(TranslationError::UnsupportedToolChoiceType("unknown".to_owned())),
+    }
 }
 
 /// Return a stable JSON type name for diagnostics.
@@ -759,7 +930,7 @@ pub(crate) fn chat_response_to_response_resource(
         .and_then(Value::as_str);
     let status = response_status(finish_reason);
     let incomplete_details = incomplete_details(finish_reason);
-    let output = build_output_items(obj, context, status);
+    let output = build_output_items(obj, context, status)?;
     let usage = build_usage(obj);
     let service_tier = service_tier_value_with_context(obj, context);
     let parts = ResponseResourceParts {
@@ -973,18 +1144,22 @@ fn number_value(value: f64) -> Value {
 }
 
 /// Build all `Responses` output items from the first Chat choice.
-fn build_output_items(obj: &Map<String, Value>, context: &ResponseContext<'_>, status: &str) -> Vec<Value> {
+fn build_output_items(
+    obj: &Map<String, Value>,
+    context: &ResponseContext<'_>,
+    status: &str,
+) -> Result<Vec<Value>, TranslationError> {
     let mut output = Vec::new();
     let Some(choice) = first_choice(obj) else {
-        return output;
+        return Ok(output);
     };
 
     let message = choice.get("message");
     let logprobs = chat_logprobs_content(choice);
     append_message_output(&mut output, message, context, status, logprobs);
-    append_tool_call_outputs(&mut output, message, status);
+    append_tool_call_outputs(&mut output, message, context, status)?;
 
-    output
+    Ok(output)
 }
 
 /// Append a message output item when the Chat response includes assistant text.
@@ -1085,17 +1260,100 @@ fn refusal_item(refusal: &str) -> Value {
 }
 
 /// Append function call output items for Chat Completions tool calls.
-fn append_tool_call_outputs(output: &mut Vec<Value>, message: Option<&Value>, status: &str) {
+fn append_tool_call_outputs(
+    output: &mut Vec<Value>,
+    message: Option<&Value>,
+    context: &ResponseContext<'_>,
+    status: &str,
+) -> Result<(), TranslationError> {
     let Some(tool_calls) = message
         .and_then(|message| message.get("tool_calls"))
         .and_then(Value::as_array)
     else {
-        return;
+        return Ok(());
     };
 
     for tool_call in tool_calls {
-        output.push(function_call_output_item(tool_call, status));
+        if context_has_web_search(context) && tool_call_function_name(tool_call) == Some("web_search") {
+            output.push(web_search_call_output_item(tool_call, status)?);
+        } else {
+            output.push(function_call_output_item(tool_call, status));
+        }
     }
+    Ok(())
+}
+
+/// Return whether the original request declared hosted web search.
+fn context_has_web_search(context: &ResponseContext<'_>) -> bool {
+    context.tools.iter().any(|tool| {
+        tool.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    })
+}
+
+/// Read a Chat Completions function name from one tool call.
+fn tool_call_function_name(tool_call: &Value) -> Option<&str> {
+    tool_call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+}
+
+/// Normalize the private web-search function into a canonical hosted call.
+fn web_search_call_output_item(tool_call: &Value, status: &str) -> Result<Value, TranslationError> {
+    let call_id = web_search_call_id(tool_call)?;
+    let arguments = tool_call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .and_then(Value::as_str)
+        .ok_or(TranslationError::InvalidWebSearchCall(
+            "arguments must be a JSON object encoded as a string",
+        ))?;
+    let query = web_search_query(arguments)?;
+
+    Ok(json!({
+        "id": call_id,
+        "type": "web_search_call",
+        "status": status,
+        "action": {
+            "type": "search",
+            "query": query
+        }
+    }))
+}
+
+/// Read and validate the id of a synthesized web-search call.
+fn web_search_call_id(tool_call: &Value) -> Result<&str, TranslationError> {
+    tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or(TranslationError::InvalidWebSearchCall("missing call id"))
+}
+
+/// Strict arguments accepted from the private web-search function.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSearchFunctionArguments {
+    /// Query to pass to the hosted search executor.
+    query: String,
+}
+
+/// Parse and bound the query emitted by a Chat Completions model.
+fn web_search_query(arguments: &str) -> Result<String, TranslationError> {
+    let parsed: WebSearchFunctionArguments = serde_json::from_str(arguments).map_err(|_error| {
+        TranslationError::InvalidWebSearchCall("arguments must contain only a string-valued query")
+    })?;
+    if parsed.query.is_empty() {
+        return Err(TranslationError::InvalidWebSearchCall(
+            "query must be a non-empty string",
+        ));
+    }
+    if parsed.query.chars().count() > WEB_SEARCH_QUERY_MAX_LENGTH {
+        return Err(TranslationError::InvalidWebSearchCall("query exceeds maximum length"));
+    }
+    Ok(parsed.query)
 }
 
 /// Build one `Responses` function call item from a Chat Completions tool call.

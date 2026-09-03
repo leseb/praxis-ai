@@ -29,6 +29,7 @@ const SKIP: &[&str] = &[
     "model-to-header-routing.yaml",
     "openai/conversations/conversations.yaml",
     "openai/responses/agentic-loop-fixture.yaml",
+    "openai/responses/web-search-chat-completions-fixture.yaml",
     "openai/responses/format-routing.yaml",
     "openai/responses/full-flow.yaml",
     "openai/responses/model-rewrite.yaml",

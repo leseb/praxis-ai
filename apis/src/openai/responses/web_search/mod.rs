@@ -259,6 +259,7 @@ impl HttpFilter for WebSearchFilter {
 
         let context_size = ctx
             .get_metadata("tool_parse.search_context_size")
+            .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
 
         let calls: Vec<Value> = state.web_search_calls.clone();
@@ -301,6 +302,21 @@ impl HttpFilter for WebSearchFilter {
         set_action(ctx, ACTION_LOOP)?;
         Ok(FilterAction::Continue)
     }
+}
+
+/// Recover per-request search context after IRR resets step-local metadata.
+fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
+    state.tools.iter().find_map(|tool| {
+        let tool_type = tool.get("type").and_then(Value::as_str)?;
+        if matches!(
+            tool_type,
+            "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26"
+        ) {
+            tool.get("search_context_size").and_then(Value::as_str)
+        } else {
+            None
+        }
+    })
 }
 
 /// Public and bridge identifiers for one appended web-search result.

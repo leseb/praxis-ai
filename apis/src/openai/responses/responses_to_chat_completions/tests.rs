@@ -409,36 +409,41 @@ async fn translated_request_over_configured_limit_is_rejected() {
 }
 
 #[tokio::test]
-async fn unsupported_responses_tool_is_rejected_at_filter_boundary() {
+async fn web_search_translation_preserves_canonical_hosted_tool_state() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.extensions.insert(ResponsesState::from_request_body(json!({
+    let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
-        "tools": [{"type": "web_search"}]
-    })));
+        "tools": [{
+            "type": "web_search",
+            "search_context_size": "high",
+            "user_location": {"type": "approximate", "country": "FR"}
+        }],
+        "tool_choice": {"type": "web_search"}
+    });
+    context
+        .extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
     let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1-mini","input":"hello","tools":[{"type":"web_search"}]}"#,
+        br#"{"model":"gpt-4.1-mini","input":"hello","tools":[{"type":"web_search","search_context_size":"high","user_location":{"type":"approximate","country":"FR"}}],"tool_choice":{"type":"web_search"}}"#,
     ));
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
-        panic!("expected rejection");
-    };
-    assert_eq!(rejection.status, 400);
-    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-    assert_eq!(parsed["error"]["code"], "invalid_request_error");
-    assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
-        "unsupported tool rejection must not arm response processing"
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(translated["tools"][0]["function"]["name"], "web_search");
+    assert_eq!(
+        translated["tool_choice"],
+        json!({"type": "function", "function": {"name": "web_search"}})
     );
-    assert!(
-        context.get_metadata(CREATED_AT_KEY).is_none(),
-        "unsupported tool rejection must not set created_at"
-    );
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.tools.as_slice(), request_body["tools"].as_array().unwrap());
+    assert_eq!(state.tool_choice, request_body["tool_choice"]);
+    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
 }
 
 #[tokio::test]
@@ -452,10 +457,10 @@ async fn streaming_translation_error_uses_responses_sse_error_event() {
         "model": "gpt-4.1-mini",
         "input": "hello",
         "stream": true,
-        "tools": [{"type": "web_search"}]
+        "tools": [{"type": "code_interpreter"}]
     })));
     let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1-mini","input":"hello","stream":true,"tools":[{"type":"web_search"}]}"#,
+        br#"{"model":"gpt-4.1-mini","input":"hello","stream":true,"tools":[{"type":"code_interpreter"}]}"#,
     ));
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
@@ -491,7 +496,7 @@ fn assert_responses_sse_translation_error(rejection: &praxis_filter::Rejection) 
     assert_eq!(parsed["error"]["code"], "invalid_request_error");
     assert_eq!(
         parsed["error"]["message"],
-        "unsupported Responses tool type for Chat Completions translation: web_search"
+        "unsupported Responses tool type for Chat Completions translation: code_interpreter"
     );
     assert!(parsed["error"]["param"].is_null());
 }
