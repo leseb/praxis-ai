@@ -323,6 +323,31 @@ mod tests {
     }
 
     #[test]
+    fn excessive_vector_store_ids_are_rejected() {
+        // One past the maximum (10) amplifies fan-out and is rejected...
+        let too_many: Vec<String> = (0..11).map(|i| format!("vs_{i}")).collect();
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"type": "file_search", "vector_store_ids": too_many}]
+        }));
+        assert_eq!(
+            error,
+            "invalid Responses file_search tool for Chat Completions translation: \
+             vector_store_ids must contain at most 10 entries"
+        );
+
+        // ...but the maximum count itself is accepted.
+        let at_limit: Vec<String> = (0..10).map(|i| format!("vs_{i}")).collect();
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"type": "file_search", "vector_store_ids": at_limit}]
+        }));
+        assert_eq!(mapped["tools"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
     fn duplicate_file_search_definitions_are_rejected() {
         let error = map_error(&json!({
             "model": "m",

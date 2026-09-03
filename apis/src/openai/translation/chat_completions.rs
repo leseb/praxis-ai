@@ -29,6 +29,16 @@ const DEFAULT_TEXT_FORMAT: &str = "text";
 /// request, so multi-byte input remains bounded at the callout boundary.
 const FILE_SEARCH_QUERY_MAX_LENGTH: usize = 65_536;
 
+/// Maximum number of vector stores a single hosted file-search tool may target.
+///
+/// `openai_file_search_callout` issues an upstream vector-store query per id on
+/// every inference round, so an unbounded array would amplify one inbound
+/// request into many outbound searches. The OpenAI API currently caps this at
+/// 1; a small generous bound keeps proxy fan-out finite without enforcing the
+/// exact backend range. Keep the rejection message below in sync with this
+/// value.
+const MAX_VECTOR_STORE_IDS: usize = 10;
+
 /// Build the default `Responses` text configuration.
 fn default_text_config() -> Value {
     json!({"format": {"type": DEFAULT_TEXT_FORMAT}})
@@ -793,6 +803,11 @@ fn validate_vector_store_ids(tool: &Map<String, Value>) -> Result<(), Translatio
             .any(|value| value.as_str().is_none_or(str::is_empty))
     {
         return Err(ERROR);
+    }
+    if vector_store_ids.len() > MAX_VECTOR_STORE_IDS {
+        return Err(TranslationError::InvalidFileSearchTool(
+            "vector_store_ids must contain at most 10 entries",
+        ));
     }
     Ok(())
 }
