@@ -633,4 +633,15 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn missing_tool_call_arguments_field_fails_transformation() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_time"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let error = transform_response(body, "gpt-4").err().unwrap();
+
+        assert!(
+            error.contains("tool call arguments must be a JSON-encoded object string"),
+            "an absent arguments field should fail response transformation: {error}"
+        );
+    }
 }
