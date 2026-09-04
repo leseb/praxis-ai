@@ -247,6 +247,54 @@ mod tests {
     }
 
     #[test]
+    fn web_search_null_user_location_and_null_members_are_treated_as_unset() {
+        // `WebSearchApproximateLocation` is object-or-null: a null location is a
+        // valid "unset" and must translate cleanly, not fail with a 400.
+        let null_location = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "latest news",
+            "tools": [{"type": "web_search", "user_location": null}]
+        }));
+
+        assert_eq!(null_location["tools"][0]["type"], "function");
+        assert_eq!(null_location["tools"][0]["function"]["name"], "web_search");
+        assert!(null_location["tools"][0].get("user_location").is_none());
+
+        // Each optional member is string-or-null: null members are valid "unset".
+        let null_members = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "latest news",
+            "tools": [{
+                "type": "web_search",
+                "user_location": {
+                    "type": "approximate",
+                    "country": null,
+                    "region": null,
+                    "city": null,
+                    "timezone": null
+                }
+            }]
+        }));
+
+        assert_eq!(null_members["tools"][0]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn web_search_non_null_user_location_members_are_still_validated() {
+        let empty_country = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "country": ""}}]
+        }));
+        let non_string_city = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "city": 42}}]
+        }));
+
+        assert!(empty_country.contains("user_location.country must be a non-empty string"));
+        assert!(non_string_city.contains("user_location.city must be a non-empty string"));
+    }
+
+    #[test]
     fn forced_web_search_choice_maps_without_widening() {
         let mapped = map(&json!({
             "model": "gpt-4o-mini",

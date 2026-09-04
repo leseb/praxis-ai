@@ -774,7 +774,11 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
         ));
     }
 
-    if let Some(user_location) = tool.get("user_location") {
+    // `WebSearchApproximateLocation` is object-or-null in the pinned schema, so a
+    // null location is a valid "unset" and must be treated as omitted, not rejected.
+    if let Some(user_location) = tool.get("user_location")
+        && !user_location.is_null()
+    {
         validate_web_search_user_location(user_location)?;
     }
 
@@ -800,10 +804,12 @@ fn validate_web_search_user_location(user_location: &Value) -> Result<(), Transl
             "user_location.type must be approximate".to_owned(),
         ));
     }
+    // Each optional member is string-or-null in the pinned schema; a null member is
+    // a valid "unset", so only non-null values must be non-empty strings.
     for field in ["city", "country", "region", "timezone"] {
         if location
             .get(field)
-            .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
+            .is_some_and(|value| !value.is_null() && value.as_str().is_none_or(str::is_empty))
         {
             return Err(TranslationError::InvalidWebSearchTool(format!(
                 "user_location.{field} must be a non-empty string"
