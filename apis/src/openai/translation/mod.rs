@@ -181,23 +181,201 @@ mod tests {
     }
 
     #[test]
-    fn non_function_responses_tools_are_rejected() {
+    fn unsupported_hosted_responses_tools_are_rejected() {
         let only_unsupported = map_error(&json!({
             "model": "gpt-4o-mini",
             "input": "hello",
-            "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]
+            "tools": [{"type": "code_interpreter"}]
         }));
         let mixed = map_error(&json!({
             "model": "gpt-4o-mini",
             "input": "hello",
             "tools": [
-                {"type": "file_search"},
+                {"type": "image_generation"},
                 {"type": "function", "name": "lookup_weather", "parameters": {"type": "object"}}
             ]
         }));
 
         assert!(only_unsupported.contains("code_interpreter"));
-        assert!(mixed.contains("file_search"));
+        assert!(mixed.contains("image_generation"));
+    }
+
+    #[test]
+    fn file_search_tool_maps_to_bounded_private_function() {
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "find the quarterly results",
+            "tools": [{
+                "type": "file_search",
+                "vector_store_ids": ["vs_q4"],
+                "max_num_results": 8,
+                "filters": {"type": "eq", "key": "year", "value": 2026},
+                "ranking_options": {"ranker": "auto", "score_threshold": 0.2}
+            }]
+        }));
+
+        assert_eq!(mapped["tools"].as_array().map(Vec::len), Some(1));
+        let function = &mapped["tools"][0]["function"];
+        assert_eq!(function["name"], "file_search");
+        assert_eq!(function["strict"], true);
+        assert_eq!(function["parameters"]["type"], "object");
+        assert_eq!(function["parameters"]["required"], json!(["query"]));
+        assert_eq!(function["parameters"]["properties"]["query"]["type"], "string");
+        assert_eq!(function["parameters"]["properties"]["query"]["minLength"], 1);
+        assert_eq!(function["parameters"]["properties"]["query"]["maxLength"], 65_536);
+        assert_eq!(function["parameters"]["additionalProperties"], false);
+        assert!(
+            mapped["tools"][0].get("vector_store_ids").is_none(),
+            "hosted-tool configuration must not leak into the Chat function"
+        );
+    }
+
+    #[test]
+    fn file_search_tool_choice_maps_to_forced_function() {
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "find the report",
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_reports"]}],
+            "tool_choice": {"type": "file_search"}
+        }));
+
+        assert_eq!(
+            mapped["tool_choice"],
+            json!({"type": "function", "function": {"name": "file_search"}})
+        );
+    }
+
+    #[test]
+    fn client_function_choice_cannot_target_synthesized_file_search() {
+        let error = map_error(&json!({
+            "model": "gpt-4o-mini",
+            "input": "find the report",
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_reports"]}],
+            "tool_choice": {"type": "function", "name": "file_search"}
+        }));
+
+        assert_eq!(
+            error,
+            "invalid Responses file_search tool for Chat Completions translation: tool_choice for hosted file_search must use type file_search"
+        );
+    }
+
+    #[test]
+    fn file_search_function_name_collisions_are_rejected() {
+        for function in [
+            json!({"type": "function", "name": "file_search", "parameters": {"type": "object"}}),
+            json!({
+                "type": "function",
+                "function": {"name": "file_search", "parameters": {"type": "object"}}
+            }),
+        ] {
+            let error = map_error(&json!({
+                "model": "gpt-4o-mini",
+                "input": "find the report",
+                "tools": [
+                    {"type": "file_search", "vector_store_ids": ["vs_reports"]},
+                    function
+                ]
+            }));
+
+            assert_eq!(
+                error,
+                "Responses function tool name `file_search` conflicts with the synthesized file_search function"
+            );
+        }
+    }
+
+    #[test]
+    fn client_file_search_function_without_hosted_tool_is_preserved() {
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "call my function",
+            "tools": [{
+                "type": "function",
+                "name": "file_search",
+                "parameters": {"type": "object"}
+            }]
+        }));
+
+        assert_eq!(mapped["tools"][0]["function"]["name"], "file_search");
+    }
+
+    #[test]
+    fn malformed_file_search_definitions_are_rejected() {
+        let malformed = [
+            json!({"type": "file_search"}),
+            json!({"type": "file_search", "vector_store_ids": []}),
+            json!({"type": "file_search", "vector_store_ids": [""]}),
+            json!({"type": "file_search", "vector_store_ids": [42]}),
+            json!({"type": "file_search", "vector_store_ids": ["vs"], "max_num_results": 0}),
+            json!({"type": "file_search", "vector_store_ids": ["vs"], "max_num_results": 51}),
+            json!({"type": "file_search", "vector_store_ids": ["vs"], "filters": []}),
+            json!({"type": "file_search", "vector_store_ids": ["vs"], "ranking_options": "auto"}),
+        ];
+
+        for tool in malformed {
+            let error = map_error(&json!({"model": "m", "input": "hello", "tools": [tool]}));
+            assert!(
+                error.starts_with("invalid Responses file_search tool for Chat Completions translation:"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn excessive_vector_store_ids_are_rejected() {
+        // One past the maximum (10) amplifies fan-out and is rejected...
+        let too_many: Vec<String> = (0..11).map(|i| format!("vs_{i}")).collect();
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"type": "file_search", "vector_store_ids": too_many}]
+        }));
+        assert_eq!(
+            error,
+            "invalid Responses file_search tool for Chat Completions translation: \
+             vector_store_ids must contain at most 10 entries"
+        );
+
+        // ...but the maximum count itself is accepted.
+        let at_limit: Vec<String> = (0..10).map(|i| format!("vs_{i}")).collect();
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"type": "file_search", "vector_store_ids": at_limit}]
+        }));
+        assert_eq!(mapped["tools"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn duplicate_file_search_definitions_are_rejected() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [
+                {"type": "file_search", "vector_store_ids": ["vs_a"]},
+                {"type": "file_search", "vector_store_ids": ["vs_b"]}
+            ]
+        }));
+
+        assert_eq!(
+            error,
+            "invalid Responses file_search tool for Chat Completions translation: only one file_search tool may be declared"
+        );
+    }
+
+    #[test]
+    fn file_search_choice_without_definition_is_rejected() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": {"type": "file_search"}
+        }));
+
+        assert_eq!(
+            error,
+            "invalid Responses file_search tool for Chat Completions translation: tool_choice requires a declared file_search tool"
+        );
     }
 
     #[test]
