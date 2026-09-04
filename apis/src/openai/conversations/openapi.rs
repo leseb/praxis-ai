@@ -170,14 +170,26 @@ mod tests {
     fn generated_create_request_contract_matches_runtime() {
         let document = serde_json::to_value(implementation_openapi()).unwrap();
 
+        let items = "/components/schemas/CreateConversationRequest/properties/items";
         assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/type"),
-            Some(&Value::String("array".to_owned()))
+            document.pointer(&format!("{items}/anyOf/0/type")),
+            Some(&Value::String("array".to_owned())),
+            "initial items should be an array in the first anyOf branch"
         );
         assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/maxItems"),
+            document.pointer(&format!("{items}/anyOf/0/items/$ref")),
+            Some(&Value::String("#/components/schemas/InputItem".to_owned())),
+            "initial items should reference the InputItem union"
+        );
+        assert_eq!(
+            document.pointer(&format!("{items}/anyOf/0/maxItems")),
             Some(&Value::Number(serde_json::Number::from(20_u64))),
             "items array should preserve the 20-item bound"
+        );
+        assert_eq!(
+            document.pointer(&format!("{items}/anyOf/1/type")),
+            Some(&Value::String("null".to_owned())),
+            "initial items should be nullable to match the reference"
         );
         assert!(
             document

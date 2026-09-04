@@ -253,13 +253,13 @@
         "implementation_source": "generated:praxis-ai-apis/openai/conversations",
         "operation_contracts": {
           "total": 8,
-          "exact": 4,
+          "exact": 5,
           "missing": 0,
-          "drifted": 4,
-          "request_drifted": 4,
+          "drifted": 3,
+          "request_drifted": 3,
           "response_drifted": 0,
           "other_drifted": 0,
-          "exact_percent": 50.0,
+          "exact_percent": 62.5,
           "missing_operations": [],
           "drifted_operations": [
             {
@@ -278,26 +278,6 @@
                 "parameters.query.limit.schema.default.to",
                 "parameters.query.limit.schema.min.from",
                 "parameters.query.limit.schema.min.to"
-              ],
-              "response_details": [],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/conversations",
-                "operation": "POST /conversations"
-              },
-              "has_request_drift": true,
-              "has_response_drift": false,
-              "has_other_drift": false,
-              "request_details": [
-                "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
-                "requestBody.content.application/json.schema.properties.items.type.added",
-                "requestBody.content.application/json.schema.properties.items.maxItems.from",
-                "requestBody.content.application/json.schema.properties.items.maxItems.to",
-                "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
-                "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted"
               ],
               "response_details": [],
               "other_details": []
@@ -483,24 +463,24 @@
     ],
     "operation_contracts": {
       "total": 8,
-      "exact": 4,
+      "exact": 5,
       "missing": 0,
-      "drifted": 4,
-      "request_drifted": 4,
+      "drifted": 3,
+      "request_drifted": 3,
       "response_drifted": 0,
       "other_drifted": 0,
-      "exact_percent": 50.0,
+      "exact_percent": 62.5,
       "by_area": [
         {
           "area": "Conversations",
           "total": 8,
-          "conformant": 4,
+          "conformant": 5,
           "missing": 0,
-          "drifted": 4,
-          "request_drifted": 4,
+          "drifted": 3,
+          "request_drifted": 3,
           "response_drifted": 0,
           "other_drifted": 0,
-          "conformance_percent": 50.0
+          "conformance_percent": 62.5
         }
       ]
     },
@@ -514,10 +494,10 @@
     "all_exact": false,
     "fixes_required": {
       "summary": {
-        "operations_to_fix": 4,
+        "operations_to_fix": 3,
         "area_contracts_to_fix": 0,
         "missing_operations": 0,
-        "request_drift_operations": 4,
+        "request_drift_operations": 3,
         "response_drift_operations": 0,
         "other_drift_operations": 0
       },
@@ -540,28 +520,6 @@
                 "parameters.query.limit.schema.default.to",
                 "parameters.query.limit.schema.min.from",
                 "parameters.query.limit.schema.min.to"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/conversations",
-            "operation": "POST /conversations"
-          },
-          "fixes": [
-            {
-              "area": "request",
-              "kind": "request_body_schema",
-              "summary": "Align the request body schema with the OpenAI spec.",
-              "detail_paths": [
-                "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
-                "requestBody.content.application/json.schema.properties.items.type.added",
-                "requestBody.content.application/json.schema.properties.items.maxItems.from",
-                "requestBody.content.application/json.schema.properties.items.maxItems.to",
-                "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
-                "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted"
               ]
             }
           ]

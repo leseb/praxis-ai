@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use utoipa::{
     ToSchema,
-    openapi::schema::{AnyOfBuilder, Object, ObjectBuilder, Schema, Type},
+    openapi::schema::{AnyOfBuilder, ArrayBuilder, Object, ObjectBuilder, Ref, Schema, Type},
 };
 
 use super::item_schema::validate_input_item;
@@ -31,7 +31,7 @@ pub(super) struct CreateConversationRequest {
 
     /// Optional initial items to add to the conversation.
     #[serde(default, deserialize_with = "nullable_vec")]
-    #[schema(max_items = 20)]
+    #[schema(schema_with = nullable_initial_items_schema)]
     pub(super) items: Vec<InputItem>,
 }
 
@@ -92,6 +92,25 @@ fn nullable_metadata_schema() -> Schema {
     Schema::AnyOf(
         AnyOfBuilder::new()
             .item(Schema::AnyOf(metadata))
+            .item(Schema::Object(ObjectBuilder::new().schema_type(Type::Null).build()))
+            .build(),
+    )
+}
+
+/// Emit the nullable initial-items schema mandated by the official reference:
+/// `anyOf: [{type: array, items: $ref InputItem, maxItems: 20}, {type: null}]`.
+///
+/// The runtime keeps a plain `Vec<InputItem>` and coerces a `null` payload to an
+/// empty vec via [`nullable_vec`]; only the emitted contract carries the null
+/// branch so the generated document matches OpenAI's `CreateConversationBody`.
+fn nullable_initial_items_schema() -> Schema {
+    Schema::AnyOf(
+        AnyOfBuilder::new()
+            .item(
+                ArrayBuilder::new()
+                    .items(Ref::from_schema_name("InputItem"))
+                    .max_items(Some(MAX_ITEMS_PER_REQUEST)),
+            )
             .item(Schema::Object(ObjectBuilder::new().schema_type(Type::Null).build()))
             .build(),
     )
