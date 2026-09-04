@@ -546,19 +546,45 @@ fn convert_tools(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
     }
 }
 
-/// Convert one Anthropic client tool definition to a Chat Completions tool.
-fn convert_tool_definition(tool: &Value) -> Option<Value> {
+/// Return a stable JSON type name for diagnostics, never the value itself.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Classify an Anthropic tool: keep only untyped or explicit `custom` client
+/// tools, dropping (and logging) every typed server tool so unknown server
+/// tools fail closed instead of leaking to the backend as client functions.
+fn is_translatable_client_tool(tool: &Value) -> bool {
     match tool.get("type") {
-        None => {},
-        Some(Value::String(tool_type)) if tool_type == "custom" => {},
+        None => true,
+        Some(Value::String(tool_type)) if tool_type == "custom" => true,
         Some(Value::String(tool_type)) => {
             warn!(tool_type, "dropping typed Anthropic tool");
-            return None;
+            false
         },
         Some(other) => {
-            warn!(?other, "dropping Anthropic tool with non-string type");
-            return None;
+            // Log only the JSON value kind, never the value itself: `type` is
+            // attacker-controlled and could carry a large or sensitive payload.
+            warn!(
+                type_kind = json_type_name(other),
+                "dropping Anthropic tool with non-string type"
+            );
+            false
         },
+    }
+}
+
+/// Convert one Anthropic client tool definition to a Chat Completions tool.
+fn convert_tool_definition(tool: &Value) -> Option<Value> {
+    if !is_translatable_client_tool(tool) {
+        return None;
     }
 
     let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
