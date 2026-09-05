@@ -194,6 +194,9 @@ pub(crate) enum TranslationError {
     /// A Responses message `content` field is neither a string nor an array of parts.
     #[error("Responses message input item field `content` must be a string or array of content parts")]
     InvalidMessageContent,
+    /// A Responses input item `type` discriminator is present but not a string.
+    #[error("Responses input item field `type` must be a string")]
+    InvalidInputItemType,
     /// A Responses input item has no Chat Completions-compatible representation.
     #[error("unsupported Responses input item type for Chat Completions translation: {0}")]
     UnsupportedInputItemType(String),
@@ -463,7 +466,7 @@ fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Tran
         return Err(TranslationError::ExpectedObject("Responses input item"));
     };
 
-    match obj.get("type").and_then(Value::as_str) {
+    match input_item_type(obj)? {
         Some("function_call_output") => append_tool_output(messages, obj)?,
         Some("message") => append_message_item(messages, obj)?,
         Some("compaction") => append_compaction_item(messages, obj),
@@ -473,6 +476,19 @@ fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Tran
     }
 
     Ok(())
+}
+
+/// Read a Responses input item `type` discriminator.
+///
+/// A missing `type` is allowed (the caller falls back to message detection),
+/// but a present non-string discriminator fails closed rather than being
+/// treated as an untyped message that silently drops the invalid value.
+fn input_item_type(obj: &Map<String, Value>) -> Result<Option<&str>, TranslationError> {
+    match obj.get("type") {
+        Some(Value::String(item_type)) => Ok(Some(item_type)),
+        Some(_) => Err(TranslationError::InvalidInputItemType),
+        None => Ok(None),
+    }
 }
 
 /// Convert a Responses message item into a Chat Completions message.
@@ -511,17 +527,17 @@ fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
 fn function_call_tool_call(obj: &Map<String, Value>) -> Result<Value, TranslationError> {
     let call_id = required_input_item_string(obj, "function_call", "call_id")?;
     let name = required_input_item_string(obj, "function_call", "name")?;
-    let arguments = obj.get("arguments").ok_or(TranslationError::MissingInputItemField {
-        item_type: "function_call",
-        field: "arguments",
-    })?;
+    // Responses function-call `arguments` is always a JSON-encoded string; a
+    // non-string value fails closed instead of being stringified into the
+    // Chat Completions request.
+    let arguments = required_input_item_string(obj, "function_call", "arguments")?;
 
     Ok(json!({
         "id": call_id,
         "type": "function",
         "function": {
             "name": name,
-            "arguments": chat_string_field(Some(arguments)),
+            "arguments": arguments,
         }
     }))
 }

@@ -342,6 +342,42 @@ mod tests {
     }
 
     #[test]
+    fn non_string_call_id_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"type": "function_call", "call_id": 123, "name": "f", "arguments": "{}"}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses function_call input item field `call_id` must be a string"
+        );
+    }
+
+    #[test]
+    fn non_string_function_call_arguments_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"type": "function_call", "call_id": "call_1", "name": "f", "arguments": 42}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses function_call input item field `arguments` must be a string"
+        );
+    }
+
+    #[test]
+    fn non_string_input_item_type_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"type": 42, "role": "user", "content": "hi"}]
+        }));
+
+        assert_eq!(error, "Responses input item field `type` must be a string");
+    }
+
+    #[test]
     fn unsupported_typed_input_items_are_rejected() {
         let error = super::chat_completions::responses_request_to_chat_request(&json!({
             "model": "gpt-4o-mini",
@@ -444,7 +480,7 @@ mod tests {
                 "type": "function_call",
                 "call_id": "call_weather",
                 "name": "lookup_weather",
-                "arguments": {"city": "NYC"}
+                "arguments": "{\"city\":\"NYC\"}"
             }
         }));
 
@@ -1062,24 +1098,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // Request translation: function call edge cases
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn function_call_with_non_string_arguments_serializes_to_json() {
-        let mapped = map(&json!({
-            "model": "m",
-            "input": [{
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "get_weather",
-                "arguments": {"city": "NYC"}
-            }]
-        }));
-
-        assert_eq!(
-            mapped["messages"][0]["tool_calls"][0]["function"]["arguments"],
-            "{\"city\":\"NYC\"}"
-        );
-    }
 
     #[test]
     fn function_call_without_arguments_returns_error() {
