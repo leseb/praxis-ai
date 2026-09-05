@@ -61,3 +61,4 @@ mod token_usage_headers;
 mod vector_stores_routing;
 mod vllm_agentic_api;
 mod web_search;
+mod web_search_chat_completions;

@@ -191,13 +191,13 @@ mod tests {
             "model": "gpt-4o-mini",
             "input": "hello",
             "tools": [
-                {"type": "web_search"},
+                {"type": "image_generation"},
                 {"type": "function", "name": "lookup_weather", "parameters": {"type": "object"}}
             ]
         }));
 
         assert!(only_unsupported.contains("code_interpreter"));
-        assert!(mixed.contains("web_search"));
+        assert!(mixed.contains("image_generation"));
     }
 
     #[test]
@@ -376,6 +376,173 @@ mod tests {
             error,
             "invalid Responses file_search tool for Chat Completions translation: tool_choice requires a declared file_search tool"
         );
+    }
+
+    #[test]
+    fn web_search_tools_map_to_one_bounded_private_function() {
+        for tool_type in [
+            "web_search",
+            "web_search_preview",
+            "web_search_preview_2025_03_11",
+            "web_search_2025_08_26",
+        ] {
+            let mapped = map(&json!({
+                "model": "gpt-4o-mini",
+                "input": "latest news",
+                "tools": [{
+                    "type": tool_type,
+                    "search_context_size": "high",
+                    "user_location": {
+                        "type": "approximate",
+                        "country": "FR",
+                        "city": "Paris",
+                        "timezone": "Europe/Paris"
+                    }
+                }]
+            }));
+
+            assert_eq!(mapped["tools"][0]["type"], "function");
+            assert_eq!(mapped["tools"][0]["function"]["name"], "web_search");
+            assert_eq!(
+                mapped["tools"][0]["function"]["parameters"]["required"],
+                json!(["query"])
+            );
+            assert_eq!(
+                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["minLength"],
+                1
+            );
+            assert_eq!(
+                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["maxLength"],
+                4096
+            );
+            assert_eq!(
+                mapped["tools"][0]["function"]["parameters"]["additionalProperties"],
+                false
+            );
+            assert!(mapped["tools"][0].get("search_context_size").is_none());
+            assert!(mapped["tools"][0].get("user_location").is_none());
+        }
+    }
+
+    #[test]
+    fn web_search_null_user_location_and_null_members_are_treated_as_unset() {
+        // `WebSearchApproximateLocation` is object-or-null: a null location is a
+        // valid "unset" and must translate cleanly, not fail with a 400.
+        let null_location = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "latest news",
+            "tools": [{"type": "web_search", "user_location": null}]
+        }));
+
+        assert_eq!(null_location["tools"][0]["type"], "function");
+        assert_eq!(null_location["tools"][0]["function"]["name"], "web_search");
+        assert!(null_location["tools"][0].get("user_location").is_none());
+
+        // Each optional member is string-or-null: null members are valid "unset".
+        let null_members = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "latest news",
+            "tools": [{
+                "type": "web_search",
+                "user_location": {
+                    "type": "approximate",
+                    "country": null,
+                    "region": null,
+                    "city": null,
+                    "timezone": null
+                }
+            }]
+        }));
+
+        assert_eq!(null_members["tools"][0]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn web_search_non_null_user_location_members_are_still_validated() {
+        let empty_country = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "country": ""}}]
+        }));
+        let non_string_city = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "city": 42}}]
+        }));
+
+        assert!(empty_country.contains("user_location.country must be a non-empty string"));
+        assert!(non_string_city.contains("user_location.city must be a non-empty string"));
+    }
+
+    #[test]
+    fn forced_web_search_choice_maps_without_widening() {
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "latest news",
+            "tools": [{"type": "web_search_preview"}],
+            "tool_choice": {"type": "web_search_preview"}
+        }));
+
+        assert_eq!(
+            mapped["tool_choice"],
+            json!({"type": "function", "function": {"name": "web_search"}})
+        );
+    }
+
+    #[test]
+    fn web_search_function_name_collision_is_rejected() {
+        let error = map_error(&json!({
+            "model": "gpt-4o-mini",
+            "input": "latest news",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "web_search", "parameters": {"type": "object"}}
+            ]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses function tool name `web_search` conflicts with the synthesized web_search function"
+        );
+    }
+
+    #[test]
+    fn malformed_or_unsupported_web_search_config_is_rejected() {
+        let duplicate = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search"}, {"type": "web_search_preview"}]
+        }));
+        let unsupported_field = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search", "filters": {"allowed_domains": ["example.com"]}}]
+        }));
+        let unsupported_variant = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search_future"}]
+        }));
+        let invalid_context = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search", "search_context_size": "huge"}]
+        }));
+        let invalid_location = map_error(&json!({
+            "model": "m",
+            "tools": [{"type": "web_search", "user_location": {"type": "precise"}}]
+        }));
+
+        assert!(duplicate.contains("only one web-search tool"));
+        assert!(unsupported_field.contains("field `filters` is not supported"));
+        assert!(unsupported_variant.contains("unsupported Responses tool type"));
+        assert!(invalid_context.contains("search_context_size must be one of"));
+        assert!(invalid_location.contains("user_location.type must be approximate"));
+    }
+
+    #[test]
+    fn forced_web_search_choice_requires_a_hosted_declaration() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "latest news",
+            "tool_choice": {"type": "web_search"}
+        }));
+
+        assert!(error.contains("tool_choice requires a declared web-search tool"));
     }
 
     #[test]
@@ -881,6 +1048,84 @@ mod tests {
         assert_eq!(tool_mapped["output"][0]["arguments"], "{\"city\":\"NYC\"}");
         assert_eq!(filter_mapped["status"], "incomplete");
         assert_eq!(filter_mapped["incomplete_details"], json!({"reason": "content_filter"}));
+    }
+
+    #[test]
+    fn private_web_search_call_maps_to_canonical_hosted_output() {
+        let response = json!({
+            "id": "chatcmpl-web-search",
+            "object": "chat.completion",
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_search_1",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{\"query\":\"Praxis Proxy\"}"}
+                    }]
+                }
+            }]
+        });
+        let request = json!({
+            "model": "gpt-4o-mini",
+            "input": "search",
+            "tools": [{"type": "web_search", "search_context_size": "high"}]
+        });
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_web_search".to_owned(), 0);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(
+            mapped["output"][0],
+            json!({
+                "id": "call_search_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"type": "search", "query": "Praxis Proxy"}
+            })
+        );
+        assert_eq!(mapped["tools"], request["tools"]);
+    }
+
+    #[test]
+    fn malformed_private_web_search_arguments_are_rejected() {
+        let request = json!({"model": "m", "tools": [{"type": "web_search"}]});
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_ws".to_owned(), 0);
+
+        let oversized = serde_json::to_string(&json!({"query": "x".repeat(4097)})).unwrap();
+        let cases = [
+            "{}",
+            "{\"query\":\"\"}",
+            "{\"query\":42}",
+            "{\"query\":\"ok\",\"extra\":true}",
+            "not json",
+            oversized.as_str(),
+        ];
+        for arguments in cases {
+            let response = json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "tool_calls": [{
+                        "id": "call_ws",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": arguments}
+                    }]}
+                }]
+            });
+            let error = super::chat_completions::chat_response_to_response_resource(&response, &context)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("invalid synthesized web_search function call:"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
