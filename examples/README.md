@@ -71,10 +71,13 @@ before sending requests.
 | [prompts-routing.yaml](configs/openai/prompts/prompts-routing.yaml) | Routes OpenAI Prompts API requests to a dedicated Prompts API backend |
 | [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
+| [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates the compaction flow: store a response, rehydrate it on the next turn, and count tokens to check if compaction is needed |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
 | [file-search-callout.yaml](configs/openai/responses/file-search-callout.yaml) | Demonstrates the `openai_file_search_callout` filter configuration |
+| [file-search-chat-completions-fixture.yaml](configs/openai/responses/file-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses file_search tool |
+| [file-search-chat-completions.yaml](configs/openai/responses/file-search-chat-completions.yaml) | Accepts finite OpenAI Responses requests with hosted file search while targeting a backend that only implements /v1/chat/completions |
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by detected body format |
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Extends the full-flow pipeline with an iterative_request_router (IRR) around the inference step, enabling server-side file search execution |
 | [full-flow.yaml](configs/openai/responses/full-flow.yaml) | Combines conversations, format classification, request validation, file resolution, and backend routing into a single pipeline |

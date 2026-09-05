@@ -1237,6 +1237,7 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
             ]
@@ -1263,11 +1264,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 15);
-        assert_eq!(report.scenarios_total, 13);
-        assert_eq!(report.recordings_total, 18);
+        assert_eq!(report.features_total, 16);
+        assert_eq!(report.scenarios_total, 14);
+        assert_eq!(report.recordings_total, 19);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1281,12 +1283,13 @@ mod tests {
                 "messages/upstream-error",
                 "responses/agentic-parallel-tool-calls",
                 "responses/chat-basic-nonstream",
+                "responses/chat-file-search",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 15);
+        assert_eq!(manifest.features.len(), 16);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1366,6 +1369,10 @@ mod tests {
                 (
                     &"responses.chat.response.text".to_owned(),
                     &vec!["responses/chat-basic-nonstream".to_owned()]
+                ),
+                (
+                    &"responses.chat.file_search".to_owned(),
+                    &vec!["responses/chat-file-search".to_owned()]
                 ),
                 (
                     &"responses.agentic.parallel_tool_calls".to_owned(),

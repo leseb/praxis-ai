@@ -16,6 +16,7 @@ mod azure_ad;
 mod compact;
 mod credential_injection;
 mod file_search_callout;
+mod file_search_chat_completions;
 mod full_flow;
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
@@ -38,6 +39,7 @@ mod openai_mcp_tool_resolve;
 mod openai_prompts_routing;
 mod openai_response_store;
 mod openai_response_store_postgres;
+mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;

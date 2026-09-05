@@ -23,7 +23,8 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -32,6 +33,7 @@ use self::{
     error::normalize_provider_error,
 };
 use super::{
+    body_limits::reject_rewritten_body_too_large,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
 };
@@ -90,7 +92,7 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 ///
 /// ```yaml
 /// filter: responses_to_chat_completions
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
 /// ```
 pub struct ResponsesToChatCompletionsFilter {
     /// Parsed and validated body limits.
@@ -127,18 +129,17 @@ impl ResponsesToChatCompletionsFilter {
         };
         let serialized = serde_json::to_vec(&translated)
             .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
-        if serialized.len() > self.config.max_body_bytes {
+        if serialized.len() > self.config.max_rewritten_body_bytes {
             debug!(
                 body_bytes = serialized.len(),
-                max_bytes = self.config.max_body_bytes,
+                max_bytes = self.config.max_rewritten_body_bytes,
                 "translated request body exceeds maximum size"
             );
-            return Ok(Err(FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                "request body exceeds maximum size",
+            return Ok(Err(reject_rewritten_body_too_large(
+                serialized.len(),
+                self.config.max_rewritten_body_bytes,
                 streaming,
-            ))));
+            )));
         }
         Ok(Ok(serialized))
     }
@@ -151,7 +152,7 @@ impl ResponsesToChatCompletionsFilter {
     ) -> Result<(), FilterError> {
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
             Some(RESPONSE_TRANSFORM_ERROR) => {
-                transform_provider_error(ctx, body, self.config.max_body_bytes)?;
+                transform_provider_error(ctx, body, self.config.max_rewritten_body_bytes)?;
                 Ok(())
             },
             Some(RESPONSE_TRANSFORM_SUCCESS) => self.transform_success_response(ctx, body),
@@ -166,14 +167,14 @@ impl ResponsesToChatCompletionsFilter {
         body: &mut Option<Bytes>,
     ) -> Result<(), FilterError> {
         match translate_success_response(ctx, body.as_deref().unwrap_or_default()) {
-            Ok(translated) if translated.len() <= self.config.max_body_bytes => {
+            Ok(translated) if translated.len() <= self.config.max_rewritten_body_bytes => {
                 *body = Some(translated);
                 Ok(())
             },
             Ok(translated) => {
                 debug!(
                     body_bytes = translated.len(),
-                    max_bytes = self.config.max_body_bytes,
+                    max_bytes = self.config.max_rewritten_body_bytes,
                     "translated response body exceeds maximum size"
                 );
                 Err("responses_to_chat_completions: translated response exceeds maximum size".into())
@@ -197,8 +198,11 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the translated body this filter produces.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -230,8 +234,10 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
+        // Buffer the finite response up to the absolute ceiling; the
+        // pipeline's body_limits decides the real raw cap.
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         });
         prepare_transformed_response_headers(ctx);
 
@@ -276,7 +282,12 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
-        ctx.set_metadata(CREATED_AT_KEY, ctx.time_source.now().as_secs().to_string());
+        let now = ctx.time_source.now().as_secs();
+        let created_at = ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .map_or(now, |state| *state.response_created_at.get_or_insert(now));
+        ctx.set_metadata(CREATED_AT_KEY, created_at.to_string());
 
         Ok(FilterAction::Continue)
     }
@@ -292,6 +303,14 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
         Some(format) => {
             trace!(format, "releasing request classified as a different API format");
             Some(FilterAction::Release)
+        },
+        None if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.response_id.is_some()) =>
+        {
+            trace!("using canonical Responses state across an iterative router metadata boundary");
+            None
         },
         None => {
             warn!(
@@ -340,8 +359,16 @@ fn ensure_previous_response_rehydrated(state: &ResponsesState, streaming: bool) 
 
 /// Return the client stream preference captured by the classifier.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream")
-        .is_some_and(|value| value == "true")
+    ctx.get_metadata("openai_responses_format.stream").map_or_else(
+        || {
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.request_body.get("stream"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        },
+        |value| value == "true",
+    )
 }
 
 /// Detect an SSE media type while response headers are still available.
@@ -372,16 +399,16 @@ fn captured_response_status(ctx: &HttpFilterContext<'_>) -> Result<http::StatusC
 fn transform_provider_error(
     ctx: &HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
-    max_body_bytes: usize,
+    max_rewritten_body_bytes: usize,
 ) -> Result<(), FilterError> {
     let status = captured_response_status(ctx)?;
     let normalized = normalize_provider_error(status, body.as_deref().unwrap_or_default());
     let mut transformed = responses_error_body(&normalized.code, &normalized.message);
-    if transformed.len() > max_body_bytes {
+    if transformed.len() > max_rewritten_body_bytes {
         let fallback = normalize_provider_error(status, &[]);
         transformed = responses_error_body(&fallback.code, &fallback.message);
     }
-    if transformed.len() > max_body_bytes {
+    if transformed.len() > max_rewritten_body_bytes {
         return Err("responses_to_chat_completions: normalized provider error exceeds maximum size".into());
     }
     *body = Some(transformed);
@@ -438,20 +465,25 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
 
 /// Convert a finite successful Chat response into a Responses resource.
 fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Result<Bytes, FilterError> {
-    let response_id = ctx
-        .get_metadata("responses.response_id")
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing response id".into() })?;
-    let created_at = ctx
-        .get_metadata(CREATED_AT_KEY)
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing creation timestamp".into() })?;
     let state = ctx
         .extensions
         .get::<ResponsesState>()
         .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing Responses state".into() })?;
-    let response_context =
+    let response_id = ctx
+        .get_metadata("responses.response_id")
+        .or(state.response_id.as_deref())
+        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing response id".into() })?;
+    let created_at = ctx
+        .get_metadata(CREATED_AT_KEY)
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(state.response_created_at)
+        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing creation timestamp".into() })?;
+    let mut response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
             .with_completed_at(ctx.time_source.now().as_secs());
+    if let Some(tool_choice) = state.original_tool_choice.as_ref() {
+        response_context.tool_choice = Some(tool_choice);
+    }
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)

@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
+
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 
@@ -122,6 +124,19 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
+    /// Original client tool choice retained when continuation widens the
+    /// provider-visible choice to `auto`.
+    pub original_tool_choice: Option<serde_json::Value>,
+
+    /// Stable creation timestamp for the public response across iterations.
+    pub response_created_at: Option<u64>,
+
+    /// Stable public response ID assigned by request validation.
+    ///
+    /// Stored with canonical state because iterative router steps preserve
+    /// extensions while resetting per-step metadata.
+    pub response_id: Option<String>,
+
     /// Whether provider-visible request fields require outbound serialization.
     pub request_body_rebuild: RequestBodyRebuild,
 
@@ -198,6 +213,9 @@ impl Default for ResponsesState {
             previous_tools: Vec::new(),
             previous_usage: None,
             request_body: serde_json::Value::Null,
+            original_tool_choice: None,
+            response_created_at: None,
+            response_id: None,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
@@ -276,6 +294,31 @@ impl ResponsesState {
     /// Return whether provider-visible request state requires serialization.
     pub(crate) fn request_body_requires_rebuild(&self) -> bool {
         self.request_body_rebuild == RequestBodyRebuild::Required
+    }
+
+    /// Build the final response body from accumulated state.
+    ///
+    /// Replaces `response_object["output"]` with the full `accumulated_output`
+    /// (all rounds), stamps accumulated usage, and serializes back to body bytes.
+    pub(crate) fn finalize_response_body(&self, body: &mut Option<Bytes>) {
+        if !self.response_object.is_object() {
+            return;
+        }
+        let mut response = self.response_object.clone();
+        if let Some(obj) = response.as_object_mut() {
+            if !self.accumulated_output.is_empty() {
+                obj.insert(
+                    "output".to_owned(),
+                    serde_json::Value::Array(self.accumulated_output.clone()),
+                );
+            }
+            if !self.usage.is_null() {
+                obj.insert("usage".to_owned(), self.usage.clone());
+            }
+        }
+        if let Ok(serialized) = serde_json::to_vec(&response) {
+            *body = Some(Bytes::from(serialized));
+        }
     }
 }
 

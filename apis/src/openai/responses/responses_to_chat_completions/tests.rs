@@ -65,30 +65,43 @@ async fn non_create_request_continues_without_rewriting_or_arming() {
 }
 
 #[test]
-fn custom_body_limit_parses() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
+fn custom_rewritten_body_limit_parses() {
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1048576").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
 
+    // The configured limit bounds only the translated body this filter
+    // produces; the buffer still accepts up to the absolute ceiling because
+    // the pipeline's body_limits governs the raw transport cap.
     assert!(matches!(
         filter.request_body_mode(),
         BodyMode::StreamBuffer {
-            max_bytes: Some(1_048_576)
+            max_bytes: Some(67_108_864)
         }
     ));
 }
 
 #[test]
-fn zero_body_limit_is_rejected() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 0").unwrap();
+fn zero_rewritten_body_limit_is_rejected() {
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 0").unwrap();
 
     assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
 }
 
 #[test]
-fn oversized_body_limit_is_rejected() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 67108865").unwrap();
+fn oversized_rewritten_body_limit_is_rejected() {
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 67108865").unwrap();
 
     assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn legacy_max_body_bytes_is_rejected() {
+    let yaml = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
+
+    assert!(
+        ResponsesToChatCompletionsFilter::from_config(&yaml).is_err(),
+        "legacy max_body_bytes should be rejected as an unknown field"
+    );
 }
 
 #[test]
@@ -142,6 +155,48 @@ async fn classified_responses_create_without_state_fails_closed() {
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
     assert_server_error(action);
+}
+
+#[tokio::test]
+async fn canonical_state_translates_across_iterative_metadata_boundary() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "stream": false
+    }));
+    state.response_id = Some("resp_iterative".to_owned());
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1-mini","input":"hello","stream":false}"#,
+    ));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(translated["messages"][0]["content"], "hello");
+    assert_eq!(translated["stream"], false);
+    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+}
+
+#[tokio::test]
+async fn unvalidated_state_does_not_bypass_missing_classifier_metadata() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello"
+    })));
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert_server_error(action);
+    assert!(context.get_metadata(ARMED_KEY).is_none());
 }
 
 #[tokio::test]
@@ -311,6 +366,13 @@ async fn canonical_state_is_translated_and_arms_response() {
     );
     assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
     assert_eq!(context.get_metadata(CREATED_AT_KEY), Some("1700000000"));
+    assert_eq!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(|state| state.response_created_at),
+        Some(1_700_000_000)
+    );
 }
 
 #[tokio::test]
@@ -366,7 +428,7 @@ async fn rehydrated_previous_response_id_translates_full_history() {
 
 #[tokio::test]
 async fn translated_request_over_configured_limit_is_rejected() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 32").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 32").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -530,7 +592,7 @@ async fn successful_sse_response_stays_streaming() {
 
 #[tokio::test]
 async fn non_streaming_success_upgrades_to_bounded_buffer() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
+    let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -557,7 +619,7 @@ async fn non_streaming_success_upgrades_to_bounded_buffer() {
     assert!(matches!(
         context.response_body_mode,
         BodyMode::StreamBuffer {
-            max_bytes: Some(1_048_576)
+            max_bytes: Some(67_108_864)
         }
     ));
     assert!(
@@ -761,6 +823,57 @@ async fn non_streaming_chat_response_becomes_response_resource() {
 }
 
 #[tokio::test]
+async fn chat_file_search_function_call_becomes_responses_function_call() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    let request_value = json!({
+        "model": "chat-only-model",
+        "input": "find revenue",
+        "stream": false,
+        "store": false,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}],
+        "tool_choice": {"type": "file_search"}
+    });
+    let mut state = ResponsesState::from_request_body(request_value);
+    state.response_id = Some("resp_file_search".to_owned());
+    context.extensions.insert(state);
+    let mut request_body = Some(Bytes::from_static(
+        br#"{"model":"chat-only-model","input":"find revenue"}"#,
+    ));
+    let request_action = filter
+        .on_request_body(&mut context, &mut request_body, true)
+        .await
+        .unwrap();
+    assert!(matches!(request_action, FilterAction::Continue));
+
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    let response_action = filter.on_response(&mut context).await.unwrap();
+    assert!(matches!(response_action, FilterAction::Continue));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_search","object":"chat.completion","model":"chat-only-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_search","type":"function","function":{"name":"file_search","arguments":"{\"query\":\"Q4 revenue\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(translated["id"], "resp_file_search");
+    assert_eq!(translated["tools"][0]["type"], "file_search");
+    assert_eq!(translated["output"][0]["type"], "function_call");
+    assert_eq!(translated["output"][0]["name"], "file_search");
+    assert_eq!(translated["output"][0]["arguments"], "{\"query\":\"Q4 revenue\"}");
+}
+
+#[tokio::test]
 async fn malformed_success_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
@@ -883,7 +996,7 @@ async fn finite_provider_error_uses_captured_status_without_mutable_headers() {
 
 #[tokio::test]
 async fn expanded_provider_error_falls_back_within_configured_limit() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 150").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 150").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -920,7 +1033,7 @@ async fn expanded_provider_error_falls_back_within_configured_limit() {
 
 #[tokio::test]
 async fn oversized_translated_success_aborts_after_headers_are_sent() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 512").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 512").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
