@@ -995,14 +995,17 @@ fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Re
 
 /// Validate optional assistant content and report whether it is present.
 ///
-/// `null` is treated as absent: the emitter produces no output for it, so
-/// counting it as content would let a completed terminal translate into a
+/// `null`, empty strings, and arrays that carry no non-empty text are all
+/// treated as absent, because the emitter produces no output for any of them.
+/// Counting them as content would let a completed terminal translate into a
 /// counterfeit success with an empty output array.
 fn validate_chat_content(message: &Map<String, Value>) -> Result<bool, TranslationError> {
     match message.get("content") {
         None | Some(Value::Null) => Ok(false),
-        Some(Value::String(_)) => Ok(true),
-        Some(Value::Array(parts)) if parts.iter().all(is_supported_text_part) => Ok(true),
+        Some(Value::String(text)) => Ok(!text.is_empty()),
+        Some(Value::Array(parts)) if parts.iter().all(is_supported_text_part) => {
+            Ok(parts.iter().any(is_nonempty_text_part))
+        },
         Some(_) => Err(TranslationError::InvalidChatResponse(
             "first choice message contains unsupported content",
         )),
@@ -1010,9 +1013,12 @@ fn validate_chat_content(message: &Map<String, Value>) -> Result<bool, Translati
 }
 
 /// Validate optional assistant refusal content and report whether it is present.
+///
+/// An empty refusal string is treated as absent to match the emitter, which
+/// drops it rather than producing a refusal item.
 fn validate_chat_refusal(message: &Map<String, Value>) -> Result<bool, TranslationError> {
     match message.get("refusal") {
-        Some(Value::String(_)) => Ok(true),
+        Some(Value::String(refusal)) => Ok(!refusal.is_empty()),
         Some(Value::Null) | None => Ok(false),
         Some(_) => Err(TranslationError::InvalidChatResponse(
             "first choice message contains an invalid refusal",
@@ -1023,6 +1029,13 @@ fn validate_chat_refusal(message: &Map<String, Value>) -> Result<bool, Translati
 /// Return whether one provider-specific content part can be translated as text.
 fn is_supported_text_part(part: &Value) -> bool {
     part.get("text").is_some_and(Value::is_string)
+}
+
+/// Return whether one content part carries non-empty text the emitter will keep.
+fn is_nonempty_text_part(part: &Value) -> bool {
+    part.get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
 }
 
 /// Validate optional function calls and require them for a tool-call terminal.
