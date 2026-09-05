@@ -23,6 +23,22 @@ const DEFAULT_TOOL_CHOICE: &str = "auto";
 /// Default text format for translated responses.
 const DEFAULT_TEXT_FORMAT: &str = "text";
 
+/// Maximum query length advertised by the synthesized file-search function.
+///
+/// The executor also applies a byte limit before issuing a vector-store
+/// request, so multi-byte input remains bounded at the callout boundary.
+const FILE_SEARCH_QUERY_MAX_LENGTH: usize = 65_536;
+
+/// Maximum number of vector stores a single hosted file-search tool may target.
+///
+/// `openai_file_search_callout` issues an upstream vector-store query per id on
+/// every inference round, so an unbounded array would amplify one inbound
+/// request into many outbound searches. The OpenAI API currently caps this at
+/// 1; a small generous bound keeps proxy fan-out finite without enforcing the
+/// exact backend range. Keep the rejection message below in sync with this
+/// value.
+const MAX_VECTOR_STORE_IDS: usize = 10;
+
 /// Build the default `Responses` text configuration.
 fn default_text_config() -> Value {
     json!({"format": {"type": DEFAULT_TEXT_FORMAT}})
@@ -188,6 +204,12 @@ pub(crate) enum TranslationError {
     /// A Responses tool choice has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool_choice type for Chat Completions translation: {0}")]
     UnsupportedToolChoiceType(String),
+    /// A client function would be indistinguishable from synthesized file search.
+    #[error("Responses function tool name `file_search` conflicts with the synthesized file_search function")]
+    FileSearchFunctionNameCollision,
+    /// A file-search definition cannot be executed by the local callout.
+    #[error("invalid Responses file_search tool for Chat Completions translation: {0}")]
+    InvalidFileSearchTool(&'static str),
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -242,9 +264,11 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
     let tools = overrides
         .tools
         .or_else(|| obj.get("tools").and_then(Value::as_array).map(Vec::as_slice));
-    if let Some(tools) = tools
-        && let Some(tools) = build_chat_tools(tools)?
-    {
+    let BuiltChatTools {
+        value: built_tools,
+        has_file_search,
+    } = tools.map(build_chat_tools).transpose()?.unwrap_or_default();
+    if let Some(tools) = built_tools {
         chat.insert("tools".to_owned(), tools);
         chat.remove("response_format");
     }
@@ -254,7 +278,7 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
         && overrides
             .tool_choice
             .is_some_and(|choice| choice.as_str() == Some("auto"));
-    if !omit_synthesized_default && let Some(tool_choice) = build_chat_tool_choice(tool_choice)? {
+    if !omit_synthesized_default && let Some(tool_choice) = build_chat_tool_choice(tool_choice, has_file_search)? {
         chat.insert("tool_choice".to_owned(), tool_choice);
     }
 
@@ -664,24 +688,152 @@ fn convert_input_file_part(part: &Value) -> Result<Value, TranslationError> {
     }))
 }
 
+/// Chat tool translation plus facts needed to validate `tool_choice`.
+#[derive(Default)]
+struct BuiltChatTools {
+    /// Translated Chat Completions tools, omitted when empty.
+    value: Option<Value>,
+    /// Whether the request declared a valid hosted file-search tool.
+    has_file_search: bool,
+}
+
 /// Build Chat Completions tool definitions from `Responses` tools.
-fn build_chat_tools(tools: &[Value]) -> Result<Option<Value>, TranslationError> {
+fn build_chat_tools(tools: &[Value]) -> Result<BuiltChatTools, TranslationError> {
+    validate_file_search_tools(tools)?;
+
     let mut chat_tools = Vec::new();
+    let mut has_file_search = false;
 
     for tool in tools {
         let Some(tool_obj) = tool.as_object() else {
             continue;
         };
 
-        if tool_obj.get("type").and_then(Value::as_str) == Some("function") {
-            chat_tools.push(convert_function_tool(tool_obj));
-        } else {
-            let tool_type = tool_obj.get("type").and_then(Value::as_str).unwrap_or("unknown");
-            return Err(TranslationError::UnsupportedToolType(tool_type.to_owned()));
+        match tool_obj.get("type").and_then(Value::as_str) {
+            Some("function") => chat_tools.push(convert_function_tool(tool_obj)),
+            Some("file_search") => {
+                chat_tools.push(synthesized_file_search_tool());
+                has_file_search = true;
+            },
+            Some(tool_type) => return Err(TranslationError::UnsupportedToolType(tool_type.to_owned())),
+            None => return Err(TranslationError::UnsupportedToolType("unknown".to_owned())),
         }
     }
 
-    Ok((!chat_tools.is_empty()).then_some(Value::Array(chat_tools)))
+    Ok(BuiltChatTools {
+        value: (!chat_tools.is_empty()).then_some(Value::Array(chat_tools)),
+        has_file_search,
+    })
+}
+
+/// Reject ambiguous or structurally unusable file-search declarations.
+fn validate_file_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
+    let mut file_search_count = 0_usize;
+    let mut has_file_search_function = false;
+
+    for tool in tools.iter().filter_map(Value::as_object) {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") if function_tool_name(tool) == Some("file_search") => {
+                has_file_search_function = true;
+            },
+            Some("file_search") => {
+                file_search_count = file_search_count.saturating_add(1);
+                validate_file_search_tool(tool)?;
+            },
+            _ => {},
+        }
+    }
+
+    if file_search_count > 1 {
+        return Err(TranslationError::InvalidFileSearchTool(
+            "only one file_search tool may be declared",
+        ));
+    }
+    if file_search_count == 1 && has_file_search_function {
+        return Err(TranslationError::FileSearchFunctionNameCollision);
+    }
+
+    Ok(())
+}
+
+/// Return a function name from either Responses or pre-wrapped Chat shape.
+fn function_tool_name(tool: &Map<String, Value>) -> Option<&str> {
+    tool.get("name")
+        .and_then(Value::as_str)
+        .or_else(|| tool.get("function")?.get("name")?.as_str())
+}
+
+/// Validate fields required later by `openai_file_search_callout`.
+fn validate_file_search_tool(tool: &Map<String, Value>) -> Result<(), TranslationError> {
+    validate_vector_store_ids(tool)?;
+
+    if tool
+        .get("max_num_results")
+        .is_some_and(|value| !matches!(value.as_u64(), Some(1..=50)))
+    {
+        return Err(TranslationError::InvalidFileSearchTool(
+            "max_num_results must be an integer between 1 and 50",
+        ));
+    }
+    if tool
+        .get("filters")
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        return Err(TranslationError::InvalidFileSearchTool(
+            "filters must be an object or null",
+        ));
+    }
+    if tool.get("ranking_options").is_some_and(|value| !value.is_object()) {
+        return Err(TranslationError::InvalidFileSearchTool(
+            "ranking_options must be an object",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate the vector stores that the callout will search.
+fn validate_vector_store_ids(tool: &Map<String, Value>) -> Result<(), TranslationError> {
+    const ERROR: TranslationError =
+        TranslationError::InvalidFileSearchTool("vector_store_ids must be a non-empty array of non-empty strings");
+    let vector_store_ids = tool.get("vector_store_ids").and_then(Value::as_array).ok_or(ERROR)?;
+    if vector_store_ids.is_empty()
+        || vector_store_ids
+            .iter()
+            .any(|value| value.as_str().is_none_or(str::is_empty))
+    {
+        return Err(ERROR);
+    }
+    if vector_store_ids.len() > MAX_VECTOR_STORE_IDS {
+        return Err(TranslationError::InvalidFileSearchTool(
+            "vector_store_ids must contain at most 10 entries",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the private Chat Completions representation of hosted file search.
+fn synthesized_file_search_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "file_search",
+            "description": "Search the configured vector stores for relevant files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": FILE_SEARCH_QUERY_MAX_LENGTH
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }
+    })
 }
 
 /// Convert a `Responses` function tool to the Chat Completions nested shape.
@@ -703,30 +855,40 @@ fn convert_function_tool(tool: &Map<String, Value>) -> Value {
 }
 
 /// Convert Responses `tool_choice` into Chat Completions-compatible shape.
-fn build_chat_tool_choice(choice: Option<&Value>) -> Result<Option<Value>, TranslationError> {
+fn build_chat_tool_choice(choice: Option<&Value>, has_file_search: bool) -> Result<Option<Value>, TranslationError> {
     let Some(choice) = choice else {
         return Ok(None);
     };
 
-    let tool_choice = match choice {
-        Value::String(_) => Some(choice.clone()),
-        Value::Object(choice_obj) => match choice_obj.get("type").and_then(Value::as_str) {
-            Some("function") => {
-                let mut function = Map::new();
-                copy_field(choice_obj, &mut function, "name");
-                Some(json!({"type": "function", "function": Value::Object(function)}))
-            },
-            Some(other) => return Err(TranslationError::UnsupportedToolChoiceType(other.to_owned())),
-            None => return Err(TranslationError::UnsupportedToolChoiceType("unknown".to_owned())),
-        },
-        _ => {
-            return Err(TranslationError::UnsupportedToolChoiceType(
-                json_type_name(choice).to_owned(),
-            ));
-        },
-    };
+    match choice {
+        Value::String(_) => Ok(Some(choice.clone())),
+        Value::Object(choice_obj) => build_object_tool_choice(choice_obj, has_file_search).map(Some),
+        _ => Err(TranslationError::UnsupportedToolChoiceType(
+            json_type_name(choice).to_owned(),
+        )),
+    }
+}
 
-    Ok(tool_choice)
+/// Convert an object-form Responses tool choice.
+fn build_object_tool_choice(choice: &Map<String, Value>, has_file_search: bool) -> Result<Value, TranslationError> {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("function") if has_file_search && choice.get("name").and_then(Value::as_str) == Some("file_search") => {
+            Err(TranslationError::InvalidFileSearchTool(
+                "tool_choice for hosted file_search must use type file_search",
+            ))
+        },
+        Some("function") => {
+            let mut function = Map::new();
+            copy_field(choice, &mut function, "name");
+            Ok(json!({"type": "function", "function": Value::Object(function)}))
+        },
+        Some("file_search") if has_file_search => Ok(json!({"type": "function", "function": {"name": "file_search"}})),
+        Some("file_search") => Err(TranslationError::InvalidFileSearchTool(
+            "tool_choice requires a declared file_search tool",
+        )),
+        Some(other) => Err(TranslationError::UnsupportedToolChoiceType(other.to_owned())),
+        None => Err(TranslationError::UnsupportedToolChoiceType("unknown".to_owned())),
+    }
 }
 
 /// Return a stable JSON type name for diagnostics.
@@ -1001,7 +1163,7 @@ fn append_message_output(
         return;
     }
 
-    output.push(message_output_item(context, status, &content_items));
+    output.push(message_output_item(context, status, content_items));
 }
 
 /// Build a stable assistant message output item id.
@@ -1010,13 +1172,13 @@ fn message_item_id(context: &ResponseContext<'_>) -> String {
 }
 
 /// Build a schema-complete `Responses` assistant message item.
-fn message_output_item(context: &ResponseContext<'_>, status: &str, content: &[Value]) -> Value {
+fn message_output_item(context: &ResponseContext<'_>, status: &str, content: Vec<Value>) -> Value {
     json!({
         "id": message_item_id(context),
         "type": "message",
         "status": status,
         "role": "assistant",
-        "content": Value::Array(content.to_vec())
+        "content": Value::Array(content)
     })
 }
 
