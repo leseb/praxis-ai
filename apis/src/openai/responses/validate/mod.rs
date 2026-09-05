@@ -137,7 +137,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Initialize canonical request state, including metadata that survives IRR steps.
+/// Initialize canonical request state, including metadata that must survive IRR steps.
 fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(
             state.response_id.as_deref(),
             ctx.filter_metadata.get("responses.response_id").map(String::as_str),
-            "canonical state should retain the public ID across iterative metadata boundaries"
+            "canonical state should retain the response id across IRR steps"
         );
     }
 

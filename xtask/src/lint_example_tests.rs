@@ -38,6 +38,7 @@ const SKIP: &[&str] = &[
     "openai/responses/response-store.yaml",
     "openai/responses/responses-proxy.yaml",
     "openai/responses/responses-routing.yaml",
+    "openai/responses/web-search-chat-completions-fixture.yaml",
     "prompt-enrichment.yaml",
     "token-usage-headers.yaml",
 ];

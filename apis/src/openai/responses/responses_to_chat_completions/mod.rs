@@ -69,6 +69,9 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// It converts the enriched request to Chat Completions wire format, converts
 /// finite successful Chat responses back to Responses resources, and
 /// normalizes finite provider errors while preserving their HTTP status.
+/// Supported hosted web-search tools are exposed to the Chat backend as a
+/// private, bounded `web_search` function. Returned calls are restored to
+/// canonical `web_search_call` output before downstream agentic filters run.
 /// Chat Completions SSE is left byte-for-byte unchanged for the separate
 /// incremental stream converter.
 ///
@@ -81,6 +84,10 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// resolved, preventing a continuation from silently losing prior turns.
 /// Chat Completions SSE response conversion is tracked separately in
 /// [issue #36](https://github.com/praxis-proxy/ai/issues/36).
+/// For finite web-search loops, place `openai_web_search` and
+/// `openai_agentic_loop` before this filter in an iterative-router step. The
+/// reverse response order then restores the hosted call before those filters
+/// inspect it.
 ///
 /// # YAML
 ///
@@ -481,8 +488,8 @@ fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Resul
     let mut response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
             .with_completed_at(ctx.time_source.now().as_secs());
-    if let Some(tool_choice) = state.original_tool_choice.as_ref() {
-        response_context.tool_choice = Some(tool_choice);
+    if let Some(original_tool_choice) = state.original_tool_choice.as_ref() {
+        response_context.tool_choice = Some(original_tool_choice);
     }
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;

@@ -141,6 +141,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.web_search
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-web-search
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.file_search
     scopes:
       - responses_to_chat_completions
