@@ -123,8 +123,8 @@ fn responses_to_chat_completions_rejects_malformed_finite_success() {
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error response should be JSON");
 
     assert_eq!(parse_status(&raw), 500);
-    assert_eq!(response["title"], "Internal Server Error");
-    assert_eq!(response["status"], 500);
+    assert_eq!(response["error"]["type"], "server_error");
+    assert_eq!(response["error"]["code"], "internal_proxy_error");
 }
 
 #[test]
