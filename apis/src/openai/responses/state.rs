@@ -206,7 +206,10 @@ pub(crate) enum RequestBodyRebuild {
 }
 
 impl Default for ResponsesState {
-    #[expect(clippy::too_many_lines, reason = "flat one-field-per-member initializer for every state field")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "flat one-field-per-member initializer for every state field"
+    )]
     fn default() -> Self {
         Self {
             citation_files: HashMap::new(),
