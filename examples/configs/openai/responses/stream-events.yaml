@@ -12,7 +12,7 @@
 # stream_events still parses final chunks before store persistence.
 # For a complete setup with multi-turn conversation support
 # (rehydrate, openai_responses_proxy), see
-# full-flow.yaml.
+# full-flow-agentic.yaml.
 #
 # Example requests:
 #

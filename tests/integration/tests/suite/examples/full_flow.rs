@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Functional tests for the Responses API full-flow example config.
+//! Functional tests for the unified Responses API full-flow example
+//! config (`full-flow-agentic.yaml`). POST /v1/responses runs through the
+//! iterative_request_router (IRR); WebSocket and non-Responses paths are
+//! routed around the IRR by the bypass branch.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -44,7 +47,7 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_file_resolve");
 
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
@@ -131,7 +134,7 @@ fn full_flow_stateful_valid_request_reaches_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "openai/responses/full-flow.yaml",
+        "openai/responses/full-flow-agentic.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -160,7 +163,7 @@ fn full_flow_stateless_valid_request_reaches_same_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "openai/responses/full-flow.yaml",
+        "openai/responses/full-flow-agentic.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -189,7 +192,7 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "openai/responses/full-flow.yaml",
+        "openai/responses/full-flow-agentic.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -206,7 +209,7 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     assert_eq!(
         parse_status(&raw),
         404,
-        "non-Responses body should not match the format-constrained route"
+        "a Chat Completions body on /v1/responses should be rejected by the format guard branch"
     );
 }
 
@@ -218,7 +221,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -646,17 +649,18 @@ async fn next_backend_event(backend: &mut praxis_test_utils::WsBackendGuard) -> 
         .expect("backend observation channel should remain open")
 }
 
-/// Load the full-flow example with a per-test temp database.
-/// The full-flow config routes streaming and WebSocket requests
-/// through the outer pipeline (no IRR), so this works for all
-/// request types without modification.
+/// Load the unified full-flow example with a per-test temp database.
+/// GET /v1/responses WebSocket handshakes fail the bypass condition's
+/// `POST` guard, so they run the bypass branch (router + load_balancer)
+/// and never enter the IRR, which buffers full responses and cannot
+/// carry a 101 upgrade.
 fn ws_full_flow_config(
     test_name: &str,
     proxy_port: u16,
     ports: &HashMap<&str, u16>,
 ) -> (praxis_core::config::Config, TempSqlite) {
     let db = TempSqlite::new(test_name);
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())
