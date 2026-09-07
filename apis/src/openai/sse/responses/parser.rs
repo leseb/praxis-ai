@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+
 use super::{
     super::{SseFrameParser, SseParseError, SseParserConfig},
     event::ResponsesEvent,
@@ -55,7 +57,7 @@ impl ResponsesSseParser {
     }
 
     /// Feed a raw chunk, returning typed events.
-    pub fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<ResponsesEvent>, SseParseError> {
+    pub fn parse_chunk(&mut self, chunk: &Bytes) -> Result<Vec<ResponsesEvent>, SseParseError> {
         let now = Instant::now();
         self.started_at.get_or_insert(now);
         self.check_timeout(now)?;
@@ -166,15 +168,15 @@ mod tests {
         }
     }
 
-    fn sse_bytes(event_type: &str, data: &Value) -> Vec<u8> {
+    fn sse_bytes(event_type: &str, data: &Value) -> Bytes {
         let mut data = data.clone();
         if let Value::Object(obj) = &mut data {
             obj.insert("type".to_owned(), Value::String(event_type.to_owned()));
         }
-        format!("event: {event_type}\ndata: {data}\n\n").into_bytes()
+        Bytes::from(format!("event: {event_type}\ndata: {data}\n\n"))
     }
 
-    fn full_lifecycle_chunks() -> Vec<Vec<u8>> {
+    fn full_lifecycle_chunks() -> Vec<Bytes> {
         vec![
             sse_bytes("response.created", &json!({"id": "resp_1"})),
             sse_bytes("response.in_progress", &json!({"id": "resp_1"})),
@@ -247,12 +249,15 @@ mod tests {
             ..config()
         };
         let mut parser = ResponsesSseParser::new(&cfg);
-        let chunk = [
+        let mut chunk = Vec::new();
+        for event in [
             sse_bytes("response.created", &json!({})),
             sse_bytes("response.in_progress", &json!({})),
             sse_bytes("response.output_text.delta", &json!({})),
-        ]
-        .concat();
+        ] {
+            chunk.extend_from_slice(&event);
+        }
+        let chunk = Bytes::from(chunk);
 
         let result = parser.parse_chunk(&chunk);
         assert!(
@@ -275,7 +280,7 @@ mod tests {
     #[test]
     fn done_sentinel_is_ignored() {
         let mut parser = ResponsesSseParser::new(&config());
-        let events = parser.parse_chunk(b"data: [DONE]\n\n").unwrap();
+        let events = parser.parse_chunk(&Bytes::from_static(b"data: [DONE]\n\n")).unwrap();
         assert!(events.is_empty(), "[DONE] should not dispatch as a typed event");
     }
 
@@ -286,7 +291,7 @@ mod tests {
             .parse_chunk(&sse_bytes("response.completed", &json!({"id": "resp_1"})))
             .unwrap();
 
-        let events = parser.parse_chunk(b"data: [DONE]\n\n").unwrap();
+        let events = parser.parse_chunk(&Bytes::from_static(b"data: [DONE]\n\n")).unwrap();
 
         assert!(events.is_empty(), "[DONE] should not dispatch as a typed event");
         assert!(
@@ -306,7 +311,7 @@ mod tests {
             .parse_chunk(&sse_bytes("response.completed", &json!({"id": "resp_1"})))
             .unwrap();
 
-        let events = parser.parse_chunk(b"data: [DONE]\n\n").unwrap();
+        let events = parser.parse_chunk(&Bytes::from_static(b"data: [DONE]\n\n")).unwrap();
 
         assert!(events.is_empty(), "[DONE] should not count against max_events");
         assert!(
@@ -385,7 +390,7 @@ mod tests {
     #[test]
     fn malformed_terminal_event_does_not_validate_complete() {
         let mut parser = ResponsesSseParser::new(&config());
-        let result = parser.parse_chunk(b"event: response.completed\ndata: {}\n\n");
+        let result = parser.parse_chunk(&Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
         assert!(
             matches!(result, Err(SseParseError::MissingEventType { field: "data.type", .. })),
             "terminal-looking SSE event must still contain data.type"
@@ -464,8 +469,8 @@ mod tests {
     #[test]
     fn malformed_json_propagated() {
         let mut parser = ResponsesSseParser::new(&config());
-        let chunk = b"event: response.created\ndata: not-json\n\n";
-        let result = parser.parse_chunk(chunk);
+        let chunk = Bytes::from_static(b"event: response.created\ndata: not-json\n\n");
+        let result = parser.parse_chunk(&chunk);
         assert!(
             matches!(result, Err(SseParseError::MalformedJson { .. })),
             "malformed event data should propagate MalformedJson"
@@ -476,12 +481,14 @@ mod tests {
     fn split_chunk_assembles_correctly() {
         let mut parser = ResponsesSseParser::new(&config());
         let full = sse_bytes("response.created", &json!({"id": "resp_1"}));
-        let (a, b) = full.split_at(full.len() / 2);
+        let mid = full.len() / 2;
+        let a = full.slice(..mid);
+        let b = full.slice(mid..);
 
-        let events1 = parser.parse_chunk(a).unwrap();
+        let events1 = parser.parse_chunk(&a).unwrap();
         assert!(events1.is_empty(), "partial event should not dispatch");
 
-        let events2 = parser.parse_chunk(b).unwrap();
+        let events2 = parser.parse_chunk(&b).unwrap();
         assert_eq!(events2.len(), 1, "completed split event should dispatch");
         assert!(
             matches!(events2[0], ResponsesEvent::ResponseCreated(_)),

@@ -1,14 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Byte-level SSE frame reassembly.
+//! SSE frame reassembly, adapted onto the shared Praxis SSE codec.
+//!
+//! This module keeps the OpenAI-facing [`SseFrame`] / [`SseFrameParser`] /
+//! [`SseParseError`] surface stable while delegating the byte-level record
+//! framing to [`praxis_filter::sse::SseDecoder`]. Provider JSON typing, the
+//! `[DONE]` sentinel, the event-count budget, timeouts, and lifecycle rules
+//! stay in the OpenAI consumers (see `responses::parser` and the
+//! `responses::stream_events` filter) — this layer only turns a byte stream
+//! into data-bearing [`SseFrame`] values.
 
 use std::{fmt, time::Duration};
+
+use bytes::Bytes;
+use praxis_filter::sse::{SseDecodeError, SseDecoder, SseLimits, SseRecord};
 
 /// A completed SSE frame: one event boundary's worth of data.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SseFrame {
-    /// Value from the `event:` field, if present.
+    /// Value from the last `event:` field, if present (lossily UTF-8 decoded).
     pub event_type: Option<String>,
     /// Joined `data:` field values, separated by `\n`.
     pub data: Vec<u8>,
@@ -16,48 +27,57 @@ pub(crate) struct SseFrame {
 
 /// Incremental SSE frame parser.
 ///
-/// Buffers partial lines across chunk boundaries and yields
-/// complete [`SseFrame`] values on each blank-line event boundary.
+/// Feeds each body chunk to a request-scoped [`SseDecoder`] and yields the
+/// data-bearing records it completed as [`SseFrame`] values on each blank-line
+/// event boundary. Comment-only, `event`-only, and `id`/`retry`-only blocks are
+/// framed by the decoder but carry no `data`, so they never surface as frames —
+/// matching the pre-codec parser, which only dispatched blocks with at least one
+/// `data:` field.
 pub(crate) struct SseFrameParser {
-    /// Accumulates the current line being parsed.
-    line_buf: Vec<u8>,
-    /// The `event:` value for the current frame, if any.
-    event_type: Option<String>,
-    /// Joined `data:` field values for the current frame.
-    data_buf: Vec<u8>,
-    /// Whether at least one `data:` field has been seen.
-    has_data: bool,
-    /// Whether the previous chunk ended with a bare `\r`.
-    prev_cr: bool,
-    /// Current total buffered bytes retained across chunks.
-    scratch_bytes: usize,
-    /// Maximum allowed buffered bytes.
-    max_buffer_bytes: usize,
+    /// Shared-codec decoder holding the cross-chunk line/record state.
+    decoder: SseDecoder,
 }
 
 impl SseFrameParser {
     /// Create a new parser with the given buffer byte limit.
+    ///
+    /// The single OpenAI `max_buffer_bytes` budget is applied to *both* shared-codec
+    /// framing bounds — `max_line_bytes` (one partial line held across chunks) and
+    /// `max_record_bytes` (the committed fields of one in-progress record) — and
+    /// either overflow surfaces as [`SseParseError::BufferOverflow`].
+    ///
+    /// For the blocks the Responses API emits — a single `data:` line each — the
+    /// record *is* that one line, so both the overflow trip point and the peak
+    /// retained bytes (`max_buffer_bytes`) match the pre-codec parser. The two
+    /// accountings do differ for a *multi-line* record, which the Responses API
+    /// never produces: the old parser summed its carried line and joined data into
+    /// one budget, whereas the codec bounds the carried line and the committed
+    /// record separately, so such a record can retain up to two budgets transiently
+    /// and is accepted slightly past the old combined trip point. This only ever
+    /// loosens the bound — no stream the old parser accepted is now rejected.
+    ///
+    /// The codec's default `max_fields_per_record` is left in place: it never trips
+    /// on Responses events and bounds an otherwise unbounded field vector (e.g. many
+    /// empty `data:` lines), so it strengthens rather than weakens backpressure.
     pub fn new(max_buffer_bytes: usize) -> Self {
         Self {
-            line_buf: Vec::new(),
-            event_type: None,
-            data_buf: Vec::new(),
-            has_data: false,
-            prev_cr: false,
-            scratch_bytes: 0,
-            max_buffer_bytes,
+            decoder: SseDecoder::with_limits(SseLimits {
+                max_line_bytes: max_buffer_bytes,
+                max_record_bytes: max_buffer_bytes,
+                ..SseLimits::default()
+            }),
         }
     }
 
     /// Feed a chunk of bytes, returning any complete SSE frames.
-    pub fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, SseParseError> {
-        self.parse_chunk_inner(chunk, None, |_| true)
+    pub fn parse_chunk(&mut self, chunk: &Bytes) -> Result<Vec<SseFrame>, SseParseError> {
+        self.parse_chunk_with_counted_event_limit(chunk, 0, usize::MAX, |_| true)
     }
 
     /// Feed a chunk and stop before emitting more frames than the event budget allows.
     pub fn parse_chunk_with_event_limit(
         &mut self,
-        chunk: &[u8],
+        chunk: &Bytes,
         current_events: usize,
         max_events: usize,
     ) -> Result<Vec<SseFrame>, SseParseError> {
@@ -65,153 +85,95 @@ impl SseFrameParser {
     }
 
     /// Feed a chunk and count only selected frames against the event budget.
+    ///
+    /// Frames complete by this chunk are built in order; a frame for which
+    /// `count_frame` returns `true` is checked against the budget *before* it is
+    /// emitted, so exceeding the budget returns [`SseParseError::EventLimitExceeded`]
+    /// and discards the whole chunk's frames — the pre-codec behavior. A framing
+    /// limit violation likewise discards the chunk's frames and surfaces as
+    /// [`SseParseError::BufferOverflow`].
     pub fn parse_chunk_with_counted_event_limit(
         &mut self,
-        chunk: &[u8],
+        chunk: &Bytes,
         current_events: usize,
         max_events: usize,
-        count_frame: impl FnMut(&SseFrame) -> bool,
-    ) -> Result<Vec<SseFrame>, SseParseError> {
-        self.parse_chunk_inner(chunk, Some((current_events, max_events)), count_frame)
-    }
-
-    /// Feed a chunk with optional event-budget enforcement.
-    #[expect(clippy::too_many_lines, reason = "linear byte-processing loop")]
-    fn parse_chunk_inner(
-        &mut self,
-        chunk: &[u8],
-        event_limit: Option<(usize, usize)>,
         mut count_frame: impl FnMut(&SseFrame) -> bool,
     ) -> Result<Vec<SseFrame>, SseParseError> {
-        if chunk.is_empty() {
-            self.scratch_bytes = self.buffered_bytes();
-            return Ok(Vec::new());
-        }
+        // Inspect only: `push` reads the chunk (a cheap `Bytes` refcount bump for
+        // Pingora), never the forwarded body, which the filter leaves untouched.
+        let batch = self.decoder.push(chunk);
 
         let mut frames = Vec::new();
         let mut counted_in_chunk = 0;
-        let mut i = 0;
 
-        if self.prev_cr && chunk.first() == Some(&b'\n') {
-            i = 1;
-        }
-        self.prev_cr = false;
-
-        while let Some(&b) = chunk.get(i) {
-            if b == b'\n' || b == b'\r' {
-                if let Some(frame) = self.process_line() {
-                    if count_frame(&frame) {
-                        Self::check_event_limit(event_limit, counted_in_chunk)?;
-                        counted_in_chunk = counted_in_chunk.saturating_add(1);
-                    }
-                    frames.push(frame);
-                }
-                self.line_buf.clear();
-                self.scratch_bytes = self.buffered_bytes();
-
-                if b == b'\r' {
-                    if let Some(&next) = chunk.get(i + 1) {
-                        if next == b'\n' {
-                            i += 1;
-                        }
-                    } else {
-                        self.prev_cr = true;
-                    }
-                }
-            } else {
-                self.line_buf.push(b);
-                self.scratch_bytes = self.scratch_bytes.saturating_add(1);
+        for record in &batch.records {
+            // The decoder frames every blank-line-terminated block; only blocks
+            // with a `data:` field are dispatchable events (WHATWG), matching the
+            // old parser's `has_data` gate.
+            if !record.is_event() {
+                continue;
             }
 
-            self.check_buffer_limit()?;
-
-            i += 1;
+            let frame = frame_from_record(record);
+            if count_frame(&frame) {
+                check_event_limit(current_events, counted_in_chunk, max_events)?;
+                counted_in_chunk = counted_in_chunk.saturating_add(1);
+            }
+            frames.push(frame);
         }
 
-        self.scratch_bytes = self.buffered_bytes();
+        // A framing-limit violation poisons the decoder; report it (and drop this
+        // chunk's frames) only after the event budget, preserving the byte-order
+        // precedence of the pre-codec parser. An unterminated final block is
+        // never salvaged: `finish` is intentionally not called, so a trailing
+        // partial record stays buffered and is discarded (WHATWG), which the
+        // consumers observe as a missing terminal event.
+        if let Some(err) = batch.error {
+            return Err(map_decode_error(err));
+        }
+
         Ok(frames)
     }
+}
 
-    /// Return the number of bytes currently retained by the parser.
-    fn buffered_bytes(&self) -> usize {
-        self.line_buf
-            .len()
-            .saturating_add(self.data_buf.len())
-            .saturating_add(self.event_type.as_ref().map_or(0, String::len))
+/// Build an [`SseFrame`] from a data-bearing decoder record.
+///
+/// The owned copy mirrors the pre-codec `SseFrame`: it is an internal inspection
+/// view, distinct from the response body, which the filter forwards byte-exact.
+fn frame_from_record(record: &SseRecord) -> SseFrame {
+    SseFrame {
+        event_type: record.event().map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+        data: record.data().to_vec(),
+    }
+}
+
+/// Check whether another counted frame would exceed the event budget.
+fn check_event_limit(current_events: usize, counted_in_chunk: usize, max_events: usize) -> Result<(), SseParseError> {
+    let count = current_events.saturating_add(counted_in_chunk).saturating_add(1);
+    if count > max_events {
+        return Err(SseParseError::EventLimitExceeded {
+            count,
+            limit: max_events,
+        });
     }
 
-    /// Check whether the current retained byte count exceeds the buffer limit.
-    fn check_buffer_limit(&self) -> Result<(), SseParseError> {
-        if self.scratch_bytes > self.max_buffer_bytes {
-            return Err(SseParseError::BufferOverflow {
-                buffered_bytes: self.scratch_bytes,
-                limit: self.max_buffer_bytes,
-            });
-        }
+    Ok(())
+}
 
-        Ok(())
-    }
-
-    /// Check whether another completed frame would exceed the event budget.
-    fn check_event_limit(event_limit: Option<(usize, usize)>, parsed_in_chunk: usize) -> Result<(), SseParseError> {
-        let Some((current_events, max_events)) = event_limit else {
-            return Ok(());
-        };
-
-        let count = current_events.saturating_add(parsed_in_chunk).saturating_add(1);
-        if count > max_events {
-            return Err(SseParseError::EventLimitExceeded {
-                count,
-                limit: max_events,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Process a completed line, emitting a frame on blank lines.
-    #[expect(clippy::indexing_slicing, reason = "colon_pos from position() guarantees bounds")]
-    #[expect(clippy::too_many_lines, reason = "linear SSE field processing")]
-    fn process_line(&mut self) -> Option<SseFrame> {
-        if self.line_buf.is_empty() {
-            let frame = self.has_data.then(|| {
-                self.has_data = false;
-                SseFrame {
-                    event_type: self.event_type.take(),
-                    data: std::mem::take(&mut self.data_buf),
-                }
-            });
-
-            self.event_type = None;
-            return frame;
-        }
-
-        if self.line_buf.first() == Some(&b':') {
-            return None;
-        }
-
-        let colon_pos = self.line_buf.iter().position(|&b| b == b':')?;
-
-        let field = &self.line_buf[..colon_pos];
-        let value_start = if self.line_buf.get(colon_pos + 1) == Some(&b' ') {
-            colon_pos + 2
-        } else {
-            colon_pos + 1
-        };
-        let value = self.line_buf.get(value_start..).unwrap_or_default();
-
-        if field == b"data" {
-            if self.has_data {
-                self.data_buf.push(b'\n');
-            }
-            self.has_data = true;
-            self.data_buf.extend_from_slice(value);
-        } else if field == b"event" {
-            self.event_type = Some(String::from_utf8_lossy(value).into_owned());
-        }
-
-        None
-    }
+/// Map a shared-codec framing error onto the OpenAI-facing [`SseParseError`].
+///
+/// Every retained-memory bound the codec enforces (line, record, or field count)
+/// is a framing overflow from this layer's perspective, so all three collapse to
+/// [`SseParseError::BufferOverflow`], preserving the pre-codec error surface.
+/// `Finished` is unreachable: this adapter only ever calls `push`, never
+/// `finish`, so the decoder never enters the finished state.
+fn map_decode_error(err: SseDecodeError) -> SseParseError {
+    let (buffered_bytes, limit) = match err {
+        SseDecodeError::LineTooLong { size, limit } | SseDecodeError::RecordTooLarge { size, limit } => (size, limit),
+        SseDecodeError::TooManyFields { count, limit } => (count, limit),
+        SseDecodeError::Finished => (0, 0),
+    };
+    SseParseError::BufferOverflow { buffered_bytes, limit }
 }
 
 /// Errors from SSE parsing, shared across frame and event layers.
@@ -317,21 +279,38 @@ mod tests {
 
     const MAX_BUF: usize = 65_536;
 
+    /// Wrap a byte slice as the `Bytes` the parser (and Pingora) hand around.
+    fn chunk(bytes: &'static [u8]) -> Bytes {
+        Bytes::from_static(bytes)
+    }
+
+    // These are adapter tests: they cover this layer's contract with the shared
+    // codec — mapping a data-bearing `SseRecord` to an `SseFrame`, skipping
+    // non-event records, translating framing-limit errors, enforcing the
+    // consumer event budget, and never salvaging an unterminated tail. Byte-level
+    // framing (CR/CRLF/LF handling, BOM stripping, cross-chunk line reassembly,
+    // optional-space and colon-less field parsing) belongs to the codec and is
+    // exercised by its own conformance tests, not duplicated here.
+
+    // -------------------------------------------------------------------------
+    // Record -> SseFrame mapping
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn single_frame_yields_one_result() {
+    fn data_record_maps_to_frame() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: hello\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
+        let frames = parser.parse_chunk(&chunk(b"data: hello\n\n")).unwrap();
         assert_eq!(frames.len(), 1, "single complete frame should dispatch");
         assert_eq!(frames[0].data, b"hello", "frame data should match");
         assert_eq!(frames[0].event_type, None, "frame should not have event type");
     }
 
     #[test]
-    fn event_type_captured() {
+    fn event_field_maps_to_frame_event_type() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"event: response.created\ndata: {\"id\":\"r1\"}\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
+        let frames = parser
+            .parse_chunk(&chunk(b"event: response.created\ndata: {\"id\":\"r1\"}\n\n"))
+            .unwrap();
         assert_eq!(frames.len(), 1, "single event frame should dispatch");
         assert_eq!(
             frames[0].event_type.as_deref(),
@@ -342,249 +321,201 @@ mod tests {
     }
 
     #[test]
-    fn event_type_resets_between_frames() {
+    fn every_record_in_chunk_maps_to_a_frame() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"event: first\ndata: a\n\ndata: b\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 2, "two frames should dispatch");
-        assert_eq!(
-            frames[0].event_type.as_deref(),
-            Some("first"),
-            "first event type should be captured"
-        );
-        assert_eq!(frames[1].event_type, None, "event type should reset between frames");
-    }
-
-    #[test]
-    fn multiple_frames_in_one_chunk() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: first\n\ndata: second\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 2, "two frames should dispatch from one chunk");
+        let frames = parser.parse_chunk(&chunk(b"data: first\n\ndata: second\n\n")).unwrap();
+        assert_eq!(frames.len(), 2, "both records in the chunk should map to frames");
         assert_eq!(frames[0].data, b"first", "first frame data should match");
         assert_eq!(frames[1].data, b"second", "second frame data should match");
     }
 
     #[test]
-    fn frame_split_across_chunks() {
+    fn multiline_data_is_joined_into_frame() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let frames1 = parser.parse_chunk(b"data: hel").unwrap();
+        let frames = parser
+            .parse_chunk(&chunk(b"data: line1\ndata: line2\ndata: line3\n\n"))
+            .unwrap();
+        assert_eq!(frames.len(), 1, "multiline data should dispatch one frame");
+        assert_eq!(
+            frames[0].data, b"line1\nline2\nline3",
+            "the record's joined data should surface in the frame"
+        );
+    }
+
+    #[test]
+    fn decoder_state_persists_across_chunks() {
+        // The adapter owns the request-scoped decoder, so a record split across
+        // two `parse_chunk` calls must still complete.
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames1 = parser.parse_chunk(&chunk(b"data: hel")).unwrap();
         assert!(frames1.is_empty(), "partial frame should not dispatch");
-        let frames2 = parser.parse_chunk(b"lo\n\n").unwrap();
+        let frames2 = parser.parse_chunk(&chunk(b"lo\n\n")).unwrap();
         assert_eq!(frames2.len(), 1, "completed split frame should dispatch");
         assert_eq!(frames2[0].data, b"hello", "joined frame data should match");
     }
 
     #[test]
-    fn blank_line_split_across_chunks() {
+    fn lossy_event_type_from_invalid_utf8() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let frames1 = parser.parse_chunk(b"data: hello\n").unwrap();
-        assert!(frames1.is_empty(), "line ending alone should not dispatch");
-        let frames2 = parser.parse_chunk(b"\n").unwrap();
-        assert_eq!(frames2.len(), 1, "blank line should dispatch frame");
-        assert_eq!(frames2[0].data, b"hello", "frame data should match");
+        let frames = parser.parse_chunk(&chunk(b"event: \xFF\xFF\ndata: x\n\n")).unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "invalid-UTF-8 event type should still dispatch its data frame"
+        );
+        assert_eq!(
+            frames[0].event_type.as_deref(),
+            Some("\u{FFFD}\u{FFFD}"),
+            "invalid UTF-8 in the event type should be replaced lossily"
+        );
+        assert_eq!(
+            frames[0].data, b"x",
+            "data should be preserved alongside the lossy event type"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Non-event records are skipped (is_event filtering)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn comment_only_record_is_not_a_frame() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser.parse_chunk(&chunk(b": keepalive\n\ndata: hello\n\n")).unwrap();
+        assert_eq!(frames.len(), 1, "a comment-only block is not a dispatchable event");
+        assert_eq!(frames[0].data, b"hello", "only the data-bearing frame dispatches");
     }
 
     #[test]
-    fn multiline_data_joined_with_newline() {
+    fn event_only_record_is_not_a_frame() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: line1\ndata: line2\ndata: line3\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "multiline data should dispatch one frame");
+        let frames = parser.parse_chunk(&chunk(b"event: ping\n\ndata: hello\n\n")).unwrap();
         assert_eq!(
-            frames[0].data, b"line1\nline2\nline3",
-            "data lines should be joined with newlines"
+            frames.len(),
+            1,
+            "an event-only block carries no data and does not dispatch"
+        );
+        assert_eq!(frames[0].data, b"hello", "only the data-bearing frame dispatches");
+        assert_eq!(
+            frames[0].event_type, None,
+            "the discarded event: does not leak into the next frame"
         );
     }
 
     #[test]
-    fn crlf_line_endings() {
+    fn unterminated_final_block_is_discarded() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: hello\r\n\r\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "CRLF frame should dispatch");
-        assert_eq!(frames[0].data, b"hello", "frame data should match");
-    }
-
-    #[test]
-    fn crlf_split_across_chunks() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let frames1 = parser.parse_chunk(b"data: hello\r").unwrap();
-        assert!(frames1.is_empty(), "CR at chunk boundary should wait for LF");
-        let frames2 = parser.parse_chunk(b"\n\r\n").unwrap();
-        assert_eq!(frames2.len(), 1, "CRLF split across chunks should dispatch");
-        assert_eq!(frames2[0].data, b"hello", "frame data should match");
-    }
-
-    #[test]
-    fn crlf_split_by_empty_chunk_preserves_event_type() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-
-        let frames1 = parser.parse_chunk(b"event: response.completed\r").unwrap();
-        assert!(frames1.is_empty(), "event line alone should not dispatch");
-
-        let frames2 = parser.parse_chunk(b"").unwrap();
-        assert!(frames2.is_empty(), "empty chunk should not dispatch");
-
-        let frames3 = parser.parse_chunk(b"\ndata: {}\r\n\r\n").unwrap();
-        assert_eq!(frames3.len(), 1, "data frame should dispatch after split CRLF");
-        assert_eq!(
-            frames3[0].event_type.as_deref(),
-            Some("response.completed"),
-            "empty chunk should preserve pending CRLF state"
-        );
-    }
-
-    #[test]
-    fn bare_cr_line_ending() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: hello\r\r";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "bare CR frame should dispatch");
-        assert_eq!(frames[0].data, b"hello", "frame data should match");
-    }
-
-    #[test]
-    fn comments_ignored() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b": this is a comment\ndata: hello\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "comment should be ignored");
-        assert_eq!(frames[0].data, b"hello", "frame data should match");
-    }
-
-    #[test]
-    fn unknown_fields_ignored() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"id: 42\nretry: 1000\ndata: hello\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "unknown fields should be ignored");
-        assert_eq!(frames[0].data, b"hello", "frame data should match");
-    }
-
-    #[test]
-    fn empty_frames_ignored() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"\n\ndata: hello\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "empty frames should be ignored");
-        assert_eq!(frames[0].data, b"hello", "non-empty frame data should match");
-    }
-
-    #[test]
-    fn data_without_space_after_colon() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data:nospace\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "data without optional space should dispatch");
-        assert_eq!(frames[0].data, b"nospace", "frame data should match");
-    }
-
-    #[test]
-    fn data_with_empty_value() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data:\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "empty data value should dispatch");
-        assert!(frames[0].data.is_empty(), "empty data value should remain empty");
-    }
-
-    #[test]
-    fn line_without_colon_ignored() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"justtext\ndata: hello\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(frames.len(), 1, "line without colon should be ignored");
-        assert_eq!(frames[0].data, b"hello", "frame data should match");
-    }
-
-    #[test]
-    fn buffer_overflow_returns_error() {
-        let mut parser = SseFrameParser::new(10);
-        let result = parser.parse_chunk(b"data: this line is way too long for the limit\n\n");
-        assert!(result.is_err(), "oversized line should return an error");
-    }
-
-    #[test]
-    fn overflow_after_completed_frame() {
-        let mut parser = SseFrameParser::new(15);
-        let chunk = b"data: ok\n\ndata: this-is-way-too-long\n\n";
-        let result = parser.parse_chunk(chunk);
+        let frames = parser.parse_chunk(&chunk(b"data: no terminator")).unwrap();
         assert!(
-            result.is_err(),
-            "overflow after a completed frame should return an error"
+            frames.is_empty(),
+            "an unterminated final block is never dispatched (finish is not called; WHATWG discard)"
         );
     }
 
+    // -------------------------------------------------------------------------
+    // Framing-limit -> BufferOverflow mapping
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn event_type_counts_toward_buffer_limit() {
-        let mut parser = SseFrameParser::new(20);
-        let result = parser.parse_chunk(b"event: 1234567890123\ndata: 12345678\n\n");
+    fn line_overflow_maps_to_buffer_overflow() {
+        let mut parser = SseFrameParser::new(10);
+        let result = parser.parse_chunk(&chunk(b"data: this line is way too long for the limit\n\n"));
         assert!(
             matches!(result, Err(SseParseError::BufferOverflow { .. })),
-            "retained event type bytes should count toward the buffer limit"
+            "an over-long line should map to a buffer overflow error"
         );
     }
 
     #[test]
-    fn lossy_event_type_expansion_counts_after_line_processing() {
-        let mut parser = SseFrameParser::new(11);
-        let result = parser.parse_chunk(b"event: \xFF\xFF\xFF\xFF\n");
+    fn record_overflow_maps_to_buffer_overflow() {
+        let mut parser = SseFrameParser::new(20);
+        let result = parser.parse_chunk(&chunk(b"event: 1234567890123\ndata: 12345678\n\n"));
         assert!(
-            matches!(
-                result,
-                Err(SseParseError::BufferOverflow {
-                    buffered_bytes: 12,
-                    limit: 11
-                })
-            ),
-            "lossy UTF-8 expansion in event type should be checked after line processing"
+            matches!(result, Err(SseParseError::BufferOverflow { .. })),
+            "retained record bytes over the limit should map to a buffer overflow error"
         );
     }
 
     #[test]
-    fn event_limit_returns_error_before_extra_frame() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: one\n\ndata: two\n\n";
-        let result = parser.parse_chunk_with_event_limit(chunk, 1, 1);
+    fn overflow_after_a_frame_discards_the_chunk_frames() {
+        let mut parser = SseFrameParser::new(15);
+        let result = parser.parse_chunk(&chunk(b"data: ok\n\ndata: this-is-way-too-long\n\n"));
         assert!(
-            matches!(result, Err(SseParseError::EventLimitExceeded { count: 2, limit: 1 })),
-            "event limit should stop before emitting another frame"
+            matches!(result, Err(SseParseError::BufferOverflow { .. })),
+            "an overflow after a completed frame should still return an error, discarding the chunk's frames"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Event budget (a consumer limit layered above framing)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn event_limit_allows_frames_within_budget() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser
+            .parse_chunk_with_event_limit(&chunk(b"data: one\n\ndata: two\n\n"), 0, 5)
+            .unwrap();
+        assert_eq!(frames.len(), 2, "both frames should be emitted within budget");
+    }
+
+    #[test]
+    fn event_limit_exact_boundary_succeeds() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser
+            .parse_chunk_with_event_limit(&chunk(b"data: one\n\ndata: two\n\n"), 0, 2)
+            .unwrap();
+        assert_eq!(frames.len(), 2, "exactly at limit should succeed");
+    }
+
+    #[test]
+    fn event_limit_exceeded_returns_error_before_extra_frame() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let result = parser.parse_chunk_with_event_limit(&chunk(b"data: one\n\ndata: two\n\ndata: three\n\n"), 0, 2);
+        assert!(
+            matches!(result, Err(SseParseError::EventLimitExceeded { count: 3, limit: 2 })),
+            "third frame should exceed limit of 2"
         );
     }
 
     #[test]
-    fn event_type_with_space_after_colon() {
+    fn event_limit_accounts_for_current_events() {
         let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"event: response.completed\ndata: {}\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
+        let result = parser.parse_chunk_with_event_limit(&chunk(b"data: one\n\n"), 5, 5);
+        assert!(
+            matches!(result, Err(SseParseError::EventLimitExceeded { count: 6, limit: 5 })),
+            "current_events at limit should reject the next frame"
+        );
+    }
+
+    #[test]
+    fn event_limit_no_frames_always_succeeds() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser
+            .parse_chunk_with_event_limit(&chunk(b"data: partial"), 100, 100)
+            .unwrap();
+        assert!(
+            frames.is_empty(),
+            "no complete frames should succeed regardless of current count"
+        );
+    }
+
+    #[test]
+    fn counted_event_limit_skips_uncounted_frames() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        // The `[DONE]` sentinel is not counted against the budget but is still
+        // emitted, mirroring the OpenAI consumers' `count_frame` predicate.
+        let frames = parser
+            .parse_chunk_with_counted_event_limit(&chunk(b"data: one\n\ndata: [DONE]\n\n"), 0, 1, |frame| {
+                frame.data != b"[DONE]"
+            })
+            .unwrap();
         assert_eq!(
-            frames[0].event_type.as_deref(),
-            Some("response.completed"),
-            "event type with space should be captured"
+            frames.len(),
+            2,
+            "the uncounted sentinel frame is still emitted within budget"
         );
-    }
-
-    #[test]
-    fn event_type_without_space_after_colon() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"event:response.completed\ndata: {}\n\n";
-        let frames = parser.parse_chunk(chunk).unwrap();
-        assert_eq!(
-            frames[0].event_type.as_deref(),
-            Some("response.completed"),
-            "event type without space should be captured"
-        );
-    }
-
-    #[test]
-    fn multiline_data_split_across_chunks() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let frames1 = parser.parse_chunk(b"data: line1\n").unwrap();
-        assert!(frames1.is_empty(), "first data line should not dispatch");
-        let frames2 = parser.parse_chunk(b"data: line2\n\n").unwrap();
-        assert_eq!(frames2.len(), 1, "second data line with blank line should dispatch");
-        assert_eq!(frames2[0].data, b"line1\nline2", "split multiline data should match");
+        assert_eq!(frames[1].data, b"[DONE]", "sentinel frame preserved");
     }
 
     // -------------------------------------------------------------------------
@@ -678,58 +609,5 @@ mod tests {
             "should mention the event type"
         );
         assert!(msg.contains("terminal"), "should mention terminal context");
-    }
-
-    // -------------------------------------------------------------------------
-    // parse_chunk_with_event_limit
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn event_limit_allows_frames_within_budget() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: one\n\ndata: two\n\n";
-        let frames = parser.parse_chunk_with_event_limit(chunk, 0, 5).unwrap();
-        assert_eq!(frames.len(), 2, "both frames should be emitted within budget");
-    }
-
-    #[test]
-    fn event_limit_exact_boundary_succeeds() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: one\n\ndata: two\n\n";
-        let frames = parser.parse_chunk_with_event_limit(chunk, 0, 2).unwrap();
-        assert_eq!(frames.len(), 2, "exactly at limit should succeed");
-    }
-
-    #[test]
-    fn event_limit_exceeded_at_boundary() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: one\n\ndata: two\n\ndata: three\n\n";
-        let result = parser.parse_chunk_with_event_limit(chunk, 0, 2);
-        assert!(
-            matches!(result, Err(SseParseError::EventLimitExceeded { count: 3, limit: 2 })),
-            "third frame should exceed limit of 2"
-        );
-    }
-
-    #[test]
-    fn event_limit_accounts_for_current_events() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: one\n\n";
-        let result = parser.parse_chunk_with_event_limit(chunk, 5, 5);
-        assert!(
-            matches!(result, Err(SseParseError::EventLimitExceeded { count: 6, limit: 5 })),
-            "current_events at limit should reject the next frame"
-        );
-    }
-
-    #[test]
-    fn event_limit_no_frames_always_succeeds() {
-        let mut parser = SseFrameParser::new(MAX_BUF);
-        let chunk = b"data: partial";
-        let frames = parser.parse_chunk_with_event_limit(chunk, 100, 100).unwrap();
-        assert!(
-            frames.is_empty(),
-            "no complete frames should succeed regardless of current count"
-        );
     }
 }

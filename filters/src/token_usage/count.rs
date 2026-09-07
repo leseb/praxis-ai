@@ -41,6 +41,10 @@ use super::{
     providers::{parse_anthropic, parse_bedrock, parse_google, parse_openai},
     set_cache_token_usage, set_token_status_overflow, set_token_usage, streaming,
 };
+// Reuses the A2A fail-open recoverable SSE scanner. This consumer relies on the
+// same drop-oversized-event-and-continue behavior, so it is intentionally not
+// migrated onto the shared `praxis_filter::sse` codec by issue #842; see the
+// module docs on [`sse`] for the codec gap and praxis#986 refinement path.
 use crate::agentic::a2a::sse;
 
 // -----------------------------------------------------------------------------

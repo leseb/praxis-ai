@@ -10,6 +10,28 @@
 //!
 //! The scanner never modifies response bytes. It inspects chunks and
 //! yields completed payloads; the caller passes bytes through unchanged.
+//!
+//! # Why this is not the shared `praxis_filter::sse` codec
+//!
+//! Issue #842 (epic praxis#985) migrates AI's SSE record framing onto the
+//! shared `praxis_filter::sse` codec. This scanner is intentionally left in
+//! place because its framing does **not** match the shared codec's contract:
+//! on an oversized record the shared [`SseDecoder`] poisons permanently and
+//! stops yielding, whereas this scanner is **fail-open and recoverable** — it
+//! discards the oversized event's bytes without buffering them (see
+//! [`SkipPhase`]) and resumes at the next blank-line boundary, so a terminal
+//! usage/summary event arriving after an oversized one is still captured.
+//! Both this A2A route capture and the token-usage counter
+//! (`crate::token_usage::count`, via `use crate::agentic::a2a::sse`) depend on
+//! that recover-and-continue behavior, so neither can adopt the poison-on-
+//! overflow decoder without a functional regression.
+//!
+//! Adopting the shared codec here requires refining praxis#986 to add a
+//! recoverable / resync-on-overflow mode (drop the current record, clear
+//! poison, resume framing) rather than adding another AI-local parser. Until
+//! that lands, this scanner stays; revisit when the codec gains that mode.
+//!
+//! [`SseDecoder`]: praxis_filter::sse::SseDecoder
 
 // -----------------------------------------------------------------------------
 // SseScanState

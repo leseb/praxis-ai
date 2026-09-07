@@ -86,11 +86,15 @@ tokio-stream = "0.1.19"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-praxis-core = { version = "0.5.4", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.5.4", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.5.4", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.5.4", package = "praxis-proxy-tls" }
-praxis = { version = "0.5.4", package = "praxis-proxy" }
+#
+# Pinned to praxis main (no release yet) at the merge commit of
+# praxis-proxy/praxis#1060, which adds the shared `praxis_filter::sse` codec that
+# issue #842 migrates onto. Bump the rev once a release carrying the codec ships.
+praxis-core = { git = "https://github.com/praxis-proxy/praxis", rev = "c4cab7966e3a707cad1ab274ffca180970f9e1dd", package = "praxis-proxy-core" }
+praxis-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "c4cab7966e3a707cad1ab274ffca180970f9e1dd", package = "praxis-proxy-filter" }
+praxis-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "c4cab7966e3a707cad1ab274ffca180970f9e1dd", package = "praxis-proxy-protocol" }
+praxis-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "c4cab7966e3a707cad1ab274ffca180970f9e1dd", package = "praxis-proxy-tls" }
+praxis = { git = "https://github.com/praxis-proxy/praxis", rev = "c4cab7966e3a707cad1ab274ffca180970f9e1dd", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # AI-owned llm-d ext_proc compatibility layer
@@ -103,9 +107,12 @@ praxis-ai-apis = { version = "0.3.0", path = "apis" }
 praxis-ai-build-support = { version = "0.3.0", path = "server/build_support" }
 
 # Pingora (temporary fork)
-pingora-core = { version = "0.8.2", package = "quixotic-plecostomus-core", features = ["rustls"] }
-pingora-http = { version = "0.8.2", package = "quixotic-plecostomus-http" }
-pingora-proxy = { version = "0.8.2", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
+#
+# Kept in lockstep with praxis core: praxis main depends on the 0.8.4 fork, and
+# the proxy links the same Pingora types across both, so the versions must match.
+pingora-core = { version = "0.8.4", package = "quixotic-plecostomus-core", features = ["rustls"] }
+pingora-http = { version = "0.8.4", package = "quixotic-plecostomus-http" }
+pingora-proxy = { version = "0.8.4", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
 arc-swap = "1.9.2"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
