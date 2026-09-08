@@ -595,8 +595,8 @@ fn redact_connector_client_error(
 /// would be swallowed as `Continue` by the pipeline. The header-phase
 /// [`McpToolResolveFilter::on_request`] consumes the stash and emits the
 /// terminal SSE so the response phase can observe and persist it. All other
-/// failures -- and every local request-policy failure such as SSRF -- keep
-/// their immediate [`Rejection`].
+/// failures -- and every local request-policy failure such as SSRF -- are
+/// rejected immediately via [`FilterAction::Reject`].
 fn resolve_error_action(
     ctx: &mut HttpFilterContext<'_>,
     err: &ResolveError,
