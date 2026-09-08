@@ -2661,7 +2661,7 @@ fn body_too_large_maps_to_413() {
         actual: 1_000_000,
         limit: 65_536,
     };
-    let action = resolve_error_rejection(&err, false);
+    let action = resolve_error_rejection(&err);
     let rejection = match action {
         FilterAction::Reject(r) => r,
         other => panic!("expected Reject, got {other:?}"),

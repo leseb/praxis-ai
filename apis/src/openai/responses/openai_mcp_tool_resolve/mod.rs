@@ -297,11 +297,9 @@ impl HttpFilter for McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let streaming = is_streaming(ctx);
-
         match Box::pin(self.resolve_mcp_tools(ctx, body, bytes)).await {
             Ok(action) => Ok(action),
-            Err(e) => Ok(resolve_error_rejection(&e, streaming)),
+            Err(e) => Ok(resolve_error_rejection(&e)),
         }
     }
 }
@@ -550,7 +548,7 @@ fn redact_connector_client_error(
 }
 
 /// Map a [`ResolveError`] to an appropriate rejection response.
-fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction {
+fn resolve_error_rejection(err: &ResolveError) -> FilterAction {
     let (status, error_type) = match err {
         ResolveError::DuplicateLabel(_)
         | ResolveError::TooManyServers { .. }
@@ -567,7 +565,7 @@ fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction 
     };
     let msg = err.to_string();
     debug!(error = %msg, "openai_mcp_tool_resolve rejected");
-    FilterAction::Reject(responses_error_rejection(status, error_type, &msg, streaming))
+    FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
 }
 
 /// Return the `server_url` if the entry should be eagerly
@@ -1126,12 +1124,6 @@ fn write_state(ctx: &mut HttpFilterContext<'_>, body: &[u8], map: HashMap<(Strin
 /// Check whether `openai_tool_parse` detected MCP tools.
 fn has_mcp_tools(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_tool_parse.has_mcp")
-        .is_some_and(|v| v == "true")
-}
-
-/// Check whether the request is streaming.
-fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream")
         .is_some_and(|v| v == "true")
 }
 
