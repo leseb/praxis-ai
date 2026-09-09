@@ -629,6 +629,86 @@ async fn delete_response_removes_its_pending_approvals() {
     assert_eq!(claim, Some(0), "a deleted response's approval must not be consumable");
 }
 
+#[tokio::test]
+async fn persist_response_with_pending_approvals_writes_both() {
+    // The atomic write path records the response and every pending approval it
+    // issued together, so the resume turn can correlate the mcp_approval_response
+    // back to a durable, server-written record.
+    let store = make_store().await;
+    let record = make_response_record("resp_persist", "tenant_a", 1000);
+    let approval = PendingApprovalRecord {
+        approval_id: "call_persist".to_owned(),
+        ..make_pending("call_persist")
+    };
+
+    store
+        .persist_response_with_pending_approvals(&record, std::slice::from_ref(&approval))
+        .await
+        .expect("atomic persist should succeed");
+
+    let fetched_response = store
+        .get_response("tenant_a", "resp_persist")
+        .await
+        .expect("get should succeed");
+    assert!(fetched_response.is_some(), "the response must be written");
+
+    let fetched_approvals = store
+        .get_pending_approvals("tenant_a", "resp_persist", &["call_persist"])
+        .await
+        .expect("get should succeed");
+    assert_eq!(
+        fetched_approvals,
+        vec![approval],
+        "the pending approval must be written and scoped to the issuing response"
+    );
+}
+
+#[tokio::test]
+async fn persist_response_with_pending_approvals_rolls_back_response_on_approval_failure() {
+    // Atomicity means the response and its pending approvals commit together or not
+    // at all. If the approval write fails, a separate-writes implementation leaves
+    // the response committed — visible to a streaming client that could then issue a
+    // DELETE while the (retried) approval insert lands, orphaning a row that holds
+    // the tool arguments. A single transaction rolls the response back with the
+    // failed approval, so no half-written state is ever observable.
+    //
+    // Force the second write to fail deterministically by dropping the derived
+    // approvals table on a side connection, then assert the response did not persist.
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let store = make_file_store(&dir, None).await;
+
+    let db_path = dir.path().join("concurrent.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let side = sqlx::sqlite::SqlitePool::connect(&url)
+        .await
+        .expect("side connection should open");
+    sqlx::query("DROP TABLE test_responses_pending_approvals")
+        .execute(&side)
+        .await
+        .expect("dropping the approvals table should succeed");
+    side.close().await;
+
+    let record = make_response_record("resp_rollback", "tenant_a", 1000);
+    let approval = make_pending("call_rollback");
+    let result = store
+        .persist_response_with_pending_approvals(&record, std::slice::from_ref(&approval))
+        .await;
+    assert!(
+        result.is_err(),
+        "a failed pending-approval write must surface an error, not be swallowed"
+    );
+
+    let fetched = store
+        .get_response("tenant_a", "resp_rollback")
+        .await
+        .expect("get should succeed");
+    assert!(
+        fetched.is_none(),
+        "the response must be rolled back when its pending-approval write fails, \
+         leaving no half-written state"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Input Items
 // -----------------------------------------------------------------------------
@@ -2843,6 +2923,35 @@ async fn pg_consume_approval_replay_is_rejected() {
         replay,
         Some(0),
         "replayed consumption of the same approval must be rejected (single-use)"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_persist_response_with_pending_approvals_writes_both() {
+    let store = make_pg_store().await;
+    let record = make_response_record("resp_persist", "tenant_a", 1000);
+    let approval = make_pending("call_persist");
+
+    store
+        .persist_response_with_pending_approvals(&record, std::slice::from_ref(&approval))
+        .await
+        .expect("atomic persist should succeed");
+
+    let fetched_response = store
+        .get_response("tenant_a", "resp_persist")
+        .await
+        .expect("get should succeed");
+    assert!(fetched_response.is_some(), "the response must be written");
+
+    let fetched_approvals = store
+        .get_pending_approvals("tenant_a", "resp_persist", &["call_persist"])
+        .await
+        .expect("get should succeed");
+    assert_eq!(
+        fetched_approvals,
+        vec![approval],
+        "the pending approval must be written and scoped to the issuing response"
     );
 }
 

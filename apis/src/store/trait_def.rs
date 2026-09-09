@@ -104,6 +104,46 @@ pub trait ResponseStore: Send + Sync {
         created_at: i64,
     ) -> Result<(), StoreError>;
 
+    /// Persist a response and the pending approvals it issued together.
+    ///
+    /// Called from the proxy output path when a streamed or buffered response
+    /// carries one or more `mcp_approval_request` items. The pending rows are
+    /// scoped to `record.id` (via [`record_pending_approvals`]) so a later
+    /// `mcp_approval_response` correlates back through `previous_response_id`.
+    ///
+    /// Transactional backends **must** commit both writes in a single
+    /// transaction, serialized against [`delete_response`]. A streaming client
+    /// already knows the response id and can issue a concurrent
+    /// `DELETE /v1/responses/{id}`; writing the two records separately leaves a
+    /// window where the delete lands between them and the later approval insert
+    /// orphans a row still holding the tool arguments. One transaction closes
+    /// that window: a delete observes either both records or neither.
+    ///
+    /// The provided default persists the two records sequentially. It is correct
+    /// for in-memory or non-transactional stores that are not subject to
+    /// concurrent deletion, but it is **not** atomic; SQL backends override it.
+    /// Like [`record_pending_approvals`], the approval writes are insert-if-absent,
+    /// so re-persisting the same response never resets an already-consumed row.
+    ///
+    /// [`record_pending_approvals`]: ResponseStore::record_pending_approvals
+    /// [`delete_response`]: ResponseStore::delete_response
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn persist_response_with_pending_approvals(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<(), StoreError> {
+        self.upsert_response(record).await?;
+        if !pending_approvals.is_empty() {
+            self.record_pending_approvals(&record.tenant_id, &record.id, pending_approvals, record.created_at)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Fetch the server-owned pending approvals matching `approval_ids` that
     /// were issued by `response_id`.
     ///

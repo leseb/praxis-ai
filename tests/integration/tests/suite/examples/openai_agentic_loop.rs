@@ -4530,6 +4530,151 @@ fn approval_with_store_disabled_is_rejected() {
 }
 
 #[test]
+fn approval_with_store_disabled_on_committed_stream_emits_sse_error() {
+    // Streaming twin of `approval_with_store_disabled_is_rejected` and the
+    // committed-stream half of PR #1029 Finding #3. On a streaming request the SSE
+    // headers and the model's own events are already on the wire by the time
+    // mcp_dispatch discovers the approval-gated call is unresumable (store=false),
+    // so it can no longer reject with a fresh HTTP status. It must instead
+    // terminate the already-committed logical stream with an SSE `error` event that
+    // carries the explanation — never drop the connection into an opaque transport
+    // error that strands the client after a truncated success.
+    let model_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_appr_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_appr_stream_1",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_appr_stream",
+                    "call_id": "call_appr_stream",
+                    "name": "weather__get_weather",
+                    "arguments": "",
+                    "status": "in_progress"
+                },
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.function_call_arguments.done",
+            serde_json::json!({
+                "response_id": "resp_appr_stream_1",
+                "item_id": "fc_appr_stream",
+                "output_index": 0,
+                "arguments": r#"{"location":"SF"}"#,
+                "sequence_number": 2
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_appr_stream_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "id": "fc_appr_stream",
+                        "call_id": "call_appr_stream",
+                        "name": "weather__get_weather",
+                        "arguments": r#"{"location":"SF"}"#,
+                        "status": "completed"
+                    }],
+                    "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
+                },
+                "sequence_number": 3
+            }),
+        ),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![model_response]);
+    let mcp = approval_weather_mock();
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model_port);
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "stream": true,
+        "store": false,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "always"
+        }]
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    // The stream committed a 200 before the rejection was discovered, so the
+    // failure travels as an SSE event, not an HTTP status.
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a committed stream stays 200; the failure is delivered as an SSE error, not a status: {raw}"
+    );
+    let body = parse_body(&raw);
+    let frames = parse_sse_frames(&body);
+
+    // The failure is a single terminal SSE `error` event carrying the explanation.
+    let error = sole_event(&frames, "error");
+    assert_eq!(
+        error.data["code"], "invalid_request_error",
+        "committed-stream error code: {body}"
+    );
+    assert!(
+        error.data["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("store")),
+        "the committed-stream error must explain approvals require store=true: {body}"
+    );
+
+    // The model's own lifecycle reached the client before the error (the stream was
+    // genuinely committed), yet no success terminal and no unresumable approval
+    // request were emitted.
+    assert!(
+        body.contains("event: response.created"),
+        "the committed stream must include the model lifecycle it already sent: {body}"
+    );
+    assert_eq!(
+        event_count(&frames, "response.completed"),
+        0,
+        "a failed stream must not also emit a success terminal: {body}"
+    );
+    assert!(
+        !body.contains("mcp_approval_request"),
+        "an unresumable approval request must never be emitted: {body}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no tool may execute for a store-disabled approval request"
+    );
+
+    model_thread.join().expect("streaming model thread should finish");
+    assert_eq!(
+        model_requests
+            .lock()
+            .expect("model request lock should not be poisoned")
+            .len(),
+        1,
+        "the loop terminates at the unresumable approval; only one model request is made"
+    );
+}
+
+#[test]
 fn approval_batch_exceeding_cap_is_rejected() {
     // The agentic loop issues exactly one function call per round, so a resume
     // turn carries a single mcp_approval_response. A larger batch is a client

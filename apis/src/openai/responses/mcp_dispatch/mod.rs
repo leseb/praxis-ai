@@ -50,7 +50,7 @@ use std::{collections::HashMap, time::Duration};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, SubRequestResponseMode,
     body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, warn};
@@ -157,7 +157,7 @@ impl McpDispatchFilter {
         // persist the record — instead of stranding the client with an
         // mcp_approval_request that can never be resumed.
         if let Some(rejection) = approval_persistence_rejection(ctx, &pending.tool_name) {
-            return Ok(FilterAction::Reject(rejection));
+            return Self::reject_unresumable_approval(ctx, rejection);
         }
 
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -169,6 +169,36 @@ impl McpDispatchFilter {
         set_action(ctx, ACTION_DONE)?;
 
         Ok(FilterAction::Continue)
+    }
+
+    /// Fail closed on an approval-required call that could never be resumed.
+    ///
+    /// A buffered sub-request has not committed a response yet, so it rejects
+    /// pre-commitment with the JSON `{"error":{...}}` envelope. A streaming
+    /// sub-request has already put SSE headers and model events on the wire, so a
+    /// `FilterAction::Reject` would be converted into a transport error *after* a
+    /// truncated success — the explanation would be lost. In that case hand the
+    /// terminal error to the `openai_stream_events` logical-stream finalizer via
+    /// the committed-stream metadata and skip persisting the committed response,
+    /// mirroring the agentic loop's committed-stream error path. Either way no
+    /// unresumable `mcp_approval_request` is emitted.
+    fn reject_unresumable_approval(
+        ctx: &mut HttpFilterContext<'_>,
+        rejection: ApprovalRejection,
+    ) -> Result<FilterAction, FilterError> {
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+            ctx.set_metadata("responses.stream_error_code".to_owned(), rejection.code.to_owned());
+            ctx.set_metadata("responses.stream_error_message".to_owned(), rejection.message);
+            ctx.set_metadata("responses.skip_persist".to_owned(), "true".to_owned());
+            ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "done".to_owned());
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Continue);
+        }
+        Ok(FilterAction::Reject(responses_error_rejection(
+            rejection.status,
+            rejection.code,
+            &rejection.message,
+        )))
     }
 
     /// Resume any pending approvals carried by the current request input.
@@ -448,7 +478,7 @@ fn record_and_emit_approval(state: &mut ResponsesState, body: &mut Option<Bytes>
 /// The client-controlled `store=false` is a `400`; a store not armed to persist
 /// this response is a server-configuration `500`, mirroring the resume path's
 /// identical guard.
-fn approval_persistence_rejection(ctx: &HttpFilterContext<'_>, tool_name: &str) -> Option<Rejection> {
+fn approval_persistence_rejection(ctx: &HttpFilterContext<'_>, tool_name: &str) -> Option<ApprovalRejection> {
     let state = ctx.extensions.get::<ResponsesState>();
     if state.is_some_and(|state| !response_will_be_stored(state)) {
         warn!(
@@ -466,6 +496,19 @@ fn approval_persistence_rejection(ctx: &HttpFilterContext<'_>, tool_name: &str) 
         return Some(approval_store_unavailable_rejection(tool_name));
     }
     None
+}
+
+/// A fail-closed approval rejection as raw parts, so the caller can surface it as
+/// a pre-commitment JSON envelope (buffered) or a committed-stream SSE error
+/// (streaming) without re-deriving the status, code, and message.
+struct ApprovalRejection {
+    /// HTTP status for the pre-commitment JSON envelope. Ignored on a committed
+    /// stream, where headers are already sent and the error is an SSE event.
+    status: u16,
+    /// Machine-readable error code, shared by both surfaces.
+    code: &'static str,
+    /// Human-readable explanation, shared by both surfaces.
+    message: String,
 }
 
 /// Whether the client opted into persistence for this Responses request.
@@ -491,15 +534,15 @@ fn response_will_be_stored(state: &ResponsesState) -> bool {
 /// Combining `require_approval` with `store: false` is a client error: the
 /// mandatory `mcp_approval_response` follow-up correlates to server-owned state
 /// via `previous_response_id`, which only exists when the response is stored.
-fn approval_requires_store_rejection(tool_name: &str) -> Rejection {
-    responses_error_rejection(
-        400,
-        "invalid_request_error",
-        &format!(
+fn approval_requires_store_rejection(tool_name: &str) -> ApprovalRejection {
+    ApprovalRejection {
+        status: 400,
+        code: "invalid_request_error",
+        message: format!(
             "MCP tool '{tool_name}' requires approval, but this request set store=false; approvals require \
              store=true so the mcp_approval_response follow-up can resume via previous_response_id"
         ),
-    )
+    }
 }
 
 /// Fail-closed `500` for an approval-required call when the response store did
@@ -511,15 +554,15 @@ fn approval_requires_store_rejection(tool_name: &str) -> Rejection {
 /// absent, request-conditioned out, or ordered after dispatch — so the mandatory
 /// follow-up could never resume. This mirrors the resume path, which returns the
 /// same server error when the store is unavailable.
-fn approval_store_unavailable_rejection(tool_name: &str) -> Rejection {
-    responses_error_rejection(
-        500,
-        "server_error",
-        &format!(
+fn approval_store_unavailable_rejection(tool_name: &str) -> ApprovalRejection {
+    ApprovalRejection {
+        status: 500,
+        code: "server_error",
+        message: format!(
             "MCP tool '{tool_name}' requires approval, but no response store is configured to persist the \
              pending approval; a store is required so the mcp_approval_response follow-up can resume"
         ),
-    )
+    }
 }
 
 /// Apply one resolved approval decision to request-scoped state.

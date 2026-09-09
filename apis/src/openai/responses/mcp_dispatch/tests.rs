@@ -1434,6 +1434,62 @@ async fn on_response_body_approval_required_registered_but_not_armed_is_rejected
     );
 }
 
+#[tokio::test]
+async fn on_response_body_unresumable_approval_on_committed_stream_emits_sse_error() {
+    // The persistence guard fires from the response-body hook. On a committed
+    // stream (subrequest_response_mode == Streaming) the SSE headers and model
+    // events are already on the wire, so returning FilterAction::Reject would be
+    // converted into a transport error after a truncated success — the client
+    // never learns why. Instead the guard must hand a terminal error to the
+    // logical-stream finalizer via the committed-stream metadata and skip
+    // persistence, without emitting an unresumable mcp_approval_request.
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_subrequest_response_mode(praxis_filter::SubRequestResponseMode::Streaming);
+    let state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1"})],
+        // store defaults to true (client opted in), yet the store filter never
+        // armed persistence for this exchange, so the approval is unresumable.
+        request_body: json!({"model": "gpt-4.1", "stream": true}),
+        ..ResponsesState::default()
+    };
+    ctx.extensions.insert(state);
+    register_store(&mut ctx, make_approval_store().await);
+    let mut body = Some(Bytes::from(r#"{"id":"resp_123","output":[]}"#));
+    let result = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(result, FilterAction::Continue),
+        "a committed stream must not fail closed with FilterAction::Reject; the error \
+         reaches the client through the logical-stream finalizer instead"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "the committed-stream error code must be published for the finalizer"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_error_message")
+            .is_some_and(|m| m.contains("store")),
+        "the committed-stream error message must explain a store is required"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an unresumable approval must not persist the committed response"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.pending_approvals.is_empty(),
+        "no pending approval may be recorded when this exchange will not persist"
+    );
+    assert!(
+        state.accumulated_output.is_empty(),
+        "no mcp_approval_request may be emitted when it can never be resumed"
+    );
+}
+
 // =========================================================================
 // on_request (HttpFilter trait)
 // =========================================================================
@@ -2450,6 +2506,35 @@ fn target_fingerprint_is_header_order_independent_and_identity_sensitive() {
             "a target identity change must change the fingerprint: {mutated}"
         );
     }
+}
+
+#[test]
+fn target_fingerprint_fails_closed_on_case_insensitive_duplicate_headers() {
+    // The MCP transport lowercases header names (via `http::HeaderName`) and keys
+    // its header map by the normalized name, so among case-insensitive duplicates
+    // the last one in JSON order wins. A case-sensitive key sort hashes both
+    // orderings identically, so reversing the two names transmits a different
+    // value while preserving the digest — an old approval would still authorize a
+    // redirected header. Such an ambiguous target must fingerprint to the empty
+    // fail-closed sentinel so it can never match on resume.
+    let forward = json!({
+        "server_url": "http://127.0.0.1:1/mcp",
+        "authorization": "Bearer token",
+        "headers": {"X-Target-Tenant": "A", "x-target-tenant": "B"},
+    });
+    let reversed = json!({
+        "server_url": "http://127.0.0.1:1/mcp",
+        "authorization": "Bearer token",
+        "headers": {"x-target-tenant": "B", "X-Target-Tenant": "A"},
+    });
+    assert!(
+        target_fingerprint(&forward).is_empty(),
+        "case-insensitive duplicate header names must fail closed"
+    );
+    assert!(
+        target_fingerprint(&reversed).is_empty(),
+        "case-insensitive duplicate header names must fail closed"
+    );
 }
 
 #[test]

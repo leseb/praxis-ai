@@ -684,11 +684,14 @@ pub(super) fn build_record_from_state(
 /// before the upsert completes.
 ///
 /// Any server-owned pending approval requests the proxy emitted on this turn are
-/// recorded in the same blocking scope, immediately after the response, so a
-/// follow-up `mcp_approval_response` can correlate against a durable, server-
-/// written record rather than trusting the (client-influenced) conversation
-/// history. `record_pending_approvals` is insert-if-absent, so re-persisting the
-/// same response never resets an already-consumed approval.
+/// recorded in the **same transaction** as the response, so a follow-up
+/// `mcp_approval_response` can correlate against a durable, server-written record
+/// rather than trusting the (client-influenced) conversation history. Committing
+/// both together, serialized against deletion, prevents a concurrent
+/// `DELETE /v1/responses/{id}` from landing between the two writes and orphaning a
+/// pending approval. `persist_response_with_pending_approvals` is insert-if-absent
+/// for the approvals, so re-persisting the same response never resets an
+/// already-consumed approval.
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 fn persist_response_blocking(
@@ -706,15 +709,9 @@ fn persist_response_blocking(
     let handle = tokio::runtime::Handle::current();
     tokio::task::block_in_place(|| {
         handle.block_on(async {
-            store.upsert_response(record).await?;
-            if !pending_approvals.is_empty() {
-                // Scope the pending rows to the response that issued them so the
-                // resume turn must name this id via `previous_response_id`.
-                store
-                    .record_pending_approvals(&record.tenant_id, &record.id, pending_approvals, record.created_at)
-                    .await?;
-            }
-            Ok::<(), StoreError>(())
+            store
+                .persist_response_with_pending_approvals(record, pending_approvals)
+                .await
         })
     })
     .map_err(|e| -> FilterError { Box::new(e) })

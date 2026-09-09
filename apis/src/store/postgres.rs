@@ -462,6 +462,85 @@ impl ResponseStore for PostgresResponseStore {
         Ok(())
     }
 
+    #[expect(clippy::too_many_lines, reason = "sequential per-record bind within a transaction")]
+    async fn persist_response_with_pending_approvals(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<(), StoreError> {
+        // No approvals: nothing to make atomic, so take the plain upsert path.
+        if pending_approvals.is_empty() {
+            return self.upsert_response(record).await;
+        }
+
+        let response_object =
+            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+        let upsert_sql = format!(
+            "INSERT INTO {} \
+             (id, tenant_id, created_at, model, response_object, input, messages) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (tenant_id, id) DO UPDATE SET \
+             created_at = EXCLUDED.created_at, \
+             model = EXCLUDED.model, \
+             response_object = EXCLUDED.response_object, \
+             input = EXCLUDED.input, \
+             messages = EXCLUDED.messages",
+            self.tables.responses
+        );
+        let approvals_table = pending_approvals_table(&self.tables.responses);
+        // Insert-if-absent so a re-emit never resets an already-consumed row back
+        // to outstanding (which would enable replay).
+        let approval_sql = format!(
+            "INSERT INTO {approvals_table} \
+             (tenant_id, response_id, approval_id, server_label, tool_name, arguments, target_fingerprint, \
+             created_at, consumed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (tenant_id, response_id, approval_id) DO NOTHING"
+        );
+
+        // One transaction so the response and its pending approvals commit
+        // together or not at all. Serialized against delete_response, this closes
+        // the window where a concurrent DELETE could land between the two writes
+        // and orphan an approval row still holding the tool arguments.
+        let mut tx = Box::pin(self.pool.begin())
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlx::query(AssertSqlSafe(upsert_sql.as_str()))
+            .bind(&record.id)
+            .bind(&record.tenant_id)
+            .bind(record.created_at)
+            .bind(&record.model)
+            .bind(&response_object)
+            .bind(&input)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        for approval in pending_approvals {
+            sqlx::query(AssertSqlSafe(approval_sql.as_str()))
+                .bind(&record.tenant_id)
+                .bind(&record.id)
+                .bind(&approval.approval_id)
+                .bind(&approval.server_label)
+                .bind(&approval.tool_name)
+                .bind(&approval.arguments)
+                .bind(&approval.target_fingerprint)
+                .bind(record.created_at)
+                .bind(Option::<i64>::None)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     async fn get_pending_approvals(
         &self,
         tenant_id: &str,

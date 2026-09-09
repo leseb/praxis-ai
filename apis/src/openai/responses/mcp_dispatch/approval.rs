@@ -14,7 +14,10 @@
 //!    arguments) resolved against the current tool map, and shaping the decision into either a tool call to execute or
 //!    a denial fed back to the model.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use sha2::{Digest as _, Sha256};
 
@@ -265,8 +268,8 @@ pub(crate) fn resolve_approval(
     // tool_name) but redirects to a different URL, swaps headers or the
     // authorization credential, or points at another connector produces a
     // different fingerprint and is rejected before any call is made. An empty
-    // stored fingerprint (e.g. an ambiguous target at approval time) can never
-    // match, so it also fails closed.
+    // stored fingerprint (e.g. an ambiguous target or case-colliding header names
+    // at approval time) can never match, so it also fails closed.
     if pending.target_fingerprint.is_empty() {
         return Err(ApprovalError::TargetIdentityMismatch(format!(
             "stored approval '{approval_id}' is missing its target fingerprint"
@@ -337,6 +340,11 @@ fn bind_target<'a>(
 /// (unlike the std hasher's per-process seed) so the request-time and
 /// resume-time computations agree. Fields are length-framed and headers are
 /// key-sorted so the digest is independent of JSON key ordering.
+///
+/// Returns the empty string as a fail-closed sentinel when the headers contain
+/// case-insensitive duplicate names: the transport lowercases names and lets the
+/// last one in JSON order win, so such a target is ambiguous and must never
+/// produce a matchable fingerprint.
 pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     for field in ["server_url", "authorization", "connector_id"] {
@@ -345,6 +353,18 @@ pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
     }
     hash_segment(&mut hasher, b"headers");
     if let Some(headers) = entry.get("headers").and_then(serde_json::Value::as_object) {
+        // The transport lowercases header names, so two names differing only in
+        // case collapse to one and the value actually sent depends on JSON order.
+        // A case-sensitive key sort would hash such an ambiguous target to a
+        // stable digest that does not reflect what is transmitted, letting a
+        // reordered resume reuse the approval with a different value. Fail closed
+        // with the empty sentinel instead so it can never match on resume.
+        let mut seen = HashSet::with_capacity(headers.len());
+        for key in headers.keys() {
+            if !seen.insert(key.to_ascii_lowercase()) {
+                return String::new();
+            }
+        }
         let mut keys: Vec<&str> = headers.keys().map(String::as_str).collect();
         keys.sort_unstable();
         for key in keys {

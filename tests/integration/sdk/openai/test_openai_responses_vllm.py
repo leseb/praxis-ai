@@ -2302,6 +2302,124 @@ class TestAgenticLoopVLLM:
             f"approved response should resume to model output; got: {output_types}"
         )
 
+    def test_mcp_approval_resume_streams_without_index_error(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #637 (PR #1029 review): a streamed approval RESUME must
+        announce the locally executed mcp_call at output index 0.
+
+        The approval resume runs *before* the first inference round, so the
+        proxy appends the executed mcp_call at accumulated output index 0 and
+        the resumed model output lands at index 1. If the proxy never emits a
+        ``response.output_item.added`` for index 0, the OpenAI SDK's streaming
+        accumulator never allocates slot 0: the resumed model item is appended
+        as ``output[0]`` and the index-1 model delta then indexes past the end
+        of the list, raising ``IndexError`` mid-stream -- the exact crash this
+        test guards against.
+
+        Turn 1 is buffered to obtain the approval request id; the RESUME turn
+        streams through the SDK's ``responses.stream`` accumulator, which is the
+        surface that raised the regression. Reaching ``get_final_response()``
+        without an exception is itself the primary assertion.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "approval-gated MCP call should emit exactly one approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute before approval"
+        )
+        approval = approval_requests[0]
+
+        # RESUME turn: stream through the SDK accumulator. Building the final
+        # snapshot from the event sequence is exactly what raised IndexError
+        # before the index-0 mcp_call was announced; letting any such exception
+        # propagate fails the test with the regression's own traceback.
+        added = []  # (output_index, item_type, item_id)
+        text_delta_indices = []
+        with agentic_client.responses.stream(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval.id,
+                    "approve": True,
+                }
+            ],
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        ) as stream:
+            for event in stream:
+                if event.type == "response.output_item.added":
+                    item = event.item.model_dump()
+                    added.append(
+                        (event.output_index, item.get("type"), item.get("id"))
+                    )
+                elif event.type == "response.output_text.delta":
+                    text_delta_indices.append(event.output_index)
+            # Replays the accumulated snapshot; raises if any delta referenced
+            # an output index that was never announced with output_item.added.
+            final_response = stream.get_final_response()
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "approving the request must execute the MCP tool exactly once"
+        )
+
+        # The locally executed mcp_call is announced as exactly one incremental
+        # output_item.added at index 0 -- the slot the accumulator needs before
+        # the resumed model output at index 1 can be applied.
+        mcp_added = [a for a in added if a[1] == "mcp_call"]
+        assert len(mcp_added) == 1, (
+            "the resumed mcp_call should surface as exactly one "
+            f"response.output_item.added; got: {added}"
+        )
+        mcp_index = mcp_added[0][0]
+        assert mcp_index == 0, (
+            "the resumed mcp_call executes before the first inference round, so "
+            f"it must be announced at output index 0; got index {mcp_index}"
+        )
+
+        # Any resumed model text streams at an output index after the index-0
+        # mcp_call -- the ordering the accumulator relies on. (Empty is fine: a
+        # small model under /no_think + a 512-token cap may emit only reasoning.)
+        assert all(idx > mcp_index for idx in text_delta_indices), (
+            "resumed model text must stream at an output index after the "
+            f"index-0 mcp_call; mcp_index={mcp_index}, deltas={text_delta_indices}"
+        )
+
+        output_types = [item.type for item in final_response.output]
+        assert "mcp_call" in output_types, (
+            f"resumed response should contain the MCP result; got: {output_types}"
+        )
+
     def test_mcp_tool_auto_executes_and_returns(
         self,
         agentic_client,
