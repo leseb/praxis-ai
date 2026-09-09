@@ -378,6 +378,33 @@ fn approval_rejection(error: &ApprovalError) -> Rejection {
 /// on the client-visible event so a client cannot reproduce it. The record is
 /// drained and persisted by the store filter so the resume turn can correlate
 /// the response back to this proxy-issued request.
+/// Append executed MCP tool results to response state and drop the
+/// now-satisfied MCP tool calls.
+fn apply_execution_results(state: &mut ResponsesState, results: Vec<McpCallResult>) {
+    for result in results {
+        state.messages.push(result.message.clone());
+        state.persisted_messages.push(result.message);
+        // Record execution provenance keyed on the item id `stream_events`
+        // reads, so only this locally executed `mcp_call` gains a synthesized
+        // lifecycle.
+        if let Some(id) = result.output_item.get("id").and_then(serde_json::Value::as_str) {
+            state.locally_executed_output_items.insert(id.to_owned());
+        }
+        state.accumulated_output.push(result.output_item);
+    }
+
+    let tool_map_ref = &state.mcp_tool_map;
+    state.tool_calls.retain(|tc| !is_mcp_tool_call(tc, tool_map_ref));
+}
+
+/// Record the server-owned pending approval and emit the client-visible
+/// `mcp_approval_request` into the response body.
+///
+/// The record captures the resolved target fingerprint — the sole source of
+/// truth for a later `mcp_approval_response` — which is deliberately NOT echoed
+/// on the client-visible event so a client cannot reproduce it. The record is
+/// drained and persisted by the store filter so the resume turn can correlate
+/// the response back to this proxy-issued request.
 fn record_and_emit_approval(state: &mut ResponsesState, body: &mut Option<Bytes>, pending: PendingApproval) {
     let record = PendingApprovalRecord {
         approval_id: pending.call_id,
@@ -386,6 +413,10 @@ fn record_and_emit_approval(state: &mut ResponsesState, body: &mut Option<Bytes>
         arguments: pending.arguments,
         target_fingerprint: pending.target_fingerprint,
     };
+    // Record execution provenance so `stream_events` may synthesize this
+    // approval item's lifecycle; a bare `accumulated_output` push is not proof
+    // that this filter produced the item.
+    state.locally_executed_output_items.insert(record.approval_id.clone());
     state.accumulated_output.push(serde_json::json!({
         "type": "mcp_approval_request",
         "id": record.approval_id,
@@ -587,14 +618,7 @@ impl HttpFilter for McpDispatchFilter {
             warn!("ResponsesState missing when appending results");
             return Ok(FilterAction::Continue);
         };
-        for result in results {
-            state.messages.push(result.message.clone());
-            state.persisted_messages.push(result.message);
-            state.accumulated_output.push(result.output_item);
-        }
-
-        let tool_map_ref = &state.mcp_tool_map;
-        state.tool_calls.retain(|tc| !is_mcp_tool_call(tc, tool_map_ref));
+        apply_execution_results(state, results);
 
         Ok(FilterAction::Continue)
     }
