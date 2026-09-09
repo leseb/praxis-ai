@@ -436,11 +436,6 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_request_rejection_uses_json_content_type() {
-        // A pre-stream validation failure happens before any 200 text/event-stream
-        // response is committed, so it must return the JSON error envelope with a
-        // non-2xx status even when the caller requested `stream:true` — matching
-        // OpenAI, which raises a typed error from the JSON body before opening the
-        // stream (see issue #1001).
         let action = run_filter_raw("not valid json", &[("openai_responses_format.stream", "true")]).await;
         if let FilterAction::Reject(rejection) = action {
             let has_content_type = rejection

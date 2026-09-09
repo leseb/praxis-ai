@@ -786,9 +786,6 @@ async fn logical_eos_without_terminal_emits_error() {
         "a logical stream must explicitly terminate when upstream omits its terminal event: {eos}"
     );
 
-    // The emitted committed-stream `error` event must match the pinned OpenAI
-    // `ResponseErrorEvent` shape: `type`, `sequence_number`, `code`, `message`,
-    // and `param` are all top-level, with no nested `error` object (issue #1001).
     let data = eos
         .split("event: error\n")
         .nth(1)

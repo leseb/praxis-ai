@@ -583,9 +583,6 @@ async fn streaming_file_search_is_rejected_before_callout() {
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
     ctx.set_metadata("openai_responses_format.stream", "true");
 
-    // The pipeline rejects `stream:true` before any 200 text/event-stream is
-    // committed, so the rejection must be the ordinary JSON error envelope with
-    // a non-2xx status — never a nonconforming SSE `error` event (issue #1001).
     let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
         panic!("streaming file_search should be rejected before any callout");
     };

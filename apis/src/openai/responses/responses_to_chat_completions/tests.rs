@@ -387,15 +387,14 @@ async fn unresolved_streaming_previous_response_id_fails_closed_with_json_error(
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
-    // Request-phase failure: no 200 text/event-stream is committed yet, so the
-    // rejection is the JSON error envelope even for a stream:true request (#1001).
     let FilterAction::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 500);
     assert_eq!(
         rejection.headers.iter().find(|(name, _)| name == "content-type"),
-        Some(&("content-type".to_owned(), "application/json".to_owned()))
+        Some(&("content-type".to_owned(), "application/json".to_owned())),
+        "an unresolved streaming request that fails before the stream is committed returns a JSON error envelope, not an SSE event (issue #1001)"
     );
     let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "server_error");
@@ -422,15 +421,14 @@ async fn streaming_responses_create_without_state_uses_json_error() {
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
-    // Same request-phase contract: a stream:true request that fails before the
-    // stream is committed returns the JSON error envelope, not an SSE event (#1001).
     let FilterAction::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 500);
     assert_eq!(
         rejection.headers.iter().find(|(name, _)| name == "content-type"),
-        Some(&("content-type".to_owned(), "application/json".to_owned()))
+        Some(&("content-type".to_owned(), "application/json".to_owned())),
+        "a streaming request that fails before the stream is committed returns a JSON error envelope, not an SSE event (issue #1001)"
     );
     let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "server_error");
@@ -778,12 +776,11 @@ async fn streaming_translation_error_uses_responses_json_error() {
 }
 
 fn assert_responses_json_translation_error(rejection: &praxis_filter::Rejection) {
-    // Request-phase translation failure: no stream is committed, so the body is
-    // the JSON error envelope, never an SSE event (#1001).
     assert_eq!(rejection.status, 400);
     assert_eq!(
         rejection.headers.iter().find(|(name, _)| name == "content-type"),
-        Some(&("content-type".to_owned(), "application/json".to_owned()))
+        Some(&("content-type".to_owned(), "application/json".to_owned())),
+        "a request-phase translation failure returns a JSON error envelope, not an SSE event (issue #1001)"
     );
     let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["type"], "invalid_request_error");

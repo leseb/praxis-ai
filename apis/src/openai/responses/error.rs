@@ -112,9 +112,6 @@ mod tests {
 
     #[test]
     fn sse_payload_matches_pinned_response_error_event_schema() {
-        // The pinned OpenAI `ResponseErrorEvent` places `type`, `code`,
-        // `message`, `param`, and `sequence_number` at the top level with no
-        // nested `error` object.
         let payload = responses_error_sse_payload("rate_limit_exceeded", "slow down");
 
         assert_eq!(payload["type"], "error", "event type is always \"error\"");
@@ -130,7 +127,6 @@ mod tests {
             "an SSE error event must not nest fields under an \"error\" object"
         );
 
-        // Exactly the five schema-defined keys, nothing more.
         let keys: std::collections::BTreeSet<&str> = payload.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
@@ -156,8 +152,6 @@ mod tests {
 
     #[test]
     fn rejection_uses_json_content_type_for_server_errors() {
-        // Even a 5xx pre-commitment rejection is a JSON envelope, never SSE:
-        // a Rejection short-circuits before any stream is committed.
         let r = responses_error_rejection(500, "server_error", "fail");
 
         assert_eq!(r.status, 500, "status should be preserved");
