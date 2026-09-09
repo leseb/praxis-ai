@@ -370,14 +370,6 @@ fn approval_rejection(error: &ApprovalError) -> Rejection {
     responses_error_rejection(400, "invalid_request_error", error.message())
 }
 
-/// Record the server-owned pending approval and emit the client-visible
-/// `mcp_approval_request` into the response body.
-///
-/// The record captures the resolved target fingerprint — the sole source of
-/// truth for a later `mcp_approval_response` — which is deliberately NOT echoed
-/// on the client-visible event so a client cannot reproduce it. The record is
-/// drained and persisted by the store filter so the resume turn can correlate
-/// the response back to this proxy-issued request.
 /// Append executed MCP tool results to response state and drop the
 /// now-satisfied MCP tool calls.
 fn apply_execution_results(state: &mut ResponsesState, results: Vec<McpCallResult>) {

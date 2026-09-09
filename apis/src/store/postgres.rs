@@ -1048,7 +1048,6 @@ async fn pg_rebuild_messages(
 // Row Conversion
 // -----------------------------------------------------------------------------
 
-/// Convert a sqlx row to a [`ResponseRecord`].
 /// Convert a sqlx row to a [`PendingApprovalRecord`].
 fn row_to_pending_approval_record(row: &PgRow) -> Result<PendingApprovalRecord, StoreError> {
     Ok(PendingApprovalRecord {
