@@ -1781,20 +1781,14 @@ fn mcp_tool_to_function_tool_preserves_nested_schema_verbatim() {
         "properties": {
             "shape": {"$ref": "#/$defs/shape"},
             "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "nested": {
-                "type": "object",
-                "properties": {"deep": {"type": "array", "items": {"type": "integer"}}},
-                "additionalProperties": false
-            }
+            "nested": {"type": "object", "additionalProperties": false,
+                       "properties": {"deep": {"type": "array", "items": {"type": "integer"}}}}
         },
         "required": ["shape"],
         "additionalProperties": false,
         "$defs": {
-            "shape": {
-                "type": "object",
-                "properties": {"kind": {"type": "string"}},
-                "required": ["kind"]
-            }
+            "shape": {"type": "object", "required": ["kind"],
+                      "properties": {"kind": {"type": "string"}}}
         }
     });
     let definition = serde_json::json!({
@@ -1821,11 +1815,8 @@ fn mcp_tool_to_function_tool_drops_output_schema() {
         "name": "structured_tool",
         "description": "Returns structured output",
         "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}},
-        "outputSchema": {
-            "type": "object",
-            "properties": {"answer": {"type": "string"}},
-            "required": ["answer"]
-        }
+        "outputSchema": {"type": "object", "required": ["answer"],
+                         "properties": {"answer": {"type": "string"}}}
     });
 
     let function_tool = mcp_tool_to_function_tool("srv", &definition);
@@ -1838,12 +1829,8 @@ fn mcp_tool_to_function_tool_drops_output_schema() {
         function_tool.get("output_schema").is_none(),
         "snake_case output_schema must also be absent"
     );
-    let mut keys: Vec<&str> = function_tool
-        .as_object()
-        .expect("function tool is an object")
-        .keys()
-        .map(String::as_str)
-        .collect();
+    let obj = function_tool.as_object().expect("function tool is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(
         keys,
@@ -1855,9 +1842,9 @@ fn mcp_tool_to_function_tool_drops_output_schema() {
 /// Fresh discovery and cached continuation must rewrite the same logical tool
 /// to the identical function tool.
 ///
-/// A fresh `tools/list` callout serializes schemas with the camelCase
+/// A fresh `tools/list` callout serializes schemas with the `camelCase`
 /// `inputSchema` spelling, while a cached `mcp_list_tools` listing carries the
-/// snake_case `input_schema` spelling. Both provenances funnel through
+/// `snake_case` `input_schema` spelling. Both provenances funnel through
 /// [`mcp_tool_to_function_tool`] in `build_entry_resolution`, so the same tool
 /// must produce byte-equivalent parameters regardless of which path resolved
 /// it — otherwise a cache hit could hand the model a different tool contract
@@ -1873,22 +1860,16 @@ fn mcp_tool_to_function_tool_fresh_and_cached_schemas_are_equivalent() {
         },
         "required": ["shape"],
         "additionalProperties": false,
-        "$defs": {
-            "shape": {"type": "object", "properties": {"kind": {"type": "string"}}}
-        }
+        "$defs": {"shape": {"type": "object", "properties": {"kind": {"type": "string"}}}}
     });
 
     // Fresh discovery: rmcp serializes `tools/list` with camelCase `inputSchema`.
     let fresh = serde_json::json!({
-        "name": "lookup",
-        "description": "Look something up",
-        "inputSchema": schema,
+        "name": "lookup", "description": "Look something up", "inputSchema": schema,
     });
     // Cached continuation: stored `mcp_list_tools` items carry snake_case.
     let cached = serde_json::json!({
-        "name": "lookup",
-        "description": "Look something up",
-        "input_schema": schema,
+        "name": "lookup", "description": "Look something up", "input_schema": schema,
     });
 
     let fresh_tool = mcp_tool_to_function_tool("srv", &fresh);
