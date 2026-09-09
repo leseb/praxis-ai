@@ -258,7 +258,7 @@ impl McpDispatchFilter {
             .and_then(|registry| registry.get(DEFAULT_STORE_NAME))
             .ok_or_else(|| {
                 warn!("mcp_dispatch: response store unavailable while resuming approvals");
-                responses_error_rejection(500, "server_error", "response store is not available", false)
+                responses_error_rejection(500, "server_error", "response store is not available")
             })?;
         let approval_ids: Vec<&str> = inputs.iter().map(|i| i.approval_id.as_str()).collect();
         let pending_records = store
@@ -266,7 +266,7 @@ impl McpDispatchFilter {
             .await
             .map_err(|e| {
                 warn!(error = %e, "mcp_dispatch: failed to load pending approvals");
-                responses_error_rejection(500, "server_error", "failed to load pending approvals", false)
+                responses_error_rejection(500, "server_error", "failed to load pending approvals")
             })?;
 
         // Phase 2: correlate each response to its pending record and bind it to a
@@ -352,7 +352,6 @@ async fn consume_batch(
                 400,
                 "invalid_request_error",
                 &format!("approval '{approval_id}' has already been used"),
-                false,
             ))
         },
         Err(e) => {
@@ -361,7 +360,6 @@ async fn consume_batch(
                 500,
                 "server_error",
                 "failed to record approval consumption",
-                false,
             ))
         },
     }
@@ -369,7 +367,7 @@ async fn consume_batch(
 
 /// Map an [`ApprovalError`] to a fail-closed `400 invalid_request_error`.
 fn approval_rejection(error: &ApprovalError) -> Rejection {
-    responses_error_rejection(400, "invalid_request_error", error.message(), false)
+    responses_error_rejection(400, "invalid_request_error", error.message())
 }
 
 /// Record the server-owned pending approval and emit the client-visible
@@ -478,7 +476,6 @@ fn approval_requires_store_rejection(tool_name: &str) -> Rejection {
             "MCP tool '{tool_name}' requires approval, but this request set store=false; approvals require \
              store=true so the mcp_approval_response follow-up can resume via previous_response_id"
         ),
-        false,
     )
 }
 
@@ -499,7 +496,6 @@ fn approval_store_unavailable_rejection(tool_name: &str) -> Rejection {
             "MCP tool '{tool_name}' requires approval, but no response store is configured to persist the \
              pending approval; a store is required so the mcp_approval_response follow-up can resume"
         ),
-        false,
     )
 }
 
