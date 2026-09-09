@@ -2368,7 +2368,6 @@ async fn does_not_rewrite_non_response_json_shape() {
         "on_response should continue and arm the restore for an eligible 2xx JSON response"
     );
 
-    // A 2xx JSON body that is not a Responses resource must be left alone.
     let original = r#"{"object":"list","data":[]}"#;
     let mut body = Some(Bytes::from(original));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -2394,12 +2393,10 @@ async fn ignores_non_end_of_stream_chunks() {
     ctx.extensions.insert(rehydrated_state("resp_prev"));
     ctx.response_header = Some(&mut response);
 
-    // Arm the restore so this exercises the end-of-stream guard, not the
-    // unarmed path.
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "on_response should continue and arm the restore before the body phase"
+        "on_response must arm the restore so the body phase exercises the end-of-stream guard, not the unarmed path"
     );
 
     let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
@@ -2535,7 +2532,6 @@ async fn declines_identity_content_encoding_conservatively() {
 async fn does_not_restore_when_content_type_missing() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    // No Content-Type header at all.
     let mut response = crate::test_utils::make_response();
 
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2710,7 +2706,6 @@ async fn declines_and_preserves_response_body_validators() {
         "repr-digest",
         http::HeaderValue::from_static("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
     );
-    // Unrelated metadata that must also survive the untouched passthrough.
     response
         .headers
         .insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
@@ -3082,7 +3077,6 @@ fn rewrite_lifecycle_frame_data_skips_delta_frame() {
 
 #[test]
 fn rewrite_lifecycle_frame_data_skips_non_response_shaped_object() {
-    // A nested `response` member whose object is not itself "response" is left alone.
     let data = br#"{"type":"x","response":{"object":"list"}}"#;
     assert!(
         rewrite_lifecycle_frame_data(data, "resp_prev").is_none(),
@@ -3168,9 +3162,6 @@ fn stream_chunk_flushes_buffered_prefix_on_overflow() {
 
 #[test]
 fn stream_chunk_flushes_unterminated_frame_at_end_of_stream() {
-    // An unterminated final frame (no blank line) must be flushed raw at
-    // end-of-stream, never withheld — the client must see every byte the backend
-    // sent.
     let mut armed = armed_stream(1 << 20, "resp_prev");
     let tail: &[u8] = b"event: response.completed\ndata: {\"response\":";
     let mut body = Some(Bytes::from_static(tail));
@@ -3260,8 +3251,6 @@ fn stream_chunk_resumes_scan_without_reprocessing_buffered_bytes() {
         "the resume cursor must sit at the buffer end, proving no rescan from zero"
     );
 
-    // Feed many filler chunks; each must advance the resume cursor to the new end and
-    // never re-scan the growing buffer from the front.
     for _ in 0..64 {
         let mut body = Some(Bytes::from_static(b"xxxxxxxxxxxxxxxx"));
         assert!(restore_previous_response_id_stream_chunk(&mut armed, &mut body, false));
