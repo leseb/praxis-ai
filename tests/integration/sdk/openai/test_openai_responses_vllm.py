@@ -331,6 +331,15 @@ class MCPHandler(BaseHTTPRequestHandler):
 
     authorization_headers: ClassVar[list[str | None]] = []
 
+    _tool_call_count = 0
+    _tool_call_count_lock = threading.Lock()
+
+    @classmethod
+    def tool_call_count(cls) -> int:
+        """Return the number of tool calls received by this test process."""
+        with cls._tool_call_count_lock:
+            return cls._tool_call_count
+
     def do_POST(self):
         type(self).authorization_headers.append(self.headers.get("Authorization"))
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -369,6 +378,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                 },
             )
         elif method == "tools/call":
+            with self._tool_call_count_lock:
+                type(self)._tool_call_count += 1
             city = req.get("params", {}).get("arguments", {}).get("city", "unknown")
             self._json_rpc(
                 rid, {"content": [{"type": "text", "text": f"72F and sunny in {city}"}]}
@@ -2041,6 +2052,75 @@ def _assert_multi_round_usage_and_trace(response, *, transport):
 
 class TestAgenticLoopVLLM:
     """Integration tests for the agentic loop against a vLLM backend."""
+
+    def test_mcp_approval_round_trip_executes_once(
+        self, agentic_client, agentic_proxy,
+    ):
+        """An SDK approval response resumes and executes the MCP call once."""
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "approval-gated MCP call should emit exactly one approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute before approval"
+        )
+
+        approval = approval_requests[0]
+        assert approval.name == "get_weather"
+        assert approval.server_label == "weather"
+
+        final_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval.id,
+                    "approve": True,
+                }
+            ],
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "approving the request must execute the MCP tool exactly once"
+        )
+        output_types = [item.type for item in final_response.output]
+        assert "mcp_call" in output_types, (
+            f"approved response should contain the MCP result; got: {output_types}"
+        )
+        assert "message" in output_types, (
+            f"approved response should resume to model output; got: {output_types}"
+        )
 
     def test_mcp_tool_auto_executes_and_returns(
         self,
