@@ -2025,8 +2025,11 @@ async fn restores_for_streaming_response() {
         );
     }
 
-    // The delta frame has no top-level response object and passes through untouched.
-    assert_eq!(frames[1].event_type.as_deref(), Some("response.output_text.delta"));
+    assert_eq!(
+        frames[1].event_type.as_deref(),
+        Some("response.output_text.delta"),
+        "the delta frame (no top-level response object) passes through untouched"
+    );
     let delta: Value = serde_json::from_slice(&frames[1].data).unwrap();
     assert!(
         delta.get("previous_response_id").is_none(),
@@ -2102,7 +2105,6 @@ async fn streaming_delta_frames_pass_through_unchanged() {
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "on_response should continue");
 
-    // Frames with no top-level response object reconstruct byte-for-byte.
     let input = concat!(
         "event: response.output_text.delta\n",
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n",
@@ -2165,7 +2167,6 @@ async fn streaming_preserves_id_retry_and_comment_lines() {
         "on_response_body should continue"
     );
 
-    // Only the lifecycle frame's `data:` line changes; every other byte is verbatim.
     let lifecycle_out = concat!(
         "id: 42\n",
         "event: response.created\n",
