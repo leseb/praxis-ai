@@ -801,10 +801,15 @@ fn is_local_tool_progress_event(event_type: &str) -> bool {
 
 /// Whether an accumulated output item was generated locally by a tool-dispatch
 /// filter rather than streamed by the model backend.
+///
+/// `mcp_list_tools` is a locally generated discovery listing: `openai_mcp_tool_resolve`
+/// resolves the MCP `tools/list` and seeds the item into `accumulated_output` before
+/// any inference round (issue #1022), so the model backend — which only ever sees the
+/// rewritten `type: "function"` tools — never streams it.
 fn is_local_tool_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("mcp_call" | "mcp_approval_request" | "web_search_call")
+        Some("mcp_call" | "mcp_approval_request" | "web_search_call" | "mcp_list_tools")
     )
 }
 
@@ -1181,8 +1186,12 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// `mcp_call` progresses `in_progress` then `completed`/`failed`;
 /// `web_search_call` progresses `in_progress`, `searching`, then `completed` only
 /// when it actually completed (web search has no conformant `failed` event, so
-/// other outcomes surface through `output_item.done` alone). `mcp_approval_request`
-/// has no dedicated progress events; it surfaces through
+/// other outcomes surface through `output_item.done` alone). `mcp_list_tools`
+/// progresses `in_progress` then `completed`: it is seeded only on successful
+/// discovery (issue #1022), so its lifecycle always completes; a discovery failure
+/// takes the separate `response.mcp_list_tools.failed` path in
+/// `openai_mcp_tool_resolve` (issue #320) and never reaches here.
+/// `mcp_approval_request` has no dedicated progress events; it surfaces through
 /// `output_item.added`/`output_item.done` alone.
 ///
 /// These are distinct API lifecycle events, not one combined milestone. Callers
@@ -1190,6 +1199,10 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// lifecycle still gets exactly its missing events synthesized.
 fn expected_phase_events(item: &Value) -> Vec<&'static str> {
     match item.get("type").and_then(Value::as_str) {
+        Some("mcp_list_tools") => vec![
+            "response.mcp_list_tools.in_progress",
+            "response.mcp_list_tools.completed",
+        ],
         Some("mcp_call") => {
             let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
                 "response.mcp_call.failed"

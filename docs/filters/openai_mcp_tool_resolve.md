@@ -11,6 +11,8 @@ Rejects the request with HTTP 400 before any callouts if two or more resolvable 
 
 For streaming requests, a runtime or response-processing failure from `tools/list` is returned as a successful SSE transport containing `response.mcp_list_tools.failed` and a terminal `response.failed` event. Local policy failures such as SSRF blocking remain HTTP error responses.
 
+On successful discovery, one `mcp_list_tools` output item per resolved server (in request order, including servers that resolve to zero tools) is surfaced to the client: buffered responses list it in `output`, and streaming responses synthesize its `output_item.added` → `mcp_list_tools.in_progress` → `mcp_list_tools.completed` → `output_item.done` lifecycle ahead of the model output. A previous-response cache hit surfaces the same item without re-calling `tools/list`, and internal retries reuse the item and its id rather than emitting a second discovery.
+
 ## Configuration
 
 | Field | Type | Required | Description |
