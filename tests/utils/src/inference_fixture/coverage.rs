@@ -1237,12 +1237,15 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
+                vec!["responses_native_passthrough"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
             ]
         );
@@ -1273,11 +1276,14 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 20);
-        assert_eq!(report.scenarios_total, 17);
-        assert_eq!(report.recordings_total, 22);
+        assert_eq!(report.features_total, 23);
+        assert_eq!(report.scenarios_total, 23);
+        assert_eq!(report.recordings_total, 28);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1292,15 +1298,21 @@ mod tests {
                 "messages/upstream-error",
                 "responses/agentic-parallel-tool-calls",
                 "responses/chat-basic-nonstream",
+                "responses/chat-basic-stream",
                 "responses/chat-file-search",
+                "responses/chat-malformed-compaction",
+                "responses/chat-tool-echo",
                 "responses/chat-web-search",
+                "responses/chat-web-search-stream",
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
+                "responses/native-continuation",
+                "responses/native-continuation-stream",
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 20);
+        assert_eq!(manifest.features.len(), 23);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1382,16 +1394,32 @@ mod tests {
                     &vec!["responses/native-tool-call".to_owned()]
                 ),
                 (
+                    &"responses.native.continuation".to_owned(),
+                    &vec![
+                        "responses/native-continuation".to_owned(),
+                        "responses/native-continuation-stream".to_owned(),
+                    ]
+                ),
+                (
                     &"responses.chat.request".to_owned(),
-                    &vec!["responses/chat-basic-nonstream".to_owned()]
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-basic-stream".to_owned(),
+                    ]
                 ),
                 (
                     &"responses.chat.response.text".to_owned(),
-                    &vec!["responses/chat-basic-nonstream".to_owned()]
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-basic-stream".to_owned(),
+                    ]
                 ),
                 (
                     &"responses.chat.web_search".to_owned(),
-                    &vec!["responses/chat-web-search".to_owned()]
+                    &vec![
+                        "responses/chat-web-search".to_owned(),
+                        "responses/chat-web-search-stream".to_owned()
+                    ]
                 ),
                 (
                     &"responses.chat.file_search".to_owned(),
@@ -1408,6 +1436,14 @@ mod tests {
                 (
                     &"responses.chat.continuation".to_owned(),
                     &vec!["responses/chat-basic-nonstream".to_owned()]
+                ),
+                (
+                    &"responses.chat.malformed_compaction".to_owned(),
+                    &vec!["responses/chat-malformed-compaction".to_owned()]
+                ),
+                (
+                    &"responses.chat.tools.function_echo".to_owned(),
+                    &vec!["responses/chat-tool-echo".to_owned()]
                 ),
             ]
         );
@@ -1803,6 +1839,221 @@ mod tests {
         assert!(
             continuation.expect.upstream_sse_events.is_empty(),
             "non-streaming continuation turn must have no upstream SSE events"
+        );
+
+        let native_continuation =
+            InferenceScenario::load(&root.join("scenarios/responses/native-continuation.yaml")).unwrap();
+        assert_eq!(native_continuation.version, 1);
+        assert_eq!(native_continuation.id, "responses/native-continuation");
+        assert_eq!(
+            native_continuation.description,
+            "Native OpenAI Responses continuation. The stored first turn is rehydrated into the outbound history and previous_response_id is stripped from the upstream request, while the caller's previous_response_id is restored into the client response (issue #932)."
+        );
+        assert_eq!(native_continuation.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            native_continuation.example_config,
+            "openai/responses/rehydrate-fixture.yaml"
+        );
+        assert_eq!(native_continuation.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(native_continuation.features, ["responses.native.continuation"]);
+        assert_eq!(native_continuation.turns.len(), 2);
+
+        let initial = &native_continuation.turns[0];
+        assert_eq!(initial.name, "initial");
+        assert_eq!(initial.request.method, "POST");
+        assert_eq!(initial.request.path, "/v1/responses");
+        assert_eq!(initial.expect.client_status, 200);
+        assert_eq!(initial.expect.client_body_kind, BodyKind::Json);
+        assert_eq!(initial.expect.upstream_path, "/v1/responses");
+        assert_eq!(initial.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &initial.request.body else {
+            panic!("native continuation initial request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(value["input"], "What is 2+2? Reply with just the number.");
+        assert_eq!(value["store"], true);
+        assert_eq!(value["stream"], false);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert!(initial.expect.client_sse_events.is_empty());
+        assert!(initial.expect.upstream_sse_events.is_empty());
+
+        let native_turn = &native_continuation.turns[1];
+        assert_eq!(native_turn.name, "continuation");
+        assert_eq!(native_turn.request.path, "/v1/responses");
+        assert_eq!(native_turn.expect.client_status, 200);
+        assert_eq!(native_turn.expect.client_body_kind, BodyKind::Json);
+        assert_eq!(native_turn.expect.upstream_path, "/v1/responses");
+        assert_eq!(native_turn.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &native_turn.request.body else {
+            panic!("native continuation request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(
+            value["input"],
+            "What was the previous answer? Reply with just the number."
+        );
+        assert_eq!(value["previous_response_id"], "${PREVIOUS_RESPONSE_ID}");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], false);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
+        assert!(native_turn.expect.client_sse_events.is_empty());
+        assert!(native_turn.expect.upstream_sse_events.is_empty());
+
+        let native_continuation_stream =
+            InferenceScenario::load(&root.join("scenarios/responses/native-continuation-stream.yaml")).unwrap();
+        assert_eq!(native_continuation_stream.version, 1);
+        assert_eq!(native_continuation_stream.id, "responses/native-continuation-stream");
+        assert_eq!(native_continuation_stream.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            native_continuation_stream.example_config,
+            "openai/responses/rehydrate-fixture.yaml"
+        );
+        assert_eq!(native_continuation_stream.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(native_continuation_stream.features, ["responses.native.continuation"]);
+        assert_eq!(native_continuation_stream.turns.len(), 2);
+
+        let stream_initial = &native_continuation_stream.turns[0];
+        assert_eq!(stream_initial.name, "initial");
+        assert_eq!(stream_initial.expect.client_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &stream_initial.request.body else {
+            panic!("streaming native continuation initial request body must be JSON");
+        };
+        assert_eq!(value["stream"], false);
+
+        // The continuation turn streams: the client receives SSE while the upstream
+        // request stays JSON, and previous_response_id is restored inside the
+        // lifecycle frames (issue #932 streaming follow-up).
+        let stream_turn = &native_continuation_stream.turns[1];
+        assert_eq!(stream_turn.name, "continuation");
+        assert_eq!(stream_turn.request.path, "/v1/responses");
+        assert_eq!(stream_turn.expect.client_status, 200);
+        assert_eq!(stream_turn.expect.client_body_kind, BodyKind::Sse);
+        assert_eq!(stream_turn.expect.upstream_path, "/v1/responses");
+        assert_eq!(stream_turn.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &stream_turn.request.body else {
+            panic!("streaming native continuation request body must be JSON");
+        };
+        assert_eq!(value["previous_response_id"], "${PREVIOUS_RESPONSE_ID}");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
+        assert_eq!(
+            stream_turn
+                .expect
+                .client_sse_events
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let responses_chat_stream =
+            InferenceScenario::load(&root.join("scenarios/responses/chat-basic-stream.yaml")).unwrap();
+        assert_eq!(responses_chat_stream.version, 1);
+        assert_eq!(responses_chat_stream.id, "responses/chat-basic-stream");
+        assert_eq!(
+            responses_chat_stream.description,
+            "Streaming OpenAI Responses request translated to Chat Completions SSE."
+        );
+        assert_eq!(responses_chat_stream.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            responses_chat_stream.example_config,
+            "openai/responses/responses-to-chat-completions.yaml"
+        );
+        assert_eq!(responses_chat_stream.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(
+            responses_chat_stream.features,
+            ["responses.chat.request", "responses.chat.response.text"]
+        );
+        assert_eq!(responses_chat_stream.turns.len(), 1);
+        let turn = &responses_chat_stream.turns[0];
+        assert_eq!(turn.name, "initial");
+        assert_eq!(turn.request.method, "POST");
+        assert_eq!(turn.request.path, "/v1/responses");
+        assert_eq!(turn.expect.client_status, 200);
+        assert_eq!(turn.expect.client_body_kind, BodyKind::Sse);
+        assert_eq!(turn.expect.upstream_path, "/v1/chat/completions");
+        assert_eq!(turn.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &turn.request.body else {
+            panic!("translated streaming Responses request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(value["input"], "Say hello in one sentence.");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert_eq!(
+            turn.expect.client_sse_events,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(turn.expect.client_sse_repeatable_events, ["response.output_text.delta"]);
+        assert!(
+            turn.expect.upstream_sse_events.is_empty(),
+            "Chat Completions upstream chunks are data-only frames"
+        );
+
+        let malformed_compaction =
+            InferenceScenario::load(&root.join("scenarios/responses/chat-malformed-compaction.yaml")).unwrap();
+        assert_eq!(malformed_compaction.version, 1);
+        assert_eq!(malformed_compaction.id, "responses/chat-malformed-compaction");
+        assert_eq!(
+            malformed_compaction.description,
+            "Malformed Responses compaction encrypted_content fails closed before Chat Completions translation."
+        );
+        assert_eq!(malformed_compaction.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            malformed_compaction.example_config,
+            "openai/responses/responses-to-chat-completions.yaml"
+        );
+        assert_eq!(malformed_compaction.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(malformed_compaction.features, ["responses.chat.malformed_compaction"]);
+        assert_eq!(malformed_compaction.turns.len(), 1);
+        let turn = &malformed_compaction.turns[0];
+        assert_eq!(turn.name, "initial");
+        assert_eq!(turn.request.method, "POST");
+        assert_eq!(turn.request.path, "/v1/responses");
+        assert_eq!(turn.expect.client_status, 400);
+        assert_eq!(turn.expect.client_body_kind, BodyKind::Json);
+        assert_eq!(turn.expect.upstream_path, "");
+        assert_eq!(turn.expect.upstream_body_kind, BodyKind::Empty);
+        let RecordedBody::Json { value } = &turn.request.body else {
+            panic!("malformed compaction request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(value["input"][0]["type"], "compaction");
+        assert_eq!(value["input"][0]["id"], "compact_1");
+        assert_eq!(value["input"][0]["encrypted_content"], "%%%not-base64%%%");
+        assert_eq!(value["input"][1]["role"], "user");
+        assert_eq!(value["input"][1]["content"], "What did we decide?");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], false);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert!(
+            turn.expect.client_sse_events.is_empty(),
+            "finite compaction rejection must have no client SSE events"
+        );
+        assert!(
+            turn.expect.upstream_sse_events.is_empty(),
+            "finite compaction rejection must have no upstream SSE events"
         );
     }
 

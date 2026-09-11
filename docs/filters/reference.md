@@ -17,10 +17,16 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`anthropic_messages_format`](anthropic_messages_format.md) | Classifies Anthropic Messages API requests and promotes routing facts to headers, metadata, and filter results. |
 | [`anthropic_messages_protocol`](anthropic_messages_protocol.md) | Normalizes Anthropic Messages protocol headers for native backends. |
-| [`anthropic_stream_events`](anthropic_stream_events.md) | Transforms streaming SSE responses between `OpenAI` and Anthropic formats, processing each chunk as it arrives. |
-| [`anthropic_to_openai`](anthropic_to_openai.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The filter name refers to the OpenAI Chat Completions wire shape, not the Responses API; non-OpenAI compatible backends are valid targets. |
+| [`anthropic_messages_to_chat_completions`](anthropic_messages_to_chat_completions.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The name refers to the Chat Completions wire shape, not the OpenAI Responses API; any Chat Completions-compatible backend is a valid target, not only OpenAI. |
+| [`anthropic_messages_to_chat_completions_stream`](anthropic_messages_to_chat_completions_stream.md) | Transforms streaming SSE responses between the Chat Completions and Anthropic Messages formats, processing each chunk as it arrives. |
 | [`anthropic_validate`](anthropic_validate.md) | Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements. |
 | [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
+
+### Azure
+
+| Filter | Description |
+|--------|-------------|
+| [`openai_chat_completions_to_azureai_chat_completions`](openai_chat_completions_to_azureai_chat_completions.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
 
 ### OpenAI
 
@@ -40,7 +46,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
 | [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
-| [`openai_stream_events`](openai_stream_events.md) | Accumulates state from native Responses API SSE event streams. |
+| [`openai_stream_events`](openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
 | [`openai_tool_parse`](openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
 | [`openai_web_search`](openai_web_search.md) | Web search filter for model-driven `web_search_call` dispatch. |
 | [`responses_to_chat_completions`](responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
@@ -89,6 +95,12 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
+
+### Metering
+
+| Filter | Description |
+|--------|-------------|
+| [`external_metering`](external_metering.md) | Integrates with an external metering service for pre-request balance checks and post-response token usage reporting. |
 
 ### Prompt Enrich
 

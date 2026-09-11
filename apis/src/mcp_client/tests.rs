@@ -81,10 +81,13 @@ fn hop_by_hop_headers_stripped_from_mcp_headers() {
         "content-length": "999",
         "transfer-encoding": "chunked",
         "connection": "keep-alive",
+        "keep-alive": "timeout=5",
+        "proxy-connection": "keep-alive",
         "te": "trailers",
         "trailer": "Foo",
         "upgrade": "websocket",
         "proxy-authorization": "Basic creds",
+        "proxy-authenticate": "Basic realm=\"mcp\"",
         "x-custom": "safe"
     });
     let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
@@ -95,6 +98,92 @@ fn hop_by_hop_headers_stripped_from_mcp_headers() {
             .custom_headers
             .contains_key(&http::HeaderName::from_static("x-custom")),
         "x-custom should pass through"
+    );
+}
+
+#[test]
+fn keep_alive_and_proxy_connection_headers_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "keep-alive": "timeout=5",
+        "proxy-connection": "keep-alive",
+        "connection": "keep-alive",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom should pass through"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("keep-alive")),
+        "keep-alive must not reach outbound MCP transport"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("proxy-connection")),
+        "proxy-connection must not reach outbound MCP transport"
+    );
+    assert!(
+        !config.custom_headers.contains_key(&http::header::CONNECTION),
+        "connection must stay blocked"
+    );
+}
+
+#[test]
+fn connection_nominated_headers_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "connection": "x-smuggle, Keep-Alive",
+        "x-smuggle": "secret",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom is not listed in Connection and should pass through"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-smuggle")),
+        "fields named by Connection must not reach outbound MCP transport"
+    );
+    assert!(
+        !config.custom_headers.contains_key(&http::header::CONNECTION),
+        "connection itself must stay blocked"
+    );
+}
+
+#[test]
+fn proxy_authenticate_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "proxy-authenticate": "Basic realm=\"mcp\"",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom should pass through"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("proxy-authenticate")),
+        "proxy-authenticate is hop-by-hop and must not reach outbound MCP transport"
     );
 }
 
@@ -746,6 +835,7 @@ async fn start_test_mcp_server() -> (String, tokio_util::sync::CancellationToken
 }
 
 const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
 
 #[tokio::test]
 async fn list_tools_returns_all_tools() {
@@ -840,6 +930,7 @@ async fn call_tool_echo() {
         "echo",
         serde_json::json!({"message": "hello world"}),
         INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
         true,
     )
     .await
@@ -865,6 +956,7 @@ async fn call_tool_add_with_arguments() {
         "add",
         serde_json::json!({"a": 17, "b": 25}),
         INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
         true,
     )
     .await
@@ -890,6 +982,7 @@ async fn call_tool_add_with_string_arguments() {
         "add",
         serde_json::Value::String(r#"{"a": 3, "b": 7}"#.to_owned()),
         INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
         true,
     )
     .await
@@ -915,6 +1008,7 @@ async fn call_tool_error_returns_is_error() {
         "fail",
         serde_json::json!({"message": "something broke"}),
         INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
         true,
     )
     .await
@@ -944,6 +1038,7 @@ async fn call_tool_nonexistent_tool() {
         "nonexistent_tool",
         serde_json::json!({}),
         INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
         true,
     )
     .await;
@@ -963,6 +1058,7 @@ async fn call_tool_timeout() {
         "slow",
         serde_json::json!({"sleep_ms": 5000}),
         short_timeout,
+        TEST_MAX_RESULT_BYTES,
         true,
     )
     .await;

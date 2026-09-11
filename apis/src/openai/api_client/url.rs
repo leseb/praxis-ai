@@ -138,20 +138,7 @@ fn is_blocked_forward_header(name: &str) -> bool {
         || name.starts_with("x-ext-agent-")
         || name.starts_with("x-mcp-")
         || name.starts_with("x-a2a-")
-        || matches!(
-            name,
-            "connection"
-                | "content-length"
-                | "host"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "proxy-connection"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-        )
+        || crate::promotion::is_transport_controlled_header_lowercase(name)
 }
 
 // -----------------------------------------------------------------------------
@@ -411,7 +398,11 @@ mod tests {
             "host",
             "content-length",
             "transfer-encoding",
+            "keep-alive",
+            "proxy-authenticate",
             "proxy-authorization",
+            "proxy-connection",
+            "te",
             "x-praxis-route",
         ] {
             let mut headers = vec![name.to_owned()];

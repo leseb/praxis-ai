@@ -7,6 +7,7 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod bounded_http;
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -22,7 +23,7 @@
 mod tests;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -33,6 +34,8 @@ use rmcp::{
     model::{CallToolRequestParams, PaginatedRequestParams},
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
+
+use self::bounded_http::BoundedMcpHttpClient;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -276,15 +279,18 @@ pub(crate) async fn call_tool(
     tool_name: &str,
     arguments: serde_json::Value,
     timeout: Duration,
+    max_result_bytes: usize,
     allow_loopback: bool,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let display_url = parse_display_url(server_url);
 
     let work = async {
         let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+        let bounded_client = BoundedMcpHttpClient::new(build_pinned_client(&resolved)?, max_result_bytes);
+        let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
-            build_pinned_client(&resolved)?,
-            build_transport_config(server_url, headers, authorization)?,
+            bounded_client,
+            build_transport_config(server_url, headers, authorization)?.max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
 
@@ -378,10 +384,12 @@ fn build_transport_config(
     let mut header_map = HashMap::new();
 
     if let Some(headers_obj) = headers.and_then(serde_json::Value::as_object) {
+        let nominated = connection_nominated_from_json(headers_obj);
         for (key, value) in headers_obj {
             if let Some(value_str) = value.as_str()
                 && let Ok(name) = key.parse::<http::HeaderName>()
                 && !is_blocked_mcp_header(&name)
+                && !nominated.contains(&name)
                 && let Ok(val) = http::HeaderValue::from_str(value_str)
             {
                 header_map.insert(name, val);
@@ -558,23 +566,44 @@ fn build_pinned_client(resolved: &ResolvedMcpUrl) -> Result<reqwest::Client, Mcp
     })
 }
 
+/// Field names listed by any `Connection` value in MCP tool-config headers.
+fn connection_nominated_from_json(
+    headers_obj: &serde_json::Map<String, serde_json::Value>,
+) -> HashSet<http::HeaderName> {
+    let mut nominated = HashSet::new();
+    for (key, value) in headers_obj {
+        let Ok(name) = key.parse::<http::HeaderName>() else {
+            continue;
+        };
+        if name != http::header::CONNECTION {
+            continue;
+        }
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        for token in crate::http_hop::connection_tokens(value) {
+            if let Ok(nominated_name) = token.parse::<http::HeaderName>() {
+                nominated.insert(nominated_name);
+            }
+        }
+    }
+    nominated
+}
+
 /// Headers that must not pass through from client-supplied MCP
 /// tool config into the proxy's outbound MCP transport.
 fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
+    if crate::http_hop::is_hop_by_hop(name.as_str()) {
+        return true;
+    }
     if matches!(
         *name,
         http::header::AUTHORIZATION
-            | http::header::CONNECTION
             | http::header::CONTENT_LENGTH
             | http::header::COOKIE
             | http::header::FORWARDED
             | http::header::HOST
-            | http::header::PROXY_AUTHORIZATION
             | http::header::SET_COOKIE
-            | http::header::TE
-            | http::header::TRAILER
-            | http::header::TRANSFER_ENCODING
-            | http::header::UPGRADE
     ) {
         return true;
     }

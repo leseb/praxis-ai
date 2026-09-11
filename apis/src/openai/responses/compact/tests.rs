@@ -407,8 +407,140 @@ fn replace_messages_preserves_current_input() {
     assert_eq!(state.messages[0]["type"], "compaction");
     assert_eq!(state.messages[0]["id"], "compact_test");
     assert!(state.messages[0].get("encrypted_content").is_some());
+    assert_eq!(
+        state.messages[1]["content"], "What's next?",
+        "current-turn tail from messages must be kept"
+    );
     assert_eq!(state.persisted_messages.len(), 2);
     assert_eq!(state.persisted_messages[0]["type"], "compaction");
+    assert_eq!(
+        state.persisted_messages[1]["content"], "What's next?",
+        "current-turn tail from persisted_messages must be kept"
+    );
+}
+
+#[test]
+fn replace_messages_keeps_each_list_current_turn_independently() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{"type": "message", "role": "user", "content": "from-input"}]
+    }));
+    state.messages = vec![
+        json!({"role": "user", "content": "hist-a"}),
+        json!({"role": "user", "content": "from-messages"}),
+    ];
+    state.persisted_messages = vec![
+        json!({"role": "user", "content": "hist-b1"}),
+        json!({"role": "user", "content": "hist-b2"}),
+        json!({"role": "user", "content": "from-persisted"}),
+    ];
+
+    replace_messages(&mut state, build_compaction_item("c1", "sum"));
+
+    assert_eq!(state.messages.len(), 2);
+    assert_eq!(state.messages[1]["content"], "from-messages");
+    assert_eq!(state.persisted_messages.len(), 2);
+    assert_eq!(state.persisted_messages[1]["content"], "from-persisted");
+    assert_eq!(
+        state.input[0]["content"], "from-input",
+        "state.input must not be used to rebuild the current turn"
+    );
+}
+
+#[test]
+fn compaction_preserves_resolved_file_data_instead_of_file_url() {
+    const FILE_URL: &str = "https://files.internal/secret.bin";
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "previous_response_id": "resp_prev",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}],
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_url": FILE_URL}]
+        }]
+    }));
+    state.history_rehydrated = true;
+    let history = json!({"role": "user", "content": "earlier turn long enough to compact"});
+    state.messages.insert(0, history.clone());
+    state.persisted_messages.insert(0, history);
+
+    let resolved_item = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
+    });
+    state.request_body["input"] = json!([resolved_item.clone()]);
+    let tail = state.messages.len() - state.input.len();
+    state.messages[tail] = resolved_item.clone();
+    state.persisted_messages[tail] = resolved_item;
+
+    assert_eq!(
+        state.input[0]["content"][0]["file_url"], FILE_URL,
+        "state.input stays the original client payload"
+    );
+
+    replace_messages(&mut state, build_compaction_item("compact_1", "summary"));
+
+    assert_eq!(state.messages[0]["type"], "compaction");
+    let current = &state.messages[1];
+    assert_eq!(
+        current["content"][0]["file_data"], "SGVsbG8=",
+        "resolved file_data must survive compaction"
+    );
+    assert!(
+        current["content"][0].get("file_url").is_none(),
+        "original file_url must not be restored from state.input"
+    );
+    assert_eq!(
+        state.persisted_messages[1]["content"][0]["file_data"], "SGVsbG8=",
+        "persisted current-turn tail must keep resolved file_data"
+    );
+    assert_eq!(
+        state.input[0]["content"][0]["file_url"], FILE_URL,
+        "state.input remains the unmodified client payload"
+    );
+}
+
+#[test]
+fn compaction_preserves_extracted_input_text_instead_of_input_file() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "previous_response_id": "resp_prev",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}],
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "filename": "notes.txt", "file_data": "c2VjcmV0"}]
+        }]
+    }));
+    state.history_rehydrated = true;
+    let history = json!({"role": "user", "content": "earlier turn"});
+    state.messages.insert(0, history.clone());
+    state.persisted_messages.insert(0, history);
+
+    let extracted_item = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "secret"}]
+    });
+    state.request_body["input"] = json!([extracted_item.clone()]);
+    let tail = state.messages.len() - state.input.len();
+    state.messages[tail] = extracted_item.clone();
+    state.persisted_messages[tail] = extracted_item;
+
+    replace_messages(&mut state, build_compaction_item("compact_1", "summary"));
+
+    let current = &state.messages[1];
+    assert_eq!(
+        current["content"][0]["type"], "input_text",
+        "doc_extract rewrite must survive compaction"
+    );
+    assert_eq!(current["content"][0]["text"], "secret");
+    assert_eq!(
+        state.input[0]["content"][0]["type"], "input_file",
+        "state.input stays the original input_file part"
+    );
 }
 
 // =============================================================================
@@ -515,7 +647,7 @@ fn make_filter(on_failure: &str) -> CompactFilter {
 #[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");
-    let result = filter.on_callout_error("something went wrong", false);
+    let result = filter.on_callout_error("something went wrong");
     assert!(result.is_ok());
     assert!(result.unwrap().is_none(), "open mode should skip compaction");
 }
@@ -523,7 +655,7 @@ fn callout_error_open_mode_skips_compaction() {
 #[test]
 fn callout_error_closed_mode_rejects_request() {
     let filter = make_filter("closed");
-    let result = filter.on_callout_error("something went wrong", false);
+    let result = filter.on_callout_error("something went wrong");
     assert!(result.is_err(), "closed mode should reject the request");
 }
 
@@ -533,7 +665,7 @@ fn parse_failure_open_mode_skips_compaction() {
     let bad_body = b"not valid json";
     let result = parse_summarization_response(bad_body)
         .map(Some)
-        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response"));
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
 }
@@ -544,7 +676,7 @@ fn parse_failure_closed_mode_rejects_request() {
     let bad_body = b"not valid json";
     let result = parse_summarization_response(bad_body)
         .map(Some)
-        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response"));
     assert!(result.is_err());
 }
 
@@ -560,7 +692,7 @@ fn non_2xx_response_open_mode_skips_compaction() {
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"service unavailable"),
     };
-    let result = filter.handle_subrequest_result(Ok(resp), false);
+    let result = filter.handle_subrequest_result(Ok(resp));
     assert!(result.is_ok());
     assert!(result.unwrap().is_none(), "open mode should skip compaction on non-2xx");
 }
@@ -573,7 +705,7 @@ fn non_2xx_response_closed_mode_rejects_request() {
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"rate limited"),
     };
-    let result = filter.handle_subrequest_result(Ok(resp), false);
+    let result = filter.handle_subrequest_result(Ok(resp));
     assert!(result.is_err(), "closed mode should reject on non-2xx");
 }
 

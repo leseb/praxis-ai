@@ -8,7 +8,9 @@
 //! this filter summarizes the conversation history via a sub-request
 //! to an inference backend, replacing it with a single compaction
 //! item. Runs after `rehydrate` (which populates messages and
-//! previous usage) and after `openai_tool_parse`.
+//! previous usage) and after `openai_tool_parse`. Place
+//! `openai_file_resolve` and `openai_doc_extract` before compact so
+//! rewritten current-turn content is what compaction preserves.
 //!
 //! # Scope
 //!
@@ -33,6 +35,7 @@ pub(super) mod config;
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "tests"
 )]
 mod tests;
@@ -180,7 +183,6 @@ impl CompactFilter {
         &self,
         state: &ResponsesState,
         params: &CompactionParams,
-        streaming: bool,
         conversation_text: &str,
     ) -> Result<Option<String>, FilterAction> {
         let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
@@ -196,42 +198,40 @@ impl CompactFilter {
             self.config.address_policy,
         )
         .await;
-        self.handle_subrequest_result(result, streaming)
+        self.handle_subrequest_result(result)
     }
 
     /// Map a subrequest result to a summary string or a filter action.
     fn handle_subrequest_result(
         &self,
         result: Result<subrequest::SubResponse, subrequest::SubRequestError>,
-        streaming: bool,
     ) -> Result<Option<String>, FilterAction> {
         match result {
             Ok(resp) if (200..300).contains(&(resp.status as usize)) => {
                 parse_summarization_response(&resp.body).map(Some).or_else(|e| {
                     warn!(error = %e, "failed to parse summarization response");
-                    self.on_callout_error("failed to parse summarization response", streaming)
+                    self.on_callout_error("failed to parse summarization response")
                 })
             },
             Ok(resp) => {
                 warn!(status = resp.status, "summarization callout returned non-2xx");
-                self.on_callout_error("summarization callout rejected", streaming)
+                self.on_callout_error("summarization callout rejected")
             },
             Err(e) => {
                 warn!(error = %e, "summarization callout failed");
-                self.on_callout_error("summarization callout failed", streaming)
+                self.on_callout_error("summarization callout failed")
             },
         }
     }
 
     /// Apply the configured open/closed policy on a callout error.
-    fn on_callout_error(&self, message: &str, streaming: bool) -> Result<Option<String>, FilterAction> {
+    fn on_callout_error(&self, message: &str) -> Result<Option<String>, FilterAction> {
         match self.config.callout.on_failure {
             OnFailure::Open => Ok(None),
             OnFailure::Closed => Err(FilterAction::Reject(responses_error_rejection(
                 self.config.callout.status_on_error,
                 "server_error",
                 message,
-                streaming,
             ))),
         }
     }
@@ -273,7 +273,6 @@ impl HttpFilter for CompactFilter {
         if !is_responses_request(ctx) {
             return Ok(FilterAction::Release);
         }
-        let streaming = is_streaming(ctx);
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Release);
         };
@@ -281,14 +280,14 @@ impl HttpFilter for CompactFilter {
             Ok(Some(pair)) => pair,
             Ok(None) => return Ok(FilterAction::Release),
             Err(msg) => {
-                let rej = responses_error_rejection(400, "invalid_request_error", &msg, streaming);
+                let rej = responses_error_rejection(400, "invalid_request_error", &msg);
                 return Ok(FilterAction::Reject(rej));
             },
         };
         if !state.history_rehydrated {
             return Ok(FilterAction::Release);
         }
-        let compaction = self.execute_compaction(state, &params, streaming, &conversation_text);
+        let compaction = self.execute_compaction(state, &params, &conversation_text);
         let summary = match compaction.await {
             Ok(Some(s)) => s,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
@@ -377,12 +376,6 @@ fn build_context_overhead_text(state: &ResponsesState) -> String {
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
-}
-
-/// Check whether the client requested streaming.
-fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream")
-        .is_some_and(|v| v == "true")
 }
 
 /// Parse the `context_management` JSON to find a compaction config.
@@ -549,18 +542,32 @@ fn build_compaction_item(id: &str, summary: &str) -> Value {
 /// Replace conversation history with the compaction item.
 ///
 /// After replacement:
-/// - `state.messages` = `[compaction_item, ...state.input]`
-/// - `state.persisted_messages` = `[compaction_item, ...state.input]`
+/// - `state.messages` = `[compaction_item, ...current_turn]`
+/// - `state.persisted_messages` = `[compaction_item, ...current_turn]`
 ///
 /// The compaction item is `{"type": "compaction", "encrypted_content": "<base64>"}`.
-/// `state.input` holds the current request's input items (unchanged
-/// by rehydrate), so the current turn's messages are preserved.
+/// The current turn is the tail of each message list whose length
+/// matches `state.input`. File resolution and document extraction
+/// rewrite that tail in place and leave `state.input` as the original
+/// client payload, so compaction must not rebuild from `state.input`.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
-    let mut new_messages = Vec::with_capacity(state.input.len() + 1);
-    new_messages.push(compaction_item);
-    new_messages.extend(state.input.iter().cloned());
-    state.persisted_messages = new_messages.clone();
-    state.messages = new_messages;
+    let input_len = state.input.len();
+    let message_tail = split_current_turn(&mut state.messages, input_len);
+    let persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+
+    state.messages.clear();
+    state.messages.push(compaction_item.clone());
+    state.messages.extend(message_tail);
+
+    state.persisted_messages.clear();
+    state.persisted_messages.push(compaction_item);
+    state.persisted_messages.extend(persisted_tail);
+}
+
+/// Move the current-turn tail off `items`, leaving history behind to drop.
+fn split_current_turn(items: &mut Vec<Value>, input_len: usize) -> Vec<Value> {
+    let start = items.len().saturating_sub(input_len);
+    items.split_off(start)
 }
 
 /// Format a message array as readable text for the summarization prompt.
