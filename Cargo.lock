@@ -3188,6 +3188,7 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-test-utils",
+ "rand 0.10.2",
  "rustls-pemfile",
  "serde",
  "serde_json",

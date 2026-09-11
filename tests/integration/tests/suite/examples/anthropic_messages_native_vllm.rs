@@ -42,8 +42,21 @@ const CONFIG: &str = "anthropic/messages-native-vllm.yaml";
 
 /// The gateway `basic_auth` username the example config configures.
 const GATEWAY_USER: &str = "gateway";
+
 /// The gateway password these tests inject in place of `GATEWAY_AUTH_PASSWORD`.
-const GATEWAY_PASSWORD: &str = "example-gateway-password";
+///
+/// Drawn once per test process from the OS RNG rather than a source literal, so
+/// it is a throwaway secret scoped to this run; the config and the caller read
+/// the same value so they agree within a run.
+fn gateway_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| {
+        rand::random::<[u8; 16]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    })
+}
 
 /// Build the native-vLLM config with ports patched, `VLLM_API_KEY` repointed to
 /// a Cargo-provided variable, and the gateway password inlined so pipeline build
@@ -61,14 +74,14 @@ fn native_vllm_config(proxy_port: u16, backend_port: u16) -> Config {
     let patched = patched.replace("env_var: VLLM_API_KEY", "env_var: CARGO_PKG_NAME");
     let patched = patched.replace(
         "env_var: GATEWAY_AUTH_PASSWORD",
-        &format!("password: {GATEWAY_PASSWORD}"),
+        &format!("password: {}", gateway_password()),
     );
     Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse {CONFIG}: {e}"))
 }
 
 /// The `Authorization` header line a trusted caller presents to the gateway.
 fn gateway_auth_line() -> String {
-    format!("Authorization: {}", basic_auth_header(GATEWAY_USER, GATEWAY_PASSWORD))
+    format!("Authorization: {}", basic_auth_header(GATEWAY_USER, gateway_password()))
 }
 
 // -----------------------------------------------------------------------------
@@ -257,7 +270,7 @@ fn native_vllm_strips_client_credentials_and_injects_backend_bearer() {
     // The client presents two distinct credentials: the native Anthropic
     // `x-api-key` and the gateway `Authorization: Basic ...`. Neither may reach
     // the backend; only the injected server-owned Bearer token may.
-    let gateway = basic_auth_header(GATEWAY_USER, GATEWAY_PASSWORD);
+    let gateway = basic_auth_header(GATEWAY_USER, gateway_password());
     let gateway_secret = gateway.trim_start_matches("Basic ").to_owned();
     let body = r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#;
     let raw = http_send(
