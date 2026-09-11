@@ -1101,6 +1101,107 @@ async fn logical_stream_synthesizes_mcp_list_tools_discovery_lifecycle_at_iterat
 }
 
 #[tokio::test]
+async fn logical_stream_forwards_backend_native_mcp_list_tools_lifecycle() {
+    // #1022 regression: a *deferred* MCP entry (`defer_loading: true`, or one lacking a
+    // `server_url`) is passed through unresolved by `openai_mcp_tool_resolve`, so the
+    // model backend performs `tools/list` itself and natively streams the discovery
+    // lifecycle for an `mcp_list_tools` item that was NEVER seeded locally (its id is
+    // absent from `locally_executed_output_items`). The logical stream must forward the
+    // backend's real lifecycle untouched — its terminal `response.output_item.done` in
+    // particular must not be suppressed as premature — and must not synthesize a
+    // duplicate lifecycle. Before recognizing `response.mcp_list_tools.*` as an in-band
+    // progress event, the completed phase went unrecorded, so `is_premature_local_tool_done`
+    // dropped the native `done` and left the client with an unterminated output item.
+    let filter = make_logical_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+
+    // Deferred passthrough: the backend resolves the listing, so nothing is seeded
+    // locally — accumulated_output is empty and no id is recorded as locally executed.
+    {
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert!(state.accumulated_output.is_empty(), "no locally seeded listing");
+        assert!(
+            state.locally_executed_output_items.is_empty(),
+            "the native listing id is not recorded as locally executed"
+        );
+    }
+
+    // arm() captures output_index_offset = 0 (nothing pre-seeded).
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_native", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    let listing = json!({
+        "id": "mcpl_native",
+        "type": "mcp_list_tools",
+        "server_label": "weather",
+        "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+        "error": null,
+    });
+
+    // The backend natively streams the full discovery lifecycle in canonical order.
+    let native_events = [
+        (
+            "response.output_item.added",
+            json!({"output_index": 0, "item": listing.clone(), "sequence_number": 1}),
+        ),
+        (
+            "response.mcp_list_tools.in_progress",
+            json!({"output_index": 0, "item_id": "mcpl_native", "sequence_number": 2}),
+        ),
+        (
+            "response.mcp_list_tools.completed",
+            json!({"output_index": 0, "item_id": "mcpl_native", "sequence_number": 3}),
+        ),
+        (
+            "response.output_item.done",
+            json!({"output_index": 0, "item": listing, "sequence_number": 4}),
+        ),
+    ];
+    let mut forwarded = String::new();
+    for (event_type, payload) in native_events {
+        let mut chunk = Some(make_sse_chunk(event_type, &payload));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        if let Some(bytes) = chunk {
+            forwarded.push_str(core::str::from_utf8(&bytes).unwrap());
+        }
+    }
+
+    // The backend's real terminal done must be forwarded, not suppressed as premature.
+    assert_eq!(
+        forwarded.matches("event: response.output_item.done").count(),
+        1,
+        "the backend-native output_item.done must be forwarded exactly once, not suppressed: {forwarded}"
+    );
+    // No synthesized duplicate: the item is not locally executed, so the flush skips it.
+    assert_eq!(
+        forwarded.matches("event: response.output_item.added").count(),
+        1,
+        "no duplicate output_item.added synthesized for a backend-native listing: {forwarded}"
+    );
+    assert!(
+        forwarded.contains("event: response.mcp_list_tools.in_progress")
+            && forwarded.contains("event: response.mcp_list_tools.completed"),
+        "the backend's native progress events must pass through: {forwarded}"
+    );
+}
+
+#[tokio::test]
 async fn logical_stream_synthesizes_progress_for_model_declared_item_without_repeating_added() {
     // #276 (Finding 1): the model announces a `web_search_call` placeholder with
     // `output_item.added` (status `in_progress`) but never streams the
