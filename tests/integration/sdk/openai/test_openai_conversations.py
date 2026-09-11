@@ -16,6 +16,7 @@ SDK to verify wire-format compatibility.
 
 Usage:
     cargo build -p praxis-ai-proxy
+    cargo build -p praxis-test-utils --example conversations_tenant_proxy
     uv run tests/integration/sdk/openai/test_openai_conversations.py -v
 """
 
@@ -30,7 +31,7 @@ import time
 
 import httpx
 import pytest
-from openai import BadRequestError, NotFoundError, OpenAI
+from openai import AuthenticationError, BadRequestError, NotFoundError, OpenAI
 
 # When set to a postgres:// URL (the vllm-responses-postgres CI job), the
 # conversations store runs against PostgreSQL instead of the default in-memory
@@ -59,6 +60,23 @@ def _find_binary() -> str:
             return candidate
     raise FileNotFoundError(
         "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
+    )
+
+
+def _find_tenant_binary() -> str:
+    configured = os.environ.get("PRAXIS_TENANT_TEST_BIN")
+    if configured:
+        if os.path.isfile(configured):
+            return configured
+        raise FileNotFoundError(
+            f"PRAXIS_TENANT_TEST_BIN={configured!r} not found"
+        )
+    candidate = "target/debug/examples/conversations_tenant_proxy"
+    if os.path.isfile(candidate):
+        return candidate
+    pytest.skip(
+        "tenant test proxy not found — run "
+        "`cargo build -p praxis-test-utils --example conversations_tenant_proxy`"
     )
 
 
@@ -116,6 +134,38 @@ def _write_config(port: int) -> str:
     return path
 
 
+def _write_tenant_config(port: int) -> str:
+    conversations_filter = _conversations_filter()
+    conversations_filter.update(
+        {
+            "conversations_table": "tenant_test_conversations",
+            "items_table": "tenant_test_conversation_items",
+        }
+    )
+    config = {
+        "listeners": [
+            {
+                "name": "tenant-test",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["tenant-conversations-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "tenant-conversations-pipeline",
+                "filters": [
+                    {"filter": "test_tenant_identity"},
+                    conversations_filter,
+                ],
+            }
+        ],
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
+
+
 def _wait_for_proxy(port: int, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -160,6 +210,42 @@ def openai_client(praxis_proxy):
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         max_retries=0,
         timeout=10.0,
+    )
+
+
+@pytest.fixture(scope="session")
+def tenant_praxis_proxy():
+    """Start Praxis with deterministic test credentials mapped to tenants."""
+    binary = _find_tenant_binary()
+    port = _free_port()
+    config_path = _write_tenant_config(port)
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_proxy(port)
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def tenant_clients(tenant_praxis_proxy):
+    """Return two official SDK clients sharing a store but not a tenant."""
+    base_url = f"http://127.0.0.1:{tenant_praxis_proxy}/v1"
+    options = {"base_url": base_url, "max_retries": 0, "timeout": 10.0}
+    return (
+        OpenAI(api_key="tenant-a-token", **options),
+        OpenAI(api_key="tenant-b-token", **options),
     )
 
 
@@ -912,6 +998,163 @@ class TestOpenAIConversations:
 
         with pytest.raises(NotFoundError):
             openai_client.conversations.retrieve(conversation.id)
+
+
+class TestConversationTenantIsolation:
+    """Tenant isolation exercised through independently authenticated SDK clients."""
+
+    def test_conversation_crud_is_tenant_scoped(self, tenant_clients):
+        tenant_a, tenant_b = tenant_clients
+        conversation = tenant_a.conversations.create(
+            metadata={"owner": "tenant-a"},
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.retrieve(conversation.id)
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.update(
+                conversation.id,
+                metadata={"owner": "tenant-b"},
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.delete(conversation.id)
+        assert exc_info.value.status_code == 404
+
+        retrieved = tenant_a.conversations.retrieve(conversation.id)
+        assert retrieved.metadata == {"owner": "tenant-a"}
+
+    def test_item_operations_are_tenant_scoped(self, tenant_clients):
+        tenant_a, tenant_b = tenant_clients
+        conversation = tenant_a.conversations.create(
+            items=[
+                {
+                    "id": "item_tenant_private",
+                    "type": "message",
+                    "role": "user",
+                    "content": "tenant-a secret",
+                }
+            ],
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.list(conversation.id)
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.create(
+                conversation.id,
+                items=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "cross-tenant write",
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.retrieve(
+                "item_tenant_private",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.delete(
+                "item_tenant_private",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        page = tenant_a.conversations.items.list(conversation.id)
+        assert [item.id for item in page.data] == ["item_tenant_private"]
+
+    def test_same_item_id_can_exist_in_both_tenants(self, tenant_clients):
+        tenant_a, tenant_b = tenant_clients
+        conversation_a = tenant_a.conversations.create(
+            items=[
+                {
+                    "id": "item_shared_across_tenants",
+                    "type": "message",
+                    "role": "user",
+                    "content": "tenant-a value",
+                }
+            ],
+        )
+        conversation_b = tenant_b.conversations.create(
+            items=[
+                {
+                    "id": "item_shared_across_tenants",
+                    "type": "message",
+                    "role": "user",
+                    "content": "tenant-b value",
+                }
+            ],
+        )
+
+        item_a = tenant_a.conversations.items.retrieve(
+            "item_shared_across_tenants",
+            conversation_id=conversation_a.id,
+        )
+        item_b = tenant_b.conversations.items.retrieve(
+            "item_shared_across_tenants",
+            conversation_id=conversation_b.id,
+        )
+        assert item_a.content[0].text == "tenant-a value"
+        assert item_b.content[0].text == "tenant-b value"
+
+    def test_denied_access_does_not_affect_callers_own_resources(
+        self,
+        tenant_clients,
+    ):
+        tenant_a, tenant_b = tenant_clients
+        conversation_a = tenant_a.conversations.create()
+        conversation_b = tenant_b.conversations.create(
+            metadata={"owner": "tenant-b"},
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.retrieve(conversation_a.id)
+        assert exc_info.value.status_code == 404
+
+        retrieved = tenant_b.conversations.retrieve(conversation_b.id)
+        assert retrieved.metadata == {"owner": "tenant-b"}
+
+    def test_unknown_bearer_token_is_rejected(self, tenant_praxis_proxy):
+        client = OpenAI(
+            api_key="unknown-tenant-token",
+            base_url=f"http://127.0.0.1:{tenant_praxis_proxy}/v1",
+            max_retries=0,
+            timeout=10.0,
+        )
+
+        with pytest.raises(AuthenticationError) as exc_info:
+            client.conversations.create()
+        assert exc_info.value.status_code == 401
+
+    def test_tenant_header_cannot_override_authenticated_tenant(
+        self,
+        tenant_clients,
+        tenant_praxis_proxy,
+    ):
+        tenant_a, _tenant_b = tenant_clients
+        conversation = tenant_a.conversations.create()
+        spoofing_client = OpenAI(
+            api_key="tenant-b-token",
+            base_url=f"http://127.0.0.1:{tenant_praxis_proxy}/v1",
+            default_headers={"x-tenant-id": "tenant-a"},
+            max_retries=0,
+            timeout=10.0,
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            spoofing_client.conversations.retrieve(conversation.id)
+        assert exc_info.value.status_code == 404
 
 
 if __name__ == "__main__":
