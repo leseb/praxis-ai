@@ -4426,11 +4426,11 @@ STRUCTURED_OUTPUT_SCHEMA_CASES = [
         {
             "type": "object",
             "properties": {
-                "student_name": {"type": "string"},
+                "student_name": {"type": "string", "enum": ["Dana"]},
                 "scores": {
                     "type": "array",
-                    "items": {"type": "integer"},
-                    "minItems": 1,
+                    "items": {"type": "integer", "enum": [78, 85, 92]},
+                    "minItems": 3,
                     "maxItems": 3,
                 },
             },
@@ -4530,6 +4530,8 @@ STRUCTURED_OUTPUT_SCHEMA_CASES = [
 
 def _assert_matches_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
     """Assert the JSON value has the types and closed shape declared by a case."""
+    if "enum" in schema:
+        assert value in schema["enum"], f"{path} is not an allowed value: {value!r}"
     expected_type = schema["type"]
     if expected_type == "object":
         assert isinstance(value, dict), f"{path} should be an object: {value!r}"
@@ -4869,12 +4871,12 @@ def test_invalid_max_tool_calls_raises_bad_request(openai_client):
 
 
 def test_invalid_temperature_raises_bad_request(openai_client):
-    """Verify the invalid sampling-temperature error scenario."""
+    """Verify propagation of the backend's sampling-temperature validation."""
     with pytest.raises(BadRequestError) as exc_info:
         openai_client.responses.create(
             model=VLLM_MODEL,
             input="Hello",
-            temperature=3.0,
+            temperature=-1.0,
         )
 
     assert exc_info.value.status_code == 400
