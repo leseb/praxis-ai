@@ -3925,6 +3925,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "nix",
  "praxis-ai-apis",
  "praxis-ai-llmd-ext-proc",
  "praxis-ai-proxy",
