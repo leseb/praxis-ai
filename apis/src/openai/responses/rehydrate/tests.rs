@@ -27,11 +27,7 @@ fn default_filter() -> RehydrateFilter {
 #[test]
 fn from_config_succeeds() {
     let filter = RehydrateFilter::from_config(&serde_yaml::Value::Null).unwrap();
-    assert_eq!(
-        filter.name(),
-        "openai_rehydrate",
-        "filter name should match convention"
-    );
+    assert_eq!(filter.name(), "openai_rehydrate", "filter name should match convention");
 }
 
 #[test]
