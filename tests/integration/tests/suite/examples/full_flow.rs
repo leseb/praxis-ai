@@ -285,7 +285,6 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
 /// null and persistence is silently skipped (the store logs "response_object is
 /// null" and returns), which is exactly the regression this test guards.
 #[test]
-#[ignore = "blocked on #313: file_search SSE streaming lifecycle for the unified full-flow config"]
 fn full_flow_streaming_response_is_persisted_and_retrievable() {
     // A native Responses SSE lifecycle. The terminal event carries the full
     // response object (id, created_at, model are all required for streaming
@@ -527,7 +526,6 @@ async fn full_flow_previous_response_id_restored_in_client_response() {
 /// each response-lifecycle frame as it streams, without buffering the stream
 /// (regression test for issue #932, streaming half).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked on #313: file_search SSE streaming lifecycle for the unified full-flow config"]
 async fn full_flow_previous_response_id_restored_in_streaming_response() {
     let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
         .header("content-type", "application/json")

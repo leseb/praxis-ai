@@ -4,18 +4,18 @@
 # iterative_request_router for server-side file search execution, with
 # the Responses WebSocket and non-Responses paths routed around the IRR.
 #
-# ⚠️ DRAFT — depends on issue #313 (file_search SSE streaming lifecycle).
-#   This config merges the standalone `full-flow.yaml` gateway into the
-#   agentic (IRR) pipeline so a single deployment serves BOTH:
-#     - POST /v1/responses  → runs through the iterative_request_router
-#       (IRR), enabling server-side file_search execution across rounds.
-#     - GET  /v1/responses  (WebSocket) and the non-Responses paths
-#       (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
-#       → routed AROUND the IRR (the IRR buffers full responses and must
-#       not sit in the path of a streaming/WebSocket upgrade).
-#   The old `full-flow.yaml` is deleted once #313 removes the stream=true
-#   rejection and validates the complete file-search/IRR streaming
-#   lifecycle. Until then treat this as a stacked draft.
+# This config merges the standalone `full-flow.yaml` gateway into the
+# agentic (IRR) pipeline so a single deployment serves BOTH:
+#   - POST /v1/responses  → runs through the iterative_request_router
+#     (IRR), enabling server-side file_search execution across rounds for
+#     BOTH buffered and streaming (`stream: true`) clients. The in-IRR
+#     openai_stream_events filter composes each round into one logical
+#     Responses SSE stream (see issue #313 for the streaming lifecycle).
+#   - GET  /v1/responses  (WebSocket) and the non-Responses paths
+#     (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
+#     → routed AROUND the IRR. The IRR drives the Responses
+#     request/response lifecycle and cannot relay a 101 WebSocket
+#     upgrade, so WebSocket traffic bypasses it.
 #
 # Architecture (B-shaped):
 #
@@ -69,20 +69,23 @@
 #      that do not natively support input_file
 #   9. openai_mcp_tool_resolve — resolves MCP tool entries via tools/list
 #
-# openai_stream_events is intentionally absent: it composes streamed
-# inference rounds into one logical Responses stream and is only valid
-# inside an IRR step. This config buffers finite responses, so it would
-# be inert here. See stream-events.yaml and agentic-loop.yaml for the
-# in-IRR streaming examples.
+# openai_stream_events is not part of this pre-IRR prefix: it composes
+# streamed inference rounds into one logical Responses stream and is only
+# valid inside an IRR step. It therefore lives in the IRR inference step
+# below (as the first filter), where it serves streaming (`stream: true`)
+# clients and is inert for buffered ones. See stream-events.yaml and
+# agentic-loop.yaml for additional in-IRR streaming examples.
 #
 # IRR inference step (all routing lives inside the IRR step because the
-# IRR must be the terminal filter):
+# IRR must be the terminal filter). Per §5 of the #313 spec,
+# openai_stream_events is the FIRST filter so it can compose each round
+# into one logical Responses SSE stream:
 #   Request phase (forward):
-#     openai_file_search_callout → openai_responses_proxy
-#       → headers → router → load_balancer
+#     openai_stream_events → openai_file_search_callout
+#       → openai_responses_proxy → headers → router → load_balancer
 #   Response phase (reverse):
 #     load_balancer → router → headers → openai_responses_proxy
-#       → openai_file_search_callout
+#       → openai_file_search_callout → openai_stream_events
 #
 # Transition rules (evaluated after each step's response-body):
 #   openai_file_search_callout.pending = "true" → next: inference
@@ -267,10 +270,17 @@ filter_chains:
         timeout_ms: 120000
         step_timeout_ms: 60000
         max_response_bytes: 67108864
+        # Streaming (`stream: true`) responses relay through the IRR with
+        # openai_stream_events; bound the retained streamed body too.
+        max_stream_response_bytes: 67108864
         max_state_bytes: 136314880
         steps:
           - name: inference
             filters:
+              # openai_stream_events is first (per §5 of the #313 spec) so
+              # it composes each IRR round into one logical Responses SSE
+              # stream for streaming clients; it is inert for buffered ones.
+              - filter: openai_stream_events
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
                 allow_private_url: true

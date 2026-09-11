@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, TempSqlite, example_config_path, free_port, http_send, json_post, parse_body,
+    Backend, StatefulCapturingBackend, TempSqlite, example_config_path, free_port, http_send, json_post, parse_body,
     parse_status, patch_yaml, start_backend_with_shutdown, start_proxy, start_stateful_backend,
 };
 use serde_json::{Value, json};
@@ -183,15 +183,30 @@ fn full_flow_agentic_non_responses_path_bypasses_irr() {
     );
 }
 
-/// Streaming POST /v1/responses through the IRR is gated on issue #313
-/// (file_search SSE progress lifecycle). The IRR currently buffers full
-/// responses; end-to-end SSE streaming semantics for the unified config
-/// are validated once #313 lands. Enable this test then.
+/// Streaming POST /v1/responses through the IRR. Since issue #313 landed
+/// (file_search SSE progress lifecycle), the IRR inference step runs
+/// openai_stream_events first, so a `stream: true` request streams
+/// Server-Sent Events across the IRR rather than buffering the full
+/// response.
 #[test]
-#[ignore = "blocked on #313: file_search SSE streaming lifecycle for the unified full-flow config"]
 fn full_flow_agentic_streaming_responses_through_irr() {
-    let backend =
-        start_backend_with_shutdown(r#"{"id":"resp_stream","object":"response","status":"completed","output":[]}"#);
+    // Native Responses SSE lifecycle from the inference backend. Inside the
+    // IRR step, openai_stream_events (first filter) composes it into one
+    // logical Responses stream and the proxy relays text/event-stream across
+    // the IRR rather than buffering the full response.
+    let sse_body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"completed\",\"output\":[]}}\n\n",
+    );
+    let backend = Backend::fixed(sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_full_flow_agentic_config(proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
@@ -201,12 +216,16 @@ fn full_flow_agentic_streaming_responses_through_irr() {
         &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello","stream":true}"#),
     );
 
-    // Post-#313: the proxy should stream Server-Sent Events across the IRR
-    // rather than buffer the full response.
+    // The proxy should stream Server-Sent Events across the IRR rather
+    // than buffer the full response.
     assert_eq!(parse_status(&raw), 200, "streaming request should succeed: {raw}");
     assert!(
         raw.to_lowercase().contains("text/event-stream"),
         "streaming response should use the SSE content-type: {raw}"
+    );
+    assert!(
+        raw.contains("response.completed"),
+        "streaming response should carry the terminal lifecycle event: {raw}"
     );
 }
 
