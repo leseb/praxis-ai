@@ -18,6 +18,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
+      - ".github/actions/start-vllm/**"
+      - ".github/actions/wait-vllm/**"
       - ".github/workflows/vllm-integration.yaml"
   pull_request:
     branches: [main]
@@ -33,6 +35,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
+      - ".github/actions/start-vllm/**"
+      - ".github/actions/wait-vllm/**"
       - ".github/workflows/vllm-integration.yaml"
   merge_group:
     branches: [main]
@@ -98,6 +102,8 @@ jobs:
             'Cargo.toml' \
             'Cargo.lock' \
             'Makefile' \
+            '.github/actions/start-vllm/' \
+            '.github/actions/wait-vllm/' \
             '.github/workflows/vllm-integration.yaml')
           if [ -n "$CHANGED" ]; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -169,6 +175,9 @@ jobs:
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
 
+      - name: Wait for vLLM readiness
+        uses: ./.github/actions/wait-vllm
+
       - name: Run Conversations SDK integration tests
         run: |
           uv run tests/integration/sdk/openai/test_openai_conversations.py -s
@@ -218,7 +227,7 @@ jobs:
 
       - name: vLLM container logs
         if: failure()
-        run: docker logs vllm
+        run: docker logs vllm 2>&1 || echo "(no vllm container)"
 
       - name: OGX logs
         if: failure()
@@ -313,6 +322,9 @@ jobs:
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
 
+      - name: Wait for vLLM readiness
+        uses: ./.github/actions/wait-vllm
+
       - name: Wait for OGX readiness
         run: |
           echo "Waiting for OGX server..."
@@ -360,7 +372,7 @@ jobs:
 
       - name: vLLM container logs
         if: failure()
-        run: docker logs vllm
+        run: docker logs vllm 2>&1 || echo "(no vllm container)"
 
       - name: OGX logs
         if: failure()
