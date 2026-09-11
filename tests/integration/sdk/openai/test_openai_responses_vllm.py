@@ -2324,16 +2324,18 @@ class TestAgenticLoopVLLM:
         self, agentic_client, agentic_proxy,
     ):
         """Issue #637 (PR #1029 review): a streamed approval RESUME must
-        announce the locally executed mcp_call at output index 0.
+        announce every locally seeded output item before a delta references it.
 
-        The approval resume runs *before* the first inference round, so the
-        proxy appends the executed mcp_call at accumulated output index 0 and
-        the resumed model output lands at index 1. If the proxy never emits a
-        ``response.output_item.added`` for index 0, the OpenAI SDK's streaming
-        accumulator never allocates slot 0: the resumed model item is appended
-        as ``output[0]`` and the index-1 model delta then indexes past the end
-        of the list, raising ``IndexError`` mid-stream -- the exact crash this
-        test guards against.
+        The approval resume runs *before* the first inference round. Tool
+        discovery (``openai_mcp_tool_resolve``) seeds the ``mcp_list_tools``
+        listing at accumulated output index 0 (issue #1022), the executed
+        mcp_call lands at index 1, and the resumed model output follows at
+        index 2+. Every one of those slots must be announced with a
+        ``response.output_item.added`` before a delta references it: if the
+        proxy skips index 0 or 1, the OpenAI SDK's streaming accumulator never
+        allocates that slot, so a later model item is appended one slot short
+        and the next delta indexes past the end of the list, raising
+        ``IndexError`` mid-stream -- the exact crash this test guards against.
 
         Turn 1 is buffered to obtain the approval request id; the RESUME turn
         streams through the SDK's ``responses.stream`` accumulator, which is the
@@ -2411,26 +2413,36 @@ class TestAgenticLoopVLLM:
             "approving the request must execute the MCP tool exactly once"
         )
 
+        # Tool discovery seeds the mcp_list_tools listing at index 0 (issue
+        # #1022); it must be announced so the accumulator allocates slot 0 ahead
+        # of the resumed tool activity.
+        list_added = [a for a in added if a[1] == "mcp_list_tools"]
+        assert list_added and list_added[0][0] == 0, (
+            "the mcp_list_tools discovery listing must be announced at output "
+            f"index 0 ahead of the resumed tool activity; got: {added}"
+        )
+
         # The locally executed mcp_call is announced as exactly one incremental
-        # output_item.added at index 0 -- the slot the accumulator needs before
-        # the resumed model output at index 1 can be applied.
+        # output_item.added at index 1 -- directly after the discovery listing,
+        # the slot the accumulator needs before the resumed model output.
         mcp_added = [a for a in added if a[1] == "mcp_call"]
         assert len(mcp_added) == 1, (
             "the resumed mcp_call should surface as exactly one "
             f"response.output_item.added; got: {added}"
         )
         mcp_index = mcp_added[0][0]
-        assert mcp_index == 0, (
-            "the resumed mcp_call executes before the first inference round, so "
-            f"it must be announced at output index 0; got index {mcp_index}"
+        assert mcp_index == 1, (
+            "the resumed mcp_call executes before the first inference round but "
+            "after tool discovery, so it must be announced at output index 1 "
+            f"(behind the mcp_list_tools listing at index 0); got index {mcp_index}"
         )
 
-        # Any resumed model text streams at an output index after the index-0
+        # Any resumed model text streams at an output index after the index-1
         # mcp_call -- the ordering the accumulator relies on. (Empty is fine: a
         # small model under /no_think + a 512-token cap may emit only reasoning.)
         assert all(idx > mcp_index for idx in text_delta_indices), (
             "resumed model text must stream at an output index after the "
-            f"index-0 mcp_call; mcp_index={mcp_index}, deltas={text_delta_indices}"
+            f"index-1 mcp_call; mcp_index={mcp_index}, deltas={text_delta_indices}"
         )
 
         output_types = [item.type for item in final_response.output]
