@@ -102,7 +102,14 @@ const GATEWAY_USER: &str = "gateway";
 
 /// The gateway `basic_auth` password the client presents via
 /// `ANTHROPIC_CUSTOM_HEADERS` and that `basic_auth` must strip before vLLM.
-const GATEWAY_PASSWORD: &str = "praxis-native-vllm-gateway-secret-do-not-forward";
+///
+/// Drawn once per test process from the OS RNG rather than a source literal:
+/// it is a throwaway secret scoped to this run, and both the in-process gateway
+/// config and the client read the same value so they agree within a run.
+fn gateway_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(random_token)
+}
 
 /// The deterministic coding-task prompt; the required value lives only on disk.
 const PROMPT: &str = "Read the file `source/value.txt`. Write its contents converted to UPPERCASE \
@@ -282,7 +289,7 @@ fn authority_of(base: &str) -> String {
 /// repointed at the real vLLM authority so Praxis forwards straight to it.
 /// `credential_injection` resolves `VLLM_API_KEY` from the environment at
 /// pipeline build; the live gate guarantees it is set. The gateway `basic_auth`
-/// password is inlined from [`GATEWAY_PASSWORD`] instead of its
+/// password is inlined from [`gateway_password`] instead of its
 /// `GATEWAY_AUTH_PASSWORD` env var, because `std::env::set_var` is `unsafe` (and
 /// `unsafe_code` is denied workspace-wide) so the test cannot set it, and the
 /// client must present the exact same value.
@@ -296,7 +303,7 @@ fn native_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
         .replace("127.0.0.1:8000", &live.vllm_authority)
         .replace(
             "env_var: GATEWAY_AUTH_PASSWORD",
-            &format!("password: {GATEWAY_PASSWORD}"),
+            &format!("password: {}", gateway_password()),
         );
     Config::from_yaml(&patched).unwrap_or_else(|error| panic!("parse {CONFIG}: {error}"))
 }
@@ -495,13 +502,20 @@ fn write_verify_script(path: &Path, marker_path: &Path, nonce: &str) {
     }
 }
 
-/// Derives a process-unique lowercase hex seed for the task value and nonce.
+/// Draws a fresh lowercase hex seed for the task value and nonce.
+///
+/// Sourced from the OS RNG so the round-tripped token and the success marker
+/// nonce are unguessable per run and contain no hard-coded value.
 fn unique_seed() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}{:x}", std::process::id(), nanos)
+    random_token()
+}
+
+/// Returns a fresh 128-bit lowercase hex token drawn from the OS RNG.
+fn random_token() -> String {
+    rand::random::<[u8; 16]>()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // -----------------------------------------------------------------------------
@@ -655,7 +669,7 @@ fn netns_can_reach(namespace: &str, host: &str, port: u16) -> bool {
 
 /// The `Authorization` header line the client presents to the gateway.
 fn gateway_auth_line() -> String {
-    format!("Authorization: {}", basic_auth_header(GATEWAY_USER, GATEWAY_PASSWORD))
+    format!("Authorization: {}", basic_auth_header(GATEWAY_USER, gateway_password()))
 }
 
 // -----------------------------------------------------------------------------
