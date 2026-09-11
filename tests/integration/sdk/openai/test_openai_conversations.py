@@ -168,6 +168,18 @@ def openai_client(praxis_proxy):
 # ---------------------------------------------------------------------------
 
 
+def _message_items(prefix: str, count: int) -> list[dict]:
+    return [
+        {
+            "id": f"{prefix}_{index}",
+            "type": "message",
+            "role": "user",
+            "content": f"message {index}",
+        }
+        for index in range(count)
+    ]
+
+
 class TestOpenAIConversations:
     """Wire-format compatibility tests for conversation CRUD."""
 
@@ -561,6 +573,326 @@ class TestOpenAIConversations:
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.create(metadata=metadata)
         assert exc_info.value.status_code == 400
+
+    def test_conversation_accepts_twenty_initial_items(self, openai_client):
+        conversation = openai_client.conversations.create(
+            items=_message_items("item_initial_limit", 20),
+        )
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            limit=20,
+            order="asc",
+        )
+        assert [item.id for item in page.data] == [
+            f"item_initial_limit_{index}" for index in range(20)
+        ]
+        assert page.has_more is False
+
+    def test_conversation_rejects_more_than_twenty_initial_items(
+        self,
+        openai_client,
+    ):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.create(
+                items=_message_items("item_initial_over_limit", 21),
+            )
+        assert exc_info.value.status_code == 400
+
+    def test_item_create_accepts_twenty_items(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=_message_items("item_append_limit", 20),
+        )
+
+        assert [item.id for item in created.data] == [
+            f"item_append_limit_{index}" for index in range(20)
+        ]
+        assert created.has_more is False
+
+    def test_oversized_item_batch_is_rejected_atomically(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=_message_items("item_append_over_limit", 21),
+            )
+        assert exc_info.value.status_code == 400
+
+        page = openai_client.conversations.items.list(conversation.id)
+        assert page.data == []
+
+    def test_metadata_length_boundaries_are_accepted(self, openai_client):
+        boundary_metadata = {"k" * 64: "v" * 512}
+        conversation = openai_client.conversations.create(
+            metadata=boundary_metadata,
+        )
+        assert conversation.metadata == boundary_metadata
+
+        updated_metadata = {"u" * 64: "w" * 512}
+        updated = openai_client.conversations.update(
+            conversation.id,
+            metadata=updated_metadata,
+        )
+        assert updated.metadata == updated_metadata
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            pytest.param({"k" * 65: "value"}, id="key-too-long"),
+            pytest.param({"key": "v" * 513}, id="value-too-long"),
+            pytest.param({"key": 123}, id="non-string-value"),
+        ],
+    )
+    def test_invalid_metadata_is_rejected_on_create(
+        self,
+        openai_client,
+        metadata,
+    ):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.create(metadata=metadata)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            pytest.param({"k" * 65: "value"}, id="key-too-long"),
+            pytest.param({"key": "v" * 513}, id="value-too-long"),
+            pytest.param({"key": 123}, id="non-string-value"),
+        ],
+    )
+    def test_invalid_metadata_is_rejected_on_update(
+        self,
+        openai_client,
+        metadata,
+    ):
+        conversation = openai_client.conversations.create()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.update(
+                conversation.id,
+                metadata=metadata,
+            )
+        assert exc_info.value.status_code == 400
+
+    def test_conversation_update_replaces_and_clears_metadata(self, openai_client):
+        conversation = openai_client.conversations.create(
+            metadata={"old": "value", "keep": "original"},
+        )
+
+        replaced = openai_client.conversations.update(
+            conversation.id,
+            metadata={"keep": "replacement", "new": "value"},
+        )
+        assert replaced.metadata == {"keep": "replacement", "new": "value"}
+
+        cleared = openai_client.conversations.update(
+            conversation.id,
+            metadata={},
+        )
+        assert cleared.metadata == {}
+
+    def test_function_call_items_round_trip(self, openai_client):
+        conversation = openai_client.conversations.create()
+        call_id = "call_conversation_round_trip"
+
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=[
+                {
+                    "id": "item_function_call",
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "get_weather",
+                    "arguments": '{"city":"Paris"}',
+                },
+                {
+                    "id": "item_function_call_output",
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "sunny",
+                },
+            ],
+        )
+
+        function_call, function_output = created.data
+        assert function_call.type == "function_call"
+        assert function_call.call_id == call_id
+        assert function_call.name == "get_weather"
+        assert json.loads(function_call.arguments) == {"city": "Paris"}
+        assert function_output.type == "function_call_output"
+        assert function_output.call_id == call_id
+        assert function_output.output == "sunny"
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            order="asc",
+        )
+        assert [item.id for item in page.data] == [
+            "item_function_call",
+            "item_function_call_output",
+        ]
+
+        retrieved = openai_client.conversations.items.retrieve(
+            "item_function_call_output",
+            conversation_id=conversation.id,
+        )
+        assert retrieved.call_id == call_id
+        assert retrieved.output == "sunny"
+
+    def test_duplicate_ids_in_one_batch_are_rejected_atomically(
+        self,
+        openai_client,
+    ):
+        conversation = openai_client.conversations.create()
+        duplicate = {
+            "id": "item_duplicate_in_batch",
+            "type": "message",
+            "role": "user",
+            "content": "duplicate",
+        }
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=[duplicate, duplicate],
+            )
+        assert exc_info.value.status_code == 400
+        assert openai_client.conversations.items.list(conversation.id).data == []
+
+    def test_invalid_mixed_item_batch_is_rejected_atomically(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=[
+                    {
+                        "id": "item_valid_before_invalid",
+                        "type": "message",
+                        "role": "user",
+                        "content": "valid",
+                    },
+                    {
+                        "id": "item_invalid_in_batch",
+                        "type": "unsupported_item_type",
+                    },
+                ],
+            )
+        assert exc_info.value.status_code == 400
+        assert openai_client.conversations.items.list(conversation.id).data == []
+
+    def test_item_cannot_be_accessed_through_another_conversation(
+        self,
+        openai_client,
+    ):
+        owner = openai_client.conversations.create(
+            items=[
+                {
+                    "id": "item_parent_isolation",
+                    "type": "message",
+                    "role": "user",
+                    "content": "private to its parent",
+                }
+            ],
+        )
+        other = openai_client.conversations.create()
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.retrieve(
+                "item_parent_isolation",
+                conversation_id=other.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.delete(
+                "item_parent_isolation",
+                conversation_id=other.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        item = openai_client.conversations.items.retrieve(
+            "item_parent_isolation",
+            conversation_id=owner.id,
+        )
+        assert item.content[0].text == "private to its parent"
+
+    def test_descending_cursor_pagination_has_no_gaps_or_duplicates(
+        self,
+        openai_client,
+    ):
+        conversation = openai_client.conversations.create(
+            items=_message_items("item_desc_page", 5),
+        )
+
+        seen = []
+        after = None
+        while True:
+            page = openai_client.conversations.items.list(
+                conversation.id,
+                after=after,
+                limit=2,
+                order="desc",
+            )
+            seen.extend(item.id for item in page.data)
+            if not page.has_more:
+                break
+            after = page.last_id
+
+        assert seen == [f"item_desc_page_{index}" for index in range(4, -1, -1)]
+        assert len(seen) == len(set(seen))
+
+    def test_conversation_delete_is_not_repeatable(self, openai_client):
+        conversation = openai_client.conversations.create()
+        openai_client.conversations.delete(conversation.id)
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.delete(conversation.id)
+        assert exc_info.value.status_code == 404
+
+    def test_item_delete_updates_list_and_is_not_repeatable(self, openai_client):
+        conversation = openai_client.conversations.create(
+            metadata={"topic": "delete-item"},
+            items=[
+                {
+                    "id": "item_delete_once",
+                    "type": "message",
+                    "role": "user",
+                    "content": "delete me",
+                },
+                {
+                    "id": "item_keep_after_delete",
+                    "type": "message",
+                    "role": "user",
+                    "content": "keep me",
+                },
+            ],
+        )
+
+        updated = openai_client.conversations.items.delete(
+            "item_delete_once",
+            conversation_id=conversation.id,
+        )
+        assert updated.id == conversation.id
+        assert updated.created_at == conversation.created_at
+        assert updated.metadata == conversation.metadata
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            order="asc",
+        )
+        assert [item.id for item in page.data] == ["item_keep_after_delete"]
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.delete(
+                "item_delete_once",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
 
     def test_full_workflow(self, openai_client):
         conversation = openai_client.conversations.create(
