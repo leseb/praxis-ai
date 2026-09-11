@@ -1203,16 +1203,20 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// The full ordered tool-specific lifecycle a local item owes the client between
 /// `output_item.added` and `output_item.done`, per issue #276.
 ///
-/// `mcp_call` progresses `in_progress` then `completed`/`failed`;
-/// `web_search_call` progresses `in_progress`, `searching`, then `completed` only
-/// when it actually completed (web search has no conformant `failed` event, so
-/// other outcomes surface through `output_item.done` alone). `mcp_list_tools`
-/// progresses `in_progress` then `completed`: a locally seeded listing is created
-/// only on successful discovery (issue #1022), and a deferred entry the backend
-/// resolves natively likewise streams the completed lifecycle, so it always
-/// completes here. A *local* discovery failure instead takes the separate
-/// `response.mcp_list_tools.failed` path in `openai_mcp_tool_resolve` (issue #320)
-/// and never reaches this synthesis.
+/// `mcp_call` progresses `in_progress` then `completed`/`failed`, selected by
+/// whether the item carries a non-null `error`. `web_search_call` progresses
+/// `in_progress`, `searching`, then `completed` only when it actually completed
+/// (web search has no conformant `failed` event, so other outcomes surface
+/// through `output_item.done` alone). `mcp_list_tools` progresses `in_progress`
+/// then `completed`/`failed`, selected the same way as `mcp_call`: a locally
+/// seeded listing is created only on successful discovery (issue #1022) so its
+/// terminal phase is `completed`, but a *deferred* entry the backend resolves
+/// natively can also fail its `tools/list`, streaming `mcp_list_tools.failed` on
+/// an item carrying an `error` — matching the expected terminal phase to that
+/// error keeps the backend's real `output_item.done` from being dropped as
+/// premature (issue #1022). A *local* discovery failure instead takes the
+/// separate `response.mcp_list_tools.failed` terminal-SSE path in
+/// `openai_mcp_tool_resolve` (issue #320) and never reaches this synthesis.
 /// `mcp_approval_request` has no dedicated progress events; it surfaces through
 /// `output_item.added`/`output_item.done` alone.
 ///
@@ -1221,10 +1225,14 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// lifecycle still gets exactly its missing events synthesized.
 fn expected_phase_events(item: &Value) -> Vec<&'static str> {
     match item.get("type").and_then(Value::as_str) {
-        Some("mcp_list_tools") => vec![
-            "response.mcp_list_tools.in_progress",
-            "response.mcp_list_tools.completed",
-        ],
+        Some("mcp_list_tools") => {
+            let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
+                "response.mcp_list_tools.failed"
+            } else {
+                "response.mcp_list_tools.completed"
+            };
+            vec!["response.mcp_list_tools.in_progress", outcome]
+        },
         Some("mcp_call") => {
             let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
                 "response.mcp_call.failed"

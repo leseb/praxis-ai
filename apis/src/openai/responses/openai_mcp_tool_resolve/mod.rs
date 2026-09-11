@@ -86,9 +86,11 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// (in request order, including servers that resolve to zero tools) is seeded into
 /// `ResponsesState` for a downstream response-finalizing filter to surface: a
 /// buffered finalizer (`openai_agentic_loop` or `openai_mcp_dispatch`) lists it in
-/// `output`, and `openai_stream_events` synthesizes its `output_item.added` →
-/// `mcp_list_tools.in_progress` → `mcp_list_tools.completed` → `output_item.done`
-/// lifecycle ahead of the model output. Unlike the failure lifecycle above — which
+/// `output`, and `openai_stream_events` configured with `logical_stream: true` (its
+/// default is `false`, which synthesizes nothing) synthesizes its
+/// `output_item.added` → `mcp_list_tools.in_progress` → `mcp_list_tools.completed`
+/// → `output_item.done` lifecycle ahead of the model output. Unlike the failure
+/// lifecycle above — which
 /// this filter emits itself as a terminal SSE — a successful discovery must still
 /// proceed to inference, so it cannot be surfaced without one of those downstream
 /// filters; the minimal `mcp-tool-resolve.yaml` example therefore demonstrates

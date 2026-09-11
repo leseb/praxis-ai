@@ -21,10 +21,12 @@
 # still reach the backend for inference, so those items are surfaced to
 # the client only by a downstream response-finalizing filter:
 # `openai_agentic_loop`/`openai_mcp_dispatch` (buffered `output`) or
-# `openai_stream_events` (streaming lifecycle). This minimal pipeline has
-# none of those, so it demonstrates resolution and the failure lifecycle
-# only; see agentic-loop.yaml for a pipeline that surfaces successful
-# `mcp_list_tools` items on both the buffered and streaming paths.
+# `openai_stream_events` with `logical_stream: true` (streaming
+# lifecycle; its default `logical_stream: false` synthesizes nothing).
+# This minimal pipeline has none of those, so it demonstrates resolution
+# and the failure lifecycle only; see agentic-loop.yaml for a pipeline
+# that surfaces successful `mcp_list_tools` items on both the buffered and
+# streaming paths.
 #
 # This is a minimal pipeline focused on MCP tool discovery. For a
 # complete setup with multi-turn conversation support (rehydrate,
