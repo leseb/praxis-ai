@@ -1006,7 +1006,7 @@ async fn logical_stream_synthesizes_mcp_list_tools_discovery_lifecycle_at_iterat
     // must synthesize its full lifecycle — output_item.added ->
     // mcp_list_tools.in_progress -> mcp_list_tools.completed -> output_item.done —
     // ahead of the model output (shifted to index 1).
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1033,7 +1033,7 @@ async fn logical_stream_synthesizes_mcp_list_tools_discovery_lifecycle_at_iterat
     }
 
     // arm() captures output_index_offset = 1 from the pre-seeded accumulated_output.
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     // The discovery item must be announced after response.created, not before it.
     let mut created = Some(make_sse_chunk(
@@ -1112,7 +1112,7 @@ async fn logical_stream_forwards_backend_native_mcp_list_tools_lifecycle() {
     // duplicate lifecycle. Before recognizing `response.mcp_list_tools.*` as an in-band
     // progress event, the completed phase went unrecorded, so `is_premature_local_tool_done`
     // dropped the native `done` and left the client with an unterminated output item.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1135,7 +1135,7 @@ async fn logical_stream_forwards_backend_native_mcp_list_tools_lifecycle() {
     }
 
     // arm() captures output_index_offset = 0 (nothing pre-seeded).
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1213,7 +1213,7 @@ async fn logical_stream_forwards_backend_native_mcp_list_tools_failed_lifecycle(
     // `output_item.done` is forwarded, not suppressed as premature. Before this,
     // the expected terminal was always `completed`, which a failed stream never
     // reaches, so the real `done` was dropped and the item left unterminated.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1236,7 +1236,7 @@ async fn logical_stream_forwards_backend_native_mcp_list_tools_failed_lifecycle(
     }
 
     // arm() captures output_index_offset = 0 (nothing pre-seeded).
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",

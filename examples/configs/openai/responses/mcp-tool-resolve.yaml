@@ -21,8 +21,8 @@
 # still reach the backend for inference, so those items are surfaced to
 # the client only by a downstream response-finalizing filter:
 # `openai_agentic_loop`/`openai_mcp_dispatch` (buffered `output`) or
-# `openai_stream_events` with `logical_stream: true` (streaming
-# lifecycle; its default `logical_stream: false` synthesizes nothing).
+# `openai_stream_events`, which synthesizes the streaming lifecycle
+# when placed inside the agentic loop.
 # This minimal pipeline has none of those, so it demonstrates resolution
 # and the failure lifecycle only; see agentic-loop.yaml for a pipeline
 # that surfaces successful `mcp_list_tools` items on both the buffered and
