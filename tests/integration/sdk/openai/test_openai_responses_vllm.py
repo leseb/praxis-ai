@@ -538,6 +538,86 @@ class CompactionHandler(BaseHTTPRequestHandler):
         pass
 
 
+class ResponsesWitnessHandler(BaseHTTPRequestHandler):
+    """Recording shim that sits between Praxis and the native vLLM backend.
+
+    Captures the JSON body of every request the backend receives, then forwards
+    it transparently to real vLLM and streams the response back so the full
+    native Responses pipeline still completes. Tests use the captured bodies to
+    assert on what the proxy actually forwards upstream after its rewrites
+    (rehydration, ``previous_response_id`` stripping, ``truncation`` passthrough).
+    """
+
+    forwarded_bodies: ClassVar[list[dict]] = []
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _forward(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        if body:
+            try:
+                type(self).forwarded_bodies.append(json.loads(body))
+            except json.JSONDecodeError:
+                pass
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length")
+        }
+        url = f"{VLLM_BASE_URL.rstrip('/')}{self.path}"
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream(
+                self.command, url, headers=headers, content=body
+            ) as upstream:
+                self.send_response(upstream.status_code)
+                for key, value in upstream.headers.items():
+                    if key.lower() in (
+                        "transfer-encoding",
+                        "content-length",
+                        "connection",
+                    ):
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                for chunk in upstream.iter_raw():
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+
+    def do_POST(self):
+        self._forward()
+
+    def do_GET(self):
+        self._forward()
+
+
+def _write_witness_config(
+    praxis_port: int,
+    db_path: str,
+    backend_port: int,
+) -> str:
+    """Patch full-flow.yaml to route the native backend through the shim.
+
+    Identical to :func:`_write_config` except the ``127.0.0.1:3001`` backend is
+    pointed at the recording shim (which forwards to vLLM) instead of vLLM
+    directly, so a test can observe the exact request bodies the backend sees.
+    """
+    with open(CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    config = config.replace("127.0.0.1:9999", _ogx_endpoint())
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
 def _write_agentic_config(
     praxis_port: int,
     db_path: str,
@@ -780,6 +860,69 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
                     file=sys.stderr,
                 )
         os.unlink(config_path)
+
+
+def _witness_proxy_session(tmp_path_factory, request):
+    """Start a proxy whose native backend is a recording shim in front of vLLM.
+
+    Shared generator body for the witness fixtures. Yields ``(client,
+    forwarded_bodies)`` where ``forwarded_bodies`` accumulates the JSON bodies
+    the vLLM Responses backend receives, letting a test assert on the request
+    the proxy actually forwards upstream after its rewrites.
+    """
+    ResponsesWitnessHandler.forwarded_bodies = []
+    forwarded = ResponsesWitnessHandler.forwarded_bodies
+    backend_port = _free_port()
+    server = HTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-witness")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_witness_config(port, db_path, backend_port)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test",
+            max_retries=0,
+            timeout=300,
+        )
+        yield client, forwarded
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Witness backend Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture()
+def witness_backend_client(tmp_path_factory, request):
+    """Function-scoped witness proxy with the stock rehydrate config."""
+    yield from _witness_proxy_session(tmp_path_factory, request)
 
 
 @pytest.fixture(scope="session")
@@ -1158,6 +1301,69 @@ class TestOpenAIResponsesVLLM:
             "client even though it strips the id from the rehydrated upstream "
             f"request; got: {second.previous_response_id!r}"
         )
+
+    def test_truncation_forwarded_to_backend_through_rehydration(
+        self, witness_backend_client
+    ):
+        """Issue #532: the caller's ``truncation`` must reach the native backend
+        on both a fresh turn and a rehydrated continuation.
+
+        The unit test only proves ``truncation`` survives into ``ResponsesState``
+        before the proxy rewrites the outbound body. This drives the full native
+        pipeline against a recording shim in front of vLLM to prove the backend
+        actually *receives* the value on both turns:
+
+        * turn 1 sends ``truncation="auto"`` — forwarded verbatim (no rewrite);
+        * turn 2 rehydrates via ``previous_response_id`` and sends
+          ``truncation="disabled"`` — the proxy replays history into ``input``
+          and strips ``previous_response_id``, but must still forward the
+          caller's ``truncation``.
+
+        Guarding both spec values through the rewrite path is exactly what #532
+        requires: process conversation history without dropping client-supplied
+        request settings.
+        """
+        client, forwarded = witness_backend_client
+
+        before_first = len(forwarded)
+        first = client.responses.create(
+            model=VLLM_MODEL,
+            input="Remember this nonce: TRUNCATE-4821. Acknowledge it. /no_think",
+            temperature=0,
+            truncation="auto",
+            store=True,
+            max_output_tokens=128,
+        )
+        assert first.status == "completed"
+        assert first.truncation == "auto"
+
+        first_seen = forwarded[before_first:]
+        assert first_seen, "backend received no request on the first turn"
+        first_backend = first_seen[-1]
+        assert first_backend.get("truncation") == "auto", first_backend
+
+        before_second = len(forwarded)
+        second = client.responses.create(
+            model=VLLM_MODEL,
+            input="What nonce did I tell you? Repeat it exactly. /no_think",
+            temperature=0,
+            previous_response_id=first.id,
+            truncation="disabled",
+            store=True,
+            max_output_tokens=128,
+        )
+        assert second.status == "completed"
+        assert second.truncation == "disabled"
+
+        second_seen = forwarded[before_second:]
+        assert second_seen, "backend received no request on the rehydrated turn"
+        second_backend = second_seen[-1]
+        # The caller's truncation survives the outbound-body rewrite...
+        assert second_backend.get("truncation") == "disabled", second_backend
+        # ...while previous_response_id is stripped and history is replayed
+        # into `input` instead.
+        assert second_backend.get("previous_response_id") is None, second_backend
+        assert isinstance(second_backend.get("input"), list), second_backend
 
     def test_conversation_context_and_append_back(self, openai_client):
         conversation = openai_client.conversations.create(
