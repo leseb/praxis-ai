@@ -19,7 +19,7 @@
 //!
 //! [`PendingApproval`]: super::mcp_dispatch
 
-use super::openai_mcp_tool_resolve::{McpToolIndex, McpToolMatch};
+use super::mcp_tool_resolve::{McpToolIndex, McpToolMatch};
 
 /// Disposition of a single model-emitted tool call relative to the resolved MCP
 /// tool map.
@@ -174,7 +174,7 @@ mod tests {
     use serde_json::json;
 
     use super::{McpDisposition, classify_mcp};
-    use crate::openai::responses::openai_mcp_tool_resolve::McpToolIndex;
+    use crate::openai::responses::mcp_tool_resolve::McpToolIndex;
 
     /// Build a one-entry tool map for `(label, tool)` with the given approval policy.
     fn tool_map_with_policy(
