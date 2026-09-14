@@ -535,7 +535,12 @@ fn parse_chunk_events(
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
         record_completion(state, &event, now)?;
-        charge_accumulation_budget(state, ctx, &event, frame)?;
+        // `&events` is this chunk's events parsed so far. Passing it lets the charge
+        // size a tool-call clone against an item introduced by an earlier
+        // `output_item.added`/`.done` in this same, not-yet-committed chunk, which the
+        // committed `output_items()` snapshot does not yet contain (see
+        // `tool_call_clone_bytes`).
+        charge_accumulation_budget(state, ctx, &events, &event, frame)?;
         events.push(event);
     }
     Ok(events)
@@ -589,6 +594,7 @@ fn parse_chunk_events(
 fn charge_accumulation_budget(
     state: &StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
+    chunk_events: &[ResponsesEvent],
     event: &ResponsesEvent,
     frame: &SseFrame,
 ) -> Result<(), SseParseError> {
@@ -601,9 +607,11 @@ fn charge_accumulation_budget(
     // payload may have arrived in an earlier, already-charged frame. Charge the
     // clone-to-be here in phase 1 — before `commit_chunk_events` performs it — so
     // the aggregate budget bounds the retained growth and the chunk aborts atomically
-    // before the clone. Absent this, an id-less function call re-cloned by hundreds
-    // of tiny `done` frames retained megabytes while the counter stayed near zero.
-    let retained_clone_bytes = tool_call_clone_bytes(ctx, event);
+    // before the clone. The clone is charged once per `done`, so N repeated dones
+    // targeting one id-less item are charged N times. Absent this, an id-less
+    // function call re-cloned by hundreds of tiny `done` frames retained megabytes
+    // while the counter stayed near zero.
+    let retained_clone_bytes = tool_call_clone_bytes(ctx, chunk_events, event);
     let accumulated_bytes = {
         let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
         responses.stream_accumulated_bytes = responses
@@ -621,19 +629,76 @@ fn charge_accumulation_budget(
 ///
 /// The clone is a full copy of the item `finalize_function_call` locates by
 /// `item_id`/`output_index`; charging its wire size keeps the aggregate byte budget
-/// aligned with the memory the commit phase is about to retain. When the referenced
-/// item was added in the same, not-yet-committed chunk it is not found here, but that
-/// chunk's own `output_item.added` frame already charged the item once, bounding the
-/// clone to that chunk's wire bytes.
-fn tool_call_clone_bytes(ctx: &HttpFilterContext<'_>, event: &ResponsesEvent) -> usize {
+/// aligned with the memory the commit phase is about to retain.
+///
+/// The item is resolved against two sources and the larger charged: the committed
+/// retained output (`output_items()`), and — because phase 1 runs over the whole
+/// chunk before phase 2 commits any of it — items introduced by an earlier
+/// `output_item.added`/`.done` in this same, not-yet-committed chunk
+/// (`pending_chunk_output_item`). Charging only the committed snapshot missed the
+/// clone when the added item and its repeated dones were coalesced into one chunk:
+/// the item was not yet committed, so an id-less function call re-cloned by hundreds
+/// of same-chunk done frames retained megabytes while the counter stayed near zero.
+/// Charging the larger is conservative — phase 2 clones whichever source it resolves,
+/// and over-charging only fails the stream closed slightly earlier.
+fn tool_call_clone_bytes(
+    ctx: &HttpFilterContext<'_>,
+    chunk_events: &[ResponsesEvent],
+    event: &ResponsesEvent,
+) -> usize {
     let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
         return 0;
     };
-    ctx.extensions
+    let committed = ctx
+        .extensions
         .get::<ResponsesState>()
         .and_then(|responses| find_output_item(responses.output_items(), payload))
         .and_then(|item| crate::json_body::serialized_len(item).ok())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let pending = pending_chunk_output_item(chunk_events, payload)
+        .and_then(|item| crate::json_body::serialized_len(item).ok())
+        .unwrap_or(0);
+    committed.max(pending)
+}
+
+/// The output item a `function_call_arguments.done` targets that was introduced by an
+/// earlier `output_item.added`/`output_item.done` in this same, not-yet-committed
+/// chunk, mirroring [`find_output_item`]'s `item_id`-then-`output_index` resolution.
+///
+/// Phase 1 charges the whole chunk before phase 2 commits any event, so an item added
+/// earlier in the chunk is not yet in the committed `output_items()` snapshot;
+/// resolving it here lets [`tool_call_clone_bytes`] size the clone the commit phase is
+/// about to retain. The most recent matching event wins, matching the last-write-wins
+/// state a replayed `added`/`done` sequence leaves behind.
+fn pending_chunk_output_item<'a>(chunk_events: &'a [ResponsesEvent], done_payload: &Value) -> Option<&'a Value> {
+    let matches_item_id = |item: &Value, item_id: &str| item.get("id").and_then(Value::as_str) == Some(item_id);
+    if let Some(item_id) = done_payload.get("item_id").and_then(Value::as_str)
+        && let Some(item) = chunk_events
+            .iter()
+            .rev()
+            .filter_map(chunk_event_output_item)
+            .find_map(|(_, item)| matches_item_id(item, item_id).then_some(item))
+    {
+        return Some(item);
+    }
+
+    let output_index = done_payload.get("output_index").and_then(Value::as_u64)?;
+    chunk_events
+        .iter()
+        .rev()
+        .filter_map(chunk_event_output_item)
+        .find_map(|(payload, item)| {
+            (payload.get("output_index").and_then(Value::as_u64) == Some(output_index)).then_some(item)
+        })
+}
+
+/// The `(payload, item)` of an event that introduces or replaces an output item, or
+/// `None` for any other event.
+fn chunk_event_output_item(event: &ResponsesEvent) -> Option<(&Value, &Value)> {
+    let (ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload)) = event else {
+        return None;
+    };
+    payload.get("item").map(|item| (payload, item))
 }
 
 /// Whether an event's wire bytes grow retained accumulation state and so must be

@@ -1272,6 +1272,61 @@ async fn accumulation_charges_retained_tool_call_clone() {
 }
 
 #[tokio::test]
+async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
+    // The coalesced variant of `accumulation_charges_retained_tool_call_clone`: the
+    // id-less `output_item.added` and every re-cloning `function_call_arguments.done`
+    // arrive in ONE chunk. Phase 1 charges the whole chunk before phase 2 commits any
+    // event, so the committed `output_items()` snapshot does not yet contain the added
+    // item; the clone charge must resolve it against the same-chunk pending item too,
+    // or the stream accepts megabytes of retained tool-call copies while the counter
+    // stays near zero (#556 re-review finding: same-chunk added + repeated dones).
+    let big_name = "n".repeat(5000);
+
+    // The cap admits the announced item and a clone or two but not fifty. The fifty
+    // tiny `done` frames alone (~2 KiB) stay far under it, so only charging the
+    // same-chunk clones fails this single chunk closed.
+    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // One chunk: the id-less, call_id-less function-call item announced once, then
+    // fifty `done` frames each re-cloning it into `tool_calls`.
+    let mut coalesced = Vec::new();
+    coalesced.extend_from_slice(&make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "output_index": 0,
+        }),
+    ));
+    for _ in 0..50 {
+        coalesced.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+    }
+
+    let mut chunk = Some(Bytes::from(coalesced));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        chunk.is_none(),
+        "a single chunk whose coalesced added + repeated dones retain megabytes of clones must fail closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a coalesced-chunk clone overflow must not be persisted"
+    );
+
+    // The chunk aborted in phase 1, before phase 2 could clone anything, so no
+    // amplified tool-call copies were retained.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.is_empty(),
+        "the overflowing chunk must fail closed before phase 2 retains any tool-call clone"
+    );
+}
+
+#[tokio::test]
 async fn count_overflow_rejects_before_recording_local_tool_milestone() {
     // A chunk that overflows the item cap must fail closed *before* recording any
     // delivery milestone: otherwise a local tool whose progress streamed earlier in
