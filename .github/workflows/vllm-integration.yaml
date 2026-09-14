@@ -408,14 +408,20 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
-  # Pinned Claude Code drives NATIVE Anthropic Messages passthrough to real vLLM
+  # Pinned Claude Code drives Anthropic Messages to real vLLM, native + transformed
   # (issue #1025)
   #
   # A pinned real Claude Code executable completes a deterministic coding task
-  # while Praxis routes native Anthropic Messages traffic (/v1/messages,
-  # /v1/messages/count_tokens, /v1/models) straight to a vLLM backend that
-  # serves the Anthropic Messages API natively — with NO
-  # anthropic_messages_to_chat_completions translation.
+  # against a pinned real vLLM backend over two Praxis paths, run sequentially
+  # against one shared vLLM container:
+  #   - NATIVE: Anthropic Messages traffic (/v1/messages,
+  #     /v1/messages/count_tokens, /v1/models) is forwarded straight to vLLM's
+  #     native Anthropic surface — with NO translation.
+  #   - TRANSFORMED: Anthropic Messages traffic is translated into OpenAI Chat
+  #     Completions (anthropic_messages_to_chat_completions) and forwarded to
+  #     vLLM's /v1/chat/completions surface.
+  # The two runs are sequential (not parallel) so they never contend for the
+  # 4-vCPU runner's CPU while a model is generating.
   #
   # Gated to workflow_dispatch: this job is reproducibility-critical and depends
   # on a qualified model + a pinned Claude Code archive recorded in
@@ -522,7 +528,7 @@ jobs:
             --served-model-name "$VLLM_SERVED_MODEL" \
             --api-key "$VLLM_API_KEY"
 
-      - name: Preflight native endpoints
+      - name: Preflight vLLM endpoints
         run: |
           set -euo pipefail
           echo "Waiting for vLLM..."
@@ -540,13 +546,19 @@ jobs:
             fi
             sleep 5
           done
-          # Prove the native Messages surface is up and gated by the bearer token.
           auth="Authorization: Bearer ${VLLM_API_KEY}"
           curl -sf -H "$auth" http://127.0.0.1:8000/v1/models > /dev/null
+          # Prove the native Messages surface is up and gated by the bearer token
+          # (used by the native acceptance run).
           curl -sf -H "$auth" -H 'content-type: application/json' \
             -d "{\"model\":\"${VLLM_SERVED_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
             http://127.0.0.1:8000/v1/messages/count_tokens > /dev/null
-          echo "native endpoints ready"
+          # Prove the OpenAI Chat Completions surface is up (used by the
+          # transformed acceptance run, which rewrites /v1/messages to it).
+          curl -sf -H "$auth" -H 'content-type: application/json' \
+            -d "{\"model\":\"${VLLM_SERVED_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+            http://127.0.0.1:8000/v1/chat/completions > /dev/null
+          echo "native and chat-completions endpoints ready"
 
       - name: Build Praxis and acceptance test
         run: |
@@ -578,15 +590,11 @@ jobs:
           echo "NS=$NS" >> "$GITHUB_ENV"
           echo "restricted namespace ready"
 
-      - name: Run Claude Code native-vLLM acceptance test (once, no retry)
-        env:
-          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
-          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
-          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
-          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+      - name: Locate compiled suite test binary
         run: |
           set -uo pipefail
-          # Locate the already-built suite binary without recompiling.
+          # Locate the already-built suite binary without recompiling; both
+          # acceptance runs below reuse it.
           TEST_BIN=$(cargo test -p praxis-tests-integration --test suite --no-run \
               --message-format=json 2>/dev/null \
             | jq -r 'select(.executable != null and .target.name == "suite") | .executable' \
@@ -595,22 +603,53 @@ jobs:
             echo "::error::could not locate the compiled suite test binary"
             exit 1
           fi
+          echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
+
+      - name: Run Claude Code native-vLLM acceptance test (once, no retry)
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+        run: |
+          set -uo pipefail
           # The child enters the network namespace via `ip netns exec`, which
           # needs CAP_NET_ADMIN, so the test binary runs under sudo. Only the
-          # acceptance test runs, exactly once, with no retry.
+          # native acceptance test runs, exactly once, with no retry.
           sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS \
             "$TEST_BIN" \
             claude_code_vllm::pinned_claude_code_drives_native_vllm_through_full_flow \
-            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance.log"
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-native.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run Claude Code transformed-vLLM acceptance test (once, no retry)
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+        run: |
+          set -uo pipefail
+          # Same shared vLLM container and restricted namespace, run sequentially
+          # after the native test so the two never contend for the 4-vCPU runner.
+          # This path routes through anthropic_messages_to_chat_completions to
+          # vLLM's /v1/chat/completions surface. Runs once, no retry.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_drives_transformed_vllm_through_full_flow \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-transformed.log"
           exit "${PIPESTATUS[0]}"
 
       - name: Acceptance log tail on failure
         if: failure()
         run: |
-          # Interleaved client and Praxis diagnostics for the run. The gateway
+          # Interleaved client and Praxis diagnostics for each run. The gateway
           # and native secrets are test constants, and Praxis does not emit auth
-          # headers at the default log level, so this log is safe to surface.
-          tail -n 400 "$RUNNER_TEMP/acceptance.log" 2>/dev/null || echo "no acceptance log captured"
+          # headers at the default log level, so these logs are safe to surface.
+          for log in acceptance-native acceptance-transformed; do
+            echo "=== $log ==="
+            tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || echo "no $log log captured"
+          done
 
       - name: vLLM container logs on failure
         if: failure()
@@ -628,7 +667,8 @@ jobs:
           # emit auth headers at the default log level, so these logs are safe to
           # retain.
           path: |
-            ${{ runner.temp }}/acceptance.log
+            ${{ runner.temp }}/acceptance-native.log
+            ${{ runner.temp }}/acceptance-transformed.log
             ${{ runner.temp }}/vllm.log
           if-no-files-found: ignore
           retention-days: 7

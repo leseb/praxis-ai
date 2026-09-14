@@ -90,34 +90,61 @@ sees the server-owned bearer token. The `router` forwards `/v1/messages`,
 `/v1/messages/count_tokens`, and `/` unchanged, so token counting and model
 discovery stay native too.
 
-### Acceptance test: real Claude Code drives native vLLM (issue #1025)
+### Committed example that translates to Chat Completions
+
+Not every backend serves the Anthropic Messages API natively. When the backend
+speaks only OpenAI Chat Completions,
+[`examples/configs/anthropic/messages-to-openai-vllm.yaml`](../examples/configs/anthropic/messages-to-openai-vllm.yaml)
+is the counterpart of the native config above: it keeps the identical
+three-boundary credential isolation but adds the
+`anthropic_messages_to_chat_completions[_stream]` translation filters and a
+`path_rewrite` that maps `POST /v1/messages` to `/v1/chat/completions`. The
+client still speaks the Anthropic wire format; Praxis rewrites both the request
+and the response, so vLLM only ever sees OpenAI Chat Completions.
+
+`/v1/messages/count_tokens` has no Chat Completions equivalent, so the
+`path_rewrite` is anchored to `^/v1/messages$` and leaves it unrewritten. A
+Chat-Completions-only backend returns 404 for it, and Claude Code degrades
+gracefully because it treats native token counting as best-effort.
+
+### Acceptance test: real Claude Code drives vLLM, native and transformed (issue #1025)
 
 [`tests/integration/tests/suite/claude_code_vllm.rs`](../tests/integration/tests/suite/claude_code_vllm.rs)
-proves the full flow end to end: a pinned real Claude Code executable completes
-a deterministic multi-step coding task while Praxis routes native Anthropic
-Messages traffic straight to a vLLM backend that serves the Anthropic Messages
-API natively.
+proves the full flow end to end on both paths: a pinned real Claude Code
+executable completes a deterministic multi-step coding task through Praxis
+against a real vLLM backend, once with the native passthrough config and once
+with the translation config.
 
 ```text
-Claude Code ─► Praxis (messages-native-vllm.yaml) ─► vLLM
+native      Claude Code ─► Praxis (messages-native-vllm.yaml)    ─► vLLM /v1/messages
+transformed Claude Code ─► Praxis (messages-to-openai-vllm.yaml) ─► vLLM /v1/chat/completions
 ```
 
-The test asserts only what a live run uniquely proves: the client completes the
+Each test asserts only what a live run uniquely proves: the client completes the
 task through Praxis against a real backend — a non-timed-out, successful exit,
 the exact uppercase-derived output file, a harness-owned verification marker
 written only when the task's `verify.sh` confirms the compare, and a non-empty
-final summary in the client's stream-json output. Wire fidelity — native
-passthrough (no `chat/completions` reshaping, the exact served model on every
-inference body), credential isolation (the client's native `x-api-key` and its
-gateway `Authorization: Basic` credential are both stripped so only the injected
-backend bearer reaches vLLM, and an unauthenticated caller is rejected by
-`basic_auth`), and native token counting — is proven deterministically against
-controlled fake backends in
-[`tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`](../tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs),
-not observed in the live run.
+final summary in the client's stream-json output. Wire fidelity is proven
+deterministically against controlled fake backends, not observed in the live
+run:
 
-The test is gated on live infrastructure and skips unless every required
-variable is set. Run it locally against your own pinned binary and backend:
+- Native passthrough (no `chat/completions` reshaping, the exact served model on
+  every inference body), credential isolation, and native token counting in
+  [`tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`](../tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs).
+- The translation path — `/v1/messages` rewritten to `/v1/chat/completions`, the
+  Anthropic request body translated (system hoisted into a Chat Completions
+  message) and the OpenAI response translated back into an Anthropic message, and
+  the same credential isolation — in
+  [`tests/integration/tests/suite/examples/anthropic_messages_to_openai_vllm.rs`](../tests/integration/tests/suite/examples/anthropic_messages_to_openai_vllm.rs).
+
+Both cases share the same credential isolation guarantee: the client's native
+`x-api-key` and its gateway `Authorization: Basic` credential are both stripped
+so only the injected backend bearer reaches vLLM, and an unauthenticated caller
+is rejected by `basic_auth`.
+
+The tests are gated on live infrastructure and skip unless every required
+variable is set. Run them locally against your own pinned binary and backend
+(one vLLM container can serve both surfaces):
 
 ```console
 PRAXIS_TEST_CLAUDE_CODE_BIN=/absolute/path/to/claude \
@@ -125,7 +152,7 @@ PRAXIS_TEST_VLLM_BASE_URL=http://127.0.0.1:8000 \
 PRAXIS_TEST_VLLM_MODEL=<exact-served-model-name> \
 VLLM_API_KEY=<backend-bearer-token> \
   cargo test -p praxis-tests-integration --test suite \
-  claude_code_vllm::pinned_claude_code_drives_native_vllm_through_full_flow -- --exact
+  claude_code_vllm::pinned_claude_code_drives -- --nocapture
 ```
 
 Set `PRAXIS_TEST_CLAUDE_CODE_NETNS` (and `PRAXIS_TEST_LISTEN_ADDRESS` to the
@@ -138,9 +165,10 @@ vLLM image digest, served model, and startup request matrix live in
 [`tests/integration/fixtures/claude-code-cli/pin.toml`](../tests/integration/fixtures/claude-code-cli/pin.toml).
 The `claude-code-native-vllm` job in
 [`.github/workflows/vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml)
-runs the test exactly once (no retry) on `workflow_dispatch` only, so PR and
-merge-queue CI stay green while qualification is pending. Before it can run, a
-model must pass the consecutive qualification runs recorded in the manifest, the
+runs both tests sequentially against one shared vLLM container, each exactly once
+(no retry), on `workflow_dispatch` only, so PR and merge-queue CI stay green
+while qualification is pending. Before it can run, a model must pass the
+consecutive qualification runs recorded in the manifest, the
 `TBD-at-qualification` pins (served model, image digest, revision, Claude Code
 archive url + sha256) must be filled in, and the manifest `status` set to
 `qualified`; the job also requires the `VLLM_API_KEY` repository secret. Until
