@@ -1184,6 +1184,138 @@ fn default_budget_is_mandatory() {
     );
 }
 
+#[tokio::test]
+async fn accumulation_count_dedups_added_done_pair() {
+    // A canonical `output_item.added` -> `output_item.done` pair for the SAME item
+    // is one retained output item, not two. The count derives from the retained
+    // output (which `done` replaces in place), so a matched pair must not trip
+    // `max_output_items: 1`. Regression for the per-envelope double count, where
+    // `added` and `done` each bumped a separate counter (#556 review finding 3).
+    let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut added = Some(output_item_added_chunk(0));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    assert!(added.is_some(), "the added envelope is the single retained item");
+
+    // Same id and output_index: `done` replaces the item in place, so the retained
+    // count stays at one.
+    let mut done = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "item": {"type": "message", "id": "item_0", "content": []},
+            "output_index": 0,
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+    assert!(
+        done.is_some(),
+        "a matched added/done pair is one item and must not trip the count cap"
+    );
+    assert_ne!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a canonical added/done pair must not fail the stream closed"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_byte_budget_spans_irr_rounds() {
+    // The aggregate byte budget is request-wide: bytes charged in an earlier IRR
+    // round persist across the per-round re-arm, so a later round cannot reset the
+    // counter and accumulate unbounded state while no single round trips the cap.
+    // Regression for the per-round reset (#556 review finding 1).
+
+    // Measure what one output item charges so the cap can admit two items but
+    // reject the third, independent of the exact wire size.
+    let probe = make_filter_from("max_accumulated_bytes: 67108864");
+    let mut probe_ctx = arm_plain_stream(&probe);
+    let mut probe_chunk = Some(output_item_added_chunk(0));
+    probe.on_response_body(&mut probe_ctx, &mut probe_chunk, false).unwrap();
+    let per_item = probe_ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .stream_accumulated_bytes;
+    assert!(per_item > 1, "streaming an output item must charge the byte budget");
+
+    // Two items fit; the third does not (2*per_item <= cap < 3*per_item).
+    let cap = per_item * 2 + 1;
+    let filter = make_filter_from(&format!("max_accumulated_bytes: {cap}"));
+    let mut ctx = arm_plain_stream(&filter);
+
+    for i in 0..2 {
+        let mut chunk = Some(output_item_added_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some(), "round-0 items stay under the aggregate cap");
+    }
+
+    // Re-arm as the IRR runner would before the next round's request phase. A
+    // per-round counter would reset to zero here; the request-wide one must not.
+    filter.arm(&mut ctx);
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().stream_accumulated_bytes,
+        per_item * 2,
+        "the request-wide byte budget must survive the per-round re-arm"
+    );
+
+    // Round 1: one more item crosses the cap because round-0 bytes still count.
+    let mut overflow = Some(output_item_added_chunk(2));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(
+        overflow.is_none(),
+        "bytes charged in round 0 must carry into round 1 and fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a stream that overflows the request-wide byte budget must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_terminal_snapshot_charged_against_byte_budget() {
+    // A terminal `response.completed` snapshots the full accumulated output plus
+    // usage into `response_object` and is retained again as the deferred terminal,
+    // so a terminal frame that alone exceeds the byte ceiling must fail closed
+    // rather than slip through just because it fits `max_buffer_bytes`. Regression
+    // for the uncharged terminal snapshot (#556 review finding 2).
+    let filter = make_filter_from("max_accumulated_bytes: 500\nmax_output_items: 100000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let big_text = "x".repeat(2000);
+    let mut completed = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {
+                "id": "resp_big_terminal",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "m1",
+                    "content": [{"type": "output_text", "text": big_text}]
+                }]
+            },
+            "sequence_number": 9
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut completed, false).unwrap();
+    assert!(
+        completed.is_none(),
+        "a terminal snapshot larger than the byte ceiling must fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "an over-cap terminal snapshot must be recorded as a stream parse error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an over-cap terminal snapshot must not be persisted"
+    );
+}
+
 /// Record execution provenance for every item currently in `accumulated_output`,
 /// mirroring what a dispatch filter (`openai_mcp_dispatch`, `openai_web_search`)
 /// records when it actually executes a tool. Tests that seed `accumulated_output`
@@ -3553,8 +3685,6 @@ fn parse_error_sets_metadata() {
         tool_call_args: std::collections::HashMap::new(),
         rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
-        accumulated_bytes: 0,
-        output_item_count: 0,
         max_accumulated_bytes: 64 * 1024 * 1024,
         max_output_items: 100_000,
         iteration: 0,
