@@ -34,6 +34,11 @@ fn make_filter() -> OpenaiStreamEventsFilter {
     OpenaiStreamEventsFilter::build(&yaml).unwrap()
 }
 
+fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    OpenaiStreamEventsFilter::build(&yaml).unwrap()
+}
+
 /// Build a context and arm the filter as the IRR runner plus `on_request`
 /// would inside a step.
 ///
@@ -320,6 +325,49 @@ fn oversized_max_tool_call_argument_bytes_rejected() {
         result.is_err(),
         "max_tool_call_argument_bytes above 64 MiB should be rejected"
     );
+}
+
+#[test]
+fn oversized_max_events_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_events: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_events above the ceiling should be rejected");
+}
+
+#[test]
+fn zero_max_accumulated_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_accumulated_bytes: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_accumulated_bytes should be rejected");
+}
+
+#[test]
+fn oversized_max_accumulated_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_accumulated_bytes: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_accumulated_bytes above 64 MiB should be rejected");
+}
+
+#[test]
+fn zero_max_output_items_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_output_items: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_output_items should be rejected");
+}
+
+#[test]
+fn oversized_max_output_items_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_output_items: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_output_items above the ceiling should be rejected");
+}
+
+#[test]
+fn accumulation_budget_fields_accepted() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("max_accumulated_bytes: 1048576\nmax_output_items: 500").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_ok(), "in-range accumulation budget fields should be accepted");
 }
 
 #[tokio::test]
@@ -872,6 +920,267 @@ async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
         ctx.get_metadata("responses.skip_persist"),
         Some("true"),
         "parse-error streams must not be persisted"
+    );
+}
+
+/// Arm a plain streaming logical-stream context (no hosted tools) for the given
+/// filter, then feed a `response.created` opener. Returns the armed context.
+fn arm_plain_stream(filter: &OpenaiStreamEventsFilter) -> praxis_filter::HttpFilterContext<'static> {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_budget", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    ctx
+}
+
+fn output_item_added_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "message", "id": format!("item_{index}"), "content": []},
+            "output_index": index,
+        }),
+    )
+}
+
+#[tokio::test]
+async fn accumulation_byte_budget_fails_closed_across_chunks() {
+    // Each output_item.added frame is individually valid (well under
+    // max_buffer_bytes), but their aggregate crosses the byte ceiling: the
+    // stream must fail closed once the running total exceeds it (#556).
+    let filter = make_filter_from("max_accumulated_bytes: 400");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut failed = false;
+    for i in 0..50 {
+        let mut chunk = Some(output_item_added_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        if chunk.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(
+        failed,
+        "aggregate output-item bytes must eventually fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "budget overflow must be recorded as a stream parse error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "budget-overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_item_count_budget_fails_closed() {
+    // The item-count dimension trips independently of the byte ceiling: with a
+    // generous byte cap, the third output item exceeds max_output_items: 2.
+    let filter = make_filter_from("max_output_items: 2\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    for i in 0..2 {
+        let mut chunk = Some(output_item_added_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some(), "items within the count cap must pass through");
+    }
+
+    let mut overflow = Some(output_item_added_chunk(2));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none(), "the item past the count cap must fail closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "count-overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_budget_poisons_subsequent_terminal() {
+    // Once tripped, the budget stays tripped: a later terminal event (which is
+    // itself not charged) must not resurrect the stream and commit a success,
+    // so the store never persists a poisoned response.
+    let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut first = Some(output_item_added_chunk(0));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(first.is_some(), "the first item is within the count cap");
+
+    let mut second = Some(output_item_added_chunk(1));
+    filter.on_response_body(&mut ctx, &mut second, false).unwrap();
+    assert!(second.is_none(), "the second item overflows the count cap");
+
+    let mut completed = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {"id": "resp_budget", "status": "completed", "output": []},
+            "sequence_number": 5
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut completed, false).unwrap();
+    assert!(
+        completed.is_none(),
+        "a terminal event after budget overflow must stay suppressed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a poisoned stream must not be persisted even after a terminal event"
+    );
+}
+
+/// A `response.web_search_call.in_progress` local-tool progress frame carrying a
+/// distinct `item_id`. Each grows `emitted_output_items` via
+/// `record_model_output_item`, so each must be charged against the byte budget.
+fn web_search_progress_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.web_search_call.in_progress",
+        &json!({"item_id": format!("ws_{index:06}"), "output_index": index}),
+    )
+}
+
+/// A `response.function_call_arguments.delta` frame for a distinct tool call. The
+/// per-call argument buffer is capped individually, but the number of distinct
+/// keys is bounded only by the aggregate byte budget.
+fn function_call_delta_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({"item_id": format!("fc_{index:06}"), "output_index": index, "delta": "{\"q\":\"x\"}"}),
+    )
+}
+
+/// A `response.output_item.done` frame that finalizes a fresh item (no prior
+/// `output_item.added`), exercising the append branch of `handle_output_item_done`.
+fn output_item_done_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "item": {"type": "message", "id": format!("done_{index}"), "content": []},
+            "output_index": index,
+        }),
+    )
+}
+
+#[tokio::test]
+async fn accumulation_charges_local_tool_progress_events() {
+    // Local-tool progress events (`response.web_search_call.*` etc.) grow the
+    // `emitted_output_items` map without pushing an output item, so before the
+    // charge they escaped the aggregate ceiling entirely. Each must now count
+    // against the byte budget so distinct `item_id`s cannot exhaust memory (#556).
+    let filter = make_filter_from("max_accumulated_bytes: 400");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut failed = false;
+    for i in 0..50 {
+        let mut chunk = Some(web_search_progress_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        if chunk.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(
+        failed,
+        "aggregate local-tool progress bytes must eventually fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "budget overflow must be recorded as a stream parse error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "budget-overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_charges_tool_call_argument_bytes() {
+    // The tool-call argument accumulator — the dimension #556 named as the core
+    // vuln, whose key count was unbounded — is charged through the same byte
+    // budget: many distinct function-call deltas must fail the stream closed.
+    let filter = make_filter_from("max_accumulated_bytes: 400");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut failed = false;
+    for i in 0..50 {
+        let mut chunk = Some(function_call_delta_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        if chunk.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(failed, "aggregate tool-call argument bytes must fail the stream closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "tool-call budget overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_count_charges_output_item_done() {
+    // `output_item.done` can append a brand-new item (no prior `added`), so it
+    // must bump the item counter too; a done-only stream cannot bypass the count
+    // cap. With a generous byte cap, the third done item trips max_output_items: 2.
+    let filter = make_filter_from("max_output_items: 2\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    for i in 0..2 {
+        let mut chunk = Some(output_item_done_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some(), "done items within the count cap must pass through");
+    }
+
+    let mut overflow = Some(output_item_done_chunk(2));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none(), "the done item past the count cap must fail closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "count-overflow streams must not be persisted"
+    );
+}
+
+#[test]
+fn default_budget_is_mandatory() {
+    // #556 requires the aggregate budget to apply even when unconfigured. A filter
+    // built from empty config must carry the default 64 MiB / 100,000 caps, not an
+    // unbounded (opt-in) ceiling.
+    let filter = make_filter();
+    assert_eq!(
+        filter.max_accumulated_bytes,
+        64 * 1024 * 1024,
+        "omitted max_accumulated_bytes must default to the mandatory 64 MiB ceiling"
+    );
+    assert_eq!(
+        filter.max_output_items, 100_000,
+        "omitted max_output_items must default to the mandatory 100,000 cap"
     );
 }
 
@@ -3244,6 +3553,10 @@ fn parse_error_sets_metadata() {
         tool_call_args: std::collections::HashMap::new(),
         rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
+        accumulated_bytes: 0,
+        output_item_count: 0,
+        max_accumulated_bytes: 64 * 1024 * 1024,
+        max_output_items: 100_000,
         iteration: 0,
         output_index_offset: 0,
         deferred_terminal: None,
@@ -4018,6 +4331,8 @@ impl OpenaiStreamEventsFilter {
                 timeout: std::time::Duration::from_secs(300),
             },
             max_tool_call_argument_bytes: 1024 * 1024,
+            max_accumulated_bytes: 64 * 1024 * 1024,
+            max_output_items: 100_000,
         }
     }
 }

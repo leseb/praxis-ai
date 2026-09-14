@@ -90,6 +90,14 @@ pub(super) struct StreamEventsState {
     rejected_tool_call_args: std::collections::HashSet<String>,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
+    /// Aggregate bytes charged against the accumulation budget this round.
+    accumulated_bytes: usize,
+    /// Count of streaming output items accumulated this round.
+    output_item_count: usize,
+    /// Aggregate accumulation byte ceiling; the stream fails closed once passed.
+    max_accumulated_bytes: usize,
+    /// Cap on accumulated output items; the stream fails closed once passed.
+    max_output_items: usize,
     /// Inference iteration number for lifecycle suppression and index offsets.
     iteration: u32,
     /// Output index offset contributed by preceding inference/tool rounds.
@@ -124,12 +132,18 @@ pub(super) struct StreamEventsState {
 /// # max_events: 100000
 /// # timeout_secs: 300
 /// # max_tool_call_argument_bytes: 1048576
+/// # max_accumulated_bytes: 67108864
+/// # max_output_items: 100000
 /// ```
 pub struct OpenaiStreamEventsFilter {
     /// Configuration for the SSE frame parser.
     parser_config: SseParserConfig,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
+    /// Aggregate accumulation byte ceiling across output items and tool-call args.
+    max_accumulated_bytes: usize,
+    /// Cap on accumulated streaming output items.
+    max_output_items: usize,
 }
 
 impl OpenaiStreamEventsFilter {
@@ -153,6 +167,8 @@ impl OpenaiStreamEventsFilter {
         Ok(Self {
             parser_config: cfg.to_parser_config(),
             max_tool_call_argument_bytes: cfg.max_tool_call_argument_bytes(),
+            max_accumulated_bytes: cfg.max_accumulated_bytes(),
+            max_output_items: cfg.max_output_items(),
         })
     }
 
@@ -190,6 +206,10 @@ impl OpenaiStreamEventsFilter {
             tool_call_args: std::collections::HashMap::new(),
             rejected_tool_call_args: std::collections::HashSet::new(),
             max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
+            accumulated_bytes: 0,
+            output_item_count: 0,
+            max_accumulated_bytes: self.max_accumulated_bytes,
+            max_output_items: self.max_output_items,
             iteration,
             output_index_offset,
             deferred_terminal: None,
@@ -451,6 +471,13 @@ fn parse_and_accumulate(
 ) -> Result<Option<Bytes>, SseParseError> {
     check_timeout(state, now)?;
 
+    // A prior chunk may have tripped the aggregate accumulation budget. Fail
+    // every remaining chunk closed before parsing so a later terminal event
+    // cannot commit on a poisoned stream (its frame is not itself charged).
+    if let Some(error) = accumulation_budget_exceeded(state) {
+        return Err(error);
+    }
+
     let frames = state.frame_parser.parse_chunk_with_counted_event_limit(
         bytes,
         state.event_count,
@@ -489,9 +516,90 @@ fn parse_chunk_events(
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
         record_completion(state, &event, now)?;
+        charge_accumulation_budget(state, &event, frame)?;
         events.push(event);
     }
     Ok(events)
+}
+
+/// Charge one parsed event against the aggregate accumulation budget.
+///
+/// Bounds every accumulator this filter grows from backend events — the response
+/// output-item list, the per-tool-call argument buffers, and the local-tool
+/// `emitted_output_items` map (keyed by an owned `item_id`, with a
+/// `streamed_phases` set of owned event-type strings) — by an aggregate byte
+/// ceiling and an output-item count. Each accumulator's growth is a substring of
+/// the frame that drives it, so `frame.data.len()` is a conservative upper bound
+/// on the bytes each event contributes to shared state, and the budget bounds
+/// total accumulated memory even when every individual event stays within
+/// `max_buffer_bytes`.
+///
+/// `frame.data.len()` is the compact JSON wire size, a proxy that undercounts the
+/// parsed `serde_json::Value` heap footprint (per-entry `String` keys and enum
+/// discriminants) by a bounded constant factor; the ceiling therefore bounds
+/// memory up to that factor, not to the byte. This is deliberate: charging wire
+/// bytes keeps the budget aligned with what a backend can actually stream and
+/// avoids rejecting a streamed response whose equivalent non-streaming body the
+/// buffered path would accept.
+///
+/// Both `output_item.added` and `output_item.done` can grow the retained output
+/// list — `added` always pushes; `done` pushes when it finalizes an item never
+/// announced with `added` — so both bump the item counter. Counting both
+/// envelopes over-counts an item that streams a matched `added`/`done` pair; that
+/// is a deliberately conservative, fail-closed-earlier bound, and the byte
+/// ceiling remains the authoritative memory bound. Terminal events overwrite a
+/// single value already bounded per-frame by `max_buffer_bytes`, so they are not
+/// charged.
+///
+/// Runs in phase 1 (parse) so the chunk aborts atomically before
+/// [`commit_chunk_events`] mutates shared state; committed state therefore never
+/// exceeds the configured caps.
+fn charge_accumulation_budget(
+    state: &mut StreamEventsState,
+    event: &ResponsesEvent,
+    frame: &SseFrame,
+) -> Result<(), SseParseError> {
+    match event {
+        ResponsesEvent::OutputItemAdded(_) | ResponsesEvent::OutputItemDone(_) => {
+            state.output_item_count = state.output_item_count.saturating_add(1);
+            state.accumulated_bytes = state.accumulated_bytes.saturating_add(frame.data.len());
+        },
+        ResponsesEvent::FunctionCallArgumentsDelta(_) | ResponsesEvent::FunctionCallArgumentsDone(_) => {
+            state.accumulated_bytes = state.accumulated_bytes.saturating_add(frame.data.len());
+        },
+        // Local-tool progress events (`response.web_search_call.*`,
+        // `response.mcp_call.*`, `response.mcp_list_tools.*`) grow
+        // `emitted_output_items` via `record_model_output_item`; charge them so
+        // that accumulator cannot be inflated by many distinct `item_id`s or
+        // event-type suffixes while the byte ceiling stays at zero.
+        ResponsesEvent::Unknown { event_type, .. } if is_local_tool_progress_event(event_type) => {
+            state.accumulated_bytes = state.accumulated_bytes.saturating_add(frame.data.len());
+        },
+        _ => {},
+    }
+    accumulation_budget_exceeded(state).map_or(Ok(()), Err)
+}
+
+/// The sticky accumulation-budget error, if any dimension is over its cap.
+///
+/// Returned both as each event is charged and as a fast-path guard on later
+/// chunks, so once tripped the stream stays failed closed.
+fn accumulation_budget_exceeded(state: &StreamEventsState) -> Option<SseParseError> {
+    if state.accumulated_bytes > state.max_accumulated_bytes {
+        return Some(SseParseError::AccumulationLimitExceeded {
+            dimension: "accumulated_bytes",
+            value: state.accumulated_bytes,
+            limit: state.max_accumulated_bytes,
+        });
+    }
+    if state.output_item_count > state.max_output_items {
+        return Some(SseParseError::AccumulationLimitExceeded {
+            dimension: "output_items",
+            value: state.output_item_count,
+            limit: state.max_output_items,
+        });
+    }
+    None
 }
 
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
