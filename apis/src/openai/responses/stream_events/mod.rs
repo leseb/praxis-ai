@@ -1532,6 +1532,19 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 fn canonicalize_logical_response(state: &mut ResponsesState) -> (Vec<Value>, Value) {
     let logical_id = state.logical_stream_response_id.clone();
     let usage = state.usage.clone();
+    // #1150: a rehydrated turn strips `previous_response_id` from the upstream
+    // request, so the backend echoes `null` in its terminal lifecycle response.
+    // `openai_responses_rehydrate` repairs the client-visible SSE bytes, but the
+    // persistence source is this independent `response_object`; restore the id
+    // here too so a later GET returns the same continuation metadata the terminal
+    // frame delivered. Gated exactly like the wire rewrite's
+    // `eligible_previous_response_id_stream`: only a rehydrated turn carrying a
+    // caller id, never fabricated for a non-rehydrated turn whose backend already
+    // echoed the real value.
+    let restored_previous_response_id = state
+        .history_rehydrated
+        .then(|| state.previous_response_id.clone())
+        .flatten();
     // Prefer the cross-round accumulator populated by dispatch/loop filters
     // (agentic pipelines). When no such filter ran — a plain one-round logical
     // stream — it stays empty, so fall back to the terminal event's own output
@@ -1558,6 +1571,9 @@ fn canonicalize_logical_response(state: &mut ResponsesState) -> (Vec<Value>, Val
     if let Some(response) = state.response_object.as_object_mut() {
         if let Some(logical_id) = logical_id {
             response.insert("id".to_owned(), Value::String(logical_id));
+        }
+        if let Some(prev_id) = restored_previous_response_id {
+            response.insert("previous_response_id".to_owned(), Value::String(prev_id));
         }
         response.insert("output".to_owned(), Value::Array(output.clone()));
         if !usage.is_null() {

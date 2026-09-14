@@ -261,6 +261,82 @@ fn local_error_flushes_file_search_lifecycle_before_terminal() {
 }
 
 #[test]
+fn canonicalize_restores_previous_response_id_into_store_source() {
+    // #1150: a rehydrated streaming turn strips `previous_response_id` from the
+    // upstream request, so the backend echoes `null` in its terminal lifecycle
+    // response. The rehydrate filter repairs the client-visible SSE bytes, but
+    // the persistence source is this independent `response_object`. The
+    // canonicalization boundary must restore the caller's id here too, or a
+    // later GET returns different continuation metadata than the terminal frame.
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        history_rehydrated: true,
+        previous_response_id: Some("resp_prev".to_owned()),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "previous_response_id": serde_json::Value::Null,
+            "output": []
+        }),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("response object should encode");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line should exist"),
+    )
+    .unwrap();
+
+    // The store source (`response_object`) is the record a later GET serves.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.response_object["previous_response_id"], "resp_prev",
+        "the persisted store source must carry the caller's previous_response_id, \
+         not the backend's null"
+    );
+    assert_eq!(
+        payload["response"]["previous_response_id"], "resp_prev",
+        "the canonical logical terminal must agree with the wire terminal"
+    );
+}
+
+#[test]
+fn canonicalize_preserves_backend_previous_response_id_without_rehydration() {
+    // Without rehydration the proxy leaves `previous_response_id` on the upstream
+    // request, so the backend echoes the real value. The canonicalization
+    // boundary must not overwrite it with request state (which is `None` here),
+    // and it must never fabricate one when history was not rehydrated.
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        history_rehydrated: false,
+        previous_response_id: None,
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "previous_response_id": "resp_backend",
+            "output": []
+        }),
+        ..ResponsesState::default()
+    });
+
+    encode_local_completion(&mut ctx).expect("response object should encode");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.response_object["previous_response_id"], "resp_backend",
+        "a non-rehydrated turn must keep the backend-echoed previous_response_id"
+    );
+}
+
+#[test]
 fn response_body_access_is_always_read_write() {
     let filter = make_filter();
     assert_eq!(
