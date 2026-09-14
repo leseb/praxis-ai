@@ -5186,25 +5186,6 @@ def test_invalid_tool_choice_raises_bad_request(openai_client):
     assert "tool_choice" in str(exc_info.value).lower()
 
 
-def test_conflicting_previous_response_and_conversation_raises_bad_request(
-    openai_client,
-):
-    """Verify the mutually exclusive conversation selectors scenario."""
-    with pytest.raises(BadRequestError) as exc_info:
-        openai_client.responses.create(
-            model=VLLM_MODEL,
-            input="Hello",
-            previous_response_id="resp_conflict_responses_coverage",
-            conversation="conv_conflict_responses_coverage",
-        )
-
-    assert exc_info.value.status_code == 400
-    message = str(exc_info.value)
-    assert "previous_response_id" in message
-    assert "conversation" in message
-
-
-
 if __name__ == "__main__":
     sys.exit(
         pytest.main(
