@@ -5186,10 +5186,6 @@ def test_invalid_tool_choice_raises_bad_request(openai_client):
     assert "tool_choice" in str(exc_info.value).lower()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="selector conflict validation currently runs after previous-response lookup",
-)
 def test_conflicting_previous_response_and_conversation_raises_bad_request(
     openai_client,
 ):
