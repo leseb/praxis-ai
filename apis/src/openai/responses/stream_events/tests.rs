@@ -1220,6 +1220,95 @@ async fn accumulation_count_dedups_added_done_pair() {
 }
 
 #[tokio::test]
+async fn accumulation_charges_retained_tool_call_clone() {
+    // A `function_call_arguments.done` clones the whole retained output item into
+    // `tool_calls`. When the item carries a large `name` (charged once on its
+    // `output_item.added`) but no `id`/`call_id`, `upsert_tool_call` cannot dedup
+    // and every later tiny `done` frame appends another full clone. Charging only
+    // `frame.data.len()` left the counter near zero while megabytes were retained,
+    // so the clone-to-be must be charged too (#556 review finding: retained
+    // tool-call copies escaped the byte budget).
+    let big_name = "n".repeat(5000);
+
+    // The cap admits the announced item and its first clone but not many. Fifty
+    // tiny `done` frames alone (~2 KiB) stay well under it, so without charging the
+    // clone the stream would never fail closed in this loop.
+    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // An id-less, call_id-less function-call item announced once.
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "output_index": 0,
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    assert!(added.is_some(), "the announced function call is within the cap");
+
+    let mut failed = false;
+    for _ in 0..50 {
+        let mut done = Some(make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+        filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+        if done.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(
+        failed,
+        "re-cloned tool-call copies must be charged and eventually fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a stream whose retained tool-call clones overflow the byte budget must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn count_overflow_rejects_before_recording_local_tool_milestone() {
+    // A chunk that overflows the item cap must fail closed *before* recording any
+    // delivery milestone: otherwise a local tool whose progress streamed earlier in
+    // the same chunk leaves a committed milestone that EOS recovery trusts, dropping
+    // the executed tool from the client-visible stream. The count guard now runs
+    // between accumulation and milestone recording (#556 review finding).
+    let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // Round-0 item fills the single-item cap.
+    let mut first = Some(output_item_added_chunk(0));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(first.is_some(), "the first item is within the count cap");
+
+    // One chunk: a local-tool progress frame (which would record a milestone for
+    // its `item_id`) followed by an `output_item.added` that overflows the count
+    // cap. The whole chunk must be rejected atomically.
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&web_search_progress_chunk(1));
+    combined.extend_from_slice(&output_item_added_chunk(1));
+    let mut chunk = Some(Bytes::from(combined));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(chunk.is_none(), "the overflowing chunk must fail closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a count-overflow chunk must not be persisted"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        !state.emitted_output_items.contains_key("ws_000001"),
+        "no local-tool milestone may be recorded for a chunk rejected on count overflow"
+    );
+}
+
+#[tokio::test]
 async fn accumulation_byte_budget_spans_irr_rounds() {
     // The aggregate byte budget is request-wide: bytes charged in an earlier IRR
     // round persist across the per-round re-arm, so a later round cannot reset the

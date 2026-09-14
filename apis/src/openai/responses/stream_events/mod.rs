@@ -36,7 +36,10 @@ use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use self::accumulator::accumulate_response_object;
-use self::{accumulator::accumulate_event, config::StreamEventsConfig};
+use self::{
+    accumulator::{accumulate_event, find_output_item},
+    config::StreamEventsConfig,
+};
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
@@ -502,15 +505,11 @@ fn parse_and_accumulate(
     // milestone is recorded for bytes that never reach the client and EOS
     // recovery still re-synthesizes the executed tool items (#276 finding 3).
     let events = parse_chunk_events(state, ctx, &frames, now)?;
-    let logical_output = commit_chunk_events(state, ctx, events);
-
-    // The retained item count is a property of the committed output that only
-    // exists after `commit_chunk_events` grows it, so it is enforced here rather
-    // than per-event in phase 1. Any overshoot is bounded to a single chunk and
-    // the request-wide budget stays sticky for every later chunk and round.
-    if let Some(error) = accumulation_count_exceeded(state, ctx) {
-        return Err(error);
-    }
+    // Commit accumulates the retained output, enforces the item-count budget
+    // against it, and only then records delivery milestones and emits bytes — so a
+    // count overflow fails the chunk closed before any milestone is committed (see
+    // [`commit_chunk_events`]).
+    let logical_output = commit_chunk_events(state, ctx, events)?;
 
     Ok((!logical_output.is_empty()).then(|| Bytes::from(logical_output)))
 }
@@ -550,10 +549,16 @@ fn parse_chunk_events(
 /// `emitted_output_items` map (keyed by an owned `item_id`, with a
 /// `streamed_phases` set of owned event-type strings), and the terminal snapshot
 /// retained in `response_object` and the deferred terminal — by an aggregate byte
-/// ceiling. Each accumulator's growth is a substring of the frame that drives it,
-/// so `frame.data.len()` is a conservative upper bound on the bytes each event
-/// contributes to shared state, and the budget bounds total accumulated memory
-/// even when every individual event stays within `max_buffer_bytes`.
+/// ceiling. For most accumulators the growth is a substring of the frame that
+/// drives it, so `frame.data.len()` is a conservative upper bound on the bytes each
+/// event contributes to shared state, and the budget bounds total accumulated
+/// memory even when every individual event stays within `max_buffer_bytes`.
+///
+/// The one accumulator whose growth is *not* bounded by the driving frame is the
+/// `tool_calls` list: a `function_call_arguments.done` clones the whole retained
+/// output item (whose payload arrived in an earlier frame) rather than the small
+/// `done` frame. `tool_call_clone_bytes` charges that clone-to-be here as well, so
+/// `frame.data.len()` alone can no longer undercount it.
 ///
 /// The running total lives in [`ResponsesState::stream_accumulated_bytes`], so it
 /// is charged once per request and survives the per-round re-arm: a multi-round
@@ -590,12 +595,45 @@ fn charge_accumulation_budget(
     if !charges_accumulation_bytes(event) {
         return Ok(());
     }
+    // `frame.data.len()` under-counts one accumulator: a
+    // `function_call_arguments.done` clones the whole retained output item into
+    // `tool_calls` (see `finalize_function_call`), and that item's `name`/wire
+    // payload may have arrived in an earlier, already-charged frame. Charge the
+    // clone-to-be here in phase 1 — before `commit_chunk_events` performs it — so
+    // the aggregate budget bounds the retained growth and the chunk aborts atomically
+    // before the clone. Absent this, an id-less function call re-cloned by hundreds
+    // of tiny `done` frames retained megabytes while the counter stayed near zero.
+    let retained_clone_bytes = tool_call_clone_bytes(ctx, event);
     let accumulated_bytes = {
         let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-        responses.stream_accumulated_bytes = responses.stream_accumulated_bytes.saturating_add(frame.data.len());
+        responses.stream_accumulated_bytes = responses
+            .stream_accumulated_bytes
+            .saturating_add(frame.data.len())
+            .saturating_add(retained_clone_bytes);
         responses.stream_accumulated_bytes
     };
     accumulation_bytes_exceeded(state, accumulated_bytes).map_or(Ok(()), Err)
+}
+
+/// Serialized size of the retained output item that a `function_call_arguments.done`
+/// will clone into `tool_calls`, or `0` when the event is not a done or no matching
+/// item is retained yet.
+///
+/// The clone is a full copy of the item `finalize_function_call` locates by
+/// `item_id`/`output_index`; charging its wire size keeps the aggregate byte budget
+/// aligned with the memory the commit phase is about to retain. When the referenced
+/// item was added in the same, not-yet-committed chunk it is not found here, but that
+/// chunk's own `output_item.added` frame already charged the item once, bounding the
+/// clone to that chunk's wire bytes.
+fn tool_call_clone_bytes(ctx: &HttpFilterContext<'_>, event: &ResponsesEvent) -> usize {
+    let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
+        return 0;
+    };
+    ctx.extensions
+        .get::<ResponsesState>()
+        .and_then(|responses| find_output_item(responses.output_items(), payload))
+        .and_then(|item| crate::json_body::serialized_len(item).ok())
+        .unwrap_or(0)
 }
 
 /// Whether an event's wire bytes grow retained accumulation state and so must be
@@ -669,16 +707,39 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
 ///
-/// Both steps are infallible, so every recorded milestone corresponds to bytes
-/// that actually reach the client. Returns the logical-stream bytes.
+/// Split into two passes so the item-count budget is validated between them:
+///
+/// - Phase 2a accumulates every event into the retained output (`output_items`, `tool_calls`, `response_object`) — the
+///   only state the count derives from, and state no delivery milestone depends on.
+/// - The count guard then runs against that grown output, *before* any delivery milestone is recorded. A chunk that
+///   overflows the item cap therefore fails closed without leaving a committed local-tool milestone that EOS recovery
+///   would trust for bytes the client never received (review finding: the former post-commit count check let an
+///   already-executed tool's milestone survive a rejected chunk, dropping that tool from the client-visible stream).
+/// - Phase 2b records milestones and emits the logical bytes.
+///
+/// On a rejected chunk phase 2a has already grown the retained output past the cap,
+/// so the request-wide count guard in [`accumulation_budget_exceeded`] stays sticky
+/// for every later chunk and round. Phase 2b is infallible, so every recorded
+/// milestone still corresponds to bytes that actually reach the client. Returns the
+/// logical-stream bytes.
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, SseParseError> {
+    for event in &events {
+        accumulate_event(ctx, state, event);
+    }
+
+    // The retained item count only exists after phase 2a grows it. Enforce it here,
+    // before phase 2b records any delivery milestone, so a rejected chunk leaves no
+    // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
+    if let Some(error) = accumulation_count_exceeded(state, ctx) {
+        return Err(error);
+    }
+
     let mut logical_output = Vec::new();
     for event in events {
-        accumulate_event(ctx, state, &event);
         append_logical_event(state, ctx, event, &mut logical_output);
     }
 
@@ -692,7 +753,7 @@ fn commit_chunk_events(
         response_state.deferred_stream_done = true;
     }
 
-    logical_output
+    Ok(logical_output)
 }
 
 /// Whether an event is a response lifecycle-creation event

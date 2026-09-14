@@ -293,6 +293,27 @@ fn tool_call_key(payload: &Value) -> Option<String> {
         })
 }
 
+/// Find the output item targeted by a function-call arguments event, read-only.
+///
+/// Mirrors [`find_output_item_mut`]'s `item_id`-then-`output_index` resolution so
+/// the accumulation budget can measure, in phase 1, the item that
+/// [`finalize_function_call`] will clone into `tool_calls` in phase 2.
+pub(super) fn find_output_item<'a>(output_items: &'a [Value], payload: &Value) -> Option<&'a Value> {
+    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str)
+        && let Some(index) = output_items
+            .iter()
+            .position(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
+    {
+        return output_items.get(index);
+    }
+
+    let output_index = payload
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())?;
+    output_items.get(output_index)
+}
+
 /// Find the output item targeted by a function-call arguments event.
 fn find_output_item_mut<'a>(output_items: &'a mut [Value], payload: &Value) -> Option<&'a mut Value> {
     if let Some(item_id) = payload.get("item_id").and_then(Value::as_str)
