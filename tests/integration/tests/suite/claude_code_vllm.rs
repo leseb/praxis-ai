@@ -1,29 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Black-box Claude Code acceptance test for native Anthropic Messages
-//! passthrough to a real vLLM backend (issue #1025).
+//! Black-box Claude Code acceptance tests against a real vLLM backend, both
+//! ways Praxis can bridge Anthropic Messages to it (issue #1025).
 //!
-//! A pinned real Claude Code executable completes a deterministic multi-step
-//! coding task while Praxis routes NATIVE Anthropic Messages traffic
-//! (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`) straight to a
-//! vLLM backend that serves the Anthropic Messages API natively — with NO
-//! `anthropic_messages_to_chat_completions` translation:
+//! A pinned real Claude Code executable completes the same deterministic
+//! multi-step coding task through Praxis against a real vLLM backend under two
+//! configs that exercise the two production paths:
 //!
 //! ```text
-//! Claude Code ─► Praxis (messages-native-vllm.yaml) ─► vLLM
+//! native      Claude Code ─► Praxis (messages-native-vllm.yaml)    ─► vLLM /v1/messages
+//! transformed Claude Code ─► Praxis (messages-to-openai-vllm.yaml) ─► vLLM /v1/chat/completions
 //! ```
 //!
-//! This test asserts only what a live end-to-end run uniquely proves: the real
+//! The native path routes NATIVE Anthropic Messages traffic (`/v1/messages`,
+//! `/v1/messages/count_tokens`, `/v1/models`) straight through with NO body
+//! translation. The transformed path rewrites the Anthropic request into OpenAI
+//! Chat Completions (and the response back) via
+//! `anthropic_messages_to_chat_completions[_stream]`, so a Chat-Completions-only
+//! vLLM can serve the same client. One vLLM container serves both surfaces, so a
+//! single gated CI job runs both tests.
+//!
+//! These tests assert only what a live end-to-end run uniquely proves: the real
 //! client completes the task through Praxis against a real backend. Wire
-//! fidelity — native passthrough (no `chat/completions` reshaping), credential
+//! fidelity — native passthrough or Chat Completions translation, credential
 //! isolation, and streaming semantics — is proven deterministically against
 //! controlled fake backends in
-//! `tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`,
-//! not observed here.
+//! `tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`
+//! and `.../anthropic_messages_to_openai_vllm.rs`, not observed here.
 //!
-//! This test is gated on live infrastructure and skips unless every required
-//! variable is set. Run it locally with, e.g.:
+//! Both tests are gated on live infrastructure and skip unless every required
+//! variable is set. Run them locally with, e.g.:
 //!
 //! ```console
 //! PRAXIS_TEST_CLAUDE_CODE_BIN=/absolute/path/to/claude \
@@ -32,6 +39,8 @@
 //! VLLM_API_KEY=<backend-bearer-token> \
 //!   cargo test -p praxis-tests-integration --test suite \
 //!   claude_code_vllm::pinned_claude_code_drives_native_vllm_through_full_flow -- --exact
+//! # and, against the same backend's Chat Completions surface:
+//! #   claude_code_vllm::pinned_claude_code_drives_transformed_vllm_through_full_flow
 //! ```
 //!
 //! Pin discipline: [`CLAUDE_CODE_VERSION`] and [`LAUNCH_FLAGS`] are part of the
@@ -90,8 +99,12 @@ const LISTEN_ADDRESS_ENV: &str = "PRAXIS_TEST_LISTEN_ADDRESS";
 /// qualification run and update this constant and the manifest together.
 const CLAUDE_CODE_VERSION: &str = "2.0.1";
 
-/// The native-vLLM passthrough example config under test.
-const CONFIG: &str = "anthropic/messages-native-vllm.yaml";
+/// The native-vLLM passthrough example config under test (no body translation).
+const CONFIG_NATIVE: &str = "anthropic/messages-native-vllm.yaml";
+
+/// The transformed-vLLM example config under test: Anthropic Messages is
+/// translated to OpenAI Chat Completions for a Chat-Completions-only backend.
+const CONFIG_TRANSFORMED: &str = "anthropic/messages-to-openai-vllm.yaml";
 
 /// The client's native Anthropic `x-api-key`. Distinct from the gateway
 /// credential; the config's `headers` filter must strip it before vLLM.
@@ -144,21 +157,43 @@ const LAUNCH_FLAGS: &[&str] = &[
 // -----------------------------------------------------------------------------
 
 /// Prove the pinned Claude Code client completes a coding task through Praxis
-/// against a real native-Anthropic vLLM backend.
+/// against a real native-Anthropic vLLM backend, with NO body translation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_claude_code_drives_native_vllm_through_full_flow() {
     let Some(live) = LiveConfig::from_env() else {
         return;
     };
+    run_full_flow(&live, native_vllm_config).await;
+}
+
+/// Prove the same client completes the same task through Praxis when Praxis
+/// TRANSLATES Anthropic Messages into OpenAI Chat Completions for the same vLLM
+/// backend's Chat Completions surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_claude_code_drives_transformed_vllm_through_full_flow() {
+    let Some(live) = LiveConfig::from_env() else {
+        return;
+    };
+    run_full_flow(&live, transformed_vllm_config).await;
+}
+
+/// Drives the pinned client end to end through a Praxis config built by
+/// `build_config`, asserting the task completed against the real backend.
+///
+/// Both acceptance paths (native passthrough and Chat Completions translation)
+/// share this flow; only the config filter chain differs. The client, task,
+/// egress-isolation enforcement, and outcome assertions are identical, so the
+/// two tests prove the same real-model behavior over the two wire bridges.
+async fn run_full_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16) -> Config) {
     assert_pinned_version(&live.claude_bin).await;
     live.require_egress_isolation_if_demanded();
 
-    // Praxis binds the configured address and forwards native Anthropic Messages
-    // traffic straight to the real vLLM backend. Under network isolation Praxis
-    // binds the host-side veth address so the namespaced client can reach only
-    // Praxis, proving it cannot bypass the proxy.
+    // Praxis binds the configured address and forwards Anthropic Messages traffic
+    // to the real vLLM backend. Under network isolation Praxis binds the
+    // host-side veth address so the namespaced client can reach only Praxis,
+    // proving it cannot bypass the proxy.
     let proxy_port = free_port();
-    let config = native_vllm_config(&live, proxy_port);
+    let config = build_config(live, proxy_port);
     let proxy = start_proxy(&config);
     let proxy_base_url = format!("http://{}", proxy.addr());
 
@@ -173,7 +208,7 @@ async fn pinned_claude_code_drives_native_vllm_through_full_flow() {
 
     let workspace = Workspace::create();
     let started = SystemTime::now();
-    let output = launch_claude_code(&live, &proxy_base_url, &workspace).await;
+    let output = launch_claude_code(live, &proxy_base_url, &workspace).await;
 
     assert!(
         !output.timed_out,
@@ -282,7 +317,17 @@ fn authority_of(base: &str) -> String {
         .to_owned()
 }
 
-/// Build the native-vLLM config with the listener and backend endpoint patched.
+/// Build the native-vLLM passthrough config (no body translation).
+fn native_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
+    live_vllm_config(CONFIG_NATIVE, live, proxy_port)
+}
+
+/// Build the transformed-vLLM config (Anthropic Messages -> Chat Completions).
+fn transformed_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
+    live_vllm_config(CONFIG_TRANSFORMED, live, proxy_port)
+}
+
+/// Load an example config, patching the listener and backend endpoint for a live run.
 ///
 /// The listener binds [`LiveConfig::listen_address`] (loopback by default, the
 /// host-side veth address under network isolation) and the backend endpoint is
@@ -292,9 +337,10 @@ fn authority_of(base: &str) -> String {
 /// password is inlined from [`gateway_password`] instead of its
 /// `GATEWAY_AUTH_PASSWORD` env var, because `std::env::set_var` is `unsafe` (and
 /// `unsafe_code` is denied workspace-wide) so the test cannot set it, and the
-/// client must present the exact same value.
-fn native_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
-    let path = example_config_path(CONFIG);
+/// client must present the exact same value. Both example configs share the same
+/// listener/backend/gateway placeholders, so this loader serves both paths.
+fn live_vllm_config(config: &str, live: &LiveConfig, proxy_port: u16) -> Config {
+    let path = example_config_path(config);
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let listener = format!("{}:{proxy_port}", live.listen_address);
     let patched = yaml
@@ -305,7 +351,7 @@ fn native_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
             "env_var: GATEWAY_AUTH_PASSWORD",
             &format!("password: {}", gateway_password()),
         );
-    Config::from_yaml(&patched).unwrap_or_else(|error| panic!("parse {CONFIG}: {error}"))
+    Config::from_yaml(&patched).unwrap_or_else(|error| panic!("parse {config}: {error}"))
 }
 
 // -----------------------------------------------------------------------------
