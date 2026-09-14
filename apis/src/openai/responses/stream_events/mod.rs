@@ -36,10 +36,7 @@ use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use self::accumulator::accumulate_response_object;
-use self::{
-    accumulator::{accumulate_event, find_output_item},
-    config::StreamEventsConfig,
-};
+use self::{accumulator::accumulate_event, config::StreamEventsConfig};
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
@@ -535,12 +532,7 @@ fn parse_chunk_events(
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
         record_completion(state, &event, now)?;
-        // `&events` is this chunk's events parsed so far. Passing it lets the charge
-        // size a tool-call clone against an item introduced by an earlier
-        // `output_item.added`/`.done` in this same, not-yet-committed chunk, which the
-        // committed `output_items()` snapshot does not yet contain (see
-        // `tool_call_clone_bytes`).
-        charge_accumulation_budget(state, ctx, &events, &event, frame)?;
+        charge_accumulation_budget(state, ctx, &event, frame)?;
         events.push(event);
     }
     Ok(events)
@@ -549,21 +541,23 @@ fn parse_chunk_events(
 /// Charge one parsed event's wire bytes against the request-wide accumulation
 /// byte budget.
 ///
-/// Bounds every accumulator this filter grows from backend events — the response
-/// output-item list, the per-tool-call argument buffers, the local-tool
+/// Bounds every accumulator this filter grows *from the driving frame* — the
+/// response output-item list, the per-tool-call argument buffers, the local-tool
 /// `emitted_output_items` map (keyed by an owned `item_id`, with a
 /// `streamed_phases` set of owned event-type strings), and the terminal snapshot
 /// retained in `response_object` and the deferred terminal — by an aggregate byte
-/// ceiling. For most accumulators the growth is a substring of the frame that
-/// drives it, so `frame.data.len()` is a conservative upper bound on the bytes each
-/// event contributes to shared state, and the budget bounds total accumulated
-/// memory even when every individual event stays within `max_buffer_bytes`.
+/// ceiling. Each of these grows by a substring of the frame that drives it, so
+/// `frame.data.len()` is a conservative upper bound on the bytes each event
+/// contributes to shared state, and the budget bounds total accumulated memory even
+/// when every individual event stays within `max_buffer_bytes`.
 ///
 /// The one accumulator whose growth is *not* bounded by the driving frame is the
 /// `tool_calls` list: a `function_call_arguments.done` clones the whole retained
 /// output item (whose payload arrived in an earlier frame) rather than the small
-/// `done` frame. `tool_call_clone_bytes` charges that clone-to-be here as well, so
-/// `frame.data.len()` alone can no longer undercount it.
+/// `done` frame. That clone is charged in phase 2 ([`commit_chunk_events`]), where
+/// it is actually performed and its size is known exactly, instead of being
+/// predicted here — so the byte budget cannot diverge from the item the commit
+/// retains, and no per-event history rescan is needed.
 ///
 /// The running total lives in [`ResponsesState::stream_accumulated_bytes`], so it
 /// is charged once per request and survives the per-round re-arm: a multi-round
@@ -588,117 +582,23 @@ fn parse_chunk_events(
 /// byte bound. The distinct item-count dimension is enforced separately from the
 /// retained output (see [`accumulation_count_exceeded`]).
 ///
-/// Runs in phase 1 (parse) so the chunk aborts atomically before
-/// [`commit_chunk_events`] mutates shared state; committed byte-bearing state
-/// therefore never exceeds the configured ceiling.
+/// Runs in phase 1 (parse) so a frame-bounded accumulator's growth aborts the chunk
+/// atomically before [`commit_chunk_events`] mutates shared state.
 fn charge_accumulation_budget(
     state: &StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    chunk_events: &[ResponsesEvent],
     event: &ResponsesEvent,
     frame: &SseFrame,
 ) -> Result<(), SseParseError> {
     if !charges_accumulation_bytes(event) {
         return Ok(());
     }
-    // `frame.data.len()` under-counts one accumulator: a
-    // `function_call_arguments.done` clones the whole retained output item into
-    // `tool_calls` (see `finalize_function_call`), and that item's `name`/wire
-    // payload may have arrived in an earlier, already-charged frame. Charge the
-    // clone-to-be here in phase 1 — before `commit_chunk_events` performs it — so
-    // the aggregate budget bounds the retained growth and the chunk aborts atomically
-    // before the clone. The clone is charged once per `done`, so N repeated dones
-    // targeting one id-less item are charged N times. Absent this, an id-less
-    // function call re-cloned by hundreds of tiny `done` frames retained megabytes
-    // while the counter stayed near zero.
-    let retained_clone_bytes = tool_call_clone_bytes(ctx, chunk_events, event);
     let accumulated_bytes = {
         let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-        responses.stream_accumulated_bytes = responses
-            .stream_accumulated_bytes
-            .saturating_add(frame.data.len())
-            .saturating_add(retained_clone_bytes);
+        responses.stream_accumulated_bytes = responses.stream_accumulated_bytes.saturating_add(frame.data.len());
         responses.stream_accumulated_bytes
     };
     accumulation_bytes_exceeded(state, accumulated_bytes).map_or(Ok(()), Err)
-}
-
-/// Serialized size of the retained output item that a `function_call_arguments.done`
-/// will clone into `tool_calls`, or `0` when the event is not a done or no matching
-/// item is retained yet.
-///
-/// The clone is a full copy of the item `finalize_function_call` locates by
-/// `item_id`/`output_index`; charging its wire size keeps the aggregate byte budget
-/// aligned with the memory the commit phase is about to retain.
-///
-/// The item is resolved against two sources and the larger charged: the committed
-/// retained output (`output_items()`), and — because phase 1 runs over the whole
-/// chunk before phase 2 commits any of it — items introduced by an earlier
-/// `output_item.added`/`.done` in this same, not-yet-committed chunk
-/// (`pending_chunk_output_item`). Charging only the committed snapshot missed the
-/// clone when the added item and its repeated dones were coalesced into one chunk:
-/// the item was not yet committed, so an id-less function call re-cloned by hundreds
-/// of same-chunk done frames retained megabytes while the counter stayed near zero.
-/// Charging the larger is conservative — phase 2 clones whichever source it resolves,
-/// and over-charging only fails the stream closed slightly earlier.
-fn tool_call_clone_bytes(
-    ctx: &HttpFilterContext<'_>,
-    chunk_events: &[ResponsesEvent],
-    event: &ResponsesEvent,
-) -> usize {
-    let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
-        return 0;
-    };
-    let committed = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .and_then(|responses| find_output_item(responses.output_items(), payload))
-        .and_then(|item| crate::json_body::serialized_len(item).ok())
-        .unwrap_or(0);
-    let pending = pending_chunk_output_item(chunk_events, payload)
-        .and_then(|item| crate::json_body::serialized_len(item).ok())
-        .unwrap_or(0);
-    committed.max(pending)
-}
-
-/// The output item a `function_call_arguments.done` targets that was introduced by an
-/// earlier `output_item.added`/`output_item.done` in this same, not-yet-committed
-/// chunk, mirroring [`find_output_item`]'s `item_id`-then-`output_index` resolution.
-///
-/// Phase 1 charges the whole chunk before phase 2 commits any event, so an item added
-/// earlier in the chunk is not yet in the committed `output_items()` snapshot;
-/// resolving it here lets [`tool_call_clone_bytes`] size the clone the commit phase is
-/// about to retain. The most recent matching event wins, matching the last-write-wins
-/// state a replayed `added`/`done` sequence leaves behind.
-fn pending_chunk_output_item<'a>(chunk_events: &'a [ResponsesEvent], done_payload: &Value) -> Option<&'a Value> {
-    let matches_item_id = |item: &Value, item_id: &str| item.get("id").and_then(Value::as_str) == Some(item_id);
-    if let Some(item_id) = done_payload.get("item_id").and_then(Value::as_str)
-        && let Some(item) = chunk_events
-            .iter()
-            .rev()
-            .filter_map(chunk_event_output_item)
-            .find_map(|(_, item)| matches_item_id(item, item_id).then_some(item))
-    {
-        return Some(item);
-    }
-
-    let output_index = done_payload.get("output_index").and_then(Value::as_u64)?;
-    chunk_events
-        .iter()
-        .rev()
-        .filter_map(chunk_event_output_item)
-        .find_map(|(payload, item)| {
-            (payload.get("output_index").and_then(Value::as_u64) == Some(output_index)).then_some(item)
-        })
-}
-
-/// The `(payload, item)` of an event that introduces or replaces an output item, or
-/// `None` for any other event.
-fn chunk_event_output_item(event: &ResponsesEvent) -> Option<(&Value, &Value)> {
-    let (ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload)) = event else {
-        return None;
-    };
-    payload.get("item").map(|item| (payload, item))
 }
 
 /// Whether an event's wire bytes grow retained accumulation state and so must be
@@ -772,28 +672,52 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
 ///
-/// Split into two passes so the item-count budget is validated between them:
+/// Split into two passes so both retained-state budgets are validated before any
+/// delivery milestone is recorded:
 ///
 /// - Phase 2a accumulates every event into the retained output (`output_items`, `tool_calls`, `response_object`) — the
-///   only state the count derives from, and state no delivery milestone depends on.
-/// - The count guard then runs against that grown output, *before* any delivery milestone is recorded. A chunk that
+///   only state the count derives from, and state no delivery milestone depends on. As it accumulates it charges the
+///   one byte-bearing growth the phase-1 frame charge cannot bound: the `tool_calls` clone a
+///   `function_call_arguments.done` makes of a whole retained output item (see [`charge_accumulation_budget`]). That
+///   clone is measured, not predicted, so the charge equals the item the commit actually retained and a `done` that
+///   re-clones a large item fails the chunk closed the instant the request-wide byte total exceeds the cap.
+/// - The count guard then runs against the grown output, *before* any delivery milestone is recorded. A chunk that
 ///   overflows the item cap therefore fails closed without leaving a committed local-tool milestone that EOS recovery
 ///   would trust for bytes the client never received (review finding: the former post-commit count check let an
 ///   already-executed tool's milestone survive a rejected chunk, dropping that tool from the client-visible stream).
 /// - Phase 2b records milestones and emits the logical bytes.
 ///
-/// On a rejected chunk phase 2a has already grown the retained output past the cap,
-/// so the request-wide count guard in [`accumulation_budget_exceeded`] stays sticky
-/// for every later chunk and round. Phase 2b is infallible, so every recorded
-/// milestone still corresponds to bytes that actually reach the client. Returns the
-/// logical-stream bytes.
+/// On a rejected chunk phase 2a has already grown the retained output past a cap, so
+/// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
+/// later chunk and round. The byte guard fails closed per event, so transient
+/// overshoot is bounded to the single clone that trips the cap. Phase 2b is
+/// infallible, so every recorded milestone still corresponds to bytes that actually
+/// reach the client. Returns the logical-stream bytes.
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
 ) -> Result<Vec<u8>, SseParseError> {
     for event in &events {
-        accumulate_event(ctx, state, event);
+        let retained_clone_bytes = accumulate_event(ctx, state, event);
+        // A `function_call_arguments.done` clones a whole retained output item into
+        // `tool_calls` — the one accumulator whose growth the driving `done` frame
+        // does not bound. Charge that measured clone here, where it happens, and fail
+        // the chunk closed the instant the request-wide byte total exceeds the cap.
+        // Charging the actual clone (not a phase-1 prediction) is exact and
+        // O(clone size): it cannot diverge from the item the commit retained, and the
+        // per-event check bounds transient overshoot to a single clone.
+        if retained_clone_bytes > 0 {
+            let accumulated_bytes = {
+                let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
+                responses.stream_accumulated_bytes =
+                    responses.stream_accumulated_bytes.saturating_add(retained_clone_bytes);
+                responses.stream_accumulated_bytes
+            };
+            if let Some(error) = accumulation_bytes_exceeded(state, accumulated_bytes) {
+                return Err(error);
+            }
+        }
     }
 
     // The retained item count only exists after phase 2a grows it. Enforce it here,

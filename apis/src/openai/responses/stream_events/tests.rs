@@ -1275,10 +1275,10 @@ async fn accumulation_charges_retained_tool_call_clone() {
 async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
     // The coalesced variant of `accumulation_charges_retained_tool_call_clone`: the
     // id-less `output_item.added` and every re-cloning `function_call_arguments.done`
-    // arrive in ONE chunk. Phase 1 charges the whole chunk before phase 2 commits any
-    // event, so the committed `output_items()` snapshot does not yet contain the added
-    // item; the clone charge must resolve it against the same-chunk pending item too,
-    // or the stream accepts megabytes of retained tool-call copies while the counter
+    // arrive in ONE chunk. The clone charge is measured in phase 2 as each `done`
+    // actually clones the item into `tool_calls`, so a coalesced added + repeated
+    // dones fails the stream closed the instant the retained clones cross the cap —
+    // never accepting the full amplification of tool-call copies while the counter
     // stays near zero (#556 re-review finding: same-chunk added + repeated dones).
     let big_name = "n".repeat(5000);
 
@@ -1317,12 +1317,107 @@ async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
         "a coalesced-chunk clone overflow must not be persisted"
     );
 
-    // The chunk aborted in phase 1, before phase 2 could clone anything, so no
-    // amplified tool-call copies were retained.
+    // The chunk fails closed inside phase 2, the moment the measured clones cross the
+    // cap — after retaining only a bounded handful, never the full 50-way
+    // amplification. Bounded retention with rejection is the fix; the earlier phase-1
+    // prediction under-charged the coalesced case and never rejected at all.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.len() < 50,
+        "the per-event byte guard must fail closed before the full amplification, got {} clones",
+        state.tool_calls.len()
+    );
+}
+
+#[tokio::test]
+async fn accumulation_charges_clone_when_added_output_index_mismatches() {
+    // Finding 1 (#556 re-review): the clone charge must follow the accumulator's
+    // actual append/replace rules, not an advertised `output_index`.
+    // `handle_output_item_added` IGNORES `output_index` and pushes, so an item
+    // announced with `output_index: 7` still lands at actual index 0. A
+    // `function_call_arguments.done` targeting index 0 then clones that large item.
+    // The former phase-1 prediction resolved the pending item by the advertised
+    // index 7, matched nothing, charged zero, and never rejected — retaining
+    // megabytes uncharged. Measuring the clone where it is made closes the gap: the
+    // done resolves the real index-0 item, clones it, and is charged.
+    let big_name = "n".repeat(5000);
+
+    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // One chunk: an id-less function call announced with a MISMATCHED output_index
+    // (7, though `added` ignores it and lands the item at index 0), then repeated
+    // dones targeting the real index 0.
+    let mut coalesced = Vec::new();
+    coalesced.extend_from_slice(&make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "output_index": 7,
+        }),
+    ));
+    for _ in 0..50 {
+        coalesced.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+    }
+
+    let mut chunk = Some(Bytes::from(coalesced));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        chunk.is_none(),
+        "an added item whose advertised output_index differs from its landing index must still have \
+         its repeated clones charged and fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a mismatched-index clone overflow must not be persisted"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.len() < 50,
+        "the clone charge must fail closed before the full amplification, got {} clones",
+        state.tool_calls.len()
+    );
+}
+
+#[tokio::test]
+async fn accumulation_argument_done_without_item_is_incremental() {
+    // Finding 2 (#556 re-review): the clone charge must not rescan the parsed-event
+    // history for every completion. A coalesced chunk of many
+    // `function_call_arguments.done` events with NO matching output item was the
+    // O(N^2) worst case the old rescan hit (~1.9s for 60k events). Charging the clone
+    // at commit makes each done O(1): it finds no item, clones nothing, and charges
+    // nothing. A large such chunk must be processed without spurious overflow and
+    // without retaining any tool call.
+    let filter = make_filter_from("max_accumulated_bytes: 67108864\nmax_events: 100000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut coalesced = Vec::new();
+    for _ in 0..20_000 {
+        coalesced.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+    }
+
+    let mut chunk = Some(Bytes::from(coalesced));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    // No matching output item ever existed, so nothing was cloned or charged as a
+    // clone and the stream is not failed closed.
+    assert_ne!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "dones without a matching output item must not spuriously overflow the byte budget"
+    );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(
         state.tool_calls.is_empty(),
-        "the overflowing chunk must fail closed before phase 2 retains any tool-call clone"
+        "a done with no matching output item must retain no tool call"
     );
 }
 
