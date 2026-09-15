@@ -42,6 +42,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_mcp_dispatch`](openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
 | [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
 | [`openai_model_rewrite`](openai_model_rewrite.md) | Rewrites the `model` field in Responses API request bodies. |
+| [`openai_operation`](openai_operation.md) | Classifies supported OpenAI operations from the request head. |
 | [`openai_proxy`](openai_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_rehydrate`](openai_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
 | [`openai_responses_to_chat_completions`](openai_responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
