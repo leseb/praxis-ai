@@ -850,7 +850,10 @@ async fn web_search_continuation_serializes_backend_valid_input() {
 
     // Re-entry request phase: web_search_dispatch executes the search and bridges results,
     // then the proxy rebuilds the outbound body from continuation state.
-    let action = web_search_dispatch.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    let action = web_search_dispatch
+        .on_request_body(&mut ctx, &mut None, true)
+        .await
+        .unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
         "web_search_dispatch dispatch should continue"

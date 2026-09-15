@@ -319,8 +319,7 @@ impl HttpFilter for StreamEventsFilter {
             && (typed_streaming
                 || ctx.get_metadata("openai_format.format") == Some("openai_responses")
                 || has_responses_state);
-        let is_streaming =
-            typed_streaming || ctx.get_metadata("openai_format.stream") == Some("true") || body_stream;
+        let is_streaming = typed_streaming || ctx.get_metadata("openai_format.stream") == Some("true") || body_stream;
         // `IterationState` is inserted by the IRR runner before the request phase
         // of every iteration (including iteration 0), so its presence is the
         // runtime signal that the filter is placed inside an IRR step.

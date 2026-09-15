@@ -15,11 +15,7 @@ use super::*;
 fn default_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(
-        filter.name(),
-        "openai_format",
-        "filter name should be openai_format"
-    );
+    assert_eq!(filter.name(), "openai_format", "filter name should be openai_format");
 }
 
 #[test]
@@ -36,11 +32,7 @@ headers:
     .unwrap();
 
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(
-        filter.name(),
-        "openai_format",
-        "filter name should be openai_format"
-    );
+    assert_eq!(filter.name(), "openai_format", "filter name should be openai_format");
 }
 
 #[test]
@@ -112,11 +104,7 @@ headers:
     )
     .unwrap();
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(
-        filter.name(),
-        "openai_format",
-        "null headers should disable promotion"
-    );
+    assert_eq!(filter.name(), "openai_format", "null headers should disable promotion");
 }
 
 // -----------------------------------------------------------------------------
@@ -313,33 +301,23 @@ async fn promotes_metadata_for_full_responses_request() {
     let ctx = run_filter("{}", FULL_RESPONSES_BODY).await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.model").map(String::as_str),
         Some("gpt-4.1")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.stream")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.stream").map(String::as_str),
         Some("true")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.store")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.store").map(String::as_str),
         Some("false")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.background")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.background").map(String::as_str),
         Some("true")
     );
     assert_eq!(
@@ -355,9 +333,7 @@ async fn promotes_metadata_for_full_responses_request() {
         Some("true")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.has_tools")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.has_tools").map(String::as_str),
         Some("true")
     );
     assert_eq!(
@@ -367,9 +343,7 @@ async fn promotes_metadata_for_full_responses_request() {
         Some("true")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateful")
     );
 }
@@ -425,8 +399,7 @@ async fn missing_optional_facts_not_promoted() {
         "prev_id metadata absent"
     );
     assert!(
-        !ctx.filter_metadata
-            .contains_key("openai_format.has_conversation"),
+        !ctx.filter_metadata.contains_key("openai_format.has_conversation"),
         "conversation metadata absent"
     );
     assert!(
@@ -434,14 +407,11 @@ async fn missing_optional_facts_not_promoted() {
         "tools metadata absent"
     );
     assert!(
-        !ctx.filter_metadata
-            .contains_key("openai_format.has_prompt_id"),
+        !ctx.filter_metadata.contains_key("openai_format.has_prompt_id"),
         "prompt_id metadata absent"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateful"),
         "mode should be stateful when store is omitted (defaults to true)"
     );
@@ -502,9 +472,7 @@ async fn null_headers_suppress_emission() {
         "null headers suppress all emission"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "metadata still written with null headers"
     );
@@ -519,9 +487,7 @@ async fn get_v1_responses_with_id_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses/resp_abc123").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "GET /v1/responses/{{id}} should classify as responses"
     );
@@ -537,9 +503,7 @@ async fn get_v1_responses_input_items_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses/resp_abc123/input_items").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "GET /v1/responses/{{id}}/input_items should classify as responses"
     );
@@ -550,9 +514,7 @@ async fn delete_v1_responses_with_id_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::DELETE, "/v1/responses/resp_abc123").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "DELETE /v1/responses/{{id}} should classify as responses"
     );
@@ -563,9 +525,7 @@ async fn post_v1_responses_cancel_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::POST, "/v1/responses/resp_abc123/cancel").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST /v1/responses/{{id}}/cancel should classify as responses"
     );
@@ -578,9 +538,7 @@ async fn post_v1_responses_input_tokens_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::POST, "/v1/responses/input_tokens").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST /v1/responses/input_tokens should classify as responses"
     );
@@ -591,9 +549,7 @@ async fn post_v1_responses_compact_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::POST, "/v1/responses/compact").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST /v1/responses/compact should classify as responses"
     );
@@ -670,9 +626,7 @@ async fn put_unrelated_path_classifies_body_normally() {
     .await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_chat_completions"),
         "non-path method should classify using request body"
     );
@@ -689,16 +643,12 @@ async fn post_v1_responses_classifies_body_normally() {
     .await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST should classify via body, not path"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.model").map(String::as_str),
         Some("gpt-4.1"),
         "POST should extract model from body"
     );
@@ -713,16 +663,12 @@ async fn post_v1_responses_create_without_discriminator_classifies_as_responses(
     let ctx = run_filter_with_method("{}", r#"{"model":"gpt-5"}"#, http::Method::POST, "/v1/responses").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "create body without discriminator fields should classify as responses"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.model").map(String::as_str),
         Some("gpt-5"),
         "model should still be extracted from the create body"
     );
@@ -741,23 +687,17 @@ async fn post_v1_responses_create_preserves_body_facts() {
     .await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "create endpoint should classify as responses"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.stream")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.stream").map(String::as_str),
         Some("true"),
         "stream fact should be preserved"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.store")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.store").map(String::as_str),
         Some("false"),
         "store fact should be preserved"
     );
@@ -818,9 +758,7 @@ async fn responses_websocket_handshake_promotes_only_format() {
         "the handshake should promote the Responses format header"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "the handshake should write the Responses format metadata"
     );
@@ -846,8 +784,7 @@ async fn responses_websocket_handshake_promotes_only_format() {
         "mode",
     ] {
         assert!(
-            !ctx.filter_metadata
-                .contains_key(&format!("openai_format.{fact}")),
+            !ctx.filter_metadata.contains_key(&format!("openai_format.{fact}")),
             "handshake should not write {fact} metadata"
         );
         assert!(
@@ -863,9 +800,7 @@ async fn get_responses_without_websocket_headers_classifies_body_normally() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("non_json"),
         "an ordinary GET list request must not be promoted as a WebSocket handshake"
     );
@@ -887,9 +822,7 @@ async fn mode_stateless_when_store_false_no_stateful_markers() {
 
     assert_eq!(results.get("mode"), Some("stateless"));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateless")
     );
     let headers = collect_headers(&ctx);
@@ -1021,9 +954,7 @@ async fn mode_header_suppressed_when_null() {
         "null mode header should suppress emission"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateless"),
         "metadata still written with null mode header"
     );

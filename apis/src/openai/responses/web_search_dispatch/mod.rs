@@ -174,9 +174,10 @@ impl WebSearchDispatchFilter {
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search_dispatch", config)?;
         if cfg.max_calls_per_round == 0 || cfg.max_calls_per_round > MAX_CALLS_PER_ROUND {
-            return Err(
-                format!("openai_web_search_dispatch: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}").into(),
-            );
+            return Err(format!(
+                "openai_web_search_dispatch: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}"
+            )
+            .into());
         }
         let max_calls_per_round = cfg.max_calls_per_round;
         let validated = build_config("openai_web_search_dispatch", &cfg.into_shared())?;
