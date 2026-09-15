@@ -373,8 +373,8 @@ const PRIMARY_KEY_QUERY: &str = "SELECT a.attname AS column_name, a.atttypid::in
        AND n.nspname = current_schema() \
      ORDER BY k.ord";
 
-/// Fetch the names of unique indexes on a `PostgreSQL` table other than the
-/// primary key.
+/// Query for the unique indexes on a `PostgreSQL` table other than the primary
+/// key, each with the columns it covers.
 ///
 /// `pg_index.indisunique AND NOT indisprimary` covers every `UNIQUE` constraint
 /// and standalone `CREATE UNIQUE INDEX`. No `indisready`/`indislive` filter is
@@ -387,38 +387,41 @@ const PRIMARY_KEY_QUERY: &str = "SELECT a.attname AS column_name, a.atttypid::in
 /// Expression index members have `attnum = 0` and are dropped by the
 /// `pg_attribute` join, so an expression-based unique index resolves to fewer
 /// columns than any expected set and is rejected fail-closed.
+const UNIQUE_INDEX_QUERY: &str = "SELECT ix.relname AS index_name, \
+            array_agg(a.attname ORDER BY k.ord) AS columns \
+     FROM pg_index i \
+     JOIN pg_class t ON t.oid = i.indrelid \
+     JOIN pg_class ix ON ix.oid = i.indexrelid \
+     JOIN pg_namespace n ON n.oid = t.relnamespace \
+     JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+     WHERE i.indisunique \
+       AND NOT i.indisprimary \
+       AND t.relname = $1 \
+       AND n.nspname = current_schema() \
+     GROUP BY ix.relname \
+     ORDER BY ix.relname";
+
+/// Fetch the unique indexes on a `PostgreSQL` table other than the primary key,
+/// each with the columns it covers, via [`UNIQUE_INDEX_QUERY`].
 async fn table_extra_unique_indexes(pool: &sqlx::PgPool, table: &str) -> Result<Vec<ActualUniqueIndex>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT ix.relname AS index_name, \
-                array_agg(a.attname ORDER BY k.ord) AS columns \
-         FROM pg_index i \
-         JOIN pg_class t ON t.oid = i.indrelid \
-         JOIN pg_class ix ON ix.oid = i.indexrelid \
-         JOIN pg_namespace n ON n.oid = t.relnamespace \
-         JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
-         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-         WHERE i.indisunique \
-           AND NOT i.indisprimary \
-           AND t.relname = $1 \
-           AND n.nspname = current_schema() \
-         GROUP BY ix.relname \
-         ORDER BY ix.relname",
-    )
-    .bind(table)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| StoreError::Database(e.to_string()))?;
-    let mut indexes = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let name: String = row
-            .try_get("index_name")
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        let columns: Vec<String> = row
-            .try_get("columns")
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        indexes.push(ActualUniqueIndex { name, columns });
-    }
-    Ok(indexes)
+    let rows = sqlx::query(UNIQUE_INDEX_QUERY)
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    rows.iter().map(pg_row_to_unique_index).collect()
+}
+
+/// Convert one [`UNIQUE_INDEX_QUERY`] row into an [`ActualUniqueIndex`].
+fn pg_row_to_unique_index(row: &PgRow) -> Result<ActualUniqueIndex, StoreError> {
+    let name: String = row
+        .try_get("index_name")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let columns: Vec<String> = row
+        .try_get("columns")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    Ok(ActualUniqueIndex { name, columns })
 }
 
 /// Discover each tenant-scoped table's schema and compare it against the schema
