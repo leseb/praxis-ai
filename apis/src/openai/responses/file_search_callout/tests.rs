@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::{BodyMode, FilterAction, HttpFilter};
+use praxis_filter::{BodyMode, FilterAction, FilterEntry, FilterPipeline, FilterRegistry, HttpFilter};
 use serde_json::{Value, json};
 
 use super::{
@@ -21,13 +21,13 @@ use super::{
         MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchResult, VectorStoreSearchRequest,
         VectorStoreSearchResponse, request_error,
     },
-    config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client},
     *,
 };
 use crate::{
     callout_policy::OnFailure,
     openai::responses::state::{FileSearchAssignment, SynthesisKind},
-    subrequest::{SubRequestError, SubResponse},
+    subrequest::{SubRequestClient, SubRequestError, SubResponse},
 };
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
@@ -38,12 +38,13 @@ fn minimal_config_uses_safe_defaults() {
     let raw: FileSearchFilterConfig = serde_yaml::from_str(
         r#"
         vector_store_url: "https://8.8.8.8"
+        outbound_chain: vector_store_chain
         "#,
     )
     .unwrap();
-    let config = build_config(&raw).unwrap();
+    let config = build_config_with_client(&raw, test_subrequest_client()).unwrap();
 
-    assert_eq!(config.api_client.api_base_url(), "https://8.8.8.8");
+    assert_eq!(config.base_url, "https://8.8.8.8");
     assert_eq!(config.max_response_bytes, 10_485_760);
     assert_eq!(config.max_total_response_bytes, 67_108_864);
     assert_eq!(config.max_state_bytes, 52_428_800);
@@ -53,11 +54,13 @@ fn minimal_config_uses_safe_defaults() {
 #[test]
 fn config_rejects_unknown_and_removed_circuit_breaker_fields() {
     for yaml in [
-        "vector_store_url: https://8.8.8.8\nunknown: true\n",
-        "vector_store_url: https://8.8.8.8\ncircuit_breaker: {}\n",
-        "vector_store_url: https://8.8.8.8\nsearch_template: '{query}'\n",
-        "vector_store_url: https://8.8.8.8\nannotation_template: '{content}'\n",
-        "vector_store_url: https://8.8.8.8\ncontext_template: '{results}'\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nunknown: true\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\ncircuit_breaker: {}\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nsearch_template: '{query}'\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nannotation_template: '{content}'\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\ncontext_template: '{results}'\n",
+        // The removed per-filter SSRF opt-in is now an unknown field.
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nallow_private_url: true\n",
     ] {
         assert!(
             serde_yaml::from_str::<FileSearchFilterConfig>(yaml).is_err(),
@@ -83,7 +86,12 @@ fn config_rejects_ambiguous_or_invalid_urls() {
 }
 
 #[test]
-fn config_rejects_sensitive_ip_targets_by_default() {
+fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
+    // Private/loopback literals and DNS names all pass config-time structural
+    // validation. SSRF is decided at connect time by `prepare_url_target`, which
+    // honours `insecure_options.allow_private_upstreams`; startup cannot see that
+    // flag, so it must not reject a literal private target here (that would make
+    // the central opt-in unable to ever permit one).
     for url in [
         "http://localhost:8001",
         "http://127.0.0.1:8001",
@@ -93,27 +101,20 @@ fn config_rejects_sensitive_ip_targets_by_default() {
         "http://0.7.8.9:8001",
         "http://[::1]:8001",
         "http://[::ffff:10.0.0.1]:8001",
+        "http://vector-store.example:8001",
     ] {
-        assert!(parse_config(&format!("vector_store_url: '{url}'\n")).is_err(), "{url}");
+        assert!(
+            parse_config(&format!("vector_store_url: '{url}'\n")).is_ok(),
+            "private-address gating is deferred to the runtime hook: {url}"
+        );
     }
-
-    assert!(
-        parse_config("vector_store_url: 'http://vector-store.example:8001'\n").is_ok(),
-        "DNS targets are validated and pinned at connect time"
-    );
-}
-
-#[test]
-fn config_private_override_is_explicit() {
-    let config = parse_config("vector_store_url: 'http://localhost:8001'\nallow_private_url: true\n").unwrap();
-    assert_eq!(config.api_client.api_base_url(), "http://localhost:8001");
 }
 
 #[tokio::test]
 async fn build_config_with_client_shares_connector_circuit_state() {
     use praxis_core::{
         circuit::CircuitBreakerConfig,
-        subrequest::{SubRequestClient, SubRequestConnector, SubRequestConnectorOptions, SubRequestError},
+        subrequest::{SubRequestConnector, SubRequestConnectorOptions, SubRequestError},
     };
 
     let shared = SubRequestClient::with_max_response_bytes(
@@ -128,15 +129,16 @@ async fn build_config_with_client_shares_connector_circuit_state() {
         }),
         usize::MAX,
     );
+    // Any structurally-valid target passes config-time validation; the callout
+    // still inherits the shared connector's circuit.
     let raw: FileSearchFilterConfig = serde_yaml::from_str(
         "
-vector_store_url: http://127.0.0.1:9
-allow_private_url: true
+vector_store_url: http://vector-store.test
+outbound_chain: vector_store_chain
 ",
     )
     .unwrap();
     let inherited = build_config_with_client(&raw, shared.clone()).unwrap();
-    let isolated = build_config(&raw).unwrap();
     let peer_addr = closed_loopback_addr();
 
     let first = execute_against(&shared, &peer_addr).await;
@@ -150,21 +152,10 @@ allow_private_url: true
         "shared connector should open after threshold 1; got {second:?}"
     );
 
-    let inherited_result = execute_against(inherited.api_client.subrequest_client(), &peer_addr).await;
+    let inherited_result = execute_against(&inherited.subrequest_client, &peer_addr).await;
     assert!(
         matches!(inherited_result, Err(SubRequestError::CircuitOpen { .. })),
-        "from_config_with_client must keep the callout on the same connector Arc; got {inherited_result:?}"
-    );
-
-    let isolated_debug = format!("{:?}", isolated.api_client.subrequest_client());
-    assert!(
-        isolated_debug.contains("circuit_breakers: false"),
-        "isolated from_config must not install a breaker; got {isolated_debug}"
-    );
-    let isolated_result = execute_against(isolated.api_client.subrequest_client(), &peer_addr).await;
-    assert!(
-        matches!(isolated_result, Err(SubRequestError::Connect(_))),
-        "isolated client must not observe the shared connector's open circuit; got {isolated_result:?}"
+        "build_config_with_client must keep the callout on the same connector Arc; got {inherited_result:?}"
     );
 }
 
@@ -528,6 +519,37 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.messages.len(), message_len);
+}
+
+#[tokio::test]
+async fn outbound_chain_filters_run_on_every_sub_request() {
+    // Every vector-store sub-request is dispatched through the configured
+    // `outbound_chain`. Wire a chain whose `headers` filter stamps a marker and
+    // assert the store observed it on each of two fan-out sub-requests: the chain
+    // is not a passive destination selector, its filters execute per callout.
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, "hit"));
+    let filter = make_concrete_filter_with_outbound(
+        server.port,
+        "",
+        outbound_pipeline_stamping_header("X-Vector-Store-Client", "praxis-ai-gateway"),
+    );
+    let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b"])));
+
+    assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "both stores should be searched");
+    for request in &requests {
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("X-Vector-Store-Client: praxis-ai-gateway")),
+            "outbound chain filter must stamp the marker header on each sub-request; got:\n{request}"
+        );
+    }
+    // The callout still reconciled the assignment, so the chain runs on the real
+    // dispatch path rather than a discarded probe.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
 }
 
 #[tokio::test]
@@ -949,6 +971,35 @@ async fn whole_call_timeout_covers_slow_response_body() {
             .dispatch_failure
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn runtime_ssrf_gate_rejects_private_target_without_opt_in() {
+    // The store resolves to a loopback address. Without
+    // `allow_private_upstreams` on the outbound pipeline, the connect-time
+    // `prepare_url_target` hook must reject it before any dial. The closed policy
+    // records a 502 dispatch failure and leaves the call unreconciled, and the
+    // store never receives a request.
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, "unreached"));
+    let filter =
+        make_concrete_filter_with_outbound(server.port, "on_failure: closed\n", deny_private_outbound_pipeline());
+    let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
+
+    assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+    assert!(
+        server.requests().is_empty(),
+        "SSRF rejection must occur before any sub-request reaches the store"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state
+            .dispatch_failure
+            .as_ref()
+            .expect("a rejected private dial must record a dispatch failure")
+            .status,
+        502
+    );
+    assert_eq!(state.accumulated_output[0]["status"], "searching");
 }
 
 #[tokio::test]
@@ -1385,9 +1436,56 @@ fn translate_skips_non_file_search() {
 // -----------------------------------------------------------------------------
 
 fn parse_config(yaml: &str) -> Result<ValidatedConfig, FilterError> {
+    // `outbound_chain` is a required field; inject a named reference so URL and
+    // budget assertions exercise `build_config_with_client` without every caller
+    // repeating the chain line.
+    let yaml = format!("outbound_chain: vector_store_chain\n{yaml}");
     let raw: FileSearchFilterConfig =
-        serde_yaml::from_str(yaml).map_err(|error| -> FilterError { error.to_string().into() })?;
-    build_config(&raw)
+        serde_yaml::from_str(&yaml).map_err(|error| -> FilterError { error.to_string().into() })?;
+    build_config_with_client(&raw, test_subrequest_client())
+}
+
+/// A default sub-request client for config-parsing tests that never dials.
+fn test_subrequest_client() -> SubRequestClient {
+    use praxis_core::subrequest::SubRequestConnector;
+
+    SubRequestClient::new(SubRequestConnector::new(4, None))
+}
+
+/// An outbound pipeline that permits loopback/private upstreams so tests can
+/// dial the in-process `MockServer` on `127.0.0.1`. Production wires this policy
+/// from `insecure_options.allow_private_upstreams`; here we opt in explicitly.
+fn test_outbound_pipeline() -> Arc<FilterPipeline> {
+    let registry = FilterRegistry::with_builtins();
+    let mut pipeline = FilterPipeline::build(&mut [], &registry).expect("empty pipeline builds");
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
+}
+
+/// An outbound pipeline that does not permit private upstreams, mirroring the
+/// default `insecure_options` posture. The connect-time SSRF hook rejects any
+/// resolved private/loopback address dialed through it.
+fn deny_private_outbound_pipeline() -> Arc<FilterPipeline> {
+    let registry = FilterRegistry::with_builtins();
+    let pipeline = FilterPipeline::build(&mut [], &registry).expect("empty pipeline builds");
+    Arc::new(pipeline)
+}
+
+/// An outbound pipeline whose single `headers` filter stamps a request header on
+/// every sub-request, mirroring the credential/observability chain shipped in the
+/// example configs. Loopback dials are permitted so the sub-request reaches the
+/// in-process `MockServer`; the stamped header proves the chain's filters ran.
+fn outbound_pipeline_stamping_header(name: &str, value: &str) -> Arc<FilterPipeline> {
+    let registry = FilterRegistry::with_builtins();
+    let mut entries: Vec<FilterEntry> = vec![
+        serde_yaml::from_str(&format!(
+            "filter: headers\nrequest_set:\n  - name: {name}\n    value: {value}\n"
+        ))
+        .expect("headers filter entry parses"),
+    ];
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("headers pipeline builds");
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
 }
 
 fn closed_loopback_addr() -> String {
@@ -1418,11 +1516,24 @@ fn make_filter(port: u16, extra: &str) -> Box<dyn HttpFilter> {
 }
 
 fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
-    let yaml = format!("vector_store_url: 'http://127.0.0.1:{port}'\nallow_private_url: true\n{extra}");
+    make_concrete_filter_with_outbound(port, extra, test_outbound_pipeline())
+}
+
+fn make_concrete_filter_with_outbound(
+    port: u16,
+    extra: &str,
+    outbound: Arc<FilterPipeline>,
+) -> FileSearchCalloutFilter {
+    // Parse budgets/policy through the real config path with a DNS placeholder URL,
+    // then repoint the client at the in-process `MockServer`. The supplied outbound
+    // pipeline decides whether the runtime SSRF hook allows the loopback dial.
+    let yaml = format!("vector_store_url: 'http://vector-store.test'\noutbound_chain: vector_store_chain\n{extra}");
     let raw: FileSearchFilterConfig = serde_yaml::from_str(&yaml).unwrap();
-    let validated = build_config(&raw).unwrap();
+    let validated = build_config_with_client(&raw, test_subrequest_client()).unwrap();
     let client = FileSearchClient::new(FileSearchClientConfig {
-        api_client: validated.api_client,
+        base_url: format!("http://127.0.0.1:{port}"),
+        subrequest_client: validated.subrequest_client,
+        forward_header_names: validated.forward_header_names,
         on_failure: validated.on_failure,
         max_response_bytes: validated.max_response_bytes,
         max_total_response_bytes: validated.max_total_response_bytes,
@@ -1430,6 +1541,7 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     });
     FileSearchCalloutFilter {
         client,
+        outbound,
         max_state_bytes: validated.max_state_bytes,
         on_failure: validated.on_failure,
     }

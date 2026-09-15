@@ -51,7 +51,8 @@ pub fn resolve_pipelines(
             entries.extend_from_slice(chain_filters);
         }
 
-        let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)?;
+        let mut pipeline =
+            FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
 
         validate_provider_boundary(listener, &entries, &chains)?;
@@ -85,6 +86,7 @@ fn configure_pipeline(
     }
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
     pipeline.set_subrequest_client(subrequest_client.clone());
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
     Ok(())
 }

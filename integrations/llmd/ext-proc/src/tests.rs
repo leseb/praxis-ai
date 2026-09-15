@@ -2470,6 +2470,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         request_headers_to_set: Vec::new(),
         filter_metadata: HashMap::new(),
         structured_metadata: HashMap::new(),
+        prior_pre_read_mutations: Vec::new(),
         pre_read_mutations: Vec::new(),
         filter_results: HashMap::new(),
         filter_state: HashMap::new(),

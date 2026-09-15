@@ -69,7 +69,8 @@ fn resolve_listener_pipeline(
         entries.extend_from_slice(filters);
     }
 
-    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains).unwrap();
+    let mut pipeline =
+        FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
     pipeline
         .apply_body_limits(
             config.body_limits.max_request_bytes,
@@ -79,6 +80,8 @@ fn resolve_listener_pipeline(
         .unwrap();
     pipeline.set_subrequest_client(client.clone());
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
+    pipeline.apply_insecure_options(&config.insecure_options);
     Arc::new(pipeline)
 }
 
