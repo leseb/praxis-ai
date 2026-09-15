@@ -102,7 +102,7 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// The upstream `openai_responses_validate` filter rejects requests that
+    /// The upstream `openai_validate` filter rejects requests that
     /// supply both selectors; the resolution order here is a silent fallback.
     async fn rehydrate(
         &self,

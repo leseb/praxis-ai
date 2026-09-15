@@ -656,11 +656,11 @@ fn non_responses_path_passes_through() {
 // =============================================================================
 
 #[test]
-fn body_preserved_through_openai_responses_proxy_with_function_tools() {
+fn body_preserved_through_openai_proxy_with_function_tools() {
     let backend_guard = start_echo_backend();
     let proxy_port = free_port();
 
-    let yaml = resolve_with_openai_responses_proxy_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_with_openai_proxy_yaml(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -676,11 +676,11 @@ fn body_preserved_through_openai_responses_proxy_with_function_tools() {
 }
 
 #[test]
-fn body_preserved_through_openai_responses_proxy_without_tools() {
+fn body_preserved_through_openai_proxy_without_tools() {
     let backend_guard = start_echo_backend();
     let proxy_port = free_port();
 
-    let yaml = resolve_with_openai_responses_proxy_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_with_openai_proxy_yaml(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -1333,7 +1333,7 @@ insecure_options:
     )
 }
 
-fn resolve_with_openai_responses_proxy_yaml(proxy_port: u16, backend_port: u16) -> String {
+fn resolve_with_openai_proxy_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
         r#"
 listeners:

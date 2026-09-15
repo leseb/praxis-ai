@@ -15,12 +15,12 @@
 #   4. openai_file_search_dispatch dispatches the owner's pending hosted
 #      search assignments at request-body EOS on IRR re-entry.
 #   5. openai_agentic_loop prepares the next inference round.
-#   6. responses_to_chat_completions synthesizes the private function tool.
+#   6. openai_responses_to_chat_completions synthesizes the private function tool.
 #   7. path_rewrite selects /v1/chat/completions explicitly.
 #
 # Response filters run in reverse order. Each Chat Completions response is
 # therefore converted into a Responses resource by
-# responses_to_chat_completions before openai_agentic_loop inspects it. A
+# openai_responses_to_chat_completions before openai_agentic_loop inspects it. A
 # returned function_call(name="file_search") is normalized to
 # file_search_call, recorded as an assignment, executed through the vector
 # store on the next re-entry, and retained in the client-visible final
@@ -75,7 +75,7 @@ filter_chains:
                   - authorization
 
               # Sole loop owner: on the response phase it runs after
-              # responses_to_chat_completions has converted the Chat Completions
+              # openai_responses_to_chat_completions has converted the Chat Completions
               # reply into a Responses resource, so it parses the normalized
               # file_search_call items, records assignments for the dispatcher,
               # and publishes the single continuation signal (action=loop|done).

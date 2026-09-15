@@ -5071,7 +5071,7 @@ fn logical_stream_continues_recognizes_owner_loop() {
 
     // After the #1046 unification the loop owner (`openai_agentic_loop`) is the
     // single continuation authority: its `action="loop"` — covering pending
-    // file_search assignments, web_search_dispatch calls, and MCP-classified tool calls
+    // file_search assignments, web_search calls, and MCP-classified tool calls
     // alike — is what keeps the logical stream open.
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));

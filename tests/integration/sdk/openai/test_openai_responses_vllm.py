@@ -682,7 +682,7 @@ def _write_agentic_config(
         config = config.replace(
             "              - filter: openai_proxy\n"
             "              - filter: router",
-            "              - filter: responses_to_chat_completions\n"
+            "              - filter: openai_responses_to_chat_completions\n"
             "              - filter: path_rewrite\n"
             "                replace:\n"
             '                  pattern: "^/v1/responses/?$"\n'
@@ -1715,7 +1715,7 @@ class TestOpenAIResponsesVLLM:
         """Client-side function tools are returned without auto-execution.
 
         The unified agentic pipeline's openai_agentic_loop only auto-executes
-        hosted tools (file_search, web_search_dispatch, MCP); a bare client-side
+        hosted tools (file_search, web_search, MCP); a bare client-side
         function_call has no hosted dispatcher, so the loop terminates
         (action=done) and passes the function_call through to the client.
         Validates that vLLM produces a well-formed function_call through the
@@ -2222,7 +2222,7 @@ class TestResponsesToChatCompletionsVLLM:
         """Streaming web search resumes through the agentic loop (#986).
 
         A streaming Responses request is translated to Chat Completions,
-        the returned private ``web_search_dispatch`` tool call is restored to a
+        the returned private ``web_search`` tool call is restored to a
         canonical ``web_search_call``, ``openai_web_search_dispatch`` dispatches the
         query, and inference resumes — all exposed to the client as ONE
         logical Responses SSE lifecycle. The terminal event carries the
@@ -2233,11 +2233,11 @@ class TestResponsesToChatCompletionsVLLM:
         stream = web_search_chat_streaming_client.responses.create(
             model=VLLM_MODEL,
             input=(
-                "You MUST call the web_search_dispatch tool to look up the latest "
+                "You MUST call the web_search tool to look up the latest "
                 "Praxis Proxy release, then answer. Do not answer directly. "
                 "/no_think"
             ),
-            tools=[{"type": "web_search_dispatch"}],
+            tools=[{"type": "web_search"}],
             store=False,
             stream=True,
             max_output_tokens=512,
@@ -2948,7 +2948,7 @@ class TestAgenticLoopVLLM:
             ),
             tools=[
                 {
-                    "type": "web_search_dispatch",
+                    "type": "web_search",
                     "search_context_size": "low",
                 }
             ],
@@ -2974,7 +2974,7 @@ class TestAgenticLoopVLLM:
             input=("You MUST use web search, then report the result title. /no_think"),
             tools=[
                 {
-                    "type": "web_search_dispatch",
+                    "type": "web_search",
                     "search_context_size": "low",
                 }
             ],
@@ -4380,7 +4380,7 @@ class TestFileSearchChatCompletionsVLLM:
     """Issue #296: hosted file_search against a Chat Completions backend.
 
     Unlike TestFileSearchVLLM (which proxies vLLM's native /v1/responses),
-    this drives responses_to_chat_completions: the native file_search tool
+    this drives openai_responses_to_chat_completions: the native file_search tool
     is synthesized into a private chat `function`, vLLM's
     /v1/chat/completions emits the call, the proxy runs the OGX vector-store
     search, and drives one more finite inference round -- without ever

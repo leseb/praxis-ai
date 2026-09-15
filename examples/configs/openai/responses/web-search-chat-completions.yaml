@@ -3,11 +3,11 @@
 # Accepts OpenAI Responses requests with hosted web search while targeting a
 # backend that only implements /v1/chat/completions. Serves both finite
 # (`"stream": false`) and streaming (`"stream": true`) requests from one
-# pipeline. The compatibility filter privately exposes web_search_dispatch to that
+# pipeline. The compatibility filter privately exposes web_search to that
 # backend as a strict function tool. The existing openai_web_search_dispatch executor
 # handles the returned call and IRR drives the second inference round.
 #
-# responses_to_chat_completions runs inside the iterative router and selects its
+# openai_responses_to_chat_completions runs inside the iterative router and selects its
 # transport from the effective request: a `"stream": true` request streams, so
 # each translated per-round stream stays internal to the router; a finite request
 # buffers. openai_stream_events accumulates each translated
@@ -19,13 +19,13 @@
 #
 # Request order inside IRR:
 #   openai_stream_events -> openai_web_search_dispatch -> openai_agentic_loop
-#     -> responses_to_chat_completions -> path_rewrite -> router
+#     -> openai_responses_to_chat_completions -> path_rewrite -> router
 #
 # Response filters run in reverse. Each Chat Completions response (finite JSON or
 # streamed SSE) is therefore converted into a Responses resource before
 # openai_agentic_loop and openai_web_search_dispatch see it, and openai_stream_events
 # (client-facing) composes the logical stream last. A private
-# function_call(name="web_search_dispatch") becomes a canonical web_search_call, which
+# function_call(name="web_search") becomes a canonical web_search_call, which
 # openai_web_search_dispatch executes on the next iteration.
 #
 #   curl -N http://localhost:8080/v1/responses \
@@ -34,7 +34,7 @@
 #       "model": "gpt-4.1",
 #       "input": "What is the weather in SF?",
 #       "stream": true,
-#       "tools": [{"type": "web_search_dispatch"}]
+#       "tools": [{"type": "web_search"}]
 #     }'
 
 listeners:

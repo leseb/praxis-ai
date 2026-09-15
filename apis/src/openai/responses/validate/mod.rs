@@ -415,7 +415,7 @@ mod tests {
     async fn streaming_selector_conflict_uses_json_validation_error() {
         let action = run_filter_raw(
             r#"{"input":"next","previous_response_id":"resp_win","conversation":"conv_lose","stream":true}"#,
-            &[("openai_responses_format.stream", "true")],
+            &[("openai_format.stream", "true")],
         )
         .await;
         let FilterAction::Reject(rejection) = action else {

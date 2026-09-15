@@ -1680,7 +1680,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // error code) — must clear a stale owner `action="loop"` to the two-key stop, or the
     // error frame is suppressed and another IRR round fires. Scoped to the owner: it is
     // the single continuation authority, and clearing it also covers the oversized
-    // web_search_dispatch batch case (the owner sets loop before web_search_dispatch caps the batch).
+    // web_search batch case (the owner sets loop before web_search caps the batch).
     let owner_looping = ctx
         .filter_results
         .get("openai_agentic_loop")
@@ -1743,7 +1743,7 @@ fn emit_deferred_terminal(
 /// After the #1046 unification the owner (`openai_agentic_loop`) is the single
 /// authority that decides whether the logical stream continues: its
 /// `has_dispatchable_calls` signal is a strict superset of every dispatcher's
-/// per-round work (`web_search_dispatch` calls, `file_search` assignments, MCP-classified
+/// per-round work (`web_search` calls, `file_search` assignments, MCP-classified
 /// tool calls), so keying on the owner alone covers all three dispatchers.
 fn logical_stream_continues(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.filter_results

@@ -772,7 +772,7 @@ async fn on_request_body_appends_backend_valid_continuation() {
         .iter()
         .find(|m| m.get("type").and_then(Value::as_str) == Some("function_call"))
         .expect("continuation should include a synthetic function_call");
-    assert_eq!(call["name"], "web_search_dispatch");
+    assert_eq!(call["name"], "web_search");
     let call_id = call["call_id"].as_str().expect("function_call needs a call_id");
 
     assert!(
@@ -825,7 +825,7 @@ async fn web_search_continuation_serializes_backend_valid_input() {
     let request_body = serde_json::json!({
         "model": "gpt-4.1",
         "input": "search rust",
-        "tools": [{"type": "web_search_dispatch"}],
+        "tools": [{"type": "web_search"}],
     });
     ctx.extensions.insert(ResponsesState::from_request_body(request_body));
 
@@ -856,7 +856,7 @@ async fn web_search_continuation_serializes_backend_valid_input() {
         .unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "web_search_dispatch dispatch should continue"
+        "web_search dispatch should continue"
     );
     let mut body = Some(Bytes::from(br#"{"model":"gpt-4.1","input":"search rust"}"#.to_vec()));
     let action = proxy.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -948,7 +948,7 @@ fn build_tool_result_messages_empty() {
         "continuation bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
     );
     assert_eq!(call["call_id"], "ws_123");
-    assert_eq!(call["name"], "web_search_dispatch");
+    assert_eq!(call["name"], "web_search");
     assert_eq!(call["arguments"], r#"{"query":"rust"}"#);
     assert_eq!(call["status"], "completed");
     assert_eq!(output["type"], "function_call_output");
@@ -1030,7 +1030,7 @@ fn build_failed_tool_result_messages_carry_bounded_notice() {
         "failure bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
     );
     assert_eq!(call["call_id"], "ws_123");
-    assert_eq!(call["name"], "web_search_dispatch");
+    assert_eq!(call["name"], "web_search");
     assert_eq!(call["arguments"], r#"{"query":"rust"}"#);
     assert_eq!(call["status"], "completed");
     assert_eq!(output["type"], "function_call_output");

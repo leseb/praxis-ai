@@ -667,7 +667,7 @@ pub(crate) fn build_tool_result_messages(
         serde_json::json!({
             "type": "function_call",
             "call_id": call_id,
-            "name": "web_search_dispatch",
+            "name": "web_search",
             "arguments": arguments,
             "status": "completed",
         }),
@@ -689,7 +689,7 @@ pub(crate) fn build_incomplete_tool_result_messages(call_id: &str) -> [Value; 2]
         serde_json::json!({
             "type": "function_call",
             "call_id": call_id,
-            "name": "web_search_dispatch",
+            "name": "web_search",
             "arguments": "{}",
             "status": "completed",
         }),
@@ -753,7 +753,7 @@ fn build_failed_tool_result_messages_with_output(call_id: &str, query: &str, out
         serde_json::json!({
             "type": "function_call",
             "call_id": call_id,
-            "name": "web_search_dispatch",
+            "name": "web_search",
             "arguments": arguments,
             "status": "completed",
         }),

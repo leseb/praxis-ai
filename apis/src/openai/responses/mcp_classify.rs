@@ -9,7 +9,7 @@
 //! be returned to the client for approval. It exposes a deliberately narrow
 //! surface — the [`McpDisposition`] enum and the [`classify_mcp`] function —
 //! so the agentic loop owner and every dispatcher (`openai_mcp_dispatch`,
-//! `openai_file_search_callout`) can agree on the disposition of a call
+//! `openai_file_search_dispatch`) can agree on the disposition of a call
 //! without any dispatcher importing another dispatcher's internals.
 //!
 //! The approval-policy helpers ([`parse_approval_policy`], [`requires_approval`])

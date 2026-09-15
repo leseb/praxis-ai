@@ -33,7 +33,7 @@ pub(crate) enum SynthesisKind {
 }
 
 /// One `file_search_call` the parse owner (`openai_agentic_loop`) accumulated
-/// this round and handed to `openai_file_search_callout` for execution.
+/// this round and handed to `openai_file_search_dispatch` for execution.
 ///
 /// The owner is the sole parser: it appends the canonical `file_search_call`
 /// output item to [`ResponsesState::accumulated_output`] and records its
@@ -55,7 +55,7 @@ pub(crate) struct FileSearchAssignment {
 
 /// A terminal failure a request-phase dispatcher recorded in shared state.
 ///
-/// A dispatcher (e.g. `openai_file_search_callout`) never rejects or rewrites a
+/// A dispatcher (e.g. `openai_file_search_dispatch`) never rejects or rewrites a
 /// response itself — that would make it a second terminal-response owner. Instead
 /// it records the failure here and returns `Continue`; the parse owner
 /// (`openai_agentic_loop`), which runs next in the same request phase, converts it
@@ -361,7 +361,7 @@ pub(crate) struct ResponsesState {
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
     ///
-    /// Set in the response header phase by `openai_responses_rehydrate`
+    /// Set in the response header phase by `openai_rehydrate`
     /// (`arm_streaming_restore`) to the result of `eligible_previous_response_id_stream`:
     /// `true` only for a `200 OK`, identity-coded, validator-free event stream from
     /// a rehydrated turn carrying a caller id. The persistence source
@@ -443,7 +443,7 @@ pub(crate) struct ResponsesState {
 
     /// Absolute indices into [`Self::accumulated_output`] (+ synthesis origin)
     /// of the `file_search_call` items `openai_agentic_loop` accumulated this
-    /// round for `openai_file_search_callout` to execute.
+    /// round for `openai_file_search_dispatch` to execute.
     ///
     /// The parse owner records one [`FileSearchAssignment`] per hosted file-search
     /// call it appended to `accumulated_output` (including private
@@ -794,7 +794,7 @@ impl ResponsesState {
 
     /// Move the file-search assignment queue out, leaving it empty.
     ///
-    /// `openai_file_search_callout` drains this exactly once at request-body EOS
+    /// `openai_file_search_dispatch` drains this exactly once at request-body EOS
     /// so each assigned `file_search_call` is executed and reconciled a single
     /// time (drain-once), mirroring [`Self::drain_pending_local_tool_synthesis`].
     pub fn drain_file_search_assignments(&mut self) -> Vec<FileSearchAssignment> {
