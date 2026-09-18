@@ -32,8 +32,8 @@ turns:
       upstream_body_kind: json
       client_sse_events:
         - response.output_item.added
-        - response.function_call_arguments.delta
-        - response.function_call_arguments.done
+        - response.custom_tool_call_input.delta
+        - response.custom_tool_call_input.done
         - response.output_item.done
         - response.completed
       upstream_sse_events:
