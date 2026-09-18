@@ -1090,7 +1090,7 @@ fn append_logical_event(
 /// `Suppress` is dropped before dispatch and must never reach the applier.
 #[expect(
     clippy::too_many_lines,
-    reason = "linear match dispatch over the eight client-tool restore dispositions, each with a load-bearing comment"
+    reason = "linear match dispatch over the eight client-tool restore arms, each with a load-bearing comment"
 )]
 fn apply_client_tool_disposition(
     state: &mut StreamEventsState,

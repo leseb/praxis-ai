@@ -42,8 +42,8 @@ pub(super) enum ClientToolPhase {
 ///
 /// Created at `output_item.added` and advanced by later argument/finalizer
 /// events so the plan pass can enforce lifecycle order (fail closed on a
-/// premature `output_item.done`) and synthesize the typed restoration for
-/// `Custom`/`NamespaceCustom` kinds (and, in Tasks 6-7, `Shell`/`ToolSearch`).
+/// premature `output_item.done`) and synthesize the typed restoration for the
+/// `Custom`/`NamespaceCustom` and `Shell`/`ToolSearch` kinds.
 #[derive(Clone, Debug)]
 pub(super) struct ClientToolStreamItem {
     /// Stable key matching this item across its lifecycle events (`item:{id}` or
@@ -77,13 +77,13 @@ pub(super) struct ClientToolCompletion {
 ///
 /// Task 4 constructs `Passthrough`/`RetypeInPlace`; Task 5 adds
 /// `Suppress`/`EmitCustomShell`/`EmitCustomInput`/`EmitCustomItemDone` for
-/// `Custom`/`NamespaceCustom` synthesis. `EmitTypedAdded`/`EmitTypedDone`/
-/// `RestoreSnapshot` are produced by Tasks 6-7 (`Shell`/`ToolSearch` synthesis and
-/// terminal snapshot restore).
+/// `Custom`/`NamespaceCustom` synthesis. Task 6 adds `EmitTypedAdded`/`EmitTypedDone`
+/// for `Shell`/`ToolSearch` synthesis; `RestoreSnapshot` is produced by Task 7
+/// (terminal snapshot restore).
 #[derive(Clone, Debug)]
 #[expect(
     dead_code,
-    reason = "#1159 Tasks 6-7 construct the EmitTypedAdded/EmitTypedDone/RestoreSnapshot dispositions"
+    reason = "#1159 Task 7 constructs the RestoreSnapshot disposition"
 )]
 pub(super) enum ClientToolDisposition {
     /// Forward the event unchanged.
@@ -191,8 +191,10 @@ fn plan_one_event(
 }
 
 /// Whether a lowered restore kind is tracked and restored across its streaming
-/// lifecycle. Every current kind is; the gate is defensive so any future kind not
-/// yet wired passes through untracked rather than being mishandled (#1159).
+/// lifecycle. Every current kind is, so this is a single explicit gate for the
+/// plan pass rather than a behavioral filter; the kind-dispatch matches it guards
+/// are exhaustive, so a new variant would force a compile error instead of being
+/// silently mishandled (#1159).
 fn is_restorable(restore: ClientToolRestore) -> bool {
     matches!(
         restore,
@@ -205,11 +207,11 @@ fn is_restorable(restore: ClientToolRestore) -> bool {
 }
 
 /// Plan an `output_item.added`: open tracking for a lowered `Namespace`,
-/// `Custom`, or `NamespaceCustom` call and produce its retyped `added`. `Namespace`
-/// retypes the `function_call` in place; `Custom`/`NamespaceCustom` synthesize a
-/// `custom_tool_call` added item carrying the public id. Non-lowered items and the
-/// not-yet-implemented `Shell`/`ToolSearch` kinds (Tasks 6-7) pass through
-/// unchanged.
+/// `Custom`, `NamespaceCustom`, `Shell`, or `ToolSearch` call. `Namespace` retypes
+/// the `function_call` in place; `Custom`/`NamespaceCustom` synthesize a
+/// `custom_tool_call` added item carrying the public id; `Shell`/`ToolSearch`
+/// suppress the raw `added` and synthesize the complete typed call at
+/// `arguments.done` (#1159 Task 6). Non-lowered items pass through unchanged.
 fn plan_output_item_added(
     reverse: &HashMap<String, LoweredClientTool>,
     next_items: &mut Vec<ClientToolStreamItem>,
@@ -944,6 +946,50 @@ mod tests {
         let events = [added, item_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
         assert!(result.is_err(), "shell output_item.done before arguments.done must fail closed");
+    }
+
+    #[test]
+    fn shell_args_done_without_artifact_fails_closed() {
+        let reverse = reverse_shell();
+        let added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1"}
+        }));
+        let args_done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "item_id": "fc_1",
+            "output_index": 0, "arguments": "{\"commands\":[\"ls\"]}"
+        }));
+        // No completion artifact captured (empty slice): the typed shell_call cannot
+        // be synthesized authoritatively, so fail closed rather than guess.
+        let events = [added, args_done];
+        let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
+        assert!(result.is_err(), "shell arguments.done without a completion artifact must fail closed");
+    }
+
+    #[test]
+    fn tool_search_lossy_typed_restore_fails_closed() {
+        let reverse = reverse_tool_search();
+        let added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1"}
+        }));
+        let args_done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "item_id": "fc_1",
+            "output_index": 0, "arguments": "{\"query\":\"rust\"}"
+        }));
+        // Completion artifact is present, but it carries a `namespace`: a client-owned
+        // tool_search_call must not be namespaced, so `restore_tool_search_call`
+        // returns Err and the plan pass fails closed rather than emit a lossy item.
+        let completion = ClientToolCompletion {
+            key: "item:fc_1".to_owned(),
+            item: serde_json::json!({
+                "type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1",
+                "namespace": "fs", "arguments": "{\"query\":\"rust\"}", "status": "completed"
+            }),
+        };
+        let events = [added, args_done];
+        let result = plan_client_tool_restore(&reverse, None, &[], &events, &[completion]);
+        assert!(result.is_err(), "a lossy typed restore (namespaced tool_search) must fail closed");
     }
 
     #[test]
