@@ -771,9 +771,12 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 /// On a rejected chunk phase 2a has already grown the retained output past a cap, so
 /// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
 /// later chunk and round. The byte guard fails closed per event, so transient
-/// overshoot is bounded to the single clone that trips the cap. Phase 2b is
-/// infallible, so every recorded milestone still corresponds to bytes that actually
-/// reach the client. Returns the logical-stream bytes.
+/// overshoot is bounded to the single clone that trips the cap. Phase 2b's only
+/// fallible step, the client-tool restoration plan pass (see
+/// [`restore_and_append_chunk`]), runs before any byte is appended or milestone is
+/// recorded, so a malformed lowered lifecycle fails the chunk closed with nothing
+/// delivered; every recorded milestone therefore still corresponds to bytes that
+/// actually reach the client. Returns the logical-stream bytes.
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,

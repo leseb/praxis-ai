@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     openai::{
-        responses::state::{ResponsesState, SynthesisKind},
+        responses::state::{ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
         sse::SseFrameParser,
     },
     test_utils::{make_filter_context, make_request},
@@ -5713,5 +5713,99 @@ fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
     assert!(
         ctx.get_metadata("responses.stream_error_code").is_some(),
         "validation failure sets the five-write"
+    );
+}
+
+// #1159 Task 4: end-to-end proof that a lowered `Namespace` member is retyped in
+// place through the real commit path (`commit_chunk_events` ->
+// `restore_and_append_chunk` -> `apply_client_tool_disposition`), asserting the
+// EMITTED SSE bytes carry the restored member name + namespace and never leak the
+// private lowered name. This is the one client-visible, security-relevant behavior
+// the task ships, and it exercises the payload-mutating apply code the unit tests
+// in `client_tools.rs` cannot reach.
+#[tokio::test]
+async fn namespace_lowered_call_retyped_in_place_through_commit_never_leaks_private_name() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a Namespace lowering on the shared `ResponsesState`, inserted the same
+    // way `restore_and_append_chunk` reads it (`ctx.extensions.get::<ResponsesState>()`).
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
+        "agentic_ns__fs__read".to_owned(),
+        LoweredClientTool {
+            original_name: "read".to_owned(),
+            namespace: Some("fs".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response so the incremental item events are delivered.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // One chunk carrying the lowered `function_call`'s whole lifecycle: added ->
+    // arguments.done -> item.done for the same item.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__fs__read", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"path\":\"/etc\"}",
+            "sequence_number": 2
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__fs__read", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"path\":\"/etc\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains(r#""name":"read""#),
+        "the restored member name must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""namespace":"fs""#),
+        "the namespace must be re-added on the restored item: {emitted}"
+    );
+    assert!(
+        !emitted.contains("agentic_ns__fs__read"),
+        "the private lowered name must never leak to the client: {emitted}"
     );
 }
