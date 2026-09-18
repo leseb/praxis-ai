@@ -112,15 +112,21 @@
 //!
 //! # Streaming
 //!
-//! Restoration of a **streaming** response requires re-typing live SSE events,
-//! which this filter does not yet do. To honour the invariant that a private
-//! synthesized function name never reaches the client, a request that asks for
-//! `stream: true` and either declares rich client tools or carries
-//! `tool_search`-discovered tools that would be hoisted fails closed with HTTP 400
-//! **before any upstream call** — the lowered names are never put on the wire, so
-//! an un-restored SSE stream can never leak them (full streaming restoration is
-//! #1159). A streaming request that neither declares rich client tools nor carries
-//! discovered tools stays a transparent passthrough.
+//! On the streaming Responses path (`stream: true`) the lowered client-tool calls
+//! are restored **live in the SSE lifecycle** by the `openai_stream_events` logical
+//! owner, not by this filter: this filter records the reverse lowering map and the
+//! `tools`/`tool_choice` echo snapshot on the request, and `openai_stream_events`
+//! re-types each lowered `function_call` as it streams (#1159).
+//!
+//! That hand-off requires `openai_stream_events` to be placed **before**
+//! `openai_client_tool_compat` in the inference step: on the request it publishes a
+//! marker arming streaming restoration, which this filter reads before lowering. If
+//! a streaming request declares rich client tools (or carries `tool_search`-discovered
+//! tools that would be hoisted) but no `openai_stream_events` owner is armed ahead of
+//! it, the filter fails closed with **HTTP 500** — an operator misconfiguration —
+//! **before any upstream call**, so a private lowered `function` name can never reach
+//! an un-restored SSE stream. A streaming request that neither declares rich client
+//! tools nor carries discovered tools stays a transparent passthrough.
 //!
 //! When the request declares no rich client tools and carries no discovered tools
 //! the filter is a transparent passthrough, so native traffic is unchanged.

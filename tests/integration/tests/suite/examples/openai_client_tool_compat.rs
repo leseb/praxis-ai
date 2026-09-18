@@ -40,6 +40,27 @@ fn load_client_tool_compat_config(proxy_port: u16, model_port: u16, db_url: &str
     praxis_core::config::Config::from_yaml(&yaml).expect("parse client-tool-compat config")
 }
 
+/// Like [`load_client_tool_compat_config`] but with the `openai_stream_events`
+/// filter removed from the inference step, so the streaming-restoration marker is
+/// never armed. Exercises the missing-owner fail-closed path (#1159).
+fn load_client_tool_compat_config_without_stream_owner(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/client-tool-compat.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read client-tool-compat example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    // Drop the streaming owner line; the remaining filters keep their order.
+    let yaml = yaml
+        .lines()
+        .filter(|line| line.trim() != "- filter: openai_stream_events")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse client-tool-compat config without stream owner")
+}
+
 // -----------------------------------------------------------------------------
 // Pipeline build
 // -----------------------------------------------------------------------------
@@ -723,15 +744,16 @@ fn all_client_tool_types_lower_to_functions() {
 }
 
 // -----------------------------------------------------------------------------
-// Streaming: a rich client tool fails closed before any upstream call
+// Streaming: a rich client tool fails closed without the streaming owner
 // -----------------------------------------------------------------------------
 
 /// A streaming request that declares a rich `custom` client tool fails closed
-/// with HTTP 400 before any upstream call, so the lowered private function name is
-/// never streamed to the client in an un-restored SSE event. The backend must
-/// never be contacted.
+/// with HTTP 500 before any upstream call when the `openai_stream_events` logical
+/// SSE owner is NOT in the pipeline to restore the lowered calls — an operator
+/// misconfiguration. The lowered private function name is never streamed to the
+/// client in an un-restored SSE event, and the backend must never be contacted.
 #[test]
-fn streaming_rich_client_tool_fails_closed_before_upstream() {
+fn streaming_rich_client_tool_without_stream_owner_fails_closed() {
     // The backend would 200 if ever contacted; the test asserts it is not.
     let backend_response = serde_json::json!({
         "id": "resp_never",
@@ -741,8 +763,9 @@ fn streaming_rich_client_tool_fails_closed_before_upstream() {
     });
     let model = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("client_tool_compat_streaming");
-    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let db = TempSqlite::new("client_tool_compat_streaming_no_owner");
+    // Config variant WITHOUT openai_stream_events so the marker is never armed.
+    let config = load_client_tool_compat_config_without_stream_owner(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let request = serde_json::json!({
@@ -762,13 +785,13 @@ fn streaming_rich_client_tool_fails_closed_before_upstream() {
 
     assert_eq!(
         parse_status(&raw),
-        400,
-        "streaming + rich client tools must fail closed: {raw}"
+        500,
+        "streaming rich client tools without openai_stream_events must fail closed: {raw}"
     );
     let body = parse_body(&raw);
     assert!(
-        body.contains("streaming is not supported"),
-        "the rejection explains the streaming limitation: {body}"
+        body.contains("openai_stream_events"),
+        "the rejection names the missing streaming owner: {body}"
     );
     assert!(
         model.requests().is_empty(),
