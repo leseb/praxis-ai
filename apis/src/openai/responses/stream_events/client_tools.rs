@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::openai::responses::openai_client_tool_compat::{
     custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
+    restore_shell_call, restore_tool_search_call,
 };
 use crate::openai::responses::state::{ClientToolEcho, ClientToolRestore, LoweredClientTool};
 use crate::openai::sse::SseParseError;
@@ -189,6 +190,20 @@ fn plan_one_event(
     }
 }
 
+/// Whether a lowered restore kind is tracked and restored across its streaming
+/// lifecycle. Every current kind is; the gate is defensive so any future kind not
+/// yet wired passes through untracked rather than being mishandled (#1159).
+fn is_restorable(restore: ClientToolRestore) -> bool {
+    matches!(
+        restore,
+        ClientToolRestore::Namespace
+            | ClientToolRestore::Custom
+            | ClientToolRestore::NamespaceCustom
+            | ClientToolRestore::Shell
+            | ClientToolRestore::ToolSearch
+    )
+}
+
 /// Plan an `output_item.added`: open tracking for a lowered `Namespace`,
 /// `Custom`, or `NamespaceCustom` call and produce its retyped `added`. `Namespace`
 /// retypes the `function_call` in place; `Custom`/`NamespaceCustom` synthesize a
@@ -210,12 +225,12 @@ fn plan_output_item_added(
         return ClientToolDisposition::Passthrough;
     };
 
-    // Only Namespace/Custom/NamespaceCustom members are restored in this task;
-    // Shell/ToolSearch pass through untracked until Tasks 6-7 add their synthesis.
-    if !matches!(
-        lowered.restore,
-        ClientToolRestore::Namespace | ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom
-    ) {
+    // Every lowered kind is tracked so its lifecycle can be restored: Namespace
+    // retypes in place, Custom/NamespaceCustom synthesize a custom_tool_call, and
+    // Shell/ToolSearch suppress the raw lifecycle and synthesize a complete typed
+    // call at arguments.done (#1159 Task 6). Any future kind not yet handled passes
+    // through untracked.
+    if !is_restorable(lowered.restore) {
         return ClientToolDisposition::Passthrough;
     }
 
@@ -234,8 +249,10 @@ fn plan_output_item_added(
 }
 
 /// Select the `output_item.added` disposition for a lowered call: retype a
-/// `Namespace` member's `function_call` in place, or synthesize a `custom_tool_call`
-/// added item for `Custom`/`NamespaceCustom` (client-visible name + public id).
+/// `Namespace` member's `function_call` in place, synthesize a `custom_tool_call`
+/// added item for `Custom`/`NamespaceCustom` (client-visible name + public id), or
+/// suppress the raw `Shell`/`ToolSearch` added — its schema-complete typed
+/// `output_item.added` is synthesized at `arguments.done` instead (#1159 Task 6).
 fn plan_added_disposition(lowered: &LoweredClientTool, payload: &Value) -> ClientToolDisposition {
     match lowered.restore {
         ClientToolRestore::Namespace => ClientToolDisposition::RetypeInPlace {
@@ -246,9 +263,13 @@ fn plan_added_disposition(lowered: &LoweredClientTool, payload: &Value) -> Clien
         // Custom/NamespaceCustom: retype the announced item to `custom_tool_call`
         // with the client-visible name and public id; the private lowered name and
         // `fc_` id never reach the client.
-        _ => ClientToolDisposition::EmitCustomShell {
+        ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => ClientToolDisposition::EmitCustomShell {
             item: build_custom_added_payload(payload, lowered),
         },
+        // Shell/ToolSearch: drop the raw added — a partial typed call at add time
+        // cannot be schema-valid (it lacks `action`/`arguments`). The complete typed
+        // `output_item.added` is synthesized once arguments are final.
+        ClientToolRestore::Shell | ClientToolRestore::ToolSearch => ClientToolDisposition::Suppress,
     }
 }
 
@@ -285,7 +306,9 @@ fn build_custom_added_payload(payload: &Value, lowered: &LoweredClientTool) -> V
 
 /// Plan a `function_call_arguments.delta`: suppress the backend's function-args
 /// delta for a tracked `Custom`/`NamespaceCustom` call (the canonical lifecycle
-/// uses synthesized `custom_tool_call_input.delta` instead). The arguments frame
+/// uses synthesized `custom_tool_call_input.delta` instead) and for a tracked
+/// `Shell`/`ToolSearch` call (no incremental client-visible input family exists;
+/// the complete typed call is synthesized at `arguments.done`). The arguments frame
 /// carries no typed name, so lowered-ness is resolved by matching tracked items by
 /// key. Everything else (including `Namespace`, whose args pass through unchanged)
 /// forwards untouched.
@@ -294,17 +317,23 @@ fn plan_arguments_delta(next_items: &[ClientToolStreamItem], payload: &Value) ->
         return ClientToolDisposition::Passthrough;
     };
     match next_items.iter().find(|tracked| tracked.key == key).map(|tracked| tracked.restore) {
-        Some(ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom) => ClientToolDisposition::Suppress,
+        Some(
+            ClientToolRestore::Custom
+            | ClientToolRestore::NamespaceCustom
+            | ClientToolRestore::Shell
+            | ClientToolRestore::ToolSearch,
+        ) => ClientToolDisposition::Suppress,
         _ => ClientToolDisposition::Passthrough,
     }
 }
 
 /// Plan a `function_call_arguments.done`: advance the tracked item to
-/// `ArgsComplete` and, for `Custom`/`NamespaceCustom`, synthesize the canonical
-/// custom input event pair from the completion artifact captured in phase 2a. The
-/// arguments frame carries no typed name, so lowered-ness is resolved by matching
-/// tracked items by key. Fails closed if the artifact is missing or its arguments
-/// cannot be unwrapped into the `{"input":...}` envelope.
+/// `ArgsComplete` and synthesize the restored lifecycle from the completion artifact
+/// captured in phase 2a. `Custom`/`NamespaceCustom` synthesize the canonical custom
+/// input event pair; `Shell`/`ToolSearch` synthesize the complete typed
+/// `output_item.added` (the raw added was suppressed). The arguments frame carries
+/// no typed name, so lowered-ness is resolved by matching tracked items by key. Fails
+/// closed if the artifact is missing or the restore is lossy.
 fn plan_arguments_done(
     next_items: &mut [ClientToolStreamItem],
     completions: &[ClientToolCompletion],
@@ -316,19 +345,23 @@ fn plan_arguments_done(
     let Some(tracked) = next_items.iter_mut().find(|tracked| tracked.key == key) else {
         return Ok(ClientToolDisposition::Passthrough);
     };
-    if !matches!(
-        tracked.restore,
-        ClientToolRestore::Namespace | ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom
-    ) {
+    if !is_restorable(tracked.restore) {
         return Ok(ClientToolDisposition::Passthrough);
     }
     tracked.phase = ClientToolPhase::ArgsComplete;
-    if tracked.restore == ClientToolRestore::Namespace {
+    match tracked.restore {
         // Namespace args pass through unchanged; only the phase advances.
-        return Ok(ClientToolDisposition::Passthrough);
+        ClientToolRestore::Namespace => Ok(ClientToolDisposition::Passthrough),
+        // Custom/NamespaceCustom: synthesize the canonical custom input event pair.
+        ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
+            plan_custom_arguments_done(tracked, completions, &key)
+        },
+        // Shell/ToolSearch: synthesize the complete typed `output_item.added` now
+        // that arguments are final (the raw added was suppressed).
+        ClientToolRestore::Shell | ClientToolRestore::ToolSearch => {
+            plan_typed_arguments_done(tracked, completions, &key)
+        },
     }
-    // Custom/NamespaceCustom: synthesize the canonical custom input event pair.
-    plan_custom_arguments_done(tracked, completions, &key)
 }
 
 /// Synthesize a `Custom`/`NamespaceCustom` call's `EmitCustomInput` disposition at
@@ -372,6 +405,67 @@ fn plan_custom_arguments_done(
     })
 }
 
+/// Synthesize a `Shell`/`ToolSearch` call's `EmitTypedAdded` disposition at
+/// `function_call_arguments.done`. The completion artifact captured at accumulation is
+/// authoritative; fail closed if it is absent or the typed restore is lossy. The
+/// synthesized `output_item.added` carries the restored typed call with its public id.
+fn plan_typed_arguments_done(
+    tracked: &ClientToolStreamItem,
+    completions: &[ClientToolCompletion],
+    key: &str,
+) -> Result<ClientToolDisposition, SseParseError> {
+    let Some(completion) = completions.iter().find(|c| c.key == key) else {
+        return Err(client_tool_restore_error(
+            "response.function_call_arguments.done",
+            &tracked.key,
+            "function_call_arguments.done without a captured completion artifact",
+        ));
+    };
+    let restored = restore_typed_item(
+        tracked.restore,
+        &completion.item,
+        "response.function_call_arguments.done",
+        &tracked.key,
+    )?;
+    Ok(ClientToolDisposition::EmitTypedAdded {
+        item: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": tracked.output_index,
+            "item": restored,
+        }),
+    })
+}
+
+/// Restore a lowered `Shell`/`ToolSearch` `function_call` item to its typed
+/// `shell_call`/`tool_search_call`. Fails closed (with a client-tool restore error
+/// shaped by `event_type`/`key`) if the kind is not a typed restore or the restore
+/// is lossy — a lowered call is never surfaced under a schema-invalid typed item.
+fn restore_typed_item(
+    restore: ClientToolRestore,
+    item: &Value,
+    event_type: &'static str,
+    key: &str,
+) -> Result<Value, SseParseError> {
+    match restore {
+        ClientToolRestore::Shell => restore_shell_call(item),
+        ClientToolRestore::ToolSearch => restore_tool_search_call(item),
+        _ => {
+            return Err(client_tool_restore_error(
+                event_type,
+                key,
+                "typed restore invoked for a non-typed restore kind",
+            ));
+        },
+    }
+    .map_err(|()| {
+        client_tool_restore_error(
+            event_type,
+            key,
+            "lowered client tool could not be restored to its typed call",
+        )
+    })
+}
+
 /// Build the temporary fail-closed error for a client-tool restore violation.
 ///
 /// #1159 Task 9 swaps this for the dedicated `SseParseError::ClientToolRestore {
@@ -402,10 +496,7 @@ fn plan_output_item_done(
     let Some(tracked) = next_items.iter_mut().find(|tracked| tracked.key == key) else {
         return Ok(ClientToolDisposition::Passthrough);
     };
-    if !matches!(
-        tracked.restore,
-        ClientToolRestore::Namespace | ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom
-    ) {
+    if !is_restorable(tracked.restore) {
         return Ok(ClientToolDisposition::Passthrough);
     }
 
@@ -430,9 +521,10 @@ fn plan_output_item_done(
 }
 
 /// Select the `output_item.done` disposition for a finalized lowered call: retype a
-/// `Namespace` member's `function_call` in place, or rebuild the finalized
-/// `custom_tool_call` for `Custom`/`NamespaceCustom` from the authoritative done
-/// item. Fails closed if a custom restore is lossy.
+/// `Namespace` member's `function_call` in place, rebuild the finalized
+/// `custom_tool_call` for `Custom`/`NamespaceCustom`, or rebuild the finalized typed
+/// `shell_call`/`tool_search_call` for `Shell`/`ToolSearch` — all from the
+/// authoritative done item. Fails closed if a restore is lossy.
 fn plan_done_disposition(
     payload: &Value,
     lowered: &LoweredClientTool,
@@ -446,8 +538,15 @@ fn plan_done_disposition(
         }),
         // Custom/NamespaceCustom: rebuild the finalized `custom_tool_call` from the
         // authoritative done item and splice it back onto the done envelope.
-        _ => Ok(ClientToolDisposition::EmitCustomItemDone {
-            item: build_custom_done_payload(payload, lowered, restore)?,
+        ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
+            Ok(ClientToolDisposition::EmitCustomItemDone {
+                item: build_custom_done_payload(payload, lowered, restore)?,
+            })
+        },
+        // Shell/ToolSearch: rebuild the finalized typed call from the authoritative
+        // done item and splice it back onto the done envelope.
+        ClientToolRestore::Shell | ClientToolRestore::ToolSearch => Ok(ClientToolDisposition::EmitTypedDone {
+            item: build_typed_done_payload(payload, restore)?,
         }),
     }
 }
@@ -487,6 +586,25 @@ fn build_custom_done_payload(
             "lowered custom-tool call could not be restored to custom_tool_call",
         )
     })?;
+    let mut out = payload.clone();
+    if let Some(object) = out.as_object_mut() {
+        object.insert("item".to_owned(), restored);
+    }
+    Ok(out)
+}
+
+/// Build the finalized typed `output_item.done` payload for a lowered `Shell`/`ToolSearch`
+/// call: restore the typed item from the authoritative done item and splice it onto a single
+/// owned clone of the committed done envelope. Fail closed if the item cannot be restored.
+fn build_typed_done_payload(payload: &Value, restore: ClientToolRestore) -> Result<Value, SseParseError> {
+    let Some(item) = payload.get("item") else {
+        return Err(client_tool_restore_error(
+            "response.output_item.done",
+            "shell/tool_search",
+            "output_item.done carried no item to restore",
+        ));
+    };
+    let restored = restore_typed_item(restore, item, "response.output_item.done", "shell/tool_search")?;
     let mut out = payload.clone();
     if let Some(object) = out.as_object_mut() {
         object.insert("item".to_owned(), restored);
@@ -543,6 +661,26 @@ mod tests {
             original_name: "run_python".to_owned(),
             namespace: None,
             restore: ClientToolRestore::Custom,
+        });
+        m
+    }
+
+    fn reverse_shell() -> HashMap<String, LoweredClientTool> {
+        let mut m = HashMap::new();
+        m.insert("shell".to_owned(), LoweredClientTool {
+            original_name: "shell".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Shell,
+        });
+        m
+    }
+
+    fn reverse_tool_search() -> HashMap<String, LoweredClientTool> {
+        let mut m = HashMap::new();
+        m.insert("tool_search".to_owned(), LoweredClientTool {
+            original_name: "tool_search".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::ToolSearch,
         });
         m
     }
@@ -675,6 +813,137 @@ mod tests {
         let events = [added, args_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
         assert!(result.is_err(), "custom arguments.done without a completion artifact must fail closed");
+    }
+
+    #[test]
+    fn shell_lifecycle_suppresses_raw_and_synthesizes_typed_shell_call() {
+        let reverse = reverse_shell();
+        let added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1"}
+        }));
+        let args_delta = ResponsesEvent::FunctionCallArgumentsDelta(serde_json::json!({
+            "type": "response.function_call_arguments.delta", "item_id": "fc_1",
+            "output_index": 0, "delta": "{\"commands\":"
+        }));
+        let args_done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "item_id": "fc_1",
+            "output_index": 0, "arguments": "{\"commands\":[\"ls\"]}"
+        }));
+        let item_done = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1",
+                     "id": "fc_1", "arguments": "{\"commands\":[\"ls\"]}", "status": "completed"}
+        }));
+        // Phase-2a completion artifact for the args.done key (item:fc_1).
+        let completion = ClientToolCompletion {
+            key: "item:fc_1".to_owned(),
+            item: serde_json::json!({
+                "type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1",
+                "arguments": "{\"commands\":[\"ls\"]}", "status": "completed"
+            }),
+        };
+        let events = vec![added, args_delta, args_done, item_done];
+        let plan = plan_client_tool_restore(&reverse, None, &[], &events, &[completion]).unwrap();
+
+        assert!(matches!(plan.dispositions[0], ClientToolDisposition::Suppress)); // raw added
+        assert!(matches!(plan.dispositions[1], ClientToolDisposition::Suppress)); // args delta
+        match &plan.dispositions[2] {
+            // args.done → typed added
+            ClientToolDisposition::EmitTypedAdded { item } => {
+                assert_eq!(item["type"], "response.output_item.added");
+                assert_eq!(item["item"]["type"], "shell_call");
+                assert_eq!(item["item"]["environment"]["type"], "local");
+                assert_eq!(item["item"]["action"]["commands"][0], "ls");
+                assert_eq!(item["item"]["id"], "sh_1"); // public id, not fc_1
+            },
+            other => panic!("expected EmitTypedAdded, got {other:?}"),
+        }
+        match &plan.dispositions[3] {
+            // item.done → typed done
+            ClientToolDisposition::EmitTypedDone { item } => {
+                assert_eq!(item["type"], "response.output_item.done");
+                assert_eq!(item["item"]["type"], "shell_call");
+                assert_eq!(item["item"]["environment"]["type"], "local");
+                assert_eq!(item["item"]["id"], "sh_1");
+            },
+            other => panic!("expected EmitTypedDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_search_lifecycle_suppresses_raw_and_synthesizes_typed_tool_search_call() {
+        let reverse = reverse_tool_search();
+        let added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1"}
+        }));
+        let args_delta = ResponsesEvent::FunctionCallArgumentsDelta(serde_json::json!({
+            "type": "response.function_call_arguments.delta", "item_id": "fc_1",
+            "output_index": 0, "delta": "{\"query\":"
+        }));
+        let args_done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "item_id": "fc_1",
+            "output_index": 0, "arguments": "{\"query\":\"rust\"}"
+        }));
+        let item_done = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "name": "tool_search", "call_id": "c1",
+                     "id": "fc_1", "arguments": "{\"query\":\"rust\"}", "status": "completed"}
+        }));
+        let completion = ClientToolCompletion {
+            key: "item:fc_1".to_owned(),
+            item: serde_json::json!({
+                "type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1",
+                "arguments": "{\"query\":\"rust\"}", "status": "completed"
+            }),
+        };
+        let events = vec![added, args_delta, args_done, item_done];
+        let plan = plan_client_tool_restore(&reverse, None, &[], &events, &[completion]).unwrap();
+
+        assert!(matches!(plan.dispositions[0], ClientToolDisposition::Suppress)); // raw added
+        assert!(matches!(plan.dispositions[1], ClientToolDisposition::Suppress)); // args delta
+        match &plan.dispositions[2] {
+            // args.done → typed added
+            ClientToolDisposition::EmitTypedAdded { item } => {
+                assert_eq!(item["type"], "response.output_item.added");
+                assert_eq!(item["item"]["type"], "tool_search_call");
+                assert_eq!(item["item"]["execution"], "client");
+                assert_eq!(item["item"]["arguments"]["query"], "rust");
+                let id = item["item"]["id"].as_str().unwrap();
+                assert!(id.starts_with("tsc_"), "expected public tsc_ id, got {id}");
+            },
+            other => panic!("expected EmitTypedAdded, got {other:?}"),
+        }
+        match &plan.dispositions[3] {
+            // item.done → typed done
+            ClientToolDisposition::EmitTypedDone { item } => {
+                assert_eq!(item["type"], "response.output_item.done");
+                assert_eq!(item["item"]["type"], "tool_search_call");
+                assert_eq!(item["item"]["execution"], "client");
+                let id = item["item"]["id"].as_str().unwrap();
+                assert!(id.starts_with("tsc_"), "expected public tsc_ id, got {id}");
+            },
+            other => panic!("expected EmitTypedDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_output_item_done_before_args_done_fails_closed() {
+        let reverse = reverse_shell();
+        let added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1"}
+        }));
+        let item_done = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1",
+                     "id": "fc_1", "arguments": "{\"commands\":[\"ls\"]}", "status": "completed"}
+        }));
+        // output_item.done while still `Opened` (no arguments.done) is a C4 violation.
+        let events = [added, item_done];
+        let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
+        assert!(result.is_err(), "shell output_item.done before arguments.done must fail closed");
     }
 
     #[test]

@@ -6056,3 +6056,243 @@ async fn namespace_custom_lowered_call_restored_through_commit_never_leaks_priva
         "the private lowered item type must never surface to the client: {emitted}"
     );
 }
+
+// #1159 Task 6: end-to-end proof for the local `shell` path through the real commit
+// path (`commit_chunk_events` phase-2a artifact capture -> `restore_and_append_chunk`
+// -> `apply_client_tool_disposition`). A lowered `shell` `function_call` has its raw
+// added/args-delta/args-done lifecycle SUPPRESSED and a schema-complete `shell_call`
+// synthesized at args.done, followed by the restored `output_item.done`. Asserts the
+// EMITTED SSE bytes carry the public `shell_call` shape (`environment.type=="local"`,
+// public `sh_` id, parsed `commands`) and never leak the private `fc_` id, the raw
+// `function_call` type, or a `function_call_arguments` frame.
+#[tokio::test]
+async fn shell_lowered_call_restored_to_shell_call_lifecycle_through_commit() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
+        "shell".to_owned(),
+        LoweredClientTool {
+            original_name: "shell".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Shell,
+        },
+    );
+
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // The lowered arguments are the shell action envelope openai_client_tool_compat
+    // produced on the way out: a `{"commands":[...]}` object.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_delta = make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"commands\":",
+            "sequence_number": 2
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"commands\":[\"ls\"]}",
+            "sequence_number": 3
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"commands\":[\"ls\"]}", "status": "completed"},
+            "sequence_number": 4
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_delta);
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains(r#""type":"shell_call""#),
+        "the restored shell_call type must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""environment":{"type":"local"}"#),
+        "the restored shell_call must carry a local environment: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""id":"sh_1""#),
+        "the public shell item id must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""commands":["ls"]"#),
+        "the parsed shell commands must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""call_id":"c1""#),
+        "the client's own call id must be preserved on the restored call: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("function_call_arguments"),
+        "the backend function-args frames must be suppressed, not forwarded: {emitted}"
+    );
+}
+
+// #1159 Task 6: end-to-end proof for the client-executed `tool_search` path through
+// the real commit path. Mirrors the `shell` e2e: the raw lowered lifecycle is
+// suppressed and a schema-complete `tool_search_call` (`execution=="client"`, public
+// `tsc_` id, parsed `arguments`) is synthesized at args.done, followed by the restored
+// `output_item.done`. The private `fc_` id, raw `function_call` type, and
+// `function_call_arguments` frame must never surface.
+#[tokio::test]
+async fn tool_search_lowered_call_restored_to_tool_search_call_lifecycle_through_commit() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
+        "tool_search".to_owned(),
+        LoweredClientTool {
+            original_name: "tool_search".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::ToolSearch,
+        },
+    );
+
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_delta = make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"query\":",
+            "sequence_number": 2
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"query\":\"rust\"}",
+            "sequence_number": 3
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"query\":\"rust\"}", "status": "completed"},
+            "sequence_number": 4
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_delta);
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains(r#""type":"tool_search_call""#),
+        "the restored tool_search_call type must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""execution":"client""#),
+        "the restored tool_search_call must be client-executed: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""id":"tsc_1""#),
+        "the public tool_search item id must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""query":"rust""#),
+        "the parsed tool_search arguments must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""call_id":"c1""#),
+        "the client's own call id must be preserved on the restored call: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("function_call_arguments"),
+        "the backend function-args frames must be suppressed, not forwarded: {emitted}"
+    );
+}

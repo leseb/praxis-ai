@@ -1079,12 +1079,19 @@ fn append_logical_event(
 /// `custom_tool_call` payload the plan pass already built onto the corresponding
 /// lifecycle event (Task 5). `EmitCustomInput`
 /// synthesizes the canonical `custom_tool_call_input` delta+done pair and drops the
-/// backend's `function_call_arguments.done` it replaces. None of these ever leak the
-/// private `agentic_ns__{ns}__{member}` / lowered `fc_` id. The
-/// `EmitTypedAdded`/`EmitTypedDone`/`RestoreSnapshot` dispositions the plan pass does
-/// not yet produce (Tasks 6-7) forward through [`append_logical_event`] unchanged
-/// rather than panicking; `Suppress` is dropped before dispatch and must never reach
-/// the applier.
+/// backend's `function_call_arguments.done` it replaces. `EmitTypedAdded`/`EmitTypedDone`
+/// construct a fresh `output_item.added`/`output_item.done` carrying the restored
+/// `shell_call`/`tool_search_call` (Task 6) — `EmitTypedAdded` fires on the incoming
+/// `function_call_arguments.done` and must emit under an `output_item.added` line, so it
+/// cannot splice onto the incoming event; the dropped args.done is replaced by the
+/// synthesized added. None of these ever leak the private `agentic_ns__{ns}__{member}` /
+/// lowered `fc_` id. The `RestoreSnapshot` disposition the plan pass does not yet produce
+/// (Task 7) forwards through [`append_logical_event`] unchanged rather than panicking;
+/// `Suppress` is dropped before dispatch and must never reach the applier.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear match dispatch over the eight client-tool restore dispositions, each with a load-bearing comment"
+)]
 fn apply_client_tool_disposition(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -1120,10 +1127,20 @@ fn apply_client_tool_disposition(
             // dropped by not appending `event` (#1159).
             synthesize_custom_tool_input(state, ctx, (item_id, *output_index, input), logical_output);
         },
-        // Task 6 (Shell/ToolSearch typed synthesis) and Task 7 (terminal snapshot)
-        // dispositions the plan pass does not yet produce; forward the raw event
-        // unchanged rather than panicking until those tasks wire them.
-        D::EmitTypedAdded { .. } | D::EmitTypedDone { .. } | D::RestoreSnapshot { .. } => {
+        // Shell/ToolSearch synthesized typed `output_item.added`. Fires on the incoming
+        // function_call_arguments.done, so CONSTRUCT a fresh OutputItemAdded — the SSE event
+        // type derives from the variant; splicing onto the args.done event would emit the
+        // added body under a function_call_arguments.done line (#1159 R-T6a).
+        D::EmitTypedAdded { item } => {
+            append_logical_event(state, ctx, ResponsesEvent::OutputItemAdded(item.clone()), logical_output);
+        },
+        // Shell/ToolSearch restored typed `output_item.done` (incoming is already
+        // output_item.done; construct fresh for symmetry with the added path).
+        D::EmitTypedDone { item } => {
+            append_logical_event(state, ctx, ResponsesEvent::OutputItemDone(item.clone()), logical_output);
+        },
+        // Task 7 terminal snapshot placeholder: forward unchanged until wired.
+        D::RestoreSnapshot { .. } => {
             append_logical_event(state, ctx, event, logical_output);
         },
         // Passthrough is forwarded by restore_and_append_chunk before dispatch;
