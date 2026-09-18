@@ -252,7 +252,7 @@ impl OpenaiStreamEventsFilter {
         // on_request_body) that this logical SSE owner is present and will drive
         // streaming client-tool restoration, so the compat filter arms lowering
         // instead of failing streaming closed.
-        ctx.set_metadata("responses.client_tool_stream_restoration", "true");
+        ctx.set_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
     }
 
     /// Apply the guard [`ArmDecision`], returning an early [`FilterAction`] when
@@ -313,6 +313,13 @@ enum ArmDecision {
     Arm,
 }
 
+/// Metadata marker published so `openai_client_tool_compat` (which lowers rich
+/// client tools in `on_request_body`) knows this logical SSE owner is present
+/// and will restore the lowered calls live in the stream (#1159). Published in
+/// both the request and request-body phases so the compat guard observes it
+/// regardless of which phase the IRR step executor runs first.
+const CLIENT_TOOL_STREAM_RESTORATION_MARKER: &str = "responses.client_tool_stream_restoration";
+
 /// Decide whether to arm logical composition for the current request.
 ///
 /// Arms only for a streaming Responses create request, and only inside an IRR
@@ -326,10 +333,60 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
     }
 }
 
+/// Classify the current request from context signals, shared by the request
+/// and request-body phases.
+///
+/// The `iterative_request_router` runner moves request extensions into each
+/// step but builds a fresh `filter_metadata` map, so metadata set by pre-IRR
+/// filters (e.g. `openai_responses_format`) is not visible here. `ResponsesState`
+/// is created pre-IRR and travels through extensions, so fall back to it for
+/// format and stream detection — mirroring how `responses_to_chat_completions`
+/// resolves `request_is_streaming`. `IterationState` is inserted by the IRR
+/// runner before the request phase of every iteration (including iteration 0),
+/// so its presence is the runtime signal that the filter is placed inside an
+/// IRR step.
+///
+/// Called from both `on_request` and `on_request_body` because the IRR step
+/// executor's phase order depends on the step's aggregate request body mode: a
+/// `StreamBuffer`-mode step (forced when `openai_agentic_loop` shares the step)
+/// runs `on_request_body` before `on_request`, while a `Stream`-mode step runs
+/// `on_request` first. The streaming client-tool-restoration marker (#1159)
+/// must be published in whichever phase runs first, so both call this.
+fn arm_decision_for(ctx: &HttpFilterContext<'_>) -> ArmDecision {
+    let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
+    let responses_state = ctx.extensions.get::<ResponsesState>();
+    let has_responses_state = responses_state.is_some();
+    let body_stream = responses_state
+        .and_then(|state| state.request_body.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && (typed_streaming
+            || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+            || has_responses_state);
+    let is_streaming =
+        typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+    let inside_irr = ctx.extensions.get::<IterationState>().is_some();
+    arm_decision(is_responses && is_streaming, inside_irr)
+}
+
 #[async_trait]
 impl HttpFilter for OpenaiStreamEventsFilter {
     fn name(&self) -> &'static str {
         "openai_stream_events"
+    }
+
+    fn request_body_access(&self) -> BodyAccess {
+        // ReadOnly (not None) so the IRR step executor invokes `on_request_body`,
+        // where the streaming client-tool-restoration marker is published for the
+        // `StreamBuffer`-first phase ordering (#1159). The body is never mutated;
+        // the mode stays `Stream` so this never escalates the aggregate step to
+        // buffering.
+        BodyAccess::ReadOnly
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -343,34 +400,36 @@ impl HttpFilter for OpenaiStreamEventsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
-        // The `iterative_request_router` runner moves request extensions into
-        // each step but builds a fresh `filter_metadata` map, so metadata set by
-        // pre-IRR filters (e.g. `openai_responses_format`) is not visible here.
-        // `ResponsesState` is created pre-IRR and travels through extensions, so
-        // fall back to it for format and stream detection — mirroring how
-        // `responses_to_chat_completions` resolves `request_is_streaming`.
-        let responses_state = ctx.extensions.get::<ResponsesState>();
-        let has_responses_state = responses_state.is_some();
-        let body_stream = responses_state
-            .and_then(|state| state.request_body.get("stream"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
-            && (typed_streaming
-                || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
-                || has_responses_state);
-        let is_streaming =
-            typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
-        // `IterationState` is inserted by the IRR runner before the request phase
-        // of every iteration (including iteration 0), so its presence is the
-        // runtime signal that the filter is placed inside an IRR step.
-        let inside_irr = ctx.extensions.get::<IterationState>().is_some();
-        let decision = arm_decision(is_responses && is_streaming, inside_irr);
+        let decision = arm_decision_for(ctx);
         if let Some(action) = self.apply_arm_decision(ctx, decision) {
             return Ok(action);
         }
 
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        // #1159: When `openai_agentic_loop` shares this IRR step its
+        // `StreamBuffer` request body mode makes the step executor run
+        // `on_request_body` for every step filter BEFORE any `on_request`. In
+        // that ordering `on_request`'s `arm()` — which publishes the
+        // restoration marker — has not run yet when `openai_client_tool_compat`
+        // reaches its own `on_request_body` streaming guard, so it would fail the
+        // streaming request closed. Publish the marker here too: this filter
+        // precedes the compat filter in step order, so its `on_request_body`
+        // runs first in BOTH phase orderings and the guard always observes the
+        // marker. Full arming (parser-state install) still happens in
+        // `on_request`, which always runs before the upstream response, so the
+        // response-phase restoration path is unaffected. The body is only read,
+        // never mutated.
+        if arm_decision_for(ctx) == ArmDecision::Arm {
+            ctx.set_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
+        }
         Ok(FilterAction::Continue)
     }
 
