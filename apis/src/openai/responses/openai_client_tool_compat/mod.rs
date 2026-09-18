@@ -2342,7 +2342,9 @@ pub(crate) fn restore_snapshot_tools(response: &mut Value, echo: Option<&ClientT
 /// to its canonical typed item (#1159). Fallible: `Err(item_type)` on the first
 /// lossy item so the caller can fail the response closed. No-op when `output` is
 /// absent or not an array.
-#[allow(dead_code, reason = "used by streaming restoration in later tasks")]
+// Exercised by unit tests already; dead only in the non-test lib build until the
+// streaming restoration path wires it in a later task.
+#[cfg_attr(not(test), expect(dead_code, reason = "used by streaming restoration in later tasks"))]
 pub(crate) fn restore_snapshot(
     response: &mut Value,
     reverse: &HashMap<String, LoweredClientTool>,
@@ -2361,7 +2363,7 @@ pub(crate) fn restore_snapshot(
 /// Mirrors `restore_custom_call` but with a known-empty input, so the streaming
 /// synth path can emit a complete custom lifecycle. `Err(())` if the source item
 /// lacks a `call_id`.
-#[allow(dead_code, reason = "used by streaming synth path in later tasks")]
+#[expect(dead_code, reason = "used by streaming synth path in later tasks")]
 pub(crate) fn custom_call_shell(
     item: &Value,
     original_name: &str,
@@ -2587,6 +2589,8 @@ pub(crate) fn restore_call_status(item: &Value) -> Result<&'static str, ()> {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CustomInputEnvelope {
+    /// The single string argument the lowered `custom` tool wraps; unwrapped back
+    /// to the plain-string `input` of a canonical `custom_tool_call`.
     input: String,
 }
 
@@ -2597,9 +2601,10 @@ struct CustomInputEnvelope {
 /// key, or a non-string `input`, so restoration rejects the item rather than
 /// leaking the private lowered arguments shape to the client.
 pub(crate) fn input_from_arguments_strict(arguments: &str) -> Result<String, ()> {
-    serde_json::from_str::<CustomInputEnvelope>(arguments)
-        .map(|envelope| envelope.input)
-        .map_err(|_| ())
+    match serde_json::from_str::<CustomInputEnvelope>(arguments) {
+        Ok(envelope) => Ok(envelope.input),
+        Err(_) => Err(()),
+    }
 }
 
 // -----------------------------------------------------------------------------
