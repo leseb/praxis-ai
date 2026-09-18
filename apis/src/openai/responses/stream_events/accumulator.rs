@@ -316,7 +316,7 @@ fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &
 }
 
 /// Build the stable key used by argument delta/done events.
-fn tool_call_key(payload: &Value) -> Option<String> {
+pub(super) fn tool_call_key(payload: &Value) -> Option<String> {
     payload
         .get("item_id")
         .and_then(Value::as_str)
@@ -327,6 +327,19 @@ fn tool_call_key(payload: &Value) -> Option<String> {
                 .and_then(Value::as_u64)
                 .map(|output_index| format!("index:{output_index}"))
         })
+}
+
+/// Read-only lookup of the accumulated output item matching an event payload's
+/// tool-call key, for #1159 artifact capture without a mutable borrow.
+#[expect(
+    dead_code,
+    reason = "#1159 Task 5 wires this into the streaming client-tool completion capture"
+)]
+pub(super) fn find_output_item<'a>(items: &'a [Value], payload: &Value) -> Option<&'a Value> {
+    let key = tool_call_key(payload)?;
+    items
+        .iter()
+        .find(|item| tool_call_key(item).as_deref() == Some(key.as_str()))
 }
 
 /// Find the output item targeted by a function-call arguments event.

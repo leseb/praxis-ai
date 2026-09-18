@@ -16,6 +16,7 @@
 //! [`ResponsesState`]: super::state::ResponsesState
 
 pub(crate) mod accumulator;
+pub(super) mod client_tools;
 mod config;
 mod local_tools;
 
@@ -119,6 +120,10 @@ pub(super) struct StreamEventsState {
     /// `index:{output_index}` → suppression mode (§4.1). Transient per-round: created
     /// in `arm()`, dropped when the state is removed at `finalize_logical_stream`.
     local_tool_items: std::collections::HashMap<String, local_tools::LocalToolMode>,
+    /// #1159: lowered client-tool items tracked across their streaming lifecycle,
+    /// so the plan pass can enforce lifecycle order and (Tasks 5-7) synthesize the
+    /// typed restoration. Empty for native (non-lowered) traffic.
+    client_tool_items: Vec<client_tools::ClientToolStreamItem>,
 }
 
 /// Composes the current IRR execution into one logical Responses stream.
@@ -209,6 +214,7 @@ impl OpenaiStreamEventsFilter {
             deferred_done: false,
             local_items_flushed: false,
             local_tool_items: std::collections::HashMap::new(),
+            client_tool_items: Vec::new(),
         }
     }
 
@@ -802,10 +808,9 @@ fn commit_chunk_events(
         return Err(error);
     }
 
-    let mut logical_output = Vec::new();
-    for event in events {
-        append_logical_event(state, ctx, event, &mut logical_output);
-    }
+    // Phase 2b: plan lowered client-tool restoration (fallible) then append every
+    // committed event to the logical stream applying its disposition (infallible).
+    let logical_output = restore_and_append_chunk(state, ctx, events)?;
 
     // Mirror the parser's deferred-`[DONE]` decision into shared response state,
     // but only now that the whole chunk has parsed and committed. Filter-local
@@ -817,6 +822,53 @@ fn commit_chunk_events(
         response_state.deferred_stream_done = true;
     }
 
+    Ok(logical_output)
+}
+
+/// Phase 2b of the chunk commit: plan lowered client-tool restoration, then append
+/// every committed event to the logical stream applying its disposition (#1159).
+///
+/// The plan pass ([`client_tools::plan_client_tool_restore`]) is the only fallible
+/// step: it runs after phase 2a (accumulate) and before any byte is appended, so a
+/// malformed lowered lifecycle fails the chunk closed with nothing delivered. The
+/// lowering map + echo live on the shared `ResponsesState` (populated by
+/// `openai_client_tool_compat` earlier in this pipeline); the per-round lifecycle
+/// progress lives on this `StreamEventsState`. Native passthrough (no lowering
+/// armed) skips the plan pass entirely — zero overhead, no behavior change for
+/// non-lowered traffic. Appending each event is infallible.
+fn restore_and_append_chunk(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: Vec<ResponsesEvent>,
+) -> Result<Vec<u8>, SseParseError> {
+    let completions: Vec<client_tools::ClientToolCompletion> = Vec::new(); // Task 5 populates this in phase 2a.
+    let dispositions = match ctx.extensions.get::<ResponsesState>() {
+        Some(responses) if !responses.client_tool_lowering.is_empty() => {
+            let plan = client_tools::plan_client_tool_restore(
+                &responses.client_tool_lowering,
+                responses.client_tool_echo.as_ref(),
+                &state.client_tool_items,
+                &events,
+                &completions,
+            )?;
+            state.client_tool_items = plan.next_items;
+            Some(plan.dispositions)
+        },
+        _ => None,
+    };
+
+    let mut logical_output = Vec::new();
+    for (index, event) in events.into_iter().enumerate() {
+        match dispositions.as_ref().and_then(|dispositions| dispositions.get(index)) {
+            None | Some(client_tools::ClientToolDisposition::Passthrough) => {
+                append_logical_event(state, ctx, event, &mut logical_output);
+            },
+            Some(client_tools::ClientToolDisposition::Suppress) => {},
+            Some(disposition) => {
+                apply_client_tool_disposition(state, ctx, disposition, event, &mut logical_output);
+            },
+        }
+    }
     Ok(logical_output)
 }
 
@@ -941,6 +993,52 @@ fn append_logical_event(
     let mut payload = event.into_payload();
     normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
     encode_sse_event(&event_type, &payload, output);
+}
+
+/// Apply a non-`Passthrough`/`Suppress` client-tool restoration disposition to a
+/// committed event, then append it to the logical stream (#1159).
+///
+/// Infallible by contract: the fallible planning already ran in
+/// [`commit_chunk_events`], so this only mutates the event payload and forwards
+/// it. Task 4 implements `RetypeInPlace` (retype a lowered `Namespace` member's
+/// `function_call` item back to its original name + namespace, never leaking the
+/// private `agentic_ns__{ns}__{member}` name). The `EmitCustom*`/`EmitTyped*`/
+/// `RestoreSnapshot` dispositions the plan pass does not yet produce route
+/// through [`append_logical_event`] unchanged rather than panicking.
+fn apply_client_tool_disposition(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    disposition: &client_tools::ClientToolDisposition,
+    mut event: ResponsesEvent,
+    logical_output: &mut Vec<u8>,
+) {
+    use client_tools::ClientToolDisposition as D;
+    match disposition {
+        D::RetypeInPlace {
+            item_type,
+            name,
+            namespace,
+        } => {
+            let payload = event.payload_mut();
+            if let Some(item) = payload.get_mut("item").and_then(Value::as_object_mut) {
+                item.insert("type".to_owned(), Value::String((*item_type).to_owned()));
+                item.insert("name".to_owned(), Value::String(name.clone()));
+                match namespace {
+                    Some(namespace) => {
+                        item.insert("namespace".to_owned(), Value::String(namespace.clone()));
+                    },
+                    None => {
+                        item.remove("namespace");
+                    },
+                }
+            }
+            append_logical_event(state, ctx, event, logical_output);
+        },
+        // Tasks 5-7 add the EmitCustomShell / EmitCustomInput / EmitCustomItemDone /
+        // EmitTypedAdded / EmitTypedDone / RestoreSnapshot arms. The plan pass does
+        // not yet produce them, so forward the event unchanged rather than panic.
+        _ => append_logical_event(state, ctx, event, logical_output),
+    }
 }
 
 /// Reconcile locally executed tool items against the resumed model stream for one

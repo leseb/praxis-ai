@@ -4186,6 +4186,7 @@ fn parse_error_sets_metadata() {
         deferred_done: false,
         local_items_flushed: false,
         local_tool_items: std::collections::HashMap::new(),
+        client_tool_items: Vec::new(),
     });
 
     let large_chunk =
