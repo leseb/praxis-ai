@@ -5496,12 +5496,9 @@ fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) ->
         "api_key: ${WEB_SEARCH_API_KEY}",
         &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
-    // The provider callout targets a loopback mock, so the executor's SSRF check
-    // requires the operator opt-in on the outbound pipeline.
-    let yaml = yaml.replace(
-        "allow_private_endpoints: true",
-        "allow_private_endpoints: true\n  allow_private_upstreams: true",
-    );
+    // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
+    // `insecure_options`, which is the operator opt-in the executor's SSRF check
+    // requires for the loopback provider callout — no test-time injection needed.
     praxis_core::config::Config::from_yaml(&yaml).expect("parse web search config")
 }
 
@@ -5529,12 +5526,9 @@ fn load_unified_dispatch_config(
         "api_key: ${WEB_SEARCH_API_KEY}",
         &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
-    // The provider callout targets a loopback mock, so the executor's SSRF check
-    // requires the operator opt-in on the outbound pipeline.
-    let yaml = yaml.replace(
-        "allow_private_endpoints: true",
-        "allow_private_endpoints: true\n  allow_private_upstreams: true",
-    );
+    // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
+    // `insecure_options`, which is the operator opt-in the executor's SSRF check
+    // requires for the loopback provider callout — no test-time injection needed.
     let yaml = yaml.replacen(
         "      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n",
         "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {header: x-tenant-id}\n        issuer: {static: urn:test}\n        subject: {static: test-user}\n      - filter: state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n",
