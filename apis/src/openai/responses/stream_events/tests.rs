@@ -4241,9 +4241,19 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
     validate_stream_end(&mut ctx);
 
     assert_eq!(
+        ctx.get_metadata("responses.stream_incomplete"),
+        Some("true"),
+        "incomplete client-tool lifecycle must flag the stream incomplete"
+    );
+    assert_eq!(
         ctx.get_metadata("responses.stream_error_code"),
         Some("server_error"),
         "incomplete client-tool lifecycle must fail closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some("upstream Responses stream did not terminate cleanly"),
+        "fail-closed metadata must carry the unclean-termination message"
     );
     assert_eq!(
         ctx.get_metadata("responses.skip_persist"),
