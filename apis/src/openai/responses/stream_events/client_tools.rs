@@ -75,14 +75,14 @@ pub(super) struct ClientToolCompletion {
 /// How one committed SSE event must be restored before it reaches the client.
 ///
 /// Task 4 constructs `Passthrough`/`RetypeInPlace`; Task 5 adds
-/// `Suppress`/`EmitTypedAdded`/`EmitCustomInput`/`EmitCustomItemDone` for
-/// `Custom`/`NamespaceCustom` synthesis. The remaining
-/// `EmitCustomShell`/`EmitTypedDone`/`RestoreSnapshot` dispositions are produced
-/// by Tasks 6-7 (`Shell`/`ToolSearch` synthesis and terminal snapshot restore).
+/// `Suppress`/`EmitCustomShell`/`EmitCustomInput`/`EmitCustomItemDone` for
+/// `Custom`/`NamespaceCustom` synthesis. `EmitTypedAdded`/`EmitTypedDone`/
+/// `RestoreSnapshot` are produced by Tasks 6-7 (`Shell`/`ToolSearch` synthesis and
+/// terminal snapshot restore).
 #[derive(Clone, Debug)]
 #[expect(
     dead_code,
-    reason = "#1159 Tasks 6-7 construct the EmitCustomShell/EmitTypedDone/RestoreSnapshot dispositions"
+    reason = "#1159 Tasks 6-7 construct the EmitTypedAdded/EmitTypedDone/RestoreSnapshot dispositions"
 )]
 pub(super) enum ClientToolDisposition {
     /// Forward the event unchanged.
@@ -99,12 +99,13 @@ pub(super) enum ClientToolDisposition {
         /// The namespace to re-add, or `None` to remove it.
         namespace: Option<String>,
     },
-    /// Emit a synthesized `custom_tool_call` `output_item.added` (Task 6).
+    /// Emit a synthesized `custom_tool_call` `output_item.added` for
+    /// `Custom`/`NamespaceCustom` (Task 5).
     EmitCustomShell {
         /// The synthesized output item.
         item: Value,
     },
-    /// Emit a synthesized custom-tool input event (Task 6).
+    /// Emit a synthesized custom-tool input event (Task 5).
     EmitCustomInput {
         /// Stable key of the tracked stream item.
         key: String,
@@ -115,17 +116,17 @@ pub(super) enum ClientToolDisposition {
         /// The unwrapped plain-string input.
         input: String,
     },
-    /// Emit a synthesized custom-tool `output_item.done` (Task 6).
+    /// Emit a synthesized custom-tool `output_item.done` (Task 5).
     EmitCustomItemDone {
         /// The synthesized output item.
         item: Value,
     },
-    /// Emit a synthesized typed `output_item.added` (Task 7).
+    /// Emit a synthesized typed `output_item.added` for `Shell`/`ToolSearch` (Task 6).
     EmitTypedAdded {
         /// The synthesized output item.
         item: Value,
     },
-    /// Emit a synthesized typed `output_item.done` (Task 7).
+    /// Emit a synthesized typed `output_item.done` (Task 6).
     EmitTypedDone {
         /// The synthesized output item.
         item: Value,
@@ -245,7 +246,7 @@ fn plan_added_disposition(lowered: &LoweredClientTool, payload: &Value) -> Clien
         // Custom/NamespaceCustom: retype the announced item to `custom_tool_call`
         // with the client-visible name and public id; the private lowered name and
         // `fc_` id never reach the client.
-        _ => ClientToolDisposition::EmitTypedAdded {
+        _ => ClientToolDisposition::EmitCustomShell {
             item: build_custom_added_payload(payload, lowered),
         },
     }
@@ -572,7 +573,7 @@ mod tests {
         let events = vec![added, args_delta, args_done];
         let plan = plan_client_tool_restore(&reverse, None, &[], &events, &completions).unwrap();
         assert_eq!(plan.dispositions.len(), 3);
-        assert!(matches!(plan.dispositions[0], ClientToolDisposition::EmitTypedAdded { .. }));
+        assert!(matches!(plan.dispositions[0], ClientToolDisposition::EmitCustomShell { .. }));
         assert!(matches!(plan.dispositions[1], ClientToolDisposition::Suppress));
         // args.done becomes the synthesized custom input delta+done pair, applied as EmitCustomInput.
         assert!(matches!(plan.dispositions[2], ClientToolDisposition::EmitCustomInput { .. }));
@@ -580,13 +581,13 @@ mod tests {
         // The retyped added item is a `custom_tool_call` carrying the public id, and
         // the synthesized input carries the unwrapped plain-string value.
         match &plan.dispositions[0] {
-            ClientToolDisposition::EmitTypedAdded { item } => {
+            ClientToolDisposition::EmitCustomShell { item } => {
                 let added_item = item.get("item").unwrap();
                 assert_eq!(added_item.get("type").unwrap(), "custom_tool_call");
                 assert_eq!(added_item.get("name").unwrap(), "run_python");
                 assert_eq!(added_item.get("id").unwrap(), "ctc_1");
             },
-            other => panic!("expected EmitTypedAdded, got {other:?}"),
+            other => panic!("expected EmitCustomShell, got {other:?}"),
         }
         match &plan.dispositions[2] {
             ClientToolDisposition::EmitCustomInput { item_id, input, .. } => {
@@ -625,7 +626,7 @@ mod tests {
         let events = vec![added, args_done, item_done];
         let plan = plan_client_tool_restore(&reverse, None, &[], &events, &completions).unwrap();
         assert_eq!(plan.dispositions.len(), 3);
-        assert!(matches!(plan.dispositions[0], ClientToolDisposition::EmitTypedAdded { .. }));
+        assert!(matches!(plan.dispositions[0], ClientToolDisposition::EmitCustomShell { .. }));
         assert!(matches!(plan.dispositions[1], ClientToolDisposition::EmitCustomInput { .. }));
         match &plan.dispositions[2] {
             ClientToolDisposition::EmitCustomItemDone { item } => {

@@ -5933,3 +5933,126 @@ async fn custom_lowered_call_restored_to_custom_tool_call_lifecycle_through_comm
         "the private lowered item type must never surface to the client: {emitted}"
     );
 }
+
+// #1159 Task 5: end-to-end proof for the *obfuscated* `NamespaceCustom` path — the
+// case #1159 exists to protect. A namespaced custom member is lowered to the private
+// `agentic_ns__{ns}__{member}` wire name, so its restoration must recover the member
+// name AND re-add its namespace while never leaking the private lowered name or its
+// `fc_` id. Mirrors `custom_lowered_call_restored_to_custom_tool_call_lifecycle_through_commit`
+// (the plain-Custom commit-path e2e) so the whole synthesis runs through the real
+// commit path (`commit_chunk_events` phase-2a artifact capture ->
+// `restore_and_append_chunk` -> `apply_client_tool_disposition`).
+#[tokio::test]
+async fn namespace_custom_lowered_call_restored_through_commit_never_leaks_private_name() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a NamespaceCustom lowering on the shared `ResponsesState`, read the same
+    // way `restore_and_append_chunk` / phase-2a capture read it. The wire name is the
+    // obfuscated `agentic_ns__{ns}__{member}` form; the restore must recover the bare
+    // member name and re-add the namespace.
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
+        "agentic_ns__code__run".to_owned(),
+        LoweredClientTool {
+            original_name: "run".to_owned(),
+            namespace: Some("code".to_owned()),
+            restore: ClientToolRestore::NamespaceCustom,
+        },
+    );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response so the incremental item events are delivered.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // One chunk carrying the lowered `function_call`'s whole lifecycle: added ->
+    // arguments.done -> item.done for the same item, keyed by the private `fc_ns1`
+    // id. The phase-2a accumulate must store the completed `function_call` item
+    // before the done event is planned, exactly as the plain-Custom e2e relies on.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__code__run", "call_id": "c_ns1", "id": "fc_ns1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_ns1",
+            "arguments": "{\"input\":\"print(1)\"}",
+            "sequence_number": 2
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__code__run", "call_id": "c_ns1", "id": "fc_ns1",
+                     "arguments": "{\"input\":\"print(1)\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    // The restored item is a namespaced custom_tool_call carrying the bare member
+    // name, its namespace, the unwrapped input, and the public `ctc_` id.
+    assert!(
+        emitted.contains(r#""type":"custom_tool_call""#),
+        "the restored item type must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""name":"run""#),
+        "the restored member name must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""namespace":"code""#),
+        "the namespace must be re-added on the restored item: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""input":"print(1)""#),
+        "the unwrapped plain-string input must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""id":"ctc_ns1""#),
+        "the public custom item id must reach the client: {emitted}"
+    );
+    // The load-bearing no-leak assertions: the obfuscated wire name, its private
+    // `fc_` id, and the raw lowered `function_call` type must never surface.
+    assert!(
+        !emitted.contains("agentic_ns__"),
+        "the private lowered namespace name must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_ns1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+}

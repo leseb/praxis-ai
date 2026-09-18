@@ -1075,14 +1075,16 @@ fn append_logical_event(
 /// [`commit_chunk_events`], so this only mutates or replaces the event payload and
 /// forwards it. `RetypeInPlace` retypes a lowered `Namespace` member's
 /// `function_call` item back to its original name + namespace in place (Task 4).
-/// `EmitTypedAdded`/`EmitCustomItemDone` (and Tasks 6-7's
-/// `EmitCustomShell`/`EmitTypedDone`) splice the fully-typed public payload the plan
-/// pass already built onto the corresponding lifecycle event. `EmitCustomInput`
+/// `EmitCustomShell`/`EmitCustomItemDone` splice the fully-typed public
+/// `custom_tool_call` payload the plan pass already built onto the corresponding
+/// lifecycle event (Task 5). `EmitCustomInput`
 /// synthesizes the canonical `custom_tool_call_input` delta+done pair and drops the
 /// backend's `function_call_arguments.done` it replaces. None of these ever leak the
 /// private `agentic_ns__{ns}__{member}` / lowered `fc_` id. The
-/// `RestoreSnapshot` disposition the plan pass does not yet produce forwards through
-/// [`append_logical_event`] unchanged rather than panicking.
+/// `EmitTypedAdded`/`EmitTypedDone`/`RestoreSnapshot` dispositions the plan pass does
+/// not yet produce (Tasks 6-7) forward through [`append_logical_event`] unchanged
+/// rather than panicking; `Suppress` is dropped before dispatch and must never reach
+/// the applier.
 fn apply_client_tool_disposition(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -1100,13 +1102,10 @@ fn apply_client_tool_disposition(
             retype_item_in_place(event.payload_mut(), item_type, name, namespace.as_deref());
             append_logical_event(state, ctx, event, logical_output);
         },
-        D::EmitTypedAdded { item }
-        | D::EmitCustomShell { item }
-        | D::EmitCustomItemDone { item }
-        | D::EmitTypedDone { item } => {
-            // The plan pass already built the fully-typed public payload (retyped
-            // item, public `ctc_` id, no private lowered name); splice it back onto
-            // the corresponding lifecycle event and append it.
+        // Custom/NamespaceCustom synthesized custom_tool_call output-item events.
+        // Each fires on the matching incoming lifecycle event (added / done), so the
+        // carried payload already has the right shape; splice it on and append.
+        D::EmitCustomShell { item } | D::EmitCustomItemDone { item } => {
             *event.payload_mut() = item.clone();
             append_logical_event(state, ctx, event, logical_output);
         },
@@ -1121,10 +1120,19 @@ fn apply_client_tool_disposition(
             // dropped by not appending `event` (#1159).
             synthesize_custom_tool_input(state, ctx, (item_id, *output_index, input), logical_output);
         },
-        // The RestoreSnapshot disposition the plan pass does not yet produce (Task 7)
-        // forwards unchanged rather than panicking.
-        D::RestoreSnapshot { .. } | D::Passthrough | D::Suppress => {
+        // Task 6 (Shell/ToolSearch typed synthesis) and Task 7 (terminal snapshot)
+        // dispositions the plan pass does not yet produce; forward the raw event
+        // unchanged rather than panicking until those tasks wire them.
+        D::EmitTypedAdded { .. } | D::EmitTypedDone { .. } | D::RestoreSnapshot { .. } => {
             append_logical_event(state, ctx, event, logical_output);
+        },
+        // Passthrough is forwarded by restore_and_append_chunk before dispatch;
+        // reaching it here would still mean "forward", so append.
+        D::Passthrough => append_logical_event(state, ctx, event, logical_output),
+        // Suppress is dropped by restore_and_append_chunk before dispatch and must
+        // NEVER forward; reaching the applier is a bug (debug panic; release drops).
+        D::Suppress => {
+            debug_assert!(false, "Suppress is dropped in restore_and_append_chunk, never dispatched to the applier");
         },
     }
 }
