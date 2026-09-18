@@ -307,6 +307,12 @@ pub(crate) enum SseParseError {
         /// Client-safe description of why the restore failed. Never a private name.
         reason: String,
     },
+
+    /// A prior chunk already failed the logical stream (#1159 C1). Every
+    /// remaining chunk is dropped closed so a post-failure terminal or lowered
+    /// event cannot emit on a poisoned stream. Carries no per-event detail: the
+    /// original failure already recorded the diagnostic error.
+    StreamPoisoned,
 }
 
 impl fmt::Display for SseParseError {
@@ -353,6 +359,9 @@ impl fmt::Display for SseParseError {
             ),
             Self::ClientToolRestore { key, reason } => {
                 write!(f, "client tool restoration failed for {key}: {reason}")
+            },
+            Self::StreamPoisoned => {
+                write!(f, "SSE stream already failed; dropping remaining chunks closed")
             },
         }
     }

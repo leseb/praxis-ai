@@ -203,7 +203,7 @@ fn plan_one_event(
     }
 
     match event {
-        ResponsesEvent::OutputItemAdded(payload) => Ok(plan_output_item_added(reverse, next_items, payload)),
+        ResponsesEvent::OutputItemAdded(payload) => plan_output_item_added(reverse, next_items, payload),
         ResponsesEvent::FunctionCallArgumentsDelta(payload) => Ok(plan_arguments_delta(next_items, payload)),
         ResponsesEvent::FunctionCallArgumentsDone(payload) => plan_arguments_done(next_items, completions, payload),
         ResponsesEvent::OutputItemDone(payload) => plan_output_item_done(reverse, next_items, payload),
@@ -237,15 +237,15 @@ fn plan_output_item_added(
     reverse: &HashMap<String, LoweredClientTool>,
     next_items: &mut Vec<ClientToolStreamItem>,
     payload: &Value,
-) -> ClientToolDisposition {
+) -> Result<ClientToolDisposition, SseParseError> {
     let Some(item) = payload.get("item") else {
-        return ClientToolDisposition::Passthrough;
+        return Ok(ClientToolDisposition::Passthrough);
     };
     let Some(name) = item.get("name").and_then(Value::as_str) else {
-        return ClientToolDisposition::Passthrough;
+        return Ok(ClientToolDisposition::Passthrough);
     };
     let Some(lowered) = reverse.get(name) else {
-        return ClientToolDisposition::Passthrough;
+        return Ok(ClientToolDisposition::Passthrough);
     };
 
     // Every lowered kind is tracked so its lifecycle can be restored: Namespace
@@ -254,11 +254,19 @@ fn plan_output_item_added(
     // call at arguments.done (#1159 Task 6). Any future kind not yet handled passes
     // through untracked.
     if !is_restorable(lowered.restore) {
-        return ClientToolDisposition::Passthrough;
+        return Ok(ClientToolDisposition::Passthrough);
     }
 
     let Some(key) = client_tool_event_key(payload) else {
-        return ClientToolDisposition::Passthrough;
+        // #1159 C1 defense-in-depth: `name` is already proven lowered (found in
+        // `reverse`) and restorable, so this is not a genuine non-lowered item.
+        // A lowered `added` with no resolvable event key cannot be tracked and its
+        // later `.done` could not be matched, which would risk surfacing the raw
+        // private name — fail the whole stream closed instead of passing through.
+        return Err(client_tool_restore_error(
+            "output-item-added",
+            "lowered client-tool added without a resolvable event key",
+        ));
     };
     next_items.push(ClientToolStreamItem {
         key,
@@ -268,7 +276,7 @@ fn plan_output_item_added(
         output_index: payload.get("output_index").and_then(Value::as_u64).unwrap_or_default(),
         item_id: item.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
     });
-    plan_added_disposition(lowered, payload)
+    Ok(plan_added_disposition(lowered, payload))
 }
 
 /// Select the `output_item.added` disposition for a lowered call: retype a
@@ -489,6 +497,18 @@ fn client_tool_restore_error(key: &str, reason: &str) -> SseParseError {
     }
 }
 
+/// Whether an untracked `output_item.done` carries a known lowered private name
+/// (#1159 C1). `reverse` is keyed by the private lowered name, which is exactly what
+/// the raw `function_call` item carries, so a hit means tracking was lost and the
+/// caller must fail closed rather than pass the raw lowered shape through.
+fn untracked_done_carries_lowered_name(payload: &Value, reverse: &HashMap<String, LoweredClientTool>) -> bool {
+    payload
+        .get("item")
+        .and_then(|item| item.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| reverse.contains_key(name))
+}
+
 /// Plan an `output_item.done`: finalize a tracked `Namespace`/`Custom`/
 /// `NamespaceCustom` item. `Namespace` retypes the `function_call` in place;
 /// `Custom`/`NamespaceCustom` rebuild the finalized `custom_tool_call`. Fail closed
@@ -503,6 +523,16 @@ fn plan_output_item_done(
         return Ok(ClientToolDisposition::Passthrough);
     };
     let Some(tracked) = next_items.iter_mut().find(|tracked| tracked.key == key) else {
+        // #1159 C1 defense-in-depth: an untracked item whose name is a known lowered
+        // private name means tracking was lost (e.g. its `.added` was rolled back by
+        // an earlier failed chunk). Never pass the raw lowered `function_call`
+        // through — fail closed instead of surfacing its private name.
+        if untracked_done_carries_lowered_name(payload, reverse) {
+            return Err(client_tool_restore_error(
+                "output-item-done",
+                "untracked lowered client-tool item at output_item.done",
+            ));
+        }
         return Ok(ClientToolDisposition::Passthrough);
     };
     if !is_restorable(tracked.restore) {
@@ -1233,6 +1263,63 @@ mod tests {
         assert!(
             result.is_err(),
             "non-terminal snapshot with lossy output item must fail closed"
+        );
+    }
+
+    // #1159 C1 defense-in-depth: an `output_item.done` for a lowered item that is
+    // NOT tracked in `next_items` (its `.added` was rolled back by an earlier failed
+    // chunk) must fail closed rather than pass the raw lowered `function_call`
+    // through, because `reverse` still knows the private name.
+    #[test]
+    fn untracked_output_item_done_with_lowered_name_fails_closed() {
+        let reverse = reverse_custom();
+        // No prior tracking and no matching `.added` in this batch: the item is
+        // untracked, but its name is a known lowered private name.
+        let item_done = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "name": "run_python", "call_id": "c1",
+                     "id": "fc_1", "arguments": "{\"input\":\"print(1)\"}", "status": "completed"}
+        }));
+        let result = plan_client_tool_restore(&reverse, None, &[], &[item_done], &[]);
+        assert!(
+            result.is_err(),
+            "an untracked lowered item at output_item.done must fail closed, not leak its raw name"
+        );
+    }
+
+    // #1159 C1 defense-in-depth companion: a genuine non-lowered item whose name is
+    // NOT in `reverse` must still pass through untouched at `output_item.done`.
+    #[test]
+    fn untracked_output_item_done_native_name_passes_through() {
+        let reverse = reverse_custom();
+        let item_done = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "name": "native_tool", "call_id": "c2",
+                     "id": "fc_2", "arguments": "{}", "status": "completed"}
+        }));
+        let plan = plan_client_tool_restore(&reverse, None, &[], &[item_done], &[]).unwrap();
+        assert_eq!(plan.dispositions.len(), 1);
+        assert!(
+            matches!(plan.dispositions[0], ClientToolDisposition::Passthrough),
+            "a genuine non-lowered item must still pass through unchanged"
+        );
+    }
+
+    // #1159 C1 defense-in-depth: a lowered `output_item.added` with no resolvable
+    // event key (no nested item id, no `output_index`) cannot be tracked, so its
+    // later `.done` could not be matched — fail closed instead of passing the raw
+    // lowered name through untracked.
+    #[test]
+    fn lowered_output_item_added_without_event_key_fails_closed() {
+        let reverse = reverse_custom();
+        let added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "name": "run_python", "call_id": "c1"}
+        }));
+        let result = plan_client_tool_restore(&reverse, None, &[], &[added], &[]);
+        assert!(
+            result.is_err(),
+            "a lowered added without a resolvable event key must fail closed"
         );
     }
 }

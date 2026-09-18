@@ -4284,6 +4284,7 @@ fn parse_error_sets_metadata() {
         local_items_flushed: false,
         local_tool_items: std::collections::HashMap::new(),
         client_tool_items: Vec::new(),
+        stream_failed: false,
     });
 
     let large_chunk =
@@ -4336,6 +4337,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
             output_index: 0,
             item_id: Some("call_1".to_owned()),
         }],
+        stream_failed: false,
     });
 
     validate_stream_end(&mut ctx);
@@ -6475,5 +6477,143 @@ async fn tool_search_lowered_call_restored_to_tool_search_call_lifecycle_through
     assert!(
         !emitted.contains("function_call_arguments"),
         "the backend function-args frames must be suppressed, not forwarded: {emitted}"
+    );
+}
+
+// #1159 C1 (fail-closed security regression): a fatal mid-stream error must poison
+// the whole logical stream so a co-batched lowered item whose `output_item.added`
+// was rolled back by the failed chunk cannot later leak its raw private name on a
+// subsequent `output_item.done`. Backends batch several SSE frames per network
+// chunk, so this drives the real commit path through `on_response_body`:
+//   * Chunk N: the lowered item's `output_item.added` FOLLOWED by a lossy snapshot (a `response.in_progress` whose
+//     output holds a lowered custom `function_call` with no `call_id`). The plan pass fails closed AFTER tracking the
+//     added item, so `state.client_tool_items` is rolled back and the chunk emits nothing.
+//   * Chunk N+1: that same item's `output_item.done` carrying the private name.
+// Without the sticky poison flag + defense-in-depth, chunk N+1 would find the item
+// untracked and pass the RAW `function_call` (private `agentic_ns__...` name)
+// straight to the client. Asserts no frame ever carries the private name and the
+// stream terminates as an error, not a successful completion.
+#[tokio::test]
+async fn poisoned_stream_never_leaks_rolled_back_lowered_name_on_later_done() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a Custom lowering keyed by a private lowered name, read the same way
+    // `restore_and_append_chunk` reads it.
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "agentic_ns__demo__apply_patch".to_owned(),
+            LoweredClientTool {
+                original_name: "apply_patch".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    let created_out = created.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+
+    // Chunk N: the lowered item's `output_item.added` (tracked) followed by a lossy
+    // snapshot that fails the plan pass closed — rolling back the just-added item.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__demo__apply_patch", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let lossy_in_progress = make_sse_chunk(
+        "response.in_progress",
+        &json!({
+            "response": {
+                "object": "response",
+                "output": [
+                    {"type": "function_call", "name": "agentic_ns__demo__apply_patch", "id": "fc_2"}
+                ]
+            },
+            "sequence_number": 2
+        }),
+    );
+    let mut chunk_n = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&lossy_in_progress);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk_n, false).unwrap();
+    let chunk_n_out = chunk_n.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+    assert!(
+        chunk_n_out.is_empty(),
+        "the failed chunk must emit nothing (plan pass fails before any append): {chunk_n_out}"
+    );
+
+    // Chunk N+1: the rolled-back item's `output_item.done` carrying the private name.
+    let mut chunk_n1 = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__demo__apply_patch", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"input\":\"x\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut chunk_n1, false).unwrap();
+    let chunk_n1_out = chunk_n1.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+    assert!(
+        chunk_n1_out.is_empty(),
+        "a post-failure chunk must be dropped closed on the poisoned stream: {chunk_n1_out}"
+    );
+
+    // End of stream: the logical terminal must be an error, not a completion.
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let eos_out = eos.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+
+    let combined = format!("{created_out}{chunk_n_out}{chunk_n1_out}{eos_out}");
+    assert!(
+        !combined.contains("agentic_ns__demo__apply_patch"),
+        "the private lowered name must never reach the client on a poisoned stream: {combined}"
+    );
+    assert!(
+        !combined.contains("fc_1") && !combined.contains("fc_2"),
+        "the private lowered `fc_` ids must never reach the client: {combined}"
+    );
+    assert!(
+        !combined.contains(r#""type":"function_call""#),
+        "the raw lowered function_call item must never surface to the client: {combined}"
+    );
+    assert!(
+        !combined.contains("response.completed"),
+        "a poisoned stream must not emit a successful completion terminal: {combined}"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "the poisoned stream must fail closed"
+    );
+    assert!(
+        eos_out.contains("event: error"),
+        "the logical stream must terminate with an error event: {eos_out}"
     );
 }

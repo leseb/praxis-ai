@@ -2366,24 +2366,6 @@ pub(crate) fn restore_snapshot(
     Ok(())
 }
 
-/// Build a canonical `custom_tool_call` carrying an empty `input` for a lowered
-/// custom tool whose backend `function_call` produced no arguments (#1159).
-/// Mirrors `restore_custom_call` but with a known-empty input, so the streaming
-/// synth path can emit a complete custom lifecycle. `Err(())` if the source item
-/// lacks a `call_id`.
-#[expect(dead_code, reason = "used by streaming synth path in later tasks")]
-pub(crate) fn custom_call_shell(item: &Value, original_name: &str) -> Result<Value, ()> {
-    let call_id = item.get("call_id").and_then(Value::as_str).ok_or(())?;
-    let mut out = json!({
-        "type": "custom_tool_call",
-        "name": original_name,
-        "call_id": call_id,
-        "input": "",
-    });
-    carry_caller(&mut out, item);
-    Ok(out)
-}
-
 /// Restore one output item, re-typing a lowered `function_call` when its name is
 /// in the reverse map.
 pub(crate) fn restore_output_item(

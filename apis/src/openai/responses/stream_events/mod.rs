@@ -74,6 +74,10 @@ pub(super) enum CompletionState {
 }
 
 /// Per-request parser and accumulation state.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-round lifecycle flags (deferred [DONE], local-item flush, poison)"
+)]
 pub(super) struct StreamEventsState {
     /// Byte-level SSE frame parser.
     frame_parser: SseFrameParser,
@@ -128,6 +132,10 @@ pub(super) struct StreamEventsState {
     /// so the plan pass can enforce lifecycle order and (Tasks 5-7) synthesize the
     /// typed restoration. Empty for native (non-lowered) traffic.
     client_tool_items: Vec<client_tools::ClientToolStreamItem>,
+    /// #1159 C1: once any chunk fails, the whole logical stream is poisoned; every
+    /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
+    /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
+    stream_failed: bool,
 }
 
 /// Composes the current IRR execution into one logical Responses stream.
@@ -219,6 +227,7 @@ impl OpenaiStreamEventsFilter {
             local_items_flushed: false,
             local_tool_items: std::collections::HashMap::new(),
             client_tool_items: Vec::new(),
+            stream_failed: false,
         }
     }
 
@@ -568,6 +577,13 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     state.started_at.get_or_insert(now);
 
     let parsed = parse_and_accumulate(&mut state, ctx, bytes, now);
+    // #1159 C1: any fatal chunk error poisons the whole logical stream. Mark it
+    // sticky before re-inserting state so the next chunk fails closed at the top
+    // of `parse_and_accumulate` — a co-batched lowered `output_item.done` whose
+    // `.added` was rolled back by this chunk must never emit its raw private name.
+    if parsed.is_err() {
+        state.stream_failed = true;
+    }
     handle_parse_result(ctx, body, &state, parsed);
 
     if let Some(deadline) = stream_deadline_at(&state) {
@@ -604,14 +620,31 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
     warn!(%error, "SSE parse error in stream_events");
     ctx.set_metadata("responses.stream_parse_error", "true".to_owned());
     ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata(
-        "responses.stream_error_message",
-        if matches!(error, SseParseError::Timeout { .. }) {
-            "upstream Responses stream exceeded timeout"
-        } else {
-            "upstream Responses stream could not be parsed"
+    // M3: surface a client-tool-restore-specific message when the failure is a
+    // restore error. `reason` is client-safe by construction (never a private
+    // name; see `client_tools::client_tool_restore_error`). Timeouts keep their
+    // dedicated message; all other error kinds keep the generic message.
+    // Diagnostic-only — control flow is unchanged.
+    match error {
+        SseParseError::ClientToolRestore { reason, .. } => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                format!("client tool restoration failed: {reason}"),
+            );
         },
-    );
+        SseParseError::Timeout { .. } => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                "upstream Responses stream exceeded timeout",
+            );
+        },
+        _ => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                "upstream Responses stream could not be parsed",
+            );
+        },
+    }
     ctx.set_metadata("responses.skip_persist", "true");
     *body = None;
 }
@@ -623,6 +656,15 @@ fn parse_and_accumulate(
     bytes: &Bytes,
     now: Instant,
 ) -> Result<Option<Bytes>, SseParseError> {
+    // #1159 C1: a prior chunk already failed the logical stream. Fail every
+    // remaining chunk closed before parsing so a later terminal or lowered event
+    // cannot emit on a poisoned stream (mirrors the accumulation-budget guard
+    // below). This covers ALL error kinds — parse, restore, timeout, budget — not
+    // just client-tool restore, so it is not a `client_tool_restore_error`.
+    if state.stream_failed {
+        return Err(SseParseError::StreamPoisoned);
+    }
+
     check_timeout(state, now)?;
 
     // A prior chunk or round may have tripped the aggregate accumulation budget.
@@ -1148,8 +1190,10 @@ fn append_logical_event(
 /// `function_call_arguments.done` and must emit under an `output_item.added` line, so it
 /// cannot splice onto the incoming event; the dropped args.done is replaced by the
 /// synthesized added. None of these ever leak the private `agentic_ns__{ns}__{member}` /
-/// lowered `fc_` id. The `RestoreSnapshot` disposition the plan pass does not yet produce
-/// (Task 7) forwards through [`append_logical_event`] unchanged rather than panicking;
+/// lowered `fc_` id. `RestoreSnapshot` (which the plan pass produces for the
+/// non-terminal `response.created`/`queued`/`in_progress` snapshots) splices the
+/// already-restored response object back onto the lifecycle event's payload before
+/// forwarding it, so a lowered name never appears in an intermediate snapshot;
 /// `Suppress` is dropped before dispatch and must never reach the applier.
 #[expect(
     clippy::too_many_lines,
