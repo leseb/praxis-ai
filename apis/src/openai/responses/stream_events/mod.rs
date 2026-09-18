@@ -2267,6 +2267,11 @@ fn stream_end_kind(ctx: &HttpFilterContext<'_>) -> StreamEndKind {
             warn!("stream did not terminate cleanly: missing terminal event");
             StreamEndKind::Incomplete { timed_out: false }
         },
+        Ok(()) if state.client_tool_items.iter().any(|item| !matches!(item.phase, client_tools::ClientToolPhase::Done)) => {
+            // #1159: incomplete client-tool lifecycle (never reached Done) → fail closed.
+            warn!("stream did not terminate cleanly: incomplete client-tool lifecycle");
+            StreamEndKind::Incomplete { timed_out: false }
+        },
         Ok(()) => StreamEndKind::Complete,
     }
 }

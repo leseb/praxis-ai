@@ -4201,6 +4201,57 @@ fn parse_error_sets_metadata() {
     );
 }
 
+#[test]
+fn incomplete_client_tool_lifecycle_fails_closed() {
+    use super::client_tools::{ClientToolPhase, ClientToolStreamItem};
+    use super::{CompletionState, StreamEventsState, validate_stream_end};
+    use crate::openai::responses::state::ClientToolRestore;
+
+    let (_filter, mut ctx) = make_armed_context();
+    ctx.insert_filter_state(StreamEventsState {
+        frame_parser: SseFrameParser::new(10),
+        event_count: 0,
+        max_events: 100_000,
+        timeout: std::time::Duration::from_secs(300),
+        started_at: None,
+        completed_at: None,
+        // Terminal so the ONLY incomplete trigger is the stuck client-tool item.
+        completion_state: CompletionState::TerminalLifecycle,
+        tool_call_args: std::collections::HashMap::new(),
+        rejected_tool_call_args: std::collections::HashSet::new(),
+        max_tool_call_argument_bytes: 1024 * 1024,
+        max_accumulated_bytes: 64 * 1024 * 1024,
+        max_output_items: 100_000,
+        iteration: 0,
+        output_index_offset: 0,
+        deferred_terminal: None,
+        deferred_done: false,
+        local_items_flushed: false,
+        local_tool_items: std::collections::HashMap::new(),
+        client_tool_items: vec![ClientToolStreamItem {
+            key: "item:call_1".to_owned(),
+            private_name: "custom_run_python".to_owned(),
+            restore: ClientToolRestore::Custom,
+            phase: ClientToolPhase::Opened, // never reached Done
+            output_index: 0,
+            item_id: Some("call_1".to_owned()),
+        }],
+    });
+
+    validate_stream_end(&mut ctx);
+
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "incomplete client-tool lifecycle must fail closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "must skip persisting a truncated client-tool restore"
+    );
+}
+
 #[tokio::test]
 async fn output_item_done_replaces_by_index() {
     let (filter, mut ctx) = make_armed_context();
