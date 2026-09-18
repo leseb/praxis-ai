@@ -196,7 +196,7 @@ fn lowers_custom_tool_to_function() {
             "grammar": "start: ..."
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 1);
@@ -231,7 +231,7 @@ fn custom_without_format_lowers() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "custom", "name": "c"}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(state.request_body["tools"][0]["type"], "function");
 }
 
@@ -245,7 +245,7 @@ fn deferred_top_level_custom_is_withheld() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "custom", "name": "c", "defer_loading": true}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"],
         json!([]),
@@ -278,7 +278,7 @@ fn custom_with_non_text_format_is_rejected() {
             "format": {"type": "grammar", "syntax": "lark", "definition": "start: ..."}
         }],
     }));
-    let action = filter().lower_request(&mut state, false).expect_err("must reject");
+    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
     assert!(
@@ -288,27 +288,6 @@ fn custom_with_non_text_format_is_rejected() {
     assert_eq!(
         state.request_body["tools"][0]["type"], "custom",
         "tools restored verbatim"
-    );
-}
-
-#[test]
-fn streaming_rejection_is_a_400_before_any_upstream_call() {
-    // The `on_request_body` guard fails closed on a streaming request that
-    // declares rich client tools: it recognizes the rich tool and produces the
-    // 400 rejection, so lowered private function names never reach the wire.
-    let state = ResponsesState::from_request_body(json!({
-        "stream": true,
-        "tools": [{"type": "custom", "name": "apply_patch"}],
-    }));
-    assert!(
-        request_has_rich_client_tool(&state),
-        "a custom tool is a rich client tool the streaming guard must catch"
-    );
-    let (status, message) = reject_parts(&reject_streaming_unsupported());
-    assert_eq!(status, 400);
-    assert!(
-        message.contains("streaming is not supported") && message.contains("stream=false"),
-        "the rejection explains the streaming limitation: {message}"
     );
 }
 
@@ -343,7 +322,7 @@ fn lowers_namespace_members_to_flat_functions() {
             ]
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2);
@@ -368,7 +347,7 @@ fn empty_namespace_is_rejected() {
         "tools": [{"type": "namespace", "name": "git", "description": "Git operations.", "tools": []}],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("an empty namespace must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an empty namespace is a bad request");
@@ -390,7 +369,7 @@ fn namespace_with_missing_tools_is_rejected() {
         ],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a namespace without tools must fail closed");
     let (status, _message) = reject_parts(&action);
     assert_eq!(status, 400, "a namespace without tools is a bad request");
@@ -410,7 +389,7 @@ fn lowers_local_shell_to_function() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["name"], "shell");
@@ -426,7 +405,7 @@ fn non_local_shell_is_left_untouched() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "provider"}}],
     }));
-    filter().lower_request(&mut state, false).expect("passthrough succeeds");
+    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
     assert_eq!(
         state.request_body["tools"][0]["type"], "shell",
         "not a rich local shell"
@@ -447,7 +426,7 @@ fn lowers_client_tool_search_to_function() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["name"], "tool_search");
@@ -471,7 +450,7 @@ fn server_executed_tool_search_is_left_untouched() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search", "execution": "server"}],
     }));
-    filter().lower_request(&mut state, false).expect("passthrough succeeds");
+    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
     assert_eq!(state.request_body["tools"][0]["type"], "tool_search");
     assert!(
         state.client_tool_echo.is_none(),
@@ -491,7 +470,7 @@ fn collision_between_lowered_names_is_rejected() {
             {"type": "shell", "environment": {"type": "local"}}
         ],
     }));
-    let action = filter().lower_request(&mut state, false).expect_err("must reject");
+    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
     assert!(
@@ -513,7 +492,7 @@ fn collision_with_passthrough_function_is_rejected() {
             {"type": "custom", "name": "run"}
         ],
     }));
-    let action = filter().lower_request(&mut state, false).expect_err("must reject");
+    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
     assert_eq!(reject_parts(&action).0, 400);
     assert_eq!(
         state.request_body["tools"][0]["type"], "function",
@@ -533,7 +512,7 @@ fn exceeding_max_client_tools_is_rejected() {
             {"type": "custom", "name": "b"}
         ],
     }));
-    let action = capped.lower_request(&mut state, false).expect_err("must reject");
+    let action = capped.lower_request(&mut state, false, false).expect_err("must reject");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
     assert!(
@@ -555,7 +534,7 @@ fn native_function_tools_are_passthrough() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}],
     }));
-    filter().lower_request(&mut state, false).expect("passthrough succeeds");
+    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
     assert_eq!(state.request_body["tools"][0]["type"], "function");
     assert!(state.client_tool_echo.is_none(), "native traffic takes no echo");
     assert!(state.client_tool_lowering.is_empty(), "native traffic lowers nothing");
@@ -568,7 +547,7 @@ fn native_function_tools_are_passthrough() {
 #[test]
 fn request_without_tools_is_passthrough() {
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi"}));
-    filter().lower_request(&mut state, false).expect("passthrough succeeds");
+    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
     assert!(
         state.client_tool_echo.is_none(),
         "a request without tools takes no echo"
@@ -592,7 +571,7 @@ fn native_non_array_tools_fail_closed() {
         "tools": {"type": "custom", "name": "x"}
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a non-array tools must fail closed on the passthrough path too");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a malformed tools value is a bad request");
@@ -617,7 +596,7 @@ fn lowers_custom_tool_choice_to_function() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": {"type": "custom", "name": "c"},
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"]["type"], "function");
     assert_eq!(state.request_body["tool_choice"]["name"], "c");
 }
@@ -628,7 +607,7 @@ fn lowers_namespaced_tool_choice_to_flat_function() {
         "tools": [{"type": "namespace", "name": "git", "description": "Git operations.", "tools": [{"type": "function", "name": "commit"}]}],
         "tool_choice": {"type": "function", "name": "commit", "namespace": "git"},
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"]["name"], "agentic_ns__git__commit");
     assert!(
         state.request_body["tool_choice"].get("namespace").is_none(),
@@ -649,7 +628,7 @@ fn lowers_namespaced_custom_tool_choice_to_flat_function() {
         }],
         "tool_choice": {"type": "custom", "name": "freeform", "namespace": "git"},
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let choice = &state.request_body["tool_choice"];
     assert_eq!(
         choice["type"], "function",
@@ -676,7 +655,7 @@ fn undeclared_namespaced_custom_tool_choice_is_rejected() {
         "tool_choice": {"type": "custom", "name": "missing", "namespace": "git"},
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("an undeclared namespaced custom selector must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an undeclared selector is a bad request");
@@ -700,7 +679,7 @@ fn lowers_allowed_tools_selectors_recursively() {
             "tools": [{"type": "custom", "name": "c"}]
         },
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"]["tools"][0]["type"], "function");
     assert_eq!(state.request_body["tool_choice"]["tools"][0]["name"], "c");
 }
@@ -711,7 +690,7 @@ fn tool_choice_for_undeclared_client_tool_is_rejected() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": {"type": "custom", "name": "other"},
     }));
-    let action = filter().lower_request(&mut state, false).expect_err("must reject");
+    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
     assert!(
@@ -734,7 +713,7 @@ fn tool_choice_auto_is_left_untouched() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": "auto",
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"], "auto");
 }
 
@@ -1043,7 +1022,7 @@ fn state_with_custom_lowered() -> ResponsesState {
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
         "tool_choice": {"type": "custom", "name": "run_python"},
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     state
 }
 
@@ -1088,7 +1067,7 @@ fn restores_namespaced_function_call_in_place() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "namespace", "name": "git", "description": "Git operations.", "tools": [{"type": "function", "name": "commit"}]}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1112,7 +1091,7 @@ fn restores_shell_call_with_local_environment() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1147,7 +1126,7 @@ fn restores_shell_call_normalizes_missing_action_fields() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1173,7 +1152,7 @@ fn restores_incomplete_shell_call_preserves_status() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1201,7 +1180,7 @@ fn restores_shell_call_without_status_defaults_to_completed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1226,7 +1205,7 @@ fn shell_call_without_call_id_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1253,7 +1232,7 @@ fn shell_call_with_unknown_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1278,7 +1257,7 @@ fn shell_call_with_non_string_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1301,7 +1280,7 @@ fn shell_call_with_malformed_arguments_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1329,7 +1308,7 @@ fn shell_call_with_non_string_commands_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1352,7 +1331,7 @@ fn restores_tool_search_call() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1383,7 +1362,7 @@ fn restores_non_terminal_tool_search_call_preserves_status() {
         let mut state = ResponsesState::from_request_body(json!({
             "tools": [{"type": "tool_search"}],
         }));
-        filter().lower_request(&mut state, false).expect("lowering succeeds");
+        filter().lower_request(&mut state, false, false).expect("lowering succeeds");
         let response = json!({
             "object": "response",
             "output": [{
@@ -1412,7 +1391,7 @@ fn tool_search_call_without_status_defaults_to_completed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1437,7 +1416,7 @@ fn tool_search_call_with_unknown_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1467,7 +1446,7 @@ fn tool_search_call_with_non_string_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1490,7 +1469,7 @@ fn tool_search_call_with_malformed_arguments_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1604,7 +1583,7 @@ fn local_shell_declaration_is_rejected() {
         "local_shell is a rich client tool the streaming guard must catch"
     );
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("local_shell must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
@@ -1633,7 +1612,7 @@ fn lowers_namespace_custom_member_to_flat_function() {
             ]
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2, "both members lowered: {tools:?}");
@@ -1737,7 +1716,7 @@ fn namespace_with_local_shell_member_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("an unsupported namespace member must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an unsupported member is a bad request");
@@ -1766,7 +1745,7 @@ fn deferred_namespace_custom_member_is_withheld() {
             "tools": [{"type": "custom", "name": "freeform", "defer_loading": true}]
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"],
         json!([]),
@@ -1792,7 +1771,7 @@ fn tool_search_with_null_parameters_uses_default_schema() {
         "tools": [{"type": "tool_search", "parameters": null}],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("an explicit null parameters lowers like omission");
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["type"], "function");
@@ -1809,7 +1788,7 @@ fn tool_search_with_non_object_parameters_is_rejected() {
         "tools": [{"type": "tool_search", "parameters": 5}],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("non-object, non-null parameters must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
@@ -1825,7 +1804,7 @@ fn lowers_shell_tool_choice_to_function() {
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
         "tool_choice": {"type": "shell"},
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(
         state.request_body["tool_choice"]["type"], "function",
         "a forced shell choice becomes a function selector"
@@ -1841,7 +1820,7 @@ fn shell_tool_choice_without_lowered_shell_is_untouched() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": {"type": "shell"},
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(
         state.request_body["tool_choice"]["type"], "shell",
         "a shell selector with no lowered shell tool is unchanged"
@@ -1858,7 +1837,7 @@ fn lowers_shell_selector_inside_allowed_tools() {
             "tools": [{"type": "shell"}]
         },
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(
         state.request_body["tool_choice"]["tools"][0]["type"], "function",
         "a shell selector nested in allowed_tools is lowered recursively"
@@ -1872,7 +1851,7 @@ fn custom_with_allowed_callers_is_rejected() {
         "tools": [{"type": "custom", "name": "c", "allowed_callers": ["programmatic"]}],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("an unenforceable caller restriction must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
@@ -1892,7 +1871,7 @@ fn shell_with_allowed_callers_is_rejected() {
         "tools": [{"type": "shell", "environment": {"type": "local"}, "allowed_callers": ["direct"]}],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("an unenforceable caller restriction must fail closed");
     assert_eq!(reject_parts(&action).0, 400);
 }
@@ -1908,7 +1887,7 @@ fn namespace_member_with_allowed_callers_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("an unenforceable caller restriction must fail closed");
     assert_eq!(reject_parts(&action).0, 400);
 }
@@ -1921,7 +1900,7 @@ fn custom_with_null_allowed_callers_lowers_and_omits_prose() {
         "tools": [{"type": "custom", "name": "c", "allowed_callers": null}],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a null caller restriction is permitted");
     let description = state.request_body["tools"][0]["description"]
         .as_str()
@@ -1945,7 +1924,7 @@ fn oversized_lowered_request_is_rejected_and_rolled_back() {
         "tool_choice": {"type": "custom", "name": "run_python"},
     }));
     let action = tiny
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a rewrite over the configured cap must fail closed");
     assert_eq!(
         reject_parts(&action).0,
@@ -2066,7 +2045,7 @@ fn history_only_rewrite_over_cap_fails_closed() {
         }],
     }));
     let action = tiny
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a history-only rewrite over the cap must fail closed");
     assert_eq!(
         reject_parts(&action).0,
@@ -2090,7 +2069,7 @@ fn history_only_rewrite_within_cap_lowers_and_marks_rebuild() {
         }],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a history-only rewrite under the cap succeeds");
     assert_eq!(
         state.messages[0]["type"], "function_call",
@@ -2121,7 +2100,7 @@ fn namespace_description_is_folded_into_flattened_members() {
             ]
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("tools array");
 
     let function_member = tools
@@ -2170,7 +2149,7 @@ fn namespace_without_description_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a namespace without a description must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a namespace without a description is a bad request");
@@ -2197,7 +2176,7 @@ fn namespace_with_blank_description_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a blank namespace description must fail closed");
     assert_eq!(reject_parts(&action).0, 400);
 }
@@ -2222,7 +2201,7 @@ fn shell_environment_skills_are_folded_into_description() {
             }
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let description = state.request_body["tools"][0]["description"]
         .as_str()
         .expect("description");
@@ -2259,7 +2238,7 @@ fn shell_skill_missing_name_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a skill without a name must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a skill missing a required field is a bad request");
@@ -2286,7 +2265,7 @@ fn shell_skill_missing_description_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a skill without a description must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a skill missing a required field is a bad request");
@@ -2309,7 +2288,7 @@ fn shell_skill_missing_path_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a skill without a path must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a skill missing a required field is a bad request");
@@ -2333,7 +2312,7 @@ fn shell_skill_with_non_string_field_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a non-string skill field must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a non-string skill field is a bad request");
@@ -2354,7 +2333,7 @@ fn shell_skills_non_array_is_rejected() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a non-array skills value must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a non-array skills value is a bad request");
@@ -2376,7 +2355,7 @@ fn shell_skills_null_fails_closed() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a null skills value must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a null skills value is a bad request");
@@ -2400,7 +2379,7 @@ fn shell_skill_with_empty_strings_is_accepted() {
         }],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a schema-valid empty-string skill is accepted");
     assert_eq!(
         state.request_body["tools"][0]["name"], "shell",
@@ -2417,7 +2396,7 @@ fn shell_skills_at_max_are_accepted_but_over_max_are_rejected() {
         "tools": [{"type": "shell", "environment": {"type": "local", "skills": at_max}}],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("exactly 200 skills are within the cap");
 
     let over_max: Vec<_> = (0..201).map(skill).collect();
@@ -2425,7 +2404,7 @@ fn shell_skills_at_max_are_accepted_but_over_max_are_rejected() {
         "tools": [{"type": "shell", "environment": {"type": "local", "skills": over_max}}],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("more than 200 skills must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "exceeding the skills cap is a bad request");
@@ -2437,7 +2416,7 @@ fn shell_without_skills_uses_base_description() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"][0]["description"], SHELL_BASE_DESCRIPTION,
         "a shell with no skills keeps the base description unchanged"
@@ -2485,7 +2464,7 @@ fn discovered_custom_tool_is_hoisted_and_restored() {
         &json!([{"type": "custom", "name": "apply_patch", "description": "Apply a patch.", "format": {"type": "text"}}]),
         true,
     );
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted = tools
@@ -2536,7 +2515,7 @@ fn discovered_tool_hoisted_without_declared_rich_tool() {
         &json!([{"type": "custom", "name": "apply_patch", "description": "Apply a patch.", "format": {"type": "text"}}]),
         false,
     );
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools.iter().any(|tool| tool["name"] == "apply_patch"),
@@ -2556,7 +2535,7 @@ fn discovered_plain_function_is_hoisted_and_not_restored() {
         &json!([{"type": "function", "name": "grep", "parameters": {"type": "object"}}]),
         true,
     );
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools
@@ -2585,7 +2564,7 @@ fn discovered_custom_with_defer_loading_becomes_callable() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted = tools
         .iter()
@@ -2643,7 +2622,7 @@ fn discovered_namespace_custom_member_with_defer_loading_becomes_callable() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let flat = namespace_member_name("git", "freeform");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let member = tools
@@ -2702,7 +2681,7 @@ fn discovered_namespace_function_member_with_defer_loading_becomes_callable() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let flat = namespace_member_name("git", "commit");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let member = tools
@@ -2745,7 +2724,7 @@ fn deferred_top_level_custom_and_its_discovered_copy_do_not_collide() {
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("the deferred declaration and its discovered copy do not collide");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted: Vec<_> = tools.iter().filter(|tool| tool["name"] == "apply_patch").collect();
@@ -2784,7 +2763,7 @@ fn discovered_tool_colliding_with_declared_fails_closed() {
         ],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a discovered tool colliding with a declared tool must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a collision is a bad request");
@@ -2809,7 +2788,7 @@ fn server_executed_search_discovered_tools_are_not_hoisted() {
             }
         ],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools.iter().all(|tool| tool["name"] != "apply_patch"),
@@ -2823,21 +2802,21 @@ fn server_executed_search_discovered_tools_are_not_hoisted() {
 
 #[test]
 fn streaming_discovered_tools_fail_closed() {
-    // Streaming cannot restore hoisted private names on the SSE stream, so a
-    // streaming request that would hoist discovered tools fails closed with HTTP
-    // 400 rather than silently degrading them to non-callable context (#1159).
+    // Streaming restoration requires the openai_stream_events owner. Without it,
+    // a streaming request that would hoist discovered tools fails closed with HTTP
+    // 500 rather than leaking private lowered names (#1159).
     let mut state = state_with_discovered_tools(
         &json!([{"type": "custom", "name": "apply_patch", "description": "d", "format": {"type": "text"}}]),
         false,
     );
     let action = filter()
-        .lower_request(&mut state, true)
+        .lower_request(&mut state, true, false)
         .expect_err("a streaming request carrying discovered tools must fail closed");
     let (status, message) = reject_parts(&action);
-    assert_eq!(status, 400, "streaming discovered tools is a bad request");
+    assert_eq!(status, 500, "streaming without the stream owner is a server error");
     assert!(
-        message.contains("stream=false"),
-        "the rejection tells the caller to retry without streaming: {message}"
+        message.contains("openai_stream_events"),
+        "the rejection names the missing stream owner: {message}"
     );
     assert!(
         state.client_tool_echo.is_none(),
@@ -2859,7 +2838,7 @@ fn discovered_tools_over_cap_fail_closed() {
         true,
     );
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("more discovered tools than the cap must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "exceeding the discovered-tool cap is a bad request");
@@ -2892,7 +2871,7 @@ fn passthrough_functions_are_not_counted_toward_max_client_tools() {
         ],
     }));
     capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("passthrough functions do not count toward the lowered-tool cap");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert_eq!(
@@ -2922,7 +2901,7 @@ fn withheld_deferred_tools_count_toward_max_client_tools() {
         ],
     }));
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("withheld deferred tools over the cap must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "exceeding the cap via withheld tools is a bad request");
@@ -2956,7 +2935,7 @@ fn withheld_namespace_members_count_toward_max_client_tools() {
         }],
     }));
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("withheld namespace members over the cap must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "exceeding the cap via withheld members is a bad request");
@@ -2981,7 +2960,7 @@ fn lowered_plus_withheld_tools_count_toward_max_client_tools() {
         ],
     }));
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("lowered plus withheld over the cap must fail closed");
     let (status, _) = reject_parts(&action);
     assert_eq!(status, 400, "the combined lowered-plus-withheld count exceeds the cap");
@@ -3002,7 +2981,7 @@ fn withheld_tools_at_the_cap_are_allowed() {
         ],
     }));
     capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("exactly max_client_tools withheld tools are allowed");
     assert_eq!(
         state.request_body["tools"],
@@ -3037,7 +3016,7 @@ fn deferred_custom_reloaded_by_discovery_counts_once_toward_max_client_tools() {
         ],
     }));
     capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a deferred tool reloaded by discovery counts once and fits the cap");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted: Vec<_> = tools.iter().filter(|tool| tool["name"] == "apply_patch").collect();
@@ -3082,7 +3061,7 @@ fn deferred_namespace_member_reloaded_by_discovery_counts_once_toward_max_client
         ],
     }));
     capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a deferred namespace member reloaded by discovery counts once and fits the cap");
     let flat = namespace_member_name("git", "commit");
     assert!(
@@ -3115,7 +3094,7 @@ fn deferred_custom_named_shell_and_local_shell_both_count_toward_cap() {
         };
         let mut state = ResponsesState::from_request_body(json!({ "tools": tools }));
         let action = capped
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("two distinct tools sharing the wire name 'shell' exceed a cap of 1");
         let (status, message) = reject_parts(&action);
         assert_eq!(status, 400, "the pair exceeds the cap");
@@ -3142,7 +3121,7 @@ fn deferred_custom_named_tool_search_and_client_tool_search_both_count_toward_ca
         ],
     }));
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a deferred custom and a client tool_search sharing a wire name exceed a cap of 1");
     let (status, _) = reject_parts(&action);
     assert_eq!(status, 400, "the pair exceeds the cap");
@@ -3171,7 +3150,7 @@ fn top_level_tool_using_reserved_namespace_prefix_fails_closed() {
         };
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool, {"type": "tool_search"}] }));
         let action = filter
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("a top-level tool using the reserved namespace prefix fails closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(status, 400, "the reserved prefix is rejected");
@@ -3217,7 +3196,7 @@ fn deferred_top_level_tool_colliding_with_discovered_namespace_member_fails_clos
             ],
         }));
         let action = capped
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("a deferred top-level tool colliding with a discovered member fails closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(status, 400, "the collision is rejected");
@@ -3249,7 +3228,7 @@ fn discovered_top_level_tool_using_reserved_namespace_prefix_fails_closed() {
         ],
     }));
     let action = filter
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a discovered top-level tool using the reserved prefix fails closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "the reserved prefix is rejected on the discovery path");
@@ -3277,7 +3256,7 @@ fn legitimate_namespace_member_is_not_rejected_by_the_reserved_prefix() {
         }],
     }));
     filter
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a legitimate namespace member lowers despite carrying the reserved prefix");
     assert!(
         state
@@ -3309,7 +3288,7 @@ fn namespace_name_embedding_the_reserved_delimiter_fails_closed() {
         // Declaration path.
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool.clone()] }));
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("a namespace name embedding the reserved delimiter fails closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(
@@ -3331,7 +3310,7 @@ fn namespace_name_embedding_the_reserved_delimiter_fails_closed() {
             ],
         }));
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("a discovered namespace embedding the reserved delimiter fails closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(status, 400, "the reserved delimiter is rejected on the discovery path");
@@ -3376,7 +3355,7 @@ fn deferred_namespace_member_colliding_via_reserved_delimiter_fails_closed() {
         ],
     }));
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a deferred member colliding via the reserved delimiter fails closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "the collision is rejected rather than admitting the pair");
@@ -3399,7 +3378,7 @@ fn namespace_names_with_single_underscores_are_accepted() {
         }],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a namespace with single-underscore names lowers cleanly");
     assert!(
         state
@@ -3445,7 +3424,7 @@ fn namespace_boundary_underscore_colliding_pair_fails_closed() {
         ],
     }));
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a boundary-underscore collision must fail closed rather than reclaim");
     let (status, message) = reject_parts(&action);
     assert_eq!(
@@ -3488,7 +3467,7 @@ fn deferred_namespace_member_hash_colliding_with_a_callable_member_fails_closed_
         "tool_choice": {"type": "function", "namespace": namespace, "name": deferred_member},
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("forcing a deferred member that used to alias a callable member fails closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(
@@ -3549,7 +3528,7 @@ fn hash_colliding_deferred_and_discovered_members_both_count_against_the_cap() {
         ],
     }));
     let action = capped
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("two members that used to alias one wire must both count against the cap");
     let (status, message) = reject_parts(&action);
     assert_eq!(
@@ -3587,7 +3566,7 @@ fn namespace_component_leading_or_trailing_underscore_fails_closed() {
     ] {
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool] }));
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("a boundary underscore in a namespace component fails closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(status, 400, "a boundary underscore is a bad request");
@@ -3617,7 +3596,7 @@ fn discovery_only_non_array_tools_fails_closed() {
         ],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a non-array tools on the discovery path must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a malformed tools value is a bad request");
@@ -3648,7 +3627,7 @@ fn discovery_only_null_tools_hoists_discovered() {
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("null tools hoists the discovered set onto a fresh array");
     let tools = state.request_body["tools"]
         .as_array()
@@ -3683,7 +3662,7 @@ fn discovered_tools_from_unfinished_search_are_not_hoisted() {
                 }
             ],
         }));
-        filter().lower_request(&mut state, false).expect("lowering succeeds");
+        filter().lower_request(&mut state, false, false).expect("lowering succeeds");
         let tools = state.request_body["tools"].as_array().expect("outbound tools");
         assert!(
             tools.iter().all(|tool| tool["name"] != "apply_patch"),
@@ -3718,7 +3697,7 @@ fn discovered_tools_missing_or_null_status_are_hoisted() {
                 output,
             ],
         }));
-        filter().lower_request(&mut state, false).expect("lowering succeeds");
+        filter().lower_request(&mut state, false, false).expect("lowering succeeds");
         let tools = state.request_body["tools"].as_array().expect("outbound tools");
         assert!(
             tools
@@ -3751,7 +3730,7 @@ fn discovered_tools_with_malformed_status_fail_closed() {
             ],
         }));
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err(&format!("a malformed discovered status ({label}) must fail closed"));
         let (code, message) = reject_parts(&action);
         assert_eq!(code, 400, "a malformed discovered status ({label}) is a bad request");
@@ -3776,7 +3755,7 @@ fn identical_discovered_redefinition_is_hoisted_once() {
             {"type": "tool_search_output", "call_id": "call_b", "status": "completed", "tools": discovered},
         ],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted = tools.iter().filter(|tool| tool["name"] == "grep").count();
     assert_eq!(hoisted, 1, "an identical re-listing is hoisted exactly once");
@@ -3805,7 +3784,7 @@ fn conflicting_discovered_redefinition_fails_closed() {
         ],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a conflicting discovered redefinition must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an ambiguous discovery is a bad request");
@@ -3833,7 +3812,7 @@ fn missing_status_output_participates_in_cross_output_dedup_and_conflict() {
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("identical listings across a completed and a missing-status output dedup");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted = tools.iter().filter(|tool| tool["name"] == "grep").count();
@@ -3859,7 +3838,7 @@ fn missing_status_output_participates_in_cross_output_dedup_and_conflict() {
         ],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a conflicting missing-status redefinition fails closed like a completed one");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a cross-output conflict is a bad request");
@@ -3896,7 +3875,7 @@ fn discovered_redefinition_differing_only_in_dropped_decorator_is_hoisted_once()
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("listings that lower identically are not a conflict");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let grep: Vec<_> = tools.iter().filter(|tool| tool["name"] == "grep").collect();
@@ -3938,7 +3917,7 @@ fn restrictive_allowed_callers_discovered_twin_fails_closed_regardless_of_order(
             ],
         }));
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("a restrictive allowed_callers twin must fail closed in either order");
         let (status, message) = reject_parts(&action);
         assert_eq!(status, 400, "the fail-closed guarantee is order-independent");
@@ -3976,7 +3955,7 @@ fn clean_then_malformed_output_schema_discovered_twin_fails_closed() {
         ],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a malformed output_schema twin behind a clean listing must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a malformed discovered output_schema is a bad request");
@@ -4006,7 +3985,7 @@ fn deferred_top_level_function_and_discovered_copy_do_not_collide() {
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a deferred declaration and its discovered copy do not collide");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let grep: Vec<_> = tools.iter().filter(|tool| tool["name"] == "grep").collect();
@@ -4031,7 +4010,7 @@ fn deferred_top_level_function_never_discovered_is_withheld() {
             {"type": "function", "name": "grep", "parameters": {"type": "object"}, "defer_loading": true}
         ],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools.iter().all(|tool| tool["name"] != "grep"),
@@ -4053,7 +4032,7 @@ fn deferred_top_level_function_forwards_verbatim_on_native_passthrough() {
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("native passthrough succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let grep = tools
@@ -4080,7 +4059,7 @@ fn non_deferred_top_level_function_passes_through() {
             {"type": "function", "name": "grep", "parameters": {"type": "object"}}
         ],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools
@@ -4105,7 +4084,7 @@ fn discovered_function_defer_loading_stripped_and_output_schema_preserved() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let grep = tools
         .iter()
@@ -4135,7 +4114,7 @@ fn discovered_function_with_restricted_callers_fails_closed() {
         true,
     );
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a restricted discovered function must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a restrictive allowed_callers is a bad request");
@@ -4154,7 +4133,7 @@ fn discovered_function_with_malformed_output_schema_fails_closed() {
         true,
     );
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a malformed output_schema must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a malformed output_schema is a bad request");
@@ -4184,7 +4163,7 @@ fn deferred_namespace_function_member_is_withheld() {
             }]
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"],
         json!([]),
@@ -4222,7 +4201,7 @@ fn namespace_function_member_output_schema_preserved() {
             }]
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let member = tools
         .iter()
@@ -4252,7 +4231,7 @@ fn namespace_function_member_with_malformed_output_schema_fails_closed() {
         }],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a malformed member output_schema must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a malformed output_schema is a bad request");
@@ -4275,7 +4254,7 @@ fn local_skill_text_is_rendered_verbatim_without_trimming() {
             }
         }],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let description = state.request_body["tools"][0]["description"]
         .as_str()
         .expect("description");
@@ -4306,7 +4285,7 @@ fn namespaced_custom_selector_for_function_member_is_rejected() {
         "tool_choice": {"type": "custom", "name": "commit", "namespace": "git"},
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a cross-kind namespaced selector must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(
@@ -4337,7 +4316,7 @@ fn namespaced_function_selector_for_custom_member_is_rejected() {
         "tool_choice": {"type": "function", "name": "freeform", "namespace": "git"},
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("a cross-kind namespaced selector must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(
@@ -4412,7 +4391,7 @@ fn deferred_top_level_function_forced_by_tool_choice_fails_closed() {
         "tool_choice": {"type": "function", "name": "grep"},
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("forcing a withheld deferred function must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "a dangling deferred selector is a bad request");
@@ -4455,7 +4434,7 @@ fn deferred_top_level_function_reloaded_by_discovery_can_be_forced() {
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("a re-discovered deferred function is callable and can be forced");
     let choice = &state.request_body["tool_choice"];
     assert_eq!(choice["type"], "function", "the selector stays a function selector");
@@ -4478,7 +4457,7 @@ fn deferred_top_level_custom_forced_by_tool_choice_reports_deferred() {
         "tool_choice": {"type": "custom", "name": "apply_patch"},
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("forcing a withheld deferred custom must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
@@ -4503,7 +4482,7 @@ fn deferred_namespace_function_member_forced_by_tool_choice_reports_deferred() {
         "tool_choice": {"type": "function", "name": "commit", "namespace": "git"},
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("forcing a withheld deferred namespace member must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
@@ -4546,7 +4525,7 @@ fn discovered_custom_redefinition_differing_only_in_defer_loading_is_hoisted_onc
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("custom listings differing only in defer_loading are not a conflict");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let apply_patch: Vec<_> = tools.iter().filter(|tool| tool["name"] == "apply_patch").collect();
@@ -4593,7 +4572,7 @@ fn discovered_namespace_member_redefinition_differing_only_in_defer_loading_is_h
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("namespace listings differing only in a member defer_loading are not a conflict");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let members: Vec<_> = tools
@@ -4640,7 +4619,7 @@ fn discovered_namespace_function_member_redefinition_differing_only_in_null_outp
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("namespace function members differing only in a null/absent output_schema are not a conflict");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let members: Vec<_> = tools
@@ -4687,7 +4666,7 @@ fn discovered_namespace_function_member_malformed_output_schema_twin_fails_close
             ],
         }));
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("clean vs malformed output_schema member must fail closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(
@@ -4730,7 +4709,7 @@ fn discovered_namespace_function_member_redefinition_differing_only_in_unknown_f
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("namespace function members differing only in an unwhitelisted field are not a conflict");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let members: Vec<_> = tools
@@ -4770,7 +4749,7 @@ fn discovered_custom_redefinition_differing_in_description_still_conflicts() {
         ],
     }));
     let action = filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect_err("custom listings differing in an outcome-affecting field must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an ambiguous discovery is a bad request");
@@ -4803,7 +4782,7 @@ fn discovered_custom_redefinition_differing_only_in_accepted_format_is_hoisted_o
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("custom listings differing only in an accepted format are not a conflict");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let apply_patch: Vec<_> = tools.iter().filter(|tool| tool["name"] == "apply_patch").collect();
@@ -4849,7 +4828,7 @@ fn discovered_custom_reject_worthy_format_twin_fails_closed_regardless_of_order(
             ],
         }));
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("clean vs reject-worthy format must fail closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(status, 400, "a reject-worthy format twin is a bad request ({order})");
@@ -4882,7 +4861,7 @@ fn discovered_custom_redefinition_differing_only_in_null_allowed_callers_is_hois
         ],
     }));
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .expect("custom listings differing only in a null/absent allowed_callers are not a conflict");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let apply_patch: Vec<_> = tools.iter().filter(|tool| tool["name"] == "apply_patch").collect();
@@ -4924,7 +4903,7 @@ fn discovery_of(first: Value, second: Value) -> ResponsesState {
 fn assert_discovery_hoisted_once(first: Value, second: Value, hoisted_name: &str, case: &str) {
     let mut state = discovery_of(first, second);
     filter()
-        .lower_request(&mut state, false)
+        .lower_request(&mut state, false, false)
         .unwrap_or_else(|_| panic!("equivalent listings must dedup, not conflict ({case})"));
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hits: Vec<_> = tools.iter().filter(|tool| tool["name"] == hoisted_name).collect();
@@ -4938,7 +4917,7 @@ fn assert_discovery_conflicts_both_orders(a: Value, b: Value, needle: &str, case
     for (first, second, order) in [(a.clone(), b.clone(), "a-first"), (b, a, "b-first")] {
         let mut state = discovery_of(first, second);
         let action = filter()
-            .lower_request(&mut state, false)
+            .lower_request(&mut state, false, false)
             .expect_err("conflicting listings must fail closed");
         let (status, message) = reject_parts(&action);
         assert_eq!(
@@ -5315,8 +5294,8 @@ async fn streaming_rich_request_rejects_without_arming() {
         .expect("on_request_body returns an action");
     assert_eq!(
         reject_parts(&action).0,
-        400,
-        "streaming rich client tools fail closed before any upstream call",
+        500,
+        "streaming rich client tools fail closed when stream owner is absent",
     );
     assert_eq!(
         ctx.response_body_mode,
@@ -5460,7 +5439,7 @@ fn restores_shell_call_preserves_caller() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false).expect("lowering succeeds");
+    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -5608,4 +5587,33 @@ fn restore_snapshot_restores_output_items_and_reports_lossy_type() {
         }]
     });
     assert_eq!(restore_snapshot(&mut bad, &reverse), Err("custom_tool_call"));
+}
+
+#[test]
+fn streaming_lowers_when_stream_owner_armed() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-x",
+        "stream": true,
+        "tools": [{"type": "custom", "name": "run_python"}],
+        "input": [{"type": "message", "role": "user", "content": "hi"}]
+    }));
+    // streaming = true, stream_restoration_armed = true
+    filter().lower_request(&mut state, true, true).expect("armed streaming lowers");
+    assert!(!state.client_tool_lowering.is_empty(), "rich tool was lowered");
+    assert!(state.client_tool_echo.is_some(), "echo snapshot captured");
+}
+
+#[test]
+fn streaming_fails_closed_when_stream_owner_absent() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-x",
+        "stream": true,
+        "tools": [{"type": "custom", "name": "run_python"}],
+        "input": [{"type": "message", "role": "user", "content": "hi"}]
+    }));
+    // streaming = true, stream_restoration_armed = false
+    let action = filter().lower_request(&mut state, true, false).expect_err("must fail closed");
+    let (status, body) = reject_parts(&action);
+    assert_eq!(status, 500);
+    assert!(body.contains("openai_stream_events"), "names the missing owner: {body}");
 }

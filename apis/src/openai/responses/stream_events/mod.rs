@@ -238,6 +238,11 @@ impl OpenaiStreamEventsFilter {
         // every armed round because the agentic loop overwrites it after each
         // check.
         ctx.set_metadata("responses.logical_stream", "true");
+        // #1159: advertise to openai_client_tool_compat (which runs later, in
+        // on_request_body) that this logical SSE owner is present and will drive
+        // streaming client-tool restoration, so the compat filter arms lowering
+        // instead of failing streaming closed.
+        ctx.set_metadata("responses.client_tool_stream_restoration", "true");
     }
 
     /// Apply the guard [`ArmDecision`], returning an early [`FilterAction`] when

@@ -255,7 +255,7 @@ impl ClientToolCompatFilter {
     /// Returns `Err` with a terminal rejection when lowering cannot proceed
     /// losslessly; the request body is left byte-identical so no upstream call is
     /// made with a partial rewrite.
-    fn lower_request(&self, state: &mut ResponsesState, streaming: bool) -> Result<(), FilterAction> {
+    fn lower_request(&self, state: &mut ResponsesState, streaming: bool, stream_restoration_armed: bool) -> Result<(), FilterAction> {
         // A present `tools` that is neither an array nor `null` is structurally
         // malformed: this filter's whole contract treats `tools` as an array. Fail
         // closed uniformly here — before any lowering, discovery, or native
@@ -274,15 +274,12 @@ impl ClientToolCompatFilter {
         // caught before any upstream call rather than being silently ignored on the
         // streaming path.
         let discovered = collect_discovered_tools(&state.messages)?;
-        // Discovered-tool hoisting is a buffered-only capability: the hoisted
-        // private names can only be restored on a buffered response, not on an SSE
-        // stream (full streaming restoration is #1159). A streaming request that
-        // carries discovered tools therefore fails closed rather than silently
-        // degrading them to non-callable stringified context. Rich declared tools
-        // are already rejected by the streaming guard in `on_request_body` before
-        // lowering runs.
-        if streaming && !discovered.is_empty() {
-            return Err(reject_streaming_discovered_unsupported());
+        // #1159: streaming restoration requires the openai_stream_events logical
+        // owner to be present (it published the marker in on_request). Without it
+        // there is no SSE owner to restore lowered calls, so fail closed rather than
+        // stream private lowered `function` shapes to the client.
+        if streaming && (has_rich || !discovered.is_empty()) && !stream_restoration_armed {
+            return Err(reject_streaming_missing_owner());
         }
         if !has_rich && discovered.is_empty() {
             // Native passthrough: still lower any prior typed client-owned items
@@ -466,24 +463,19 @@ impl HttpFilter for ClientToolCompatFilter {
             return Ok(FilterAction::Continue);
         }
         let streaming = request_is_streaming(ctx);
+        let stream_restoration_armed = ctx.get_metadata("responses.client_tool_stream_restoration").is_some();
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        // Fail closed before any upstream call when a streaming request declares
-        // rich client tools: streaming restoration is not implemented, so lowering
-        // their private function names onto a streamed round would leak those names
-        // to the client in un-restored SSE events (see the module streaming note).
-        if streaming && request_has_rich_client_tool(state) {
-            return Ok(reject_streaming_unsupported());
-        }
-        if let Err(action) = self.lower_request(state, streaming) {
+        if let Err(action) = self.lower_request(state, streaming, stream_restoration_armed) {
             return Ok(action);
         }
         // The `state` borrow above ends here. Re-read the echo flag before mutating
         // `ctx`: when lowering armed restoration, buffer the response and strip
         // `Accept-Encoding` so restoration sees a single, complete, uncompressed
-        // body (see `arm_restoration`).
-        if restoration_armed(ctx) {
+        // body (see `arm_restoration`). On the streaming path, the stream owner
+        // drives restoration, so the compat filter must not buffer.
+        if !streaming && restoration_armed(ctx) {
             self.arm_restoration(ctx);
         }
         Ok(FilterAction::Continue)
@@ -2865,24 +2857,18 @@ fn reject_if_restricted_callers(tool: &Value, descriptor: &str) -> Result<(), Fi
     Ok(())
 }
 
-/// Reject a streaming request that declares rich client tools before any upstream
-/// call, so lowered private function names are never streamed un-restored.
-fn reject_streaming_unsupported() -> FilterAction {
-    reject_bad_request(
-        "streaming is not supported for rich client-owned tools on a function-only Responses backend; retry with \
-         stream=false",
-    )
-}
-
-/// Reject a streaming request that carries discovered `tool_search` tools before
-/// any upstream call: the hoisted private function names can only be restored on a
-/// buffered response, so a streamed round would leak them un-restored (full
-/// streaming restoration is #1159).
-fn reject_streaming_discovered_unsupported() -> FilterAction {
-    reject_bad_request(
-        "streaming is not supported for tool_search-discovered client tools on a function-only Responses backend; \
-         retry with stream=false",
-    )
+/// #1159: streaming client-tool restoration was requested but the
+/// `openai_stream_events` logical SSE owner is not in the pipeline, so there is
+/// nothing to restore the lowered calls in the stream. Misconfiguration, so a
+/// 500 (not a client 4xx): the operator must place `openai_stream_events` before
+/// `openai_client_tool_compat` in the inference step.
+fn reject_streaming_missing_owner() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        500,
+        "server_error",
+        "openai_stream_events must precede openai_client_tool_compat to restore \
+         lowered client tools on the streaming Responses path",
+    ))
 }
 
 /// Reject a response whose lowered call cannot be restored losslessly.
