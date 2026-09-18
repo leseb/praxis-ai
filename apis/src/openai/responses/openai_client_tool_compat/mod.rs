@@ -2390,12 +2390,13 @@ fn restore_custom_call(item: &Value) -> Result<Value, ()> {
         .and_then(Value::as_str)
         .filter(|call_id| !call_id.trim().is_empty())
         .ok_or(())?;
+    let input = input_from_arguments_strict(arguments)?;
     let mut out = json!({
         "type": "custom_tool_call",
         "id": custom_public_item_id(id),
         "call_id": call_id,
         "name": item.get("name").cloned().unwrap_or(Value::Null),
-        "input": input_from_arguments(arguments),
+        "input": input,
     });
     carry_caller(&mut out, item);
     Ok(out)
@@ -2537,19 +2538,25 @@ fn restore_call_status(item: &Value) -> Result<&'static str, ()> {
     }
 }
 
-/// Recover the freeform `custom_tool_call` input from lowered arguments.
+/// The private wire envelope a lowered `custom` tool's arguments carry: exactly
+/// one string field named `input`. `deny_unknown_fields` makes any extra key a
+/// hard parse error so a malformed backend echo cannot leak a private shape.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomInputEnvelope {
+    input: String,
+}
+
+/// Unwrap a lowered `custom` call's `{"input": "<string>"}` arguments envelope
+/// back to the plain-string `input` field of a canonical `custom_tool_call`.
 ///
-/// Fails open: a JSON string is the input, a `{ "input": "..." }` object unwraps
-/// to its string, and anything else forwards the raw arguments verbatim.
-fn input_from_arguments(arguments: &str) -> String {
-    match serde_json::from_str::<Value>(arguments) {
-        Ok(Value::String(input)) => input,
-        Ok(Value::Object(fields)) => fields
-            .get("input")
-            .and_then(Value::as_str)
-            .map_or_else(|| arguments.to_owned(), str::to_owned),
-        _ => arguments.to_owned(),
-    }
+/// Fail-closed (#1159): returns `Err(())` on invalid JSON, a missing or extra
+/// key, or a non-string `input`, so restoration rejects the item rather than
+/// leaking the private lowered arguments shape to the client.
+pub(crate) fn input_from_arguments_strict(arguments: &str) -> Result<String, ()> {
+    serde_json::from_str::<CustomInputEnvelope>(arguments)
+        .map(|envelope| envelope.input)
+        .map_err(|_| ())
 }
 
 // -----------------------------------------------------------------------------

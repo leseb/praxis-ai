@@ -178,13 +178,6 @@ fn is_valid_function_name_enforces_schema() {
     );
 }
 
-#[test]
-fn input_from_arguments_is_fail_open() {
-    assert_eq!(input_from_arguments(r#""raw string""#), "raw string");
-    assert_eq!(input_from_arguments(r#"{"input":"unwrapped"}"#), "unwrapped");
-    assert_eq!(input_from_arguments("not json"), "not json");
-    assert_eq!(input_from_arguments(r#"{"other":1}"#), r#"{"other":1}"#);
-}
 
 // -----------------------------------------------------------------------------
 // Custom tool lowering
@@ -5429,6 +5422,37 @@ fn restores_custom_call_preserves_caller() {
         json!({"type": "program", "caller_id": "prog_1"}),
         "the backend caller is restored onto the custom_tool_call",
     );
+}
+
+#[test]
+fn input_from_arguments_strict_unwraps_single_input_field() {
+    assert_eq!(
+        input_from_arguments_strict(r#"{"input":"print(1)"}"#),
+        Ok("print(1)".to_owned())
+    );
+}
+
+#[test]
+fn input_from_arguments_strict_rejects_missing_input() {
+    assert_eq!(input_from_arguments_strict(r#"{"code":"print(1)"}"#), Err(()));
+}
+
+#[test]
+fn input_from_arguments_strict_rejects_extra_fields() {
+    assert_eq!(
+        input_from_arguments_strict(r#"{"input":"x","extra":1}"#),
+        Err(())
+    );
+}
+
+#[test]
+fn input_from_arguments_strict_rejects_non_string_input() {
+    assert_eq!(input_from_arguments_strict(r#"{"input":42}"#), Err(()));
+}
+
+#[test]
+fn input_from_arguments_strict_rejects_invalid_json() {
+    assert_eq!(input_from_arguments_strict("not json"), Err(()));
 }
 
 #[test]
