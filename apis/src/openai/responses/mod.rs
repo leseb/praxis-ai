@@ -285,12 +285,8 @@ impl HttpFilter for ResponsesFormatFilter {
             return Ok(action);
         }
 
-        if classified.format == AiRequestFormat::Responses && classified.background == Some(true) {
-            return Ok(FilterAction::Reject(error::responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "background mode is not supported",
-            )));
+        if let Some(action) = handle_unsupported_background(&classified) {
+            return Ok(action);
         }
 
         let mode = if websocket_handshake {
@@ -384,6 +380,22 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
             )))
         },
     }
+}
+
+/// Reject Responses create requests that request background execution.
+///
+/// Praxis does not implement the asynchronous Responses lifecycle
+/// (schedule, poll, cancel), so `background=true` is rejected uniformly
+/// before routing or upstream contact with an OpenAI-shaped 400.
+fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<FilterAction> {
+    if classified.format == AiRequestFormat::Responses && classified.background == Some(true) {
+        return Some(FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "background mode is not supported",
+        )));
+    }
+    None
 }
 
 /// Determine the routing mode for a Responses API request.
