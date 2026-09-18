@@ -5809,3 +5809,127 @@ async fn namespace_lowered_call_retyped_in_place_through_commit_never_leaks_priv
         "the private lowered name must never leak to the client: {emitted}"
     );
 }
+
+// #1159 Task 5: end-to-end proof that a lowered `custom` tool is restored to the
+// canonical `custom_tool_call` lifecycle through the real commit path
+// (`commit_chunk_events` phase-2a artifact capture -> `restore_and_append_chunk` ->
+// `apply_client_tool_disposition`). This exercises the whole synthesis the unit
+// tests in `client_tools.rs` cannot reach: the phase-2a `find_output_item` capture
+// of the completed private `function_call` item, the retyped `output_item.added`,
+// the suppressed backend args frame replaced by synthesized `custom_tool_call_input`
+// delta+done, and the restored `output_item.done`. Asserts the EMITTED SSE bytes
+// carry the public `custom_tool_call` shape and never leak the private `fc_` id.
+#[tokio::test]
+async fn custom_lowered_call_restored_to_custom_tool_call_lifecycle_through_commit() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a Custom lowering on the shared `ResponsesState`, read the same way
+    // `restore_and_append_chunk` / phase-2a capture read it.
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
+        "run_python".to_owned(),
+        LoweredClientTool {
+            original_name: "run_python".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response so the incremental item events are delivered.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // One chunk carrying the lowered `function_call`'s whole lifecycle: added ->
+    // arguments.done -> item.done for the same item. The lowered arguments are the
+    // `{"input":...}` envelope `openai_client_tool_compat` produced on the way out.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "run_python", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"input\":\"print(1)\"}",
+            "sequence_number": 2
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "run_python", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"input\":\"print(1)\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    // The retyped added and restored done both carry the public custom_tool_call type.
+    assert!(
+        emitted.contains(r#""type":"custom_tool_call""#),
+        "the restored item type must reach the client: {emitted}"
+    );
+    // The backend function-args frame is replaced by the synthesized input pair.
+    assert!(
+        emitted.contains("response.custom_tool_call_input.delta"),
+        "the synthesized custom input delta must be emitted: {emitted}"
+    );
+    assert!(
+        emitted.contains("response.custom_tool_call_input.done"),
+        "the synthesized custom input done must be emitted: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""input":"print(1)""#),
+        "the unwrapped plain-string input must reach the client: {emitted}"
+    );
+    // Every client-visible id is the public `ctc_` form, never the private `fc_` id.
+    assert!(
+        emitted.contains(r#""id":"ctc_1""#),
+        "the public custom item id must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""call_id":"c1""#),
+        "the client's own call id must be preserved on the restored call: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("function_call_arguments"),
+        "the backend function-args frames must be replaced, not forwarded: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+}

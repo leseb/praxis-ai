@@ -331,15 +331,24 @@ pub(super) fn tool_call_key(payload: &Value) -> Option<String> {
 
 /// Read-only lookup of the accumulated output item matching an event payload's
 /// tool-call key, for #1159 artifact capture without a mutable borrow.
-#[expect(
-    dead_code,
-    reason = "#1159 Task 5 wires this into the streaming client-tool completion capture"
-)]
+///
+/// Mirrors [`find_output_item_mut`]'s matching: stored output items carry an `id`
+/// (never the events' top-level `item_id`/`output_index`), so match the payload's
+/// `item_id` against each item's `id`, then fall back to positional `output_index`.
 pub(super) fn find_output_item<'a>(items: &'a [Value], payload: &Value) -> Option<&'a Value> {
-    let key = tool_call_key(payload)?;
-    items
-        .iter()
-        .find(|item| tool_call_key(item).as_deref() == Some(key.as_str()))
+    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str)
+        && let Some(item) = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
+    {
+        return Some(item);
+    }
+
+    let output_index = payload
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())?;
+    items.get(output_index)
 }
 
 /// Find the output item targeted by a function-call arguments event.

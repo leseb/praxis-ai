@@ -37,7 +37,10 @@ use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use self::accumulator::accumulate_response_object;
-use self::{accumulator::accumulate_event, config::StreamEventsConfig};
+use self::{
+    accumulator::{accumulate_event, find_output_item, tool_call_key},
+    config::StreamEventsConfig,
+};
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
@@ -782,7 +785,50 @@ fn commit_chunk_events(
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
 ) -> Result<Vec<u8>, SseParseError> {
-    for event in &events {
+    // Phase 2a: accumulate every event and charge the retained-clone byte budget,
+    // capturing lowered client-tool completion artifacts for the restore plan.
+    let completions = accumulate_chunk(state, ctx, &events)?;
+
+    // The retained item count only exists after phase 2a grows it. Enforce it here,
+    // before phase 2b records any delivery milestone, so a rejected chunk leaves no
+    // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
+    if let Some(error) = accumulation_count_exceeded(state, ctx) {
+        return Err(error);
+    }
+
+    // Phase 2b: plan lowered client-tool restoration (fallible) then append every
+    // committed event to the logical stream applying its disposition (infallible).
+    let logical_output = restore_and_append_chunk(state, ctx, events, &completions)?;
+
+    // Mirror the parser's deferred-`[DONE]` decision into shared response state,
+    // but only now that the whole chunk has parsed and committed. Filter-local
+    // parser state is re-armed before request-side dispatchers run on the next
+    // IRR step, so the sentinel must survive in shared state as well.
+    if state.deferred_done
+        && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        response_state.deferred_stream_done = true;
+    }
+
+    Ok(logical_output)
+}
+
+/// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`,
+/// charge the retained-clone byte budget, and capture lowered client-tool
+/// completion artifacts for the phase-2b restore plan (#1159).
+///
+/// Split out of [`commit_chunk_events`] so the per-event byte charge and the
+/// artifact capture stay under one owner. Fails closed the instant the request-wide
+/// accumulation byte total exceeds the cap (#556); the returned completions are the
+/// authoritative source the plan pass reads when synthesizing the `custom_tool_call`
+/// lifecycle.
+fn accumulate_chunk(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: &[ResponsesEvent],
+) -> Result<Vec<client_tools::ClientToolCompletion>, SseParseError> {
+    let mut completions: Vec<client_tools::ClientToolCompletion> = Vec::new();
+    for event in events {
         let retained_clone_bytes = accumulate_event(ctx, state, event);
         // A `function_call_arguments.done` clones a whole retained output item into
         // `tool_calls` — the one accumulator whose growth the driving `done` frame
@@ -802,30 +848,54 @@ fn commit_chunk_events(
                 return Err(error);
             }
         }
+        // Capture the just-completed lowered `function_call` item (now carrying its
+        // final arguments in `ResponsesState`) so the plan pass can restore the
+        // canonical `custom_tool_call` lifecycle without re-borrowing mutable state.
+        capture_client_tool_completion(ctx, &mut completions, event);
     }
+    Ok(completions)
+}
 
-    // The retained item count only exists after phase 2a grows it. Enforce it here,
-    // before phase 2b records any delivery milestone, so a rejected chunk leaves no
-    // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
-    if let Some(error) = accumulation_count_exceeded(state, ctx) {
-        return Err(error);
+/// Capture the completed lowered `function_call` item at
+/// `function_call_arguments.done` as a [`client_tools::ClientToolCompletion`].
+///
+/// Only fires when client-tool lowering is armed and the just-accumulated item's
+/// name is a lowering-map key, so native (non-lowered) traffic pays nothing. The
+/// completed item lives in [`ResponsesState::output_items`] after [`accumulate_event`]
+/// merged its arguments; the accumulator's own copy is moved into `tool_calls`, so
+/// the plan pass needs this owned snapshot to synthesize the restored lifecycle.
+fn capture_client_tool_completion(
+    ctx: &HttpFilterContext<'_>,
+    completions: &mut Vec<client_tools::ClientToolCompletion>,
+    event: &ResponsesEvent,
+) {
+    let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
+        return;
+    };
+    let Some(responses) = ctx.extensions.get::<ResponsesState>() else {
+        return;
+    };
+    if responses.client_tool_lowering.is_empty() {
+        return;
     }
-
-    // Phase 2b: plan lowered client-tool restoration (fallible) then append every
-    // committed event to the logical stream applying its disposition (infallible).
-    let logical_output = restore_and_append_chunk(state, ctx, events)?;
-
-    // Mirror the parser's deferred-`[DONE]` decision into shared response state,
-    // but only now that the whole chunk has parsed and committed. Filter-local
-    // parser state is re-armed before request-side dispatchers run on the next
-    // IRR step, so the sentinel must survive in shared state as well.
-    if state.deferred_done
-        && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
-    {
-        response_state.deferred_stream_done = true;
+    let Some(item) = find_output_item(responses.output_items(), payload) else {
+        return;
+    };
+    let is_lowered = item
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| responses.client_tool_lowering.contains_key(name));
+    if !is_lowered {
+        return;
     }
-
-    Ok(logical_output)
+    let Some(key) = tool_call_key(payload) else {
+        return;
+    };
+    // Necessary clone (AGENTS.md boundary): the accumulator moved its only owned copy
+    // of the completed item into `tool_calls`, so the plan pass needs an owned
+    // snapshot to restore the `custom_tool_call` lifecycle without re-borrowing the
+    // mutable `ResponsesState` (#1159).
+    completions.push(client_tools::ClientToolCompletion { key, item: item.clone() });
 }
 
 /// Phase 2b of the chunk commit: plan lowered client-tool restoration, then append
@@ -843,8 +913,8 @@ fn restore_and_append_chunk(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
+    completions: &[client_tools::ClientToolCompletion],
 ) -> Result<Vec<u8>, SseParseError> {
-    let completions: Vec<client_tools::ClientToolCompletion> = Vec::new(); // Task 5 populates this in phase 2a.
     let dispositions = match ctx.extensions.get::<ResponsesState>() {
         Some(responses) if !responses.client_tool_lowering.is_empty() => {
             let plan = client_tools::plan_client_tool_restore(
@@ -852,7 +922,7 @@ fn restore_and_append_chunk(
                 responses.client_tool_echo.as_ref(),
                 &state.client_tool_items,
                 &events,
-                &completions,
+                completions,
             )?;
             state.client_tool_items = plan.next_items;
             Some(plan.dispositions)
@@ -1002,12 +1072,17 @@ fn append_logical_event(
 /// committed event, then append it to the logical stream (#1159).
 ///
 /// Infallible by contract: the fallible planning already ran in
-/// [`commit_chunk_events`], so this only mutates the event payload and forwards
-/// it. Task 4 implements `RetypeInPlace` (retype a lowered `Namespace` member's
-/// `function_call` item back to its original name + namespace, never leaking the
-/// private `agentic_ns__{ns}__{member}` name). The `EmitCustom*`/`EmitTyped*`/
-/// `RestoreSnapshot` dispositions the plan pass does not yet produce route
-/// through [`append_logical_event`] unchanged rather than panicking.
+/// [`commit_chunk_events`], so this only mutates or replaces the event payload and
+/// forwards it. `RetypeInPlace` retypes a lowered `Namespace` member's
+/// `function_call` item back to its original name + namespace in place (Task 4).
+/// `EmitTypedAdded`/`EmitCustomItemDone` (and Tasks 6-7's
+/// `EmitCustomShell`/`EmitTypedDone`) splice the fully-typed public payload the plan
+/// pass already built onto the corresponding lifecycle event. `EmitCustomInput`
+/// synthesizes the canonical `custom_tool_call_input` delta+done pair and drops the
+/// backend's `function_call_arguments.done` it replaces. None of these ever leak the
+/// private `agentic_ns__{ns}__{member}` / lowered `fc_` id. The
+/// `RestoreSnapshot` disposition the plan pass does not yet produce forwards through
+/// [`append_logical_event`] unchanged rather than panicking.
 fn apply_client_tool_disposition(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -1022,26 +1097,102 @@ fn apply_client_tool_disposition(
             name,
             namespace,
         } => {
-            let payload = event.payload_mut();
-            if let Some(item) = payload.get_mut("item").and_then(Value::as_object_mut) {
-                item.insert("type".to_owned(), Value::String((*item_type).to_owned()));
-                item.insert("name".to_owned(), Value::String(name.clone()));
-                match namespace {
-                    Some(namespace) => {
-                        item.insert("namespace".to_owned(), Value::String(namespace.clone()));
-                    },
-                    None => {
-                        item.remove("namespace");
-                    },
-                }
-            }
+            retype_item_in_place(event.payload_mut(), item_type, name, namespace.as_deref());
             append_logical_event(state, ctx, event, logical_output);
         },
-        // Tasks 5-7 add the EmitCustomShell / EmitCustomInput / EmitCustomItemDone /
-        // EmitTypedAdded / EmitTypedDone / RestoreSnapshot arms. The plan pass does
-        // not yet produce them, so forward the event unchanged rather than panic.
-        _ => append_logical_event(state, ctx, event, logical_output),
+        D::EmitTypedAdded { item }
+        | D::EmitCustomShell { item }
+        | D::EmitCustomItemDone { item }
+        | D::EmitTypedDone { item } => {
+            // The plan pass already built the fully-typed public payload (retyped
+            // item, public `ctc_` id, no private lowered name); splice it back onto
+            // the corresponding lifecycle event and append it.
+            *event.payload_mut() = item.clone();
+            append_logical_event(state, ctx, event, logical_output);
+        },
+        D::EmitCustomInput {
+            item_id,
+            output_index,
+            input,
+            ..
+        } => {
+            // Synthesize the canonical custom_tool_call_input delta+done pair (public
+            // `ctc_` id); the backend `function_call_arguments.done` it replaces is
+            // dropped by not appending `event` (#1159).
+            synthesize_custom_tool_input(state, ctx, (item_id, *output_index, input), logical_output);
+        },
+        // The RestoreSnapshot disposition the plan pass does not yet produce (Task 7)
+        // forwards unchanged rather than panicking.
+        D::RestoreSnapshot { .. } | D::Passthrough | D::Suppress => {
+            append_logical_event(state, ctx, event, logical_output);
+        },
     }
+}
+
+/// Retype a lowered `Namespace` member's `function_call` item in place: set
+/// `type`/`name` and re-add or remove `namespace`, never leaking the private
+/// `agentic_ns__{ns}__{member}` name (#1159).
+fn retype_item_in_place(payload: &mut Value, item_type: &str, name: &str, namespace: Option<&str>) {
+    let Some(item) = payload.get_mut("item").and_then(Value::as_object_mut) else {
+        return;
+    };
+    item.insert("type".to_owned(), Value::String(item_type.to_owned()));
+    item.insert("name".to_owned(), Value::String(name.to_owned()));
+    match namespace {
+        Some(namespace) => {
+            item.insert("namespace".to_owned(), Value::String(namespace.to_owned()));
+        },
+        None => {
+            item.remove("namespace");
+        },
+    }
+}
+
+/// Synthesize the canonical `custom_tool_call_input` delta+done pair for a restored
+/// `Custom`/`NamespaceCustom` call (#1159).
+///
+/// `fields` is `(item_id, output_index, input)`. Both frames reference the PUBLIC
+/// `ctc_` item id (never the private `fc_` id) and carry the unwrapped plain-string
+/// input. The input is emitted on two distinct SSE frames, so it is necessarily
+/// copied once per frame at this boundary.
+fn synthesize_custom_tool_input(
+    state: &StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    fields: (&str, u64, &str),
+    output: &mut Vec<u8>,
+) {
+    let (item_id, output_index, input) = fields;
+    let delta = serde_json::json!({
+        "type": "response.custom_tool_call_input.delta",
+        "item_id": item_id,
+        "output_index": output_index,
+        "delta": input,
+    });
+    emit_synthetic_event(state, ctx, "response.custom_tool_call_input.delta", delta, output);
+    let done = serde_json::json!({
+        "type": "response.custom_tool_call_input.done",
+        "item_id": item_id,
+        "output_index": output_index,
+        "input": input,
+    });
+    emit_synthetic_event(state, ctx, "response.custom_tool_call_input.done", done, output);
+}
+
+/// Emit a synthesized logical SSE event with no originating provider frame (#1159).
+///
+/// Mirrors [`append_logical_event`]'s tail: normalizes the payload (stamping the
+/// running `output_index` offset and logical sequence number) then encodes it. Used
+/// by the `custom_tool_call_input` synthesis, whose delta+done frames are generated
+/// wholesale rather than derived from a committed [`ResponsesEvent`].
+fn emit_synthetic_event(
+    state: &StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event_type: &str,
+    mut payload: Value,
+    output: &mut Vec<u8>,
+) {
+    normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
+    encode_sse_event(event_type, &payload, output);
 }
 
 /// Reconcile locally executed tool items against the resumed model stream for one
