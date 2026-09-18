@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::openai::responses::openai_client_tool_compat::{
     custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
-    restore_shell_call, restore_tool_search_call,
+    restore_shell_call, restore_snapshot, restore_snapshot_tools, restore_tool_search_call,
 };
 use crate::openai::responses::state::{ClientToolEcho, ClientToolRestore, LoweredClientTool};
 use crate::openai::sse::SseParseError;
@@ -78,13 +78,9 @@ pub(super) struct ClientToolCompletion {
 /// Task 4 constructs `Passthrough`/`RetypeInPlace`; Task 5 adds
 /// `Suppress`/`EmitCustomShell`/`EmitCustomInput`/`EmitCustomItemDone` for
 /// `Custom`/`NamespaceCustom` synthesis. Task 6 adds `EmitTypedAdded`/`EmitTypedDone`
-/// for `Shell`/`ToolSearch` synthesis; `RestoreSnapshot` is produced by Task 7
-/// (terminal snapshot restore).
+/// for `Shell`/`ToolSearch` synthesis; Task 7 adds `RestoreSnapshot` for non-terminal
+/// snapshot restoration.
 #[derive(Clone, Debug)]
-#[expect(
-    dead_code,
-    reason = "#1159 Task 7 constructs the RestoreSnapshot disposition"
-)]
 pub(super) enum ClientToolDisposition {
     /// Forward the event unchanged.
     Passthrough,
@@ -109,6 +105,7 @@ pub(super) enum ClientToolDisposition {
     /// Emit a synthesized custom-tool input event (Task 5).
     EmitCustomInput {
         /// Stable key of the tracked stream item.
+        #[expect(dead_code, reason = "retained for debug formatting, not read by applier")]
         key: String,
         /// The item id to stamp on the synthesized event.
         item_id: String,
@@ -132,7 +129,11 @@ pub(super) enum ClientToolDisposition {
         /// The synthesized output item.
         item: Value,
     },
-    /// Restore the terminal response snapshot's output (Task 7).
+    /// Restore an intermediate (non-terminal) response snapshot's `tools`/`tool_choice`
+    /// and output items so lowered names never appear in client-visible
+    /// `response.created`/`response.queued`/`response.in_progress` frames (Task 7).
+    /// Terminal snapshots (`response.completed`/`incomplete`/`failed`) are handled
+    /// in `canonicalize_logical_response` (Task 9).
     RestoreSnapshot {
         /// The restored response object.
         response: Value,
@@ -166,9 +167,8 @@ pub(super) fn plan_client_tool_restore(
     if reverse.is_empty() {
         return Ok(plan);
     }
-    let _ = echo; // consumed by Task 7 (terminal snapshot restore)
     for event in events {
-        let disposition = plan_one_event(reverse, &mut plan.next_items, completions, event)?;
+        let disposition = plan_one_event(reverse, echo, &mut plan.next_items, completions, event)?;
         plan.dispositions.push(disposition);
     }
     Ok(plan)
@@ -177,10 +177,29 @@ pub(super) fn plan_client_tool_restore(
 /// Plan the restoration for a single committed event, advancing `next_items`.
 fn plan_one_event(
     reverse: &HashMap<String, LoweredClientTool>,
+    echo: Option<&ClientToolEcho>,
     next_items: &mut Vec<ClientToolStreamItem>,
     completions: &[ClientToolCompletion],
     event: &ResponsesEvent,
 ) -> Result<ClientToolDisposition, SseParseError> {
+    // Non-terminal snapshot restoration: restore tools/tool_choice and output items
+    // in intermediate response.* events (created/queued/in_progress). Terminal snapshots
+    // (completed/incomplete/failed) are handled in canonicalize_logical_response (Task 9).
+    if !event.is_terminal()
+        && let Some(response_object) = event.payload().get("response")
+    {
+        let mut response = response_object.clone();
+        restore_snapshot_tools(&mut response, echo);
+        restore_snapshot(&mut response, reverse).map_err(|item_type| {
+            client_tool_restore_error(
+                event.event_type(),
+                "response-snapshot",
+                &format!("response snapshot contains a lossy lowered {item_type}"),
+            )
+        })?;
+        return Ok(ClientToolDisposition::RestoreSnapshot { response });
+    }
+
     match event {
         ResponsesEvent::OutputItemAdded(payload) => Ok(plan_output_item_added(reverse, next_items, payload)),
         ResponsesEvent::FunctionCallArgumentsDelta(payload) => Ok(plan_arguments_delta(next_items, payload)),
@@ -1084,5 +1103,84 @@ mod tests {
         let events = [added, item_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
         assert!(result.is_err(), "output_item.done before arguments.done must fail closed");
+    }
+
+    #[test]
+    fn in_progress_event_restores_snapshot_tools() {
+        let reverse = reverse_custom();
+        let echo = ClientToolEcho {
+            tools: vec![serde_json::json!({"type": "custom", "name": "run_python"})],
+            tool_choice: Value::Null,
+        };
+        let created = ResponsesEvent::ResponseCreated(serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "object": "response",
+                "tools": [{"type": "function", "name": "run_python"}],
+                "tool_choice": "auto"
+            }
+        }));
+        let plan = plan_client_tool_restore(&reverse, Some(&echo), &[], std::slice::from_ref(&created), &[]).unwrap();
+        match &plan.dispositions[0] {
+            ClientToolDisposition::RestoreSnapshot { response } => {
+                assert_eq!(response["tools"], serde_json::json!([{"type": "custom", "name": "run_python"}]));
+                assert!(response.get("tool_choice").is_none());
+            }
+            other => panic!("expected RestoreSnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_progress_event_restores_snapshot_with_present_tool_choice() {
+        let reverse = reverse_custom();
+        let echo = ClientToolEcho {
+            tools: vec![serde_json::json!({"type": "custom", "name": "run_python"})],
+            tool_choice: serde_json::json!({"type": "custom", "name": "run_python"}),
+        };
+        let in_progress = ResponsesEvent::ResponseInProgress(serde_json::json!({
+            "type": "response.in_progress",
+            "response": {
+                "object": "response",
+                "tools": [{"type": "function", "name": "run_python"}],
+                "tool_choice": {"type": "function", "name": "run_python"}
+            }
+        }));
+        let plan = plan_client_tool_restore(&reverse, Some(&echo), &[], std::slice::from_ref(&in_progress), &[]).unwrap();
+        match &plan.dispositions[0] {
+            ClientToolDisposition::RestoreSnapshot { response } => {
+                assert_eq!(response["tools"], serde_json::json!([{"type": "custom", "name": "run_python"}]));
+                assert_eq!(response["tool_choice"], serde_json::json!({"type": "custom", "name": "run_python"}));
+            }
+            other => panic!("expected RestoreSnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intermediate_snapshot_with_lossy_output_fails_closed() {
+        let mut reverse = HashMap::new();
+        reverse.insert("run_python".to_owned(), LoweredClientTool {
+            original_name: "run_python".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        });
+        let echo = ClientToolEcho {
+            tools: vec![serde_json::json!({"type": "custom", "name": "run_python"})],
+            tool_choice: Value::Null,
+        };
+        // A ResponseInProgress whose response.output contains a lossy lowered item
+        // (custom function_call with no call_id, which restore_custom_call rejects).
+        let in_progress = ResponsesEvent::ResponseInProgress(serde_json::json!({
+            "type": "response.in_progress",
+            "response": {
+                "object": "response",
+                "tools": [{"type": "function", "name": "run_python"}],
+                "tool_choice": "auto",
+                "output": [
+                    {"type": "function_call", "name": "run_python", "id": "fc_1"}
+                ]
+            }
+        }));
+        let result = plan_client_tool_restore(&reverse, Some(&echo), &[], &[in_progress], &[]);
+        assert!(result.is_err(), "non-terminal snapshot with lossy output item must fail closed");
     }
 }

@@ -2342,9 +2342,6 @@ pub(crate) fn restore_snapshot_tools(response: &mut Value, echo: Option<&ClientT
 /// to its canonical typed item (#1159). Fallible: `Err(item_type)` on the first
 /// lossy item so the caller can fail the response closed. No-op when `output` is
 /// absent or not an array.
-// Exercised by unit tests already; dead only in the non-test lib build until the
-// streaming restoration path wires it in a later task.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by streaming restoration in later tasks"))]
 pub(crate) fn restore_snapshot(
     response: &mut Value,
     reverse: &HashMap<String, LoweredClientTool>,

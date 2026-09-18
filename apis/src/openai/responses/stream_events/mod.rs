@@ -1139,8 +1139,13 @@ fn apply_client_tool_disposition(
         D::EmitTypedDone { item } => {
             append_logical_event(state, ctx, ResponsesEvent::OutputItemDone(item.clone()), logical_output);
         },
-        // Task 7 terminal snapshot placeholder: forward unchanged until wired.
-        D::RestoreSnapshot { .. } => {
+        // Non-terminal snapshot restoration: splice the restored response object back
+        // onto the lifecycle event's payload (response.created/queued/in_progress).
+        // Tools/tool_choice and output items are already restored in the disposition.
+        D::RestoreSnapshot { response } => {
+            if let Some(object) = event.payload_mut().as_object_mut() {
+                object.insert("response".to_owned(), response.clone());
+            }
             append_logical_event(state, ctx, event, logical_output);
         },
         // Passthrough is forwarded by restore_and_append_chunk before dispatch;
