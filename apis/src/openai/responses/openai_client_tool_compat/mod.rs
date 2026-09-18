@@ -366,9 +366,9 @@ impl ClientToolCompatFilter {
     /// Returns `Ok(None)` when nothing needs rewriting (the body is not a buffered
     /// Responses object, or the request lowered nothing).
     fn restore_response(&self, state: &ResponsesState, bytes: &[u8]) -> Result<Option<SerializedJson>, FilterAction> {
-        let Some(echo) = state.client_tool_echo.as_ref() else {
+        if state.client_tool_echo.is_none() {
             return Ok(None);
-        };
+        }
         let Ok(mut response) = serde_json::from_slice::<Value>(bytes) else {
             // Streaming SSE or a non-JSON body: leave it for `openai_stream_events`.
             return Ok(None);
@@ -379,16 +379,11 @@ impl ClientToolCompatFilter {
 
         if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
             for item in output.iter_mut() {
-                restore_output_item(item, &state.client_tool_lowering)?;
+                restore_output_item(item, &state.client_tool_lowering).map_err(reject_lossy_restore)?;
             }
         }
 
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert("tools".to_owned(), Value::Array(echo.tools.clone()));
-            if !echo.tool_choice.is_null() {
-                obj.insert("tool_choice".to_owned(), echo.tool_choice.clone());
-            }
-        }
+        restore_snapshot_tools(&mut response, state.client_tool_echo.as_ref());
 
         let serialized = serialize_json_body(&response).map_err(|error| {
             FilterAction::Reject(responses_error_rejection(502, "server_error", &error.to_string()))
@@ -2334,9 +2329,65 @@ fn carry_caller(out: &mut Value, source: &Value) {
 // Response restoration
 // -----------------------------------------------------------------------------
 
+/// Restore the client's original `tools`/`tool_choice` onto an echoed response
+/// from the pre-lowering snapshot, keeping private lowered `function` names out
+/// of client-visible output (#1159). Infallible: a `None` echo or a non-object
+/// response is a no-op. A `Null` snapshot `tool_choice` means the client never
+/// sent one, so the echoed field is REMOVED rather than set to null.
+pub(crate) fn restore_snapshot_tools(response: &mut Value, echo: Option<&ClientToolEcho>) {
+    let (Some(echo), Some(object)) = (echo, response.as_object_mut()) else {
+        return;
+    };
+    object.insert("tools".to_owned(), Value::Array(echo.tools.clone()));
+    if echo.tool_choice.is_null() {
+        object.remove("tool_choice");
+    } else {
+        object.insert("tool_choice".to_owned(), echo.tool_choice.clone());
+    }
+}
+
+/// Restore every lowered `function_call` in an echoed response's `output` array
+/// to its canonical typed item (#1159). Fallible: `Err(item_type)` on the first
+/// lossy item so the caller can fail the response closed. No-op when `output` is
+/// absent or not an array.
+#[allow(dead_code, reason = "used by streaming restoration in later tasks")]
+pub(crate) fn restore_snapshot(
+    response: &mut Value,
+    reverse: &HashMap<String, LoweredClientTool>,
+) -> Result<(), &'static str> {
+    let Some(items) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for item in items {
+        restore_output_item(item, reverse)?;
+    }
+    Ok(())
+}
+
+/// Build a canonical `custom_tool_call` carrying an empty `input` for a lowered
+/// custom tool whose backend `function_call` produced no arguments (#1159).
+/// Mirrors `restore_custom_call` but with a known-empty input, so the streaming
+/// synth path can emit a complete custom lifecycle. `Err(())` if the source item
+/// lacks a `call_id`.
+#[allow(dead_code, reason = "used by streaming synth path in later tasks")]
+pub(crate) fn custom_call_shell(
+    item: &Value,
+    original_name: &str,
+) -> Result<Value, ()> {
+    let call_id = item.get("call_id").and_then(Value::as_str).ok_or(())?;
+    let mut out = json!({
+        "type": "custom_tool_call",
+        "name": original_name,
+        "call_id": call_id,
+        "input": "",
+    });
+    carry_caller(&mut out, item);
+    Ok(out)
+}
+
 /// Restore one output item, re-typing a lowered `function_call` when its name is
 /// in the reverse map.
-fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClientTool>) -> Result<(), FilterAction> {
+pub(crate) fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClientTool>) -> Result<(), &'static str> {
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
         return Ok(());
     }
@@ -2348,20 +2399,20 @@ fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClient
     };
     match lowered.restore {
         ClientToolRestore::Custom => {
-            *item = restore_custom_call(item).map_err(|()| reject_lossy_restore("custom_tool_call"))?;
+            *item = restore_custom_call(item).map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Namespace => {
             restore_namespace_call(item, &lowered.original_name, lowered.namespace.as_deref());
         },
         ClientToolRestore::NamespaceCustom => {
             *item = restore_namespace_custom_call(item, &lowered.original_name, lowered.namespace.as_deref())
-                .map_err(|()| reject_lossy_restore("custom_tool_call"))?;
+                .map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Shell => {
-            *item = restore_shell_call(item).map_err(|()| reject_lossy_restore("shell_call"))?;
+            *item = restore_shell_call(item).map_err(|()| "shell_call")?;
         },
         ClientToolRestore::ToolSearch => {
-            *item = restore_tool_search_call(item).map_err(|()| reject_lossy_restore("tool_search_call"))?;
+            *item = restore_tool_search_call(item).map_err(|()| "tool_search_call")?;
         },
     }
     Ok(())
@@ -2382,7 +2433,7 @@ fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClient
 /// schema, so carrying the backend `function_call`'s status would emit a
 /// noncanonical field. "Preserve status" applies only to target item types that
 /// define it.
-fn restore_custom_call(item: &Value) -> Result<Value, ()> {
+pub(crate) fn restore_custom_call(item: &Value) -> Result<Value, ()> {
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let call_id = item
@@ -2403,7 +2454,7 @@ fn restore_custom_call(item: &Value) -> Result<Value, ()> {
 }
 
 /// Restore a lowered flat `function_call` to its namespaced form, in place.
-fn restore_namespace_call(item: &mut Value, original_name: &str, namespace: Option<&str>) {
+pub(crate) fn restore_namespace_call(item: &mut Value, original_name: &str, namespace: Option<&str>) {
     if let Some(object) = item.as_object_mut() {
         object.insert("name".to_owned(), json!(original_name));
         if let Some(namespace) = namespace {
@@ -2418,7 +2469,7 @@ fn restore_namespace_call(item: &mut Value, original_name: &str, namespace: Opti
 /// `CustomToolCall` carries an optional `namespace` field, so a namespaced custom
 /// member round-trips to a `custom_tool_call` that names both its member and its
 /// namespace.
-fn restore_namespace_custom_call(item: &Value, member_name: &str, namespace: Option<&str>) -> Result<Value, ()> {
+pub(crate) fn restore_namespace_custom_call(item: &Value, member_name: &str, namespace: Option<&str>) -> Result<Value, ()> {
     let mut out = restore_custom_call(item)?;
     if let Some(object) = out.as_object_mut() {
         object.insert("name".to_owned(), json!(member_name));
@@ -2435,7 +2486,7 @@ fn restore_namespace_custom_call(item: &Value, member_name: &str, namespace: Opt
 /// `FunctionShellAction` requires the `timeout_ms` and `max_output_length` keys
 /// (both nullable). The lowered function omits them, so a missing optional is
 /// normalized to an explicit null to keep the restored action schema-complete.
-fn parse_shell_action(arguments: &str) -> Result<Value, ()> {
+pub(crate) fn parse_shell_action(arguments: &str) -> Result<Value, ()> {
     let mut action: Value = serde_json::from_str(arguments).ok().ok_or(())?;
     {
         let object = action.as_object().ok_or(())?;
@@ -2467,7 +2518,7 @@ fn parse_shell_action(arguments: &str) -> Result<Value, ()> {
 /// never executes a call the backend reported as incomplete; an absent or null
 /// status defaults to `completed`, while a wrong-typed or unknown status fails
 /// closed so a malformed backend call never becomes an executable client call.
-fn restore_shell_call(item: &Value) -> Result<Value, ()> {
+pub(crate) fn restore_shell_call(item: &Value) -> Result<Value, ()> {
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let action = parse_shell_action(arguments)?;
     let call_id = item
@@ -2496,7 +2547,7 @@ fn restore_shell_call(item: &Value) -> Result<Value, ()> {
 /// `ToolSearchCall.status` is a required `FunctionCallStatus`, so every valid
 /// `in_progress`/`completed`/`incomplete` value is preserved verbatim (absent or
 /// null defaults to `completed`); a wrong-typed or unknown status fails closed.
-fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
+pub(crate) fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
     if id.trim().is_empty() || call_id.trim().is_empty() {
@@ -2525,7 +2576,7 @@ fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
 /// `completed`, or `incomplete` string is preserved so a non-terminal backend
 /// call is never presented to the client as completed; a wrong-typed (non-string)
 /// or unknown value fails closed so a malformed call cannot become executable.
-fn restore_call_status(item: &Value) -> Result<&'static str, ()> {
+pub(crate) fn restore_call_status(item: &Value) -> Result<&'static str, ()> {
     match item.get("status") {
         None | Some(Value::Null) => Ok("completed"),
         Some(Value::String(status)) => match status.as_str() {
@@ -2663,7 +2714,7 @@ fn reject_reserved_namespace_delimiter(kind: &str, name: &str) -> Result<(), Fil
 }
 
 /// Derive the public `custom_tool_call` item id from a returned function id.
-fn custom_public_item_id(item_id: &str) -> String {
+pub(crate) fn custom_public_item_id(item_id: &str) -> String {
     if item_id.starts_with("ctc_") {
         return item_id.to_owned();
     }

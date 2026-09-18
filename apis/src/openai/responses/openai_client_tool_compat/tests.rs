@@ -5548,12 +5548,64 @@ fn namespace_custom_call_without_call_id_fails_closed() {
         "arguments": r#"{"input":"x"}"#,
         "status": "completed"
     });
-    let action = restore_output_item(&mut item, &reverse)
+    let item_type = restore_output_item(&mut item, &reverse)
         .expect_err("a namespaced custom call without call_id must fail closed");
-    let (status, message) = reject_parts(&action);
-    assert_eq!(status, 502);
-    assert!(
-        message.contains("custom_tool_call"),
-        "the rejection names custom_tool_call: {message}",
+    assert_eq!(item_type, "custom_tool_call", "the error reports custom_tool_call");
+}
+
+#[test]
+fn restore_snapshot_tools_removes_tool_choice_when_snapshot_null() {
+    let echo = ClientToolEcho {
+        tools: vec![serde_json::json!({"type": "custom", "name": "run_python"})],
+        tool_choice: serde_json::Value::Null,
+    };
+    let mut response = serde_json::json!({
+        "object": "response",
+        "tools": [{"type": "function", "name": "run_python"}],
+        "tool_choice": "auto"
+    });
+    restore_snapshot_tools(&mut response, Some(&echo));
+    assert_eq!(response["tools"], serde_json::json!([{"type": "custom", "name": "run_python"}]));
+    assert!(response.get("tool_choice").is_none(), "null snapshot must remove tool_choice");
+}
+
+#[test]
+fn restore_snapshot_tools_sets_tool_choice_when_snapshot_present() {
+    let echo = ClientToolEcho {
+        tools: vec![],
+        tool_choice: serde_json::json!("required"),
+    };
+    let mut response = serde_json::json!({"object": "response", "tool_choice": "auto"});
+    restore_snapshot_tools(&mut response, Some(&echo));
+    assert_eq!(response["tool_choice"], serde_json::json!("required"));
+}
+
+#[test]
+fn restore_snapshot_restores_output_items_and_reports_lossy_type() {
+    let mut reverse = HashMap::new();
+    reverse.insert(
+        "run_python".to_owned(),
+        LoweredClientTool {
+            original_name: "run_python".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
     );
+    // Well-formed custom call restores in place.
+    let mut ok = serde_json::json!({
+        "output": [{
+            "type": "function_call", "name": "run_python",
+            "call_id": "call_1", "arguments": r#"{"input":"print(1)"}"#
+        }]
+    });
+    assert_eq!(restore_snapshot(&mut ok, &reverse), Ok(()));
+    assert_eq!(ok["output"][0]["type"], "custom_tool_call");
+    // Malformed arguments -> Err naming the item type.
+    let mut bad = serde_json::json!({
+        "output": [{
+            "type": "function_call", "name": "run_python",
+            "call_id": "call_1", "arguments": "not json"
+        }]
+    });
+    assert_eq!(restore_snapshot(&mut bad, &reverse), Err("custom_tool_call"));
 }
