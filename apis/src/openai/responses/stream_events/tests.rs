@@ -23,8 +23,8 @@ use super::{
 };
 use crate::{
     openai::{
-        responses::state::{ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
-        sse::SseFrameParser,
+        responses::state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
+        sse::{SseFrameParser, SseParseError},
     },
     test_utils::{make_filter_context, make_request},
 };
@@ -394,7 +394,7 @@ fn canonicalize_skips_previous_response_id_when_wire_rewrite_declined() {
         ..ResponsesState::default()
     };
 
-    canonicalize_logical_response(&mut state, false);
+    canonicalize_logical_response(&mut state, false).expect("canonicalize");
 
     assert_eq!(
         state.response_object["previous_response_id"],
@@ -422,12 +422,106 @@ fn canonicalize_restores_previous_response_id_when_wire_rewrite_armed() {
         ..ResponsesState::default()
     };
 
-    canonicalize_logical_response(&mut state, true);
+    canonicalize_logical_response(&mut state, true).expect("canonicalize");
 
     assert_eq!(
         state.response_object["previous_response_id"], "resp_prev",
         "an armed wire rewrite must restore the caller's previous_response_id into \
          the persisted store source"
+    );
+}
+
+#[test]
+fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
+    // #1159: the terminal response.completed carries the lowered private
+    // function_call plus the backend-echoed LOWERED tools/tool_choice.
+    // canonicalize is the last-chance restore: re-type the call to a
+    // custom_tool_call and restore the client's own tools declaration, leaking
+    // no private lowered name.
+    let mut state = ResponsesState {
+        client_tool_lowering: std::collections::HashMap::from([(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        )]),
+        client_tool_echo: Some(ClientToolEcho {
+            tools: vec![json!({"type": "custom", "name": "run_python"})],
+            tool_choice: serde_json::Value::Null,
+        }),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "tools": [{"type": "function", "name": "run_python"}],
+            "tool_choice": "auto",
+            "output": [{
+                "type": "function_call",
+                "name": "run_python",
+                "call_id": "call_1",
+                "arguments": r#"{"input":"print(1)"}"#
+            }]
+        }),
+        ..ResponsesState::default()
+    };
+
+    let (output, _usage) = canonicalize_logical_response(&mut state, false).expect("terminal restore");
+
+    assert_eq!(output[0]["type"], "custom_tool_call", "lowered function_call retyped");
+    assert_eq!(output[0]["input"], "print(1)", "single string parameter unwrapped to plain input");
+    assert_eq!(
+        state.response_object["tools"],
+        json!([{"type": "custom", "name": "run_python"}]),
+        "tools restored to the client's custom declaration"
+    );
+    assert!(
+        state.response_object.get("tool_choice").is_none(),
+        "a Null tool_choice echo removes the field"
+    );
+    assert!(
+        !state.response_object.to_string().contains("agentic_ns__"),
+        "no private lowered name leaks into the terminal response object"
+    );
+}
+
+#[test]
+fn canonicalize_fails_closed_on_lossy_terminal_client_tool_restore() {
+    // #1159: a lossy terminal restore (here a lowered custom call missing its
+    // call_id) fails the whole logical stream closed rather than emitting a
+    // private lowered shape. The error must not echo the offending tool name.
+    let mut state = ResponsesState {
+        client_tool_lowering: std::collections::HashMap::from([(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        )]),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "name": "run_python",
+                "arguments": r#"{"input":"print(1)"}"#
+            }]
+        }),
+        ..ResponsesState::default()
+    };
+
+    let err =
+        canonicalize_logical_response(&mut state, false).expect_err("a lossy client-tool restore must fail closed");
+    assert!(
+        matches!(err, SseParseError::ClientToolRestore { .. }),
+        "fail-closed uses the dedicated client-tool restore variant: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains("run_python"),
+        "the error must not echo the lowered tool name: {err}"
     );
 }
 

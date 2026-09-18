@@ -192,7 +192,6 @@ fn plan_one_event(
         restore_snapshot_tools(&mut response, echo);
         restore_snapshot(&mut response, reverse).map_err(|item_type| {
             client_tool_restore_error(
-                event.event_type(),
                 "response-snapshot",
                 &format!("response snapshot contains a lossy lowered {item_type}"),
             )
@@ -400,7 +399,6 @@ fn plan_custom_arguments_done(
 ) -> Result<ClientToolDisposition, SseParseError> {
     let Some(completion) = completions.iter().find(|completion| completion.key == key) else {
         return Err(client_tool_restore_error(
-            "response.function_call_arguments.done",
             &tracked.key,
             "function_call_arguments.done without a captured completion artifact",
         ));
@@ -408,7 +406,6 @@ fn plan_custom_arguments_done(
     let arguments = completion.item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let input = input_from_arguments_strict(arguments).map_err(|()| {
         client_tool_restore_error(
-            "response.function_call_arguments.done",
             &tracked.key,
             "lowered custom-tool arguments are not a {\"input\":...} envelope",
         )
@@ -437,17 +434,11 @@ fn plan_typed_arguments_done(
 ) -> Result<ClientToolDisposition, SseParseError> {
     let Some(completion) = completions.iter().find(|c| c.key == key) else {
         return Err(client_tool_restore_error(
-            "response.function_call_arguments.done",
             &tracked.key,
             "function_call_arguments.done without a captured completion artifact",
         ));
     };
-    let restored = restore_typed_item(
-        tracked.restore,
-        &completion.item,
-        "response.function_call_arguments.done",
-        &tracked.key,
-    )?;
+    let restored = restore_typed_item(tracked.restore, &completion.item, &tracked.key)?;
     Ok(ClientToolDisposition::EmitTypedAdded {
         item: serde_json::json!({
             "type": "response.output_item.added",
@@ -459,45 +450,31 @@ fn plan_typed_arguments_done(
 
 /// Restore a lowered `Shell`/`ToolSearch` `function_call` item to its typed
 /// `shell_call`/`tool_search_call`. Fails closed (with a client-tool restore error
-/// shaped by `event_type`/`key`) if the kind is not a typed restore or the restore
-/// is lossy — a lowered call is never surfaced under a schema-invalid typed item.
-fn restore_typed_item(
-    restore: ClientToolRestore,
-    item: &Value,
-    event_type: &'static str,
-    key: &str,
-) -> Result<Value, SseParseError> {
+/// shaped by `key`) if the kind is not a typed restore or the restore is lossy — a
+/// lowered call is never surfaced under a schema-invalid typed item.
+fn restore_typed_item(restore: ClientToolRestore, item: &Value, key: &str) -> Result<Value, SseParseError> {
     match restore {
         ClientToolRestore::Shell => restore_shell_call(item),
         ClientToolRestore::ToolSearch => restore_tool_search_call(item),
         _ => {
             return Err(client_tool_restore_error(
-                event_type,
                 key,
                 "typed restore invoked for a non-typed restore kind",
             ));
         },
     }
-    .map_err(|()| {
-        client_tool_restore_error(
-            event_type,
-            key,
-            "lowered client tool could not be restored to its typed call",
-        )
-    })
+    .map_err(|()| client_tool_restore_error(key, "lowered client tool could not be restored to its typed call"))
 }
 
-/// Build the temporary fail-closed error for a client-tool restore violation.
+/// Build the fail-closed error for a client-tool restore violation (#1159).
 ///
-/// #1159 Task 9 swaps this for the dedicated `SseParseError::ClientToolRestore {
-/// key, reason }` variant; until then it reuses the same `MalformedJson` shape
-/// Task 4 used so the later swap is mechanical. `event_type` is the offending
-/// lifecycle event, retained only for the temporary variant's diagnostics.
-fn client_tool_restore_error(event_type: &str, key: &str, reason: &str) -> SseParseError {
-    // #1159 Task 9: swap to SseParseError::ClientToolRestore { key, reason }
-    SseParseError::MalformedJson {
-        event_type: event_type.to_owned(),
-        err: format!("client-tool restore for '{key}': {reason}"),
+/// `key` identifies the offending tool call (or `"response-snapshot"` /
+/// `"terminal"` for whole-snapshot failures); `reason` is a specific,
+/// client-safe description. Never carries a private lowered name.
+fn client_tool_restore_error(key: &str, reason: &str) -> SseParseError {
+    SseParseError::ClientToolRestore {
+        key: key.to_owned(),
+        reason: reason.to_owned(),
     }
 }
 
@@ -525,7 +502,6 @@ fn plan_output_item_done(
     // (item still `Opened`) is a malformed lifecycle; fail closed.
     if tracked.phase == ClientToolPhase::Opened {
         return Err(client_tool_restore_error(
-            "response.output_item.done",
             &tracked.key,
             "output_item.done before arguments.done",
         ));
@@ -588,7 +564,6 @@ fn build_custom_done_payload(
 ) -> Result<Value, SseParseError> {
     let Some(item) = payload.get("item") else {
         return Err(client_tool_restore_error(
-            "response.output_item.done",
             &lowered.original_name,
             "output_item.done carried no item to restore",
         ));
@@ -602,7 +577,6 @@ fn build_custom_done_payload(
     }
     .map_err(|()| {
         client_tool_restore_error(
-            "response.output_item.done",
             &lowered.original_name,
             "lowered custom-tool call could not be restored to custom_tool_call",
         )
@@ -620,12 +594,11 @@ fn build_custom_done_payload(
 fn build_typed_done_payload(payload: &Value, restore: ClientToolRestore) -> Result<Value, SseParseError> {
     let Some(item) = payload.get("item") else {
         return Err(client_tool_restore_error(
-            "response.output_item.done",
             "shell/tool_search",
             "output_item.done carried no item to restore",
         ));
     };
-    let restored = restore_typed_item(restore, item, "response.output_item.done", "shell/tool_search")?;
+    let restored = restore_typed_item(restore, item, "shell/tool_search")?;
     let mut out = payload.clone();
     if let Some(object) = out.as_object_mut() {
         object.insert("item".to_owned(), restored);

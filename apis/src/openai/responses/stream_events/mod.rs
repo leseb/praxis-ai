@@ -41,6 +41,7 @@ use self::{
     accumulator::{accumulate_event, find_output_item, tool_call_key},
     config::StreamEventsConfig,
 };
+use crate::openai::responses::openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools};
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
@@ -1940,7 +1941,12 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     // caller id on any rehydrated turn — there is no separate upstream wire whose
     // narrower eligibility to match.
     let restore_previous_response_id = state.history_rehydrated;
-    canonicalize_logical_response(state, restore_previous_response_id);
+    if let Err(e) = canonicalize_logical_response(state, restore_previous_response_id) {
+        // #1159: a lossy terminal restore fails closed. `output` already holds the
+        // drained local-tool events, so emit the error terminal INLINE rather than via
+        // `encode_local_error` (which would re-drain those events).
+        return Some(encode_local_restore_error(ctx, output, &e));
+    }
     if !state.response_object.is_object() {
         return None;
     }
@@ -1963,6 +1969,31 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
     Some(Bytes::from(output))
+}
+
+/// Emit a fail-closed terminal `error` frame INLINE for a locally completed stream
+/// whose terminal client-tool restore was lossy (#1159).
+///
+/// `output` already holds the drained local-tool events from
+/// `prepare_local_terminal_events`, so the error frame is appended directly rather
+/// than through `encode_local_error` (which would re-drain those events). Marks the
+/// record un-persistable so a later GET cannot serve the private lowered shape.
+fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u8>, error: &SseParseError) -> Bytes {
+    let message = error.to_string();
+    let sequence_number = ctx.extensions.get_mut::<ResponsesState>().map_or(0, |state| {
+        let sequence_number = state.logical_stream_sequence;
+        state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
+        sequence_number
+    });
+    let mut payload = responses_error_sse_payload("server_error", &message);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("sequence_number".to_owned(), Value::from(sequence_number));
+    }
+    encode_sse_event("error", &payload, &mut output);
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", message);
+    ctx.set_metadata("responses.skip_persist", "true");
+    Bytes::from(output)
 }
 
 /// Encode a terminal `error` event for an already-committed logical stream.
@@ -2059,18 +2090,36 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     }
     let continues = logical_stream_continues(ctx); // re-read AFTER drain + arm-stop: a
     // (b)-site failure or the arm-stop above flips the owner action=done.
+    finalize_emit_terminal(ctx, &mut parser_state, &mut output, continues);
+    *body = (!output.is_empty()).then(|| Bytes::from(output));
+    ctx.insert_filter_state(parser_state);
+}
+
+/// Emit the logical stream's terminal frame: a locally recorded `error`, otherwise
+/// the held deferred terminal snapshot. A lossy #1159 client-tool restore on the
+/// deferred path is routed to a fail-closed error terminal instead.
+fn finalize_emit_terminal(
+    ctx: &mut HttpFilterContext<'_>,
+    parser_state: &mut StreamEventsState,
+    output: &mut Vec<u8>,
+    continues: bool,
+) {
     if !continues && let Some(mut error) = logical_stream_error(ctx) {
         // #276: surface any locally executed tool items that never reached the
         // client before the stream terminates with an error, so already-executed
         // tool activity is not silently dropped by a resumed-round parse failure.
-        flush_local_output_items(ctx, &mut output);
+        flush_local_output_items(ctx, output);
         normalize_logical_payload(ctx, &mut error, parser_state.output_index_offset);
-        encode_sse_event("error", &error, &mut output);
-    } else if !continues && let Some(mut terminal) = parser_state.deferred_terminal.take() {
-        emit_deferred_terminal(ctx, &mut terminal, &parser_state, &mut output);
+        encode_sse_event("error", &error, output);
+    } else if !continues
+        && let Some(mut terminal) = parser_state.deferred_terminal.take()
+        && let Err(e) = emit_deferred_terminal(ctx, &mut terminal, parser_state, output)
+    {
+        // #1159: a lossy terminal client-tool restore fails the whole logical stream
+        // closed. `emit_deferred_terminal` bailed before writing the terminal frame,
+        // so `output` holds only the flushed local items.
+        emit_deferred_terminal_restore_error(ctx, output, &e);
     }
-    *body = (!output.is_empty()).then(|| Bytes::from(output));
-    ctx.insert_filter_state(parser_state);
 }
 
 /// Emit the deferred terminal snapshot as the logical stream's final event,
@@ -2080,17 +2129,15 @@ fn emit_deferred_terminal(
     terminal: &mut DeferredTerminalEvent,
     parser_state: &StreamEventsState,
     output: &mut Vec<u8>,
-) {
+) -> Result<(), SseParseError> {
     // #276: stream any locally generated tool items that never reached the
-    // client as incremental events (e.g. an MCP approval request that ends the
-    // loop without a resumed round) before the terminal snapshot.
+    // client as incremental events before the terminal snapshot.
     flush_local_output_items(ctx, output);
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-    // The upstream event stream is the client-visible terminal, rewritten (or left
-    // untouched) by `openai_responses_rehydrate`; match its wire-rewrite decision so
-    // the persisted store source cannot disagree with the streamed frame (#1150).
+    // Match the wire-rewrite decision so the persisted store source cannot disagree
+    // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
-    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id);
+    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
     // #937: `response_object` is now canonical and the client-visible terminal
     // frame is appended below as a deferred, non-end-of-stream chunk. Signal the
     // pre-IRR `openai_response_store` to persist BEFORE it releases that chunk so
@@ -2104,11 +2151,32 @@ fn emit_deferred_terminal(
             response.insert("usage".to_owned(), usage);
         }
     }
+    // #1159: the upstream deferred terminal echoes the LOWERED private tools/tool_choice.
+    // Restore them on the wire copy — this is the only place tools are restored on the
+    // deferred path (the output items were already restored inside canonicalize). No-op
+    // when nothing was lowered (echo is None).
+    if let Some(response) = terminal.payload.get_mut("response") {
+        restore_snapshot_tools(response, state.client_tool_echo.as_ref());
+    }
     normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
     encode_sse_event(&terminal.event_type, &terminal.payload, output);
     if parser_state.deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
+    Ok(())
+}
+
+/// Route a lossy deferred-terminal client-tool restore to a fail-closed error
+/// terminal (#1159): emit an `error` event instead of leaking a private lowered
+/// shape and mark the record un-persistable so a later GET cannot serve the leak.
+fn emit_deferred_terminal_restore_error(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>, error: &SseParseError) {
+    let message = error.to_string();
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(err_bytes) = encode_local_error(ctx, "server_error", &message) {
+        output.extend_from_slice(&err_bytes);
+    }
+    ctx.set_metadata("responses.stream_error_message", message);
 }
 
 /// Whether the agentic-loop owner requested another inference step.
@@ -2150,7 +2218,7 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
-) -> (Vec<Value>, Value) {
+) -> Result<(Vec<Value>, Value), SseParseError> {
     let logical_id = state.logical_stream_response_id.clone();
     let usage = state.usage.clone();
     let restored_previous_response_id = restore_previous_response_id
@@ -2191,7 +2259,44 @@ fn canonicalize_logical_response(
             response.insert("usage".to_owned(), usage.clone());
         }
     }
-    (output, usage)
+    restore_terminal_client_tools(state, &mut output)?;
+    Ok((output, usage))
+}
+
+/// #1159: last-chance restoration of every lowered client-tool call plus
+/// `tools`/`tool_choice` on the terminal response object. A lossy restore fails
+/// the whole logical stream closed rather than leaking a private lowered shape.
+///
+/// Re-syncs `output` from the now-restored `response_object`, since the
+/// deferred-terminal caller writes THAT vec to the wire (not the object). No-op
+/// when nothing was lowered.
+fn restore_terminal_client_tools(state: &mut ResponsesState, output: &mut Vec<Value>) -> Result<(), SseParseError> {
+    if state.client_tool_lowering.is_empty() {
+        return Ok(());
+    }
+    // The output items were inserted into `response_object` above; restore needs
+    // that object. If it is not an object we cannot restore -> fail closed rather
+    // than return the un-restored (lowered) output.
+    if !state.response_object.is_object() {
+        return Err(SseParseError::ClientToolRestore {
+            key: "terminal".to_owned(),
+            reason: "terminal response object unavailable for client-tool restore".to_owned(),
+        });
+    }
+    restore_snapshot(&mut state.response_object, &state.client_tool_lowering).map_err(|item_type| {
+        SseParseError::ClientToolRestore {
+            key: "terminal".to_owned(),
+            reason: format!("lossy restore of {item_type}"),
+        }
+    })?;
+    restore_snapshot_tools(&mut state.response_object, state.client_tool_echo.as_ref());
+    // Re-sync the returned vec from the now-restored object (an ownership boundary
+    // returning an owned restored vec) — a once-per-logical-stream terminal clone,
+    // not a per-chunk clone.
+    if let Some(restored) = state.response_object.get("output").and_then(Value::as_array) {
+        output.clone_from(restored);
+    }
+    Ok(())
 }
 
 /// Check whether the stream has exceeded its wall-clock timeout.
