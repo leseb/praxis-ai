@@ -196,7 +196,9 @@ fn lowers_custom_tool_to_function() {
             "grammar": "start: ..."
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 1);
@@ -231,7 +233,9 @@ fn custom_without_format_lowers() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "custom", "name": "c"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(state.request_body["tools"][0]["type"], "function");
 }
 
@@ -245,7 +249,9 @@ fn deferred_top_level_custom_is_withheld() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "custom", "name": "c", "defer_loading": true}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"],
         json!([]),
@@ -278,7 +284,9 @@ fn custom_with_non_text_format_is_rejected() {
             "format": {"type": "grammar", "syntax": "lark", "definition": "start: ..."}
         }],
     }));
-    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("must reject");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
     assert!(
@@ -322,7 +330,9 @@ fn lowers_namespace_members_to_flat_functions() {
             ]
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2);
@@ -389,7 +399,9 @@ fn lowers_local_shell_to_function() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["name"], "shell");
@@ -405,7 +417,9 @@ fn non_local_shell_is_left_untouched() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "provider"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("passthrough succeeds");
     assert_eq!(
         state.request_body["tools"][0]["type"], "shell",
         "not a rich local shell"
@@ -426,7 +440,9 @@ fn lowers_client_tool_search_to_function() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["name"], "tool_search");
@@ -450,7 +466,9 @@ fn server_executed_tool_search_is_left_untouched() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search", "execution": "server"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("passthrough succeeds");
     assert_eq!(state.request_body["tools"][0]["type"], "tool_search");
     assert!(
         state.client_tool_echo.is_none(),
@@ -470,7 +488,9 @@ fn collision_between_lowered_names_is_rejected() {
             {"type": "shell", "environment": {"type": "local"}}
         ],
     }));
-    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("must reject");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
     assert!(
@@ -492,7 +512,9 @@ fn collision_with_passthrough_function_is_rejected() {
             {"type": "custom", "name": "run"}
         ],
     }));
-    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("must reject");
     assert_eq!(reject_parts(&action).0, 400);
     assert_eq!(
         state.request_body["tools"][0]["type"], "function",
@@ -534,7 +556,9 @@ fn native_function_tools_are_passthrough() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("passthrough succeeds");
     assert_eq!(state.request_body["tools"][0]["type"], "function");
     assert!(state.client_tool_echo.is_none(), "native traffic takes no echo");
     assert!(state.client_tool_lowering.is_empty(), "native traffic lowers nothing");
@@ -547,7 +571,9 @@ fn native_function_tools_are_passthrough() {
 #[test]
 fn request_without_tools_is_passthrough() {
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi"}));
-    filter().lower_request(&mut state, false, false).expect("passthrough succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("passthrough succeeds");
     assert!(
         state.client_tool_echo.is_none(),
         "a request without tools takes no echo"
@@ -596,7 +622,9 @@ fn lowers_custom_tool_choice_to_function() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": {"type": "custom", "name": "c"},
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"]["type"], "function");
     assert_eq!(state.request_body["tool_choice"]["name"], "c");
 }
@@ -607,7 +635,9 @@ fn lowers_namespaced_tool_choice_to_flat_function() {
         "tools": [{"type": "namespace", "name": "git", "description": "Git operations.", "tools": [{"type": "function", "name": "commit"}]}],
         "tool_choice": {"type": "function", "name": "commit", "namespace": "git"},
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"]["name"], "agentic_ns__git__commit");
     assert!(
         state.request_body["tool_choice"].get("namespace").is_none(),
@@ -628,7 +658,9 @@ fn lowers_namespaced_custom_tool_choice_to_flat_function() {
         }],
         "tool_choice": {"type": "custom", "name": "freeform", "namespace": "git"},
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let choice = &state.request_body["tool_choice"];
     assert_eq!(
         choice["type"], "function",
@@ -679,7 +711,9 @@ fn lowers_allowed_tools_selectors_recursively() {
             "tools": [{"type": "custom", "name": "c"}]
         },
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"]["tools"][0]["type"], "function");
     assert_eq!(state.request_body["tool_choice"]["tools"][0]["name"], "c");
 }
@@ -690,7 +724,9 @@ fn tool_choice_for_undeclared_client_tool_is_rejected() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": {"type": "custom", "name": "other"},
     }));
-    let action = filter().lower_request(&mut state, false, false).expect_err("must reject");
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("must reject");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400);
     assert!(
@@ -713,7 +749,9 @@ fn tool_choice_auto_is_left_untouched() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": "auto",
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(state.request_body["tool_choice"], "auto");
 }
 
@@ -1022,7 +1060,9 @@ fn state_with_custom_lowered() -> ResponsesState {
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
         "tool_choice": {"type": "custom", "name": "run_python"},
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     state
 }
 
@@ -1067,7 +1107,9 @@ fn restores_namespaced_function_call_in_place() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "namespace", "name": "git", "description": "Git operations.", "tools": [{"type": "function", "name": "commit"}]}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1091,7 +1133,9 @@ fn restores_shell_call_with_local_environment() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1126,7 +1170,9 @@ fn restores_shell_call_normalizes_missing_action_fields() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1152,7 +1198,9 @@ fn restores_incomplete_shell_call_preserves_status() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1180,7 +1228,9 @@ fn restores_shell_call_without_status_defaults_to_completed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1205,7 +1255,9 @@ fn shell_call_without_call_id_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1232,7 +1284,9 @@ fn shell_call_with_unknown_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1257,7 +1311,9 @@ fn shell_call_with_non_string_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1280,7 +1336,9 @@ fn shell_call_with_malformed_arguments_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1308,7 +1366,9 @@ fn shell_call_with_non_string_commands_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1331,7 +1391,9 @@ fn restores_tool_search_call() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1362,7 +1424,9 @@ fn restores_non_terminal_tool_search_call_preserves_status() {
         let mut state = ResponsesState::from_request_body(json!({
             "tools": [{"type": "tool_search"}],
         }));
-        filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+        filter()
+            .lower_request(&mut state, false, false)
+            .expect("lowering succeeds");
         let response = json!({
             "object": "response",
             "output": [{
@@ -1391,7 +1455,9 @@ fn tool_search_call_without_status_defaults_to_completed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1416,7 +1482,9 @@ fn tool_search_call_with_unknown_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1446,7 +1514,9 @@ fn tool_search_call_with_non_string_status_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1469,7 +1539,9 @@ fn tool_search_call_with_malformed_arguments_fails_closed() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -1612,7 +1684,9 @@ fn lowers_namespace_custom_member_to_flat_function() {
             ]
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2, "both members lowered: {tools:?}");
@@ -1745,7 +1819,9 @@ fn deferred_namespace_custom_member_is_withheld() {
             "tools": [{"type": "custom", "name": "freeform", "defer_loading": true}]
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"],
         json!([]),
@@ -1804,7 +1880,9 @@ fn lowers_shell_tool_choice_to_function() {
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
         "tool_choice": {"type": "shell"},
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(
         state.request_body["tool_choice"]["type"], "function",
         "a forced shell choice becomes a function selector"
@@ -1820,7 +1898,9 @@ fn shell_tool_choice_without_lowered_shell_is_untouched() {
         "tools": [{"type": "custom", "name": "c"}],
         "tool_choice": {"type": "shell"},
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(
         state.request_body["tool_choice"]["type"], "shell",
         "a shell selector with no lowered shell tool is unchanged"
@@ -1837,7 +1917,9 @@ fn lowers_shell_selector_inside_allowed_tools() {
             "tools": [{"type": "shell"}]
         },
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(
         state.request_body["tool_choice"]["tools"][0]["type"], "function",
         "a shell selector nested in allowed_tools is lowered recursively"
@@ -2100,7 +2182,9 @@ fn namespace_description_is_folded_into_flattened_members() {
             ]
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("tools array");
 
     let function_member = tools
@@ -2201,7 +2285,9 @@ fn shell_environment_skills_are_folded_into_description() {
             }
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let description = state.request_body["tools"][0]["description"]
         .as_str()
         .expect("description");
@@ -2416,7 +2502,9 @@ fn shell_without_skills_uses_base_description() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"][0]["description"], SHELL_BASE_DESCRIPTION,
         "a shell with no skills keeps the base description unchanged"
@@ -2464,7 +2552,9 @@ fn discovered_custom_tool_is_hoisted_and_restored() {
         &json!([{"type": "custom", "name": "apply_patch", "description": "Apply a patch.", "format": {"type": "text"}}]),
         true,
     );
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
 
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted = tools
@@ -2515,7 +2605,9 @@ fn discovered_tool_hoisted_without_declared_rich_tool() {
         &json!([{"type": "custom", "name": "apply_patch", "description": "Apply a patch.", "format": {"type": "text"}}]),
         false,
     );
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools.iter().any(|tool| tool["name"] == "apply_patch"),
@@ -2535,7 +2627,9 @@ fn discovered_plain_function_is_hoisted_and_not_restored() {
         &json!([{"type": "function", "name": "grep", "parameters": {"type": "object"}}]),
         true,
     );
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools
@@ -2564,7 +2658,9 @@ fn discovered_custom_with_defer_loading_becomes_callable() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted = tools
         .iter()
@@ -2622,7 +2718,9 @@ fn discovered_namespace_custom_member_with_defer_loading_becomes_callable() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let flat = namespace_member_name("git", "freeform");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let member = tools
@@ -2681,7 +2779,9 @@ fn discovered_namespace_function_member_with_defer_loading_becomes_callable() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let flat = namespace_member_name("git", "commit");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let member = tools
@@ -2788,7 +2888,9 @@ fn server_executed_search_discovered_tools_are_not_hoisted() {
             }
         ],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools.iter().all(|tool| tool["name"] != "apply_patch"),
@@ -3662,7 +3764,9 @@ fn discovered_tools_from_unfinished_search_are_not_hoisted() {
                 }
             ],
         }));
-        filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+        filter()
+            .lower_request(&mut state, false, false)
+            .expect("lowering succeeds");
         let tools = state.request_body["tools"].as_array().expect("outbound tools");
         assert!(
             tools.iter().all(|tool| tool["name"] != "apply_patch"),
@@ -3697,7 +3801,9 @@ fn discovered_tools_missing_or_null_status_are_hoisted() {
                 output,
             ],
         }));
-        filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+        filter()
+            .lower_request(&mut state, false, false)
+            .expect("lowering succeeds");
         let tools = state.request_body["tools"].as_array().expect("outbound tools");
         assert!(
             tools
@@ -3755,7 +3861,9 @@ fn identical_discovered_redefinition_is_hoisted_once() {
             {"type": "tool_search_output", "call_id": "call_b", "status": "completed", "tools": discovered},
         ],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let hoisted = tools.iter().filter(|tool| tool["name"] == "grep").count();
     assert_eq!(hoisted, 1, "an identical re-listing is hoisted exactly once");
@@ -4010,7 +4118,9 @@ fn deferred_top_level_function_never_discovered_is_withheld() {
             {"type": "function", "name": "grep", "parameters": {"type": "object"}, "defer_loading": true}
         ],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools.iter().all(|tool| tool["name"] != "grep"),
@@ -4059,7 +4169,9 @@ fn non_deferred_top_level_function_passes_through() {
             {"type": "function", "name": "grep", "parameters": {"type": "object"}}
         ],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     assert!(
         tools
@@ -4084,7 +4196,9 @@ fn discovered_function_defer_loading_stripped_and_output_schema_preserved() {
         }]),
         true,
     );
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let grep = tools
         .iter()
@@ -4163,7 +4277,9 @@ fn deferred_namespace_function_member_is_withheld() {
             }]
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     assert_eq!(
         state.request_body["tools"],
         json!([]),
@@ -4201,7 +4317,9 @@ fn namespace_function_member_output_schema_preserved() {
             }]
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let tools = state.request_body["tools"].as_array().expect("outbound tools");
     let member = tools
         .iter()
@@ -4254,7 +4372,9 @@ fn local_skill_text_is_rendered_verbatim_without_trimming() {
             }
         }],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let description = state.request_body["tools"][0]["description"]
         .as_str()
         .expect("description");
@@ -5418,10 +5538,7 @@ fn input_from_arguments_strict_rejects_missing_input() {
 
 #[test]
 fn input_from_arguments_strict_rejects_extra_fields() {
-    assert_eq!(
-        input_from_arguments_strict(r#"{"input":"x","extra":1}"#),
-        Err(())
-    );
+    assert_eq!(input_from_arguments_strict(r#"{"input":"x","extra":1}"#), Err(()));
 }
 
 #[test]
@@ -5439,7 +5556,9 @@ fn restores_shell_call_preserves_caller() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "shell", "environment": {"type": "local"}}],
     }));
-    filter().lower_request(&mut state, false, false).expect("lowering succeeds");
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
     let response = json!({
         "object": "response",
         "output": [{
@@ -5544,8 +5663,14 @@ fn restore_snapshot_tools_removes_tool_choice_when_snapshot_null() {
         "tool_choice": "auto"
     });
     restore_snapshot_tools(&mut response, Some(&echo));
-    assert_eq!(response["tools"], serde_json::json!([{"type": "custom", "name": "run_python"}]));
-    assert!(response.get("tool_choice").is_none(), "null snapshot must remove tool_choice");
+    assert_eq!(
+        response["tools"],
+        serde_json::json!([{"type": "custom", "name": "run_python"}])
+    );
+    assert!(
+        response.get("tool_choice").is_none(),
+        "null snapshot must remove tool_choice"
+    );
 }
 
 #[test]
@@ -5598,7 +5723,9 @@ fn streaming_lowers_when_stream_owner_armed() {
         "input": [{"type": "message", "role": "user", "content": "hi"}]
     }));
     // streaming = true, stream_restoration_armed = true
-    filter().lower_request(&mut state, true, true).expect("armed streaming lowers");
+    filter()
+        .lower_request(&mut state, true, true)
+        .expect("armed streaming lowers");
     assert!(!state.client_tool_lowering.is_empty(), "rich tool was lowered");
     assert!(state.client_tool_echo.is_some(), "echo snapshot captured");
 }
@@ -5612,7 +5739,9 @@ fn streaming_fails_closed_when_stream_owner_absent() {
         "input": [{"type": "message", "role": "user", "content": "hi"}]
     }));
     // streaming = true, stream_restoration_armed = false
-    let action = filter().lower_request(&mut state, true, false).expect_err("must fail closed");
+    let action = filter()
+        .lower_request(&mut state, true, false)
+        .expect_err("must fail closed");
     let (status, body) = reject_parts(&action);
     assert_eq!(status, 500);
     assert!(body.contains("openai_stream_events"), "names the missing owner: {body}");

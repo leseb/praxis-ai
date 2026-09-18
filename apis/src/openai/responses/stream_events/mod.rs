@@ -41,13 +41,13 @@ use self::{
     accumulator::{accumulate_event, find_output_item, tool_call_key},
     config::StreamEventsConfig,
 };
-use crate::openai::responses::openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools};
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::{
         responses::{
             error::{responses_error_rejection, responses_error_sse_payload},
+            openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
             state::{EmittedItem, ResponsesState},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
@@ -955,7 +955,10 @@ fn capture_client_tool_completion(
     // of the completed item into `tool_calls`, so the plan pass needs an owned
     // snapshot to restore the `custom_tool_call` lifecycle without re-borrowing the
     // mutable `ResponsesState` (#1159).
-    completions.push(client_tools::ClientToolCompletion { key, item: item.clone() });
+    completions.push(client_tools::ClientToolCompletion {
+        key,
+        item: item.clone(),
+    });
 }
 
 /// Phase 2b of the chunk commit: plan lowered client-tool restoration, then append
@@ -1192,7 +1195,12 @@ fn apply_client_tool_disposition(
         // type derives from the variant; splicing onto the args.done event would emit the
         // added body under a function_call_arguments.done line (#1159 R-T6a).
         D::EmitTypedAdded { item } => {
-            append_logical_event(state, ctx, ResponsesEvent::OutputItemAdded(item.clone()), logical_output);
+            append_logical_event(
+                state,
+                ctx,
+                ResponsesEvent::OutputItemAdded(item.clone()),
+                logical_output,
+            );
         },
         // Shell/ToolSearch restored typed `output_item.done` (incoming is already
         // output_item.done; construct fresh for symmetry with the added path).
@@ -1214,7 +1222,10 @@ fn apply_client_tool_disposition(
         // Suppress is dropped by restore_and_append_chunk before dispatch and must
         // NEVER forward; reaching the applier is a bug (debug panic; release drops).
         D::Suppress => {
-            debug_assert!(false, "Suppress is dropped in restore_and_append_chunk, never dispatched to the applier");
+            debug_assert!(
+                false,
+                "Suppress is dropped in restore_and_append_chunk, never dispatched to the applier"
+            );
         },
     }
 }

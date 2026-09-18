@@ -261,7 +261,12 @@ impl ClientToolCompatFilter {
     /// Returns `Err` with a terminal rejection when lowering cannot proceed
     /// losslessly; the request body is left byte-identical so no upstream call is
     /// made with a partial rewrite.
-    fn lower_request(&self, state: &mut ResponsesState, streaming: bool, stream_restoration_armed: bool) -> Result<(), FilterAction> {
+    fn lower_request(
+        &self,
+        state: &mut ResponsesState,
+        streaming: bool,
+        stream_restoration_armed: bool,
+    ) -> Result<(), FilterAction> {
         // A present `tools` that is neither an array nor `null` is structurally
         // malformed: this filter's whole contract treats `tools` as an array. Fail
         // closed uniformly here — before any lowering, discovery, or native
@@ -2367,10 +2372,7 @@ pub(crate) fn restore_snapshot(
 /// synth path can emit a complete custom lifecycle. `Err(())` if the source item
 /// lacks a `call_id`.
 #[expect(dead_code, reason = "used by streaming synth path in later tasks")]
-pub(crate) fn custom_call_shell(
-    item: &Value,
-    original_name: &str,
-) -> Result<Value, ()> {
+pub(crate) fn custom_call_shell(item: &Value, original_name: &str) -> Result<Value, ()> {
     let call_id = item.get("call_id").and_then(Value::as_str).ok_or(())?;
     let mut out = json!({
         "type": "custom_tool_call",
@@ -2384,7 +2386,10 @@ pub(crate) fn custom_call_shell(
 
 /// Restore one output item, re-typing a lowered `function_call` when its name is
 /// in the reverse map.
-pub(crate) fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClientTool>) -> Result<(), &'static str> {
+pub(crate) fn restore_output_item(
+    item: &mut Value,
+    reverse: &HashMap<String, LoweredClientTool>,
+) -> Result<(), &'static str> {
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
         return Ok(());
     }
@@ -2466,7 +2471,11 @@ pub(crate) fn restore_namespace_call(item: &mut Value, original_name: &str, name
 /// `CustomToolCall` carries an optional `namespace` field, so a namespaced custom
 /// member round-trips to a `custom_tool_call` that names both its member and its
 /// namespace.
-pub(crate) fn restore_namespace_custom_call(item: &Value, member_name: &str, namespace: Option<&str>) -> Result<Value, ()> {
+pub(crate) fn restore_namespace_custom_call(
+    item: &Value,
+    member_name: &str,
+    namespace: Option<&str>,
+) -> Result<Value, ()> {
     let mut out = restore_custom_call(item)?;
     if let Some(object) = out.as_object_mut() {
         object.insert("name".to_owned(), json!(member_name));

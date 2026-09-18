@@ -470,7 +470,10 @@ fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
     let (output, _usage) = canonicalize_logical_response(&mut state, false).expect("terminal restore");
 
     assert_eq!(output[0]["type"], "custom_tool_call", "lowered function_call retyped");
-    assert_eq!(output[0]["input"], "print(1)", "single string parameter unwrapped to plain input");
+    assert_eq!(
+        output[0]["input"], "print(1)",
+        "single string parameter unwrapped to plain input"
+    );
     assert_eq!(
         state.response_object["tools"],
         json!([{"type": "custom", "name": "run_python"}]),
@@ -4297,8 +4300,11 @@ fn parse_error_sets_metadata() {
 
 #[test]
 fn incomplete_client_tool_lifecycle_fails_closed() {
-    use super::client_tools::{ClientToolPhase, ClientToolStreamItem};
-    use super::{CompletionState, StreamEventsState, validate_stream_end};
+    use super::{
+        CompletionState, StreamEventsState,
+        client_tools::{ClientToolPhase, ClientToolStreamItem},
+        validate_stream_end,
+    };
     use crate::openai::responses::state::ClientToolRestore;
 
     let (_filter, mut ctx) = make_armed_context();
@@ -5893,14 +5899,18 @@ async fn namespace_lowered_call_retyped_in_place_through_commit_never_leaks_priv
         "input": "hello",
         "stream": true
     })));
-    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
-        "agentic_ns__fs__read".to_owned(),
-        LoweredClientTool {
-            original_name: "read".to_owned(),
-            namespace: Some("fs".to_owned()),
-            restore: ClientToolRestore::Namespace,
-        },
-    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "agentic_ns__fs__read".to_owned(),
+            LoweredClientTool {
+                original_name: "read".to_owned(),
+                namespace: Some("fs".to_owned()),
+                restore: ClientToolRestore::Namespace,
+            },
+        );
 
     filter.arm(&mut ctx);
 
@@ -5989,14 +5999,18 @@ async fn custom_lowered_call_restored_to_custom_tool_call_lifecycle_through_comm
         "input": "hello",
         "stream": true
     })));
-    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
-        "run_python".to_owned(),
-        LoweredClientTool {
-            original_name: "run_python".to_owned(),
-            namespace: None,
-            restore: ClientToolRestore::Custom,
-        },
-    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
 
     filter.arm(&mut ctx);
 
@@ -6114,14 +6128,18 @@ async fn namespace_custom_lowered_call_restored_through_commit_never_leaks_priva
         "input": "hello",
         "stream": true
     })));
-    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
-        "agentic_ns__code__run".to_owned(),
-        LoweredClientTool {
-            original_name: "run".to_owned(),
-            namespace: Some("code".to_owned()),
-            restore: ClientToolRestore::NamespaceCustom,
-        },
-    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "agentic_ns__code__run".to_owned(),
+            LoweredClientTool {
+                original_name: "run".to_owned(),
+                namespace: Some("code".to_owned()),
+                restore: ClientToolRestore::NamespaceCustom,
+            },
+        );
 
     filter.arm(&mut ctx);
 
@@ -6233,14 +6251,18 @@ async fn shell_lowered_call_restored_to_shell_call_lifecycle_through_commit() {
         "input": "hello",
         "stream": true
     })));
-    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
-        "shell".to_owned(),
-        LoweredClientTool {
-            original_name: "shell".to_owned(),
-            namespace: None,
-            restore: ClientToolRestore::Shell,
-        },
-    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "shell".to_owned(),
+            LoweredClientTool {
+                original_name: "shell".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Shell,
+            },
+        );
 
     filter.arm(&mut ctx);
 
@@ -6353,14 +6375,18 @@ async fn tool_search_lowered_call_restored_to_tool_search_call_lifecycle_through
         "input": "hello",
         "stream": true
     })));
-    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_lowering.insert(
-        "tool_search".to_owned(),
-        LoweredClientTool {
-            original_name: "tool_search".to_owned(),
-            namespace: None,
-            restore: ClientToolRestore::ToolSearch,
-        },
-    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "tool_search".to_owned(),
+            LoweredClientTool {
+                original_name: "tool_search".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::ToolSearch,
+            },
+        );
 
     filter.arm(&mut ctx);
 

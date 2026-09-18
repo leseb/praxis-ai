@@ -19,13 +19,16 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::openai::responses::openai_client_tool_compat::{
-    custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
-    restore_shell_call, restore_snapshot, restore_snapshot_tools, restore_tool_search_call,
+use crate::openai::{
+    responses::{
+        openai_client_tool_compat::{
+            custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
+            restore_shell_call, restore_snapshot, restore_snapshot_tools, restore_tool_search_call,
+        },
+        state::{ClientToolEcho, ClientToolRestore, LoweredClientTool},
+    },
+    sse::{SseParseError, responses::ResponsesEvent},
 };
-use crate::openai::responses::state::{ClientToolEcho, ClientToolRestore, LoweredClientTool};
-use crate::openai::sse::SseParseError;
-use crate::openai::sse::responses::ResponsesEvent;
 
 /// Per-item lifecycle progress through a lowered `function_call`'s SSE events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,7 +339,11 @@ fn plan_arguments_delta(next_items: &[ClientToolStreamItem], payload: &Value) ->
     let Some(key) = client_tool_event_key(payload) else {
         return ClientToolDisposition::Passthrough;
     };
-    match next_items.iter().find(|tracked| tracked.key == key).map(|tracked| tracked.restore) {
+    match next_items
+        .iter()
+        .find(|tracked| tracked.key == key)
+        .map(|tracked| tracked.restore)
+    {
         Some(
             ClientToolRestore::Custom
             | ClientToolRestore::NamespaceCustom
@@ -403,7 +410,11 @@ fn plan_custom_arguments_done(
             "function_call_arguments.done without a captured completion artifact",
         ));
     };
-    let arguments = completion.item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+    let arguments = completion
+        .item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let input = input_from_arguments_strict(arguments).map_err(|()| {
         client_tool_restore_error(
             &tracked.key,
@@ -614,7 +625,10 @@ fn build_typed_done_payload(payload: &Value, restore: ClientToolRestore) -> Resu
 /// lifecycle. Mirrors [`super::accumulator::tool_call_key`]'s
 /// `item:{id}`/`index:{n}` shape.
 fn client_tool_event_key(payload: &Value) -> Option<String> {
-    let nested_id = payload.get("item").and_then(|item| item.get("id")).and_then(Value::as_str);
+    let nested_id = payload
+        .get("item")
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str);
     let top_id = payload.get("item_id").and_then(Value::as_str);
     if let Some(id) = nested_id.or(top_id) {
         return Some(format!("item:{id}"));
@@ -641,41 +655,53 @@ mod tests {
 
     fn reverse_namespace() -> HashMap<String, LoweredClientTool> {
         let mut m = HashMap::new();
-        m.insert("agentic_ns__fs__read".to_owned(), LoweredClientTool {
-            original_name: "read".to_owned(),
-            namespace: Some("fs".to_owned()),
-            restore: ClientToolRestore::Namespace,
-        });
+        m.insert(
+            "agentic_ns__fs__read".to_owned(),
+            LoweredClientTool {
+                original_name: "read".to_owned(),
+                namespace: Some("fs".to_owned()),
+                restore: ClientToolRestore::Namespace,
+            },
+        );
         m
     }
 
     fn reverse_custom() -> HashMap<String, LoweredClientTool> {
         let mut m = HashMap::new();
-        m.insert("run_python".to_owned(), LoweredClientTool {
-            original_name: "run_python".to_owned(),
-            namespace: None,
-            restore: ClientToolRestore::Custom,
-        });
+        m.insert(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
         m
     }
 
     fn reverse_shell() -> HashMap<String, LoweredClientTool> {
         let mut m = HashMap::new();
-        m.insert("shell".to_owned(), LoweredClientTool {
-            original_name: "shell".to_owned(),
-            namespace: None,
-            restore: ClientToolRestore::Shell,
-        });
+        m.insert(
+            "shell".to_owned(),
+            LoweredClientTool {
+                original_name: "shell".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Shell,
+            },
+        );
         m
     }
 
     fn reverse_tool_search() -> HashMap<String, LoweredClientTool> {
         let mut m = HashMap::new();
-        m.insert("tool_search".to_owned(), LoweredClientTool {
-            original_name: "tool_search".to_owned(),
-            namespace: None,
-            restore: ClientToolRestore::ToolSearch,
-        });
+        m.insert(
+            "tool_search".to_owned(),
+            LoweredClientTool {
+                original_name: "tool_search".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::ToolSearch,
+            },
+        );
         m
     }
 
@@ -705,10 +731,16 @@ mod tests {
         let events = vec![added, args_delta, args_done];
         let plan = plan_client_tool_restore(&reverse, None, &[], &events, &completions).unwrap();
         assert_eq!(plan.dispositions.len(), 3);
-        assert!(matches!(plan.dispositions[0], ClientToolDisposition::EmitCustomShell { .. }));
+        assert!(matches!(
+            plan.dispositions[0],
+            ClientToolDisposition::EmitCustomShell { .. }
+        ));
         assert!(matches!(plan.dispositions[1], ClientToolDisposition::Suppress));
         // args.done becomes the synthesized custom input delta+done pair, applied as EmitCustomInput.
-        assert!(matches!(plan.dispositions[2], ClientToolDisposition::EmitCustomInput { .. }));
+        assert!(matches!(
+            plan.dispositions[2],
+            ClientToolDisposition::EmitCustomInput { .. }
+        ));
 
         // The retyped added item is a `custom_tool_call` carrying the public id, and
         // the synthesized input carries the unwrapped plain-string value.
@@ -758,8 +790,14 @@ mod tests {
         let events = vec![added, args_done, item_done];
         let plan = plan_client_tool_restore(&reverse, None, &[], &events, &completions).unwrap();
         assert_eq!(plan.dispositions.len(), 3);
-        assert!(matches!(plan.dispositions[0], ClientToolDisposition::EmitCustomShell { .. }));
-        assert!(matches!(plan.dispositions[1], ClientToolDisposition::EmitCustomInput { .. }));
+        assert!(matches!(
+            plan.dispositions[0],
+            ClientToolDisposition::EmitCustomShell { .. }
+        ));
+        assert!(matches!(
+            plan.dispositions[1],
+            ClientToolDisposition::EmitCustomInput { .. }
+        ));
         match &plan.dispositions[2] {
             ClientToolDisposition::EmitCustomItemDone { item } => {
                 let done_item = item.get("item").unwrap();
@@ -788,7 +826,10 @@ mod tests {
         // output_item.done while still `Opened` (no arguments.done) is a C4 violation.
         let events = [added, item_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
-        assert!(result.is_err(), "custom output_item.done before arguments.done must fail closed");
+        assert!(
+            result.is_err(),
+            "custom output_item.done before arguments.done must fail closed"
+        );
     }
 
     #[test]
@@ -806,7 +847,10 @@ mod tests {
         // be synthesized authoritatively, so fail closed rather than guess.
         let events = [added, args_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
-        assert!(result.is_err(), "custom arguments.done without a completion artifact must fail closed");
+        assert!(
+            result.is_err(),
+            "custom arguments.done without a completion artifact must fail closed"
+        );
     }
 
     #[test]
@@ -937,7 +981,10 @@ mod tests {
         // output_item.done while still `Opened` (no arguments.done) is a C4 violation.
         let events = [added, item_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
-        assert!(result.is_err(), "shell output_item.done before arguments.done must fail closed");
+        assert!(
+            result.is_err(),
+            "shell output_item.done before arguments.done must fail closed"
+        );
     }
 
     #[test]
@@ -955,7 +1002,10 @@ mod tests {
         // be synthesized authoritatively, so fail closed rather than guess.
         let events = [added, args_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
-        assert!(result.is_err(), "shell arguments.done without a completion artifact must fail closed");
+        assert!(
+            result.is_err(),
+            "shell arguments.done without a completion artifact must fail closed"
+        );
     }
 
     #[test]
@@ -981,7 +1031,10 @@ mod tests {
         };
         let events = [added, args_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[completion]);
-        assert!(result.is_err(), "a lossy typed restore (namespaced tool_search) must fail closed");
+        assert!(
+            result.is_err(),
+            "a lossy typed restore (namespaced tool_search) must fail closed"
+        );
     }
 
     #[test]
@@ -1004,7 +1057,11 @@ mod tests {
         let plan = plan_client_tool_restore(&reverse, None, &[], std::slice::from_ref(&added), &[]).unwrap();
         assert_eq!(plan.dispositions.len(), 1);
         match &plan.dispositions[0] {
-            ClientToolDisposition::RetypeInPlace { item_type, name, namespace } => {
+            ClientToolDisposition::RetypeInPlace {
+                item_type,
+                name,
+                namespace,
+            } => {
                 assert_eq!(*item_type, "function_call");
                 assert_eq!(name, "read");
                 assert_eq!(namespace.as_deref(), Some("fs"));
@@ -1040,7 +1097,10 @@ mod tests {
         let plan = plan_client_tool_restore(&reverse, None, &[], &events, &[]).unwrap();
 
         assert_eq!(plan.dispositions.len(), 3);
-        assert!(matches!(plan.dispositions[0], ClientToolDisposition::RetypeInPlace { .. }));
+        assert!(matches!(
+            plan.dispositions[0],
+            ClientToolDisposition::RetypeInPlace { .. }
+        ));
         assert!(matches!(plan.dispositions[1], ClientToolDisposition::Passthrough));
         match &plan.dispositions[2] {
             ClientToolDisposition::RetypeInPlace { name, namespace, .. } => {
@@ -1075,7 +1135,10 @@ mod tests {
         // arguments.done seen) is a C4 lifecycle-order violation: fail closed.
         let events = [added, item_done];
         let result = plan_client_tool_restore(&reverse, None, &[], &events, &[]);
-        assert!(result.is_err(), "output_item.done before arguments.done must fail closed");
+        assert!(
+            result.is_err(),
+            "output_item.done before arguments.done must fail closed"
+        );
     }
 
     #[test]
@@ -1096,9 +1159,12 @@ mod tests {
         let plan = plan_client_tool_restore(&reverse, Some(&echo), &[], std::slice::from_ref(&created), &[]).unwrap();
         match &plan.dispositions[0] {
             ClientToolDisposition::RestoreSnapshot { response } => {
-                assert_eq!(response["tools"], serde_json::json!([{"type": "custom", "name": "run_python"}]));
+                assert_eq!(
+                    response["tools"],
+                    serde_json::json!([{"type": "custom", "name": "run_python"}])
+                );
                 assert!(response.get("tool_choice").is_none());
-            }
+            },
             other => panic!("expected RestoreSnapshot, got {other:?}"),
         }
     }
@@ -1118,12 +1184,19 @@ mod tests {
                 "tool_choice": {"type": "function", "name": "run_python"}
             }
         }));
-        let plan = plan_client_tool_restore(&reverse, Some(&echo), &[], std::slice::from_ref(&in_progress), &[]).unwrap();
+        let plan =
+            plan_client_tool_restore(&reverse, Some(&echo), &[], std::slice::from_ref(&in_progress), &[]).unwrap();
         match &plan.dispositions[0] {
             ClientToolDisposition::RestoreSnapshot { response } => {
-                assert_eq!(response["tools"], serde_json::json!([{"type": "custom", "name": "run_python"}]));
-                assert_eq!(response["tool_choice"], serde_json::json!({"type": "custom", "name": "run_python"}));
-            }
+                assert_eq!(
+                    response["tools"],
+                    serde_json::json!([{"type": "custom", "name": "run_python"}])
+                );
+                assert_eq!(
+                    response["tool_choice"],
+                    serde_json::json!({"type": "custom", "name": "run_python"})
+                );
+            },
             other => panic!("expected RestoreSnapshot, got {other:?}"),
         }
     }
@@ -1131,11 +1204,14 @@ mod tests {
     #[test]
     fn intermediate_snapshot_with_lossy_output_fails_closed() {
         let mut reverse = HashMap::new();
-        reverse.insert("run_python".to_owned(), LoweredClientTool {
-            original_name: "run_python".to_owned(),
-            namespace: None,
-            restore: ClientToolRestore::Custom,
-        });
+        reverse.insert(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
         let echo = ClientToolEcho {
             tools: vec![serde_json::json!({"type": "custom", "name": "run_python"})],
             tool_choice: Value::Null,
@@ -1154,6 +1230,9 @@ mod tests {
             }
         }));
         let result = plan_client_tool_restore(&reverse, Some(&echo), &[], &[in_progress], &[]);
-        assert!(result.is_err(), "non-terminal snapshot with lossy output item must fail closed");
+        assert!(
+            result.is_err(),
+            "non-terminal snapshot with lossy output item must fail closed"
+        );
     }
 }
