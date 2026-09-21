@@ -424,21 +424,17 @@ fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Opti
 fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let factory: praxis_filter::ChainBindingHttpFactory = if let Some(client) = subrequest_client {
         let client = client.clone();
-        std::sync::Arc::new(
-            move |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
-                praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_chain_binding_with_client(
-                    config,
-                    client.clone(),
-                    ctx,
-                )
-            },
-        )
+        std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+            praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_chain_binding_with_client(
+                config,
+                client.clone(),
+                ctx,
+            )
+        })
     } else {
-        std::sync::Arc::new(
-            |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
-                praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_chain_binding(config, ctx)
-            },
-        )
+        std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+            praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_chain_binding(config, ctx)
+        })
     };
     registry
         .register_chain_binding("anthropic_web_search", factory)
@@ -532,17 +528,13 @@ fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client
 fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let factory: praxis_filter::ChainBindingHttpFactory = if let Some(client) = subrequest_client {
         let client = client.clone();
-        std::sync::Arc::new(
-            move |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
-                praxis_ai_apis::openai::WebSearchFilter::from_chain_binding_with_client(config, client.clone(), ctx)
-            },
-        )
+        std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+            praxis_ai_apis::openai::WebSearchFilter::from_chain_binding_with_client(config, client.clone(), ctx)
+        })
     } else {
-        std::sync::Arc::new(
-            |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
-                praxis_ai_apis::openai::WebSearchFilter::from_chain_binding(config, ctx)
-            },
-        )
+        std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+            praxis_ai_apis::openai::WebSearchFilter::from_chain_binding(config, ctx)
+        })
     };
     registry
         .register_chain_binding("openai_web_search", factory)
