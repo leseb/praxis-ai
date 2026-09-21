@@ -1255,6 +1255,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat"],
             ]
@@ -1326,6 +1327,7 @@ mod tests {
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
+                "responses/chat-structured-output-with-tools",
                 "responses/chat-tool-echo",
                 "responses/chat-unrepresentable-parameters",
                 "responses/chat-web-search",
@@ -1500,6 +1502,10 @@ mod tests {
                 (
                     &"responses.chat.tools.function_echo".to_owned(),
                     &vec!["responses/chat-tool-echo".to_owned()]
+                ),
+                (
+                    &"responses.chat.structured_output_with_tools".to_owned(),
+                    &vec!["responses/chat-structured-output-with-tools".to_owned()]
                 ),
                 (
                     &"responses.client_tool_compat.lower_restore".to_owned(),
