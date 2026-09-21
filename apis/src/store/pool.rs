@@ -313,7 +313,10 @@ acquire_timeout_secs: 30
             min_connections: Some(DEFAULT_MAX_CONNECTIONS),
             ..PoolConfig::default()
         };
-        assert!(cfg.validate().is_ok());
+        assert!(
+            cfg.validate().is_ok(),
+            "min_connections equal to the implicit default max ({DEFAULT_MAX_CONNECTIONS}) should be accepted"
+        );
     }
 
     #[test]
@@ -322,7 +325,10 @@ acquire_timeout_secs: 30
             min_connections: Some(5),
             ..PoolConfig::default()
         };
-        assert!(cfg.validate().is_ok());
+        assert!(
+            cfg.validate().is_ok(),
+            "min_connections below the implicit default max ({DEFAULT_MAX_CONNECTIONS}) should be accepted"
+        );
     }
 
     #[test]
@@ -334,7 +340,10 @@ acquire_timeout_secs: 30
             max_connections: Some(30),
             ..PoolConfig::default()
         };
-        assert!(cfg.validate().is_ok());
+        assert!(
+            cfg.validate().is_ok(),
+            "min_connections above the default is valid when an explicit larger max is set"
+        );
     }
 
     // The min-vs-implicit-max check hinges on `DEFAULT_MAX_CONNECTIONS`
@@ -349,7 +358,10 @@ acquire_timeout_secs: 30
         let sqlx_default = sqlx::postgres::PgPoolOptions::new().get_max_connections();
         #[cfg(all(feature = "store-sqlite", not(feature = "store-postgres")))]
         let sqlx_default = sqlx::sqlite::SqlitePoolOptions::new().get_max_connections();
-        assert_eq!(sqlx_default, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(
+            sqlx_default, DEFAULT_MAX_CONNECTIONS,
+            "sqlx default max_connections drifted from DEFAULT_MAX_CONNECTIONS; re-verify the issue #1253 fix"
+        );
     }
 
     #[test]
