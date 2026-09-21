@@ -15,17 +15,19 @@ pub mod tls;
 pub mod wait;
 
 pub use backend::{
-    Backend, BackendGuard, CapturedRequest, CapturedWsMessage, CapturingBackendGuard, RoutedBackend, StatefulBackend,
-    StatefulBackendGuard, StatefulCapturingBackend, StatefulCapturingGuard, WsBackendEvent, WsBackendGuard,
-    WsServerAction, start_backend, start_backend_v6, start_backend_with_shutdown, start_capturing_backend,
-    start_echo_backend, start_header_echo_backend, start_scripted_websocket_backend,
-    start_scripted_websocket_backend_turns, start_stateful_backend, start_uri_echo_backend,
+    Backend, BackendGuard, CapturedHttpRequest, CapturedRequest, CapturedWsMessage, CapturingBackendGuard,
+    HttpBackendEvent, HttpBackendGuard, HttpServerAction, RoutedBackend, StatefulBackend, StatefulBackendGuard,
+    StatefulCapturingBackend, StatefulCapturingGuard, WsBackendEvent, WsBackendGuard, WsServerAction, start_backend,
+    start_backend_v6, start_backend_with_shutdown, start_capturing_backend, start_echo_backend,
+    start_header_echo_backend, start_scripted_http_backend, start_scripted_http_backend_turns,
+    start_scripted_websocket_backend, start_scripted_websocket_backend_turns, start_stateful_backend,
+    start_uri_echo_backend,
 };
 #[cfg(feature = "llmd-ext-proc")]
 pub use ext_proc_mock::{MockProcessorGuard, start_mock_routing_processor};
 pub use http_client::{
-    http_get, http_get_retry, http_get_v6, http_post, http_send, json_post, parse_body, parse_header, parse_header_all,
-    parse_status,
+    basic_auth_header, http_get, http_get_retry, http_get_v6, http_post, http_send, json_post, json_post_with_header,
+    parse_body, parse_header, parse_header_all, parse_status,
 };
 pub use port::{PortGuard, bind_unique_port, free_port, free_port_guard, free_port_v6, ipv6_available};
 pub use postgres::{PostgresCertAuthGuard, PostgresGuard, start_postgres, start_postgres_cert_auth};
