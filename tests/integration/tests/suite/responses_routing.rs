@@ -90,8 +90,13 @@ fn mode_branch_stateless_body_not_mutated() {
     let stateful_guard = start_backend_with_shutdown("stateful-path");
     let proxy_port = free_port();
 
-    let config =
-        Config::from_yaml(&mode_branch_yaml(proxy_port, stateful_guard.port(), echo_guard.port(), false)).unwrap();
+    let config = Config::from_yaml(&mode_branch_yaml(
+        proxy_port,
+        stateful_guard.port(),
+        echo_guard.port(),
+        false,
+    ))
+    .unwrap();
 
     let proxy = start_proxy(&config);
 
