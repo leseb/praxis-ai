@@ -17,6 +17,8 @@
 //! OpenAI-managed `prompt` template references fail closed unless the selected
 //! upstream declares `application_protocol: openai_responses` and
 //! `application_provider: openai`.
+//! Background creates fail closed unless the selected upstream identifies
+//! OpenAI and no local response store owns retrieval.
 
 mod config;
 
@@ -51,7 +53,10 @@ use serde::{
 use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
-use super::{body_limits::reject_rewritten_body_too_large, error::responses_error_rejection, state::ResponsesState};
+use super::{
+    BackgroundModeRequested, LocalResponseStoreConfigured, body_limits::reject_rewritten_body_too_large,
+    error::responses_error_rejection, state::ResponsesState,
+};
 use crate::{classifier::is_responses_create, json_body::SerializedJson};
 
 // -----------------------------------------------------------------------------
@@ -74,6 +79,15 @@ use crate::{classifier::is_responses_create, json_body::SerializedJson};
 /// the request-header phase, a pipeline that uses OpenAI-managed prompts must
 /// order this filter after its router and load balancer. Missing or different
 /// application metadata fails closed.
+///
+/// Requests classified with `background: true` are rejected unless the load
+/// balancer selected a cluster whose `application_provider` is `openai` or
+/// whose endpoint host is exactly `api.openai.com`. A configured local response
+/// store always causes rejection because local polling cannot observe OpenAI's
+/// asynchronous state transitions. Because cluster selection happens during
+/// the request-header phase, a pipeline that permits OpenAI background mode
+/// must order this filter after its router and load balancer. Missing or
+/// malformed selected-upstream identity fails closed.
 ///
 /// This filter always advertises the Praxis streaming capability. When the
 /// effective outbound body contains `"stream": true` it selects Praxis's
@@ -128,6 +142,25 @@ impl ResponsesProxyFilter {
                 "prompt templates are supported only when the selected upstream declares application_protocol: openai_responses and application_provider: openai",
             ))
         })
+    }
+
+    /// Reject background execution when Praxis cannot preserve its lifecycle.
+    fn reject_unsupported_background(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+        ctx.extensions.get::<BackgroundModeRequested>()?;
+
+        let local_store_owns_retrieval = ctx.extensions.get::<LocalResponseStoreConfigured>().is_some();
+        if local_store_owns_retrieval
+            || !selected_upstream_supports_background(ctx.selected_application_provider(), ctx.upstream_addr())
+        {
+            debug!("rejecting unsupported Responses background mode");
+            return Some(FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "background mode is not supported",
+            )));
+        }
+
+        None
     }
 
     /// Create from parsed YAML config.
@@ -204,6 +237,9 @@ impl HttpFilter for ResponsesProxyFilter {
         if is_responses_create(&ctx.request.method, ctx.request.uri.path())
             && let Some(action) = Self::reject_prompt_for_non_openai_upstream(ctx)
         {
+            return Ok(action);
+        }
+        if let Some(action) = Self::reject_unsupported_background(ctx) {
             return Ok(action);
         }
         Ok(FilterAction::Continue)
@@ -380,6 +416,23 @@ fn request_has_prompt_template(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>
 fn is_openai_responses_provider(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.selected_application_protocol() == Some("openai_responses")
         && ctx.selected_application_provider() == Some("openai")
+}
+
+/// Whether either selected-upstream identity permits background execution.
+fn selected_upstream_supports_background(provider: Option<&str>, address: Option<&str>) -> bool {
+    is_openai_provider(provider) || is_openai_api_address(address)
+}
+
+/// Whether the selected cluster explicitly identifies OpenAI as its provider.
+fn is_openai_provider(provider: Option<&str>) -> bool {
+    provider.is_some_and(|provider| provider.eq_ignore_ascii_case("openai"))
+}
+
+/// Whether the selected upstream address has the exact OpenAI API hostname.
+fn is_openai_api_address(address: Option<&str>) -> bool {
+    address
+        .and_then(|address| address.parse::<http::uri::Authority>().ok())
+        .is_some_and(|authority| authority.host().eq_ignore_ascii_case("api.openai.com"))
 }
 
 /// Align the typed Praxis response mode with the effective serialized request.

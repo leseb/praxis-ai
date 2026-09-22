@@ -13,7 +13,7 @@ Classification formats: `openai_responses`, `openai_chat_completions`, `unknown_
 
 A `GET /v1/responses` request with valid HTTP `WebSocket` upgrade headers is classified as `openai_responses` without inspecting a body. This handshake classification promotes only the format: model, stream, store, and mode facts remain absent. An ordinary bodyless `GET /v1/responses` remains unclassified.
 
-Requests with `background=true` are rejected because Praxis does not implement the asynchronous Responses lifecycle.
+Requests with `background=true` are rejected by default. With `background_mode: selected_upstream`, they are published as routing metadata for a downstream `openai_responses_proxy`. When ordered after upstream selection, that filter rejects destinations that cannot own the asynchronous Responses lifecycle and routes backed by the local response store. Retrieval and cancellation routes must select the same OpenAI lifecycle owner because those later requests do not repeat the `background` field.
 
 Routing mode for supported Responses API requests: `stateful` when the request contains `previous_response_id`, non-empty `tools`, `store=true` (default when omitted), `conversation`, or `prompt.id`; `stateless` when `store=false` with no other stateful markers.
 
@@ -24,6 +24,7 @@ Use with branch chains to route stateful and stateless requests to different clu
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Behavior when the body cannot be classified. |
+| `background_mode` | `reject` \| `selected_upstream` | no | Policy for Responses requests that set `background: true`. `selected_upstream` requires `openai_responses_proxy` after the router and load balancer, including inside each iterative-router step. |
 | `headers` | ResponsesFormatHeaders | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
 | `headers.format` | string | no | Header name for the detected format (e.g. `openai_responses`, `openai_chat_completions`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-format` remains allowed. |
 | `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
@@ -43,6 +44,7 @@ filter: openai_responses_format
 ```yaml
 filter: openai_responses_format
 on_invalid: continue
+background_mode: selected_upstream
 headers:
   format: x-praxis-ai-format
   model: x-praxis-ai-model

@@ -13,7 +13,9 @@
 //! - **`on_request`**: reads classifier metadata to decide whether the request needs the store (persistable POST or
 //!   `previous_response_id`). Lazily initializes the store backend when needed. Rejects with a 500 response on store
 //!   init failure for any request that requires the store (persistence or rehydration). `GET` and `DELETE` endpoints
-//!   owned by the store also reject rather than falling through to the upstream.
+//!   owned by the store also reject rather than falling through to the upstream. Publishes typed local-retrieval
+//!   ownership so background creates are rejected instead of creating a provider lifecycle that local polling cannot
+//!   observe.
 //!
 //! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
 //!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
@@ -62,8 +64,8 @@ use tracing::{debug, trace, warn};
 use super::config::revalidate_postgres_host;
 use super::{
     super::{
-        DEFAULT_STORE_NAME, append_stored_input_items, error::responses_error_rejection, is_explicit_compact_request,
-        state::ResponsesState,
+        DEFAULT_STORE_NAME, LocalResponseStoreConfigured, append_stored_input_items,
+        error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, validate_config},
@@ -829,6 +831,8 @@ impl HttpFilter for ResponseStoreFilter {
         reason = "request routing and pre-inference owner capture remain one lifecycle hook"
     )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.extensions.insert(LocalResponseStoreConfigured);
+
         if is_responses_format(ctx) && !is_streaming_request(ctx) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
                 max_bytes: Some(MAX_JSON_BODY_BYTES),
@@ -879,6 +883,8 @@ impl HttpFilter for ResponseStoreFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        ctx.extensions.insert(LocalResponseStoreConfigured);
+
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
         }

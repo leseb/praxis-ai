@@ -45,7 +45,7 @@ fn mode_branch_routes_stateful_conditions_to_stateful_path() {
 }
 
 #[test]
-fn mode_branch_rejects_background_before_upstream() {
+fn mode_branch_rejects_background_for_non_openai_upstream() {
     let stateful_guard = start_backend_with_shutdown("unexpected-stateful-request");
     let default_guard = start_backend_with_shutdown("unexpected-default-request");
     let proxy_port = free_port();
@@ -176,6 +176,7 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
+        background_mode: selected_upstream
         branch_chains:
           - name: stateful_branch
             on_result:
@@ -203,6 +204,7 @@ filter_chains:
           - name: "stateful"
             endpoints:
               - "127.0.0.1:{stateful_port}"
+      - filter: openai_responses_proxy
 insecure_options:
   allow_private_endpoints: true
 "#

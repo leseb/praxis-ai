@@ -1,6 +1,6 @@
 version: 1
 id: responses/background-unsupported
-description: Praxis rejects unsupported Responses background mode before contacting a native backend.
+description: Praxis rejects Responses background mode after selecting a non-OpenAI native backend and before contacting it.
 protocol: openai_responses
 example_config: openai/responses/request-validate.yaml
 upstream_authority: 127.0.0.1:8000

@@ -226,6 +226,88 @@ async fn on_request_returns_continue() {
 }
 
 #[tokio::test]
+async fn background_true_is_rejected_without_selected_openai_upstream() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(super::super::BackgroundModeRequested);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("background mode must fail closed without a selected OpenAI upstream");
+    };
+    assert_eq!(rejection.status, 400);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["message"], "background mode is not supported");
+}
+
+#[tokio::test]
+async fn background_true_is_allowed_for_exact_openai_api_address() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(super::super::BackgroundModeRequested);
+    ctx.upstream = Some(praxis_core::connectivity::Upstream {
+        address: std::sync::Arc::from("API.OPENAI.COM:443"),
+        authority: None,
+        connection: std::sync::Arc::new(praxis_core::connectivity::ConnectionOptions::default()),
+        tls: None,
+    });
+
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "the exact OpenAI API host should permit background mode"
+    );
+}
+
+#[tokio::test]
+async fn local_response_store_rejects_background_for_openai_address() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(super::super::BackgroundModeRequested);
+    ctx.extensions.insert(super::super::LocalResponseStoreConfigured);
+    ctx.upstream = Some(praxis_core::connectivity::Upstream {
+        address: std::sync::Arc::from("api.openai.com:443"),
+        authority: None,
+        connection: std::sync::Arc::new(praxis_core::connectivity::ConnectionOptions::default()),
+        tls: None,
+    });
+
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(rejection) if rejection.status == 400),
+        "local retrieval ownership must reject provider-owned background state"
+    );
+}
+
+#[test]
+fn background_support_requires_openai_provider_or_exact_address() {
+    assert!(super::selected_upstream_supports_background(
+        Some("openai"),
+        Some("127.0.0.1:443")
+    ));
+    assert!(super::selected_upstream_supports_background(
+        Some("vllm"),
+        Some("api.openai.com:443")
+    ));
+    assert!(super::selected_upstream_supports_background(
+        Some("OPENAI"),
+        Some("API.OPENAI.COM:443")
+    ));
+    assert!(!super::selected_upstream_supports_background(
+        Some("vllm"),
+        Some("api.openai.com.example:443")
+    ));
+    assert!(!super::selected_upstream_supports_background(
+        None,
+        Some("127.0.0.1:443")
+    ));
+    assert!(!super::selected_upstream_supports_background(None, None));
+}
+
+#[tokio::test]
 async fn passthrough_without_state() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");

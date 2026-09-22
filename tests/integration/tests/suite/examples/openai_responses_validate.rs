@@ -37,7 +37,7 @@ fn openai_responses_validate_example_forwards_valid_responses_request() {
 }
 
 #[test]
-fn openai_responses_validate_example_rejects_streaming_background_before_upstream() {
+fn openai_responses_validate_example_rejects_streaming_background_for_local_upstream() {
     let backend_guard = start_backend_with_shutdown("unexpected-upstream-request");
     let proxy_port = free_port();
 

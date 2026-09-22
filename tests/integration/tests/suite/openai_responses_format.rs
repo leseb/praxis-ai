@@ -5,8 +5,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_send, json_post, parse_body, parse_header, parse_status, start_backend_with_shutdown,
-    start_echo_backend, start_header_echo_backend, start_proxy,
+    StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_header, parse_status,
+    start_backend_with_shutdown, start_echo_backend, start_header_echo_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -433,12 +433,12 @@ fn filter_results_enable_branch_routing() {
 }
 
 #[test]
-fn background_true_is_rejected_before_branch_routing() {
+fn background_true_is_rejected_for_non_openai_upstream() {
     let background_guard = start_backend_with_shutdown("background-branch-hit");
     let default_guard = start_backend_with_shutdown("default-branch-miss");
     let proxy_port = free_port();
 
-    let yaml = background_branch_yaml(proxy_port, background_guard.port(), default_guard.port());
+    let yaml = background_branch_yaml(proxy_port, background_guard.port(), default_guard.port(), "vllm");
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -448,7 +448,7 @@ fn background_true_is_rejected_before_branch_routing() {
     assert_eq!(
         parse_status(&raw),
         400,
-        "background request should fail before branch routing"
+        "background request should fail after selecting a non-OpenAI upstream"
     );
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
     assert_eq!(response["error"]["message"], "background mode is not supported");
@@ -465,6 +465,162 @@ fn background_true_is_rejected_before_branch_routing() {
         parse_body(&foreground_raw),
         "default-branch-miss",
         "background:false should not match the background:true branch"
+    );
+}
+
+#[test]
+fn background_true_and_polling_are_forwarded_to_openai_provider() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, r#"{"id":"resp_background","status":"queued"}"#.to_owned()),
+        (200, r#"{"id":"resp_background","status":"completed"}"#.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = openai_background_lifecycle_yaml(proxy_port, backend.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","background":true,"store":false}"#;
+    let create = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(parse_status(&create), 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&parse_body(&create)).unwrap()["status"],
+        "queued"
+    );
+
+    let get = format!(
+        "GET /v1/responses/resp_background HTTP/1.1\r\n\
+         Host: localhost:{proxy_port}\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    let poll = http_send(proxy.addr(), &get);
+    assert_eq!(parse_status(&poll), 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&parse_body(&poll)).unwrap()["status"],
+        "completed"
+    );
+
+    let captured = backend.requests();
+    assert!(
+        captured
+            .iter()
+            .any(|request| request.method == "POST" && request.uri == "/v1/responses" && request.body == body),
+        "OpenAI should receive the unchanged background create"
+    );
+    assert!(
+        captured
+            .iter()
+            .any(|request| request.method == "GET" && request.uri == "/v1/responses/resp_background"),
+        "polling must reach the same OpenAI lifecycle owner"
+    );
+}
+
+#[test]
+fn background_true_is_rejected_at_irr_selected_upstream() {
+    let backend = StatefulCapturingBackend::new(vec![(200, r#"{"id":"unexpected"}"#.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = irr_background_yaml(proxy_port, backend.port(), "vllm");
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","background":true}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 400, "IRR background request should be rejected");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["error"]["type"], "invalid_request_error");
+    assert_eq!(response["error"]["code"], "invalid_request_error");
+    assert!(response["error"]["param"].is_null());
+    assert_eq!(response["error"]["message"], "background mode is not supported");
+    let captured = backend.requests();
+    let captured_summary: Vec<_> = captured
+        .iter()
+        .map(|request| format!("{} {} {}", request.method, request.uri, request.body))
+        .collect();
+    assert!(
+        captured
+            .iter()
+            .all(|request| request.method != "POST" || request.uri != "/v1/responses"),
+        "IRR must reject before forwarding the client request; captured: {captured_summary:?}"
+    );
+}
+
+#[test]
+fn background_true_is_forwarded_through_irr_to_openai_provider() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, r#"{"id":"resp_background","status":"queued"}"#.to_owned()),
+        (200, r#"{"id":"resp_background","status":"completed"}"#.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = irr_background_yaml(proxy_port, backend.port(), "openai");
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","background":true}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200, "OpenAI IRR request should be forwarded");
+    let get = format!(
+        "GET /v1/responses/resp_background HTTP/1.1\r\n\
+         Host: localhost:{proxy_port}\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    let poll = http_send(proxy.addr(), &get);
+    assert_eq!(parse_status(&poll), 200, "OpenAI IRR polling should be forwarded");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&parse_body(&poll)).unwrap()["status"],
+        "completed"
+    );
+    let captured = backend.requests();
+    assert!(
+        captured
+            .iter()
+            .any(|request| request.method == "POST" && request.uri == "/v1/responses" && request.body == body),
+        "OpenAI IRR step should receive the unchanged background request"
+    );
+    assert!(
+        captured
+            .iter()
+            .any(|request| request.method == "GET" && request.uri == "/v1/responses/resp_background"),
+        "OpenAI IRR polling must reach the same lifecycle owner"
+    );
+}
+
+#[cfg(feature = "store-sqlite")]
+#[test]
+fn background_true_is_rejected_when_local_store_owns_retrieval() {
+    let backend = StatefulCapturingBackend::new(vec![(200, r#"{"id":"unexpected"}"#.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = stored_background_yaml(proxy_port, backend.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","background":true}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "locally stored background request should be rejected"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["error"]["type"], "invalid_request_error");
+    assert_eq!(response["error"]["code"], "invalid_request_error");
+    assert!(response["error"]["param"].is_null());
+    assert_eq!(response["error"]["message"], "background mode is not supported");
+    let captured = backend.requests();
+    let captured_summary: Vec<_> = captured
+        .iter()
+        .map(|request| format!("{} {} {}", request.method, request.uri, request.body))
+        .collect();
+    assert!(
+        captured
+            .iter()
+            .all(|request| request.method != "POST" || request.uri != "/v1/responses"),
+        "local retrieval ownership must reject before forwarding the client request; captured: {captured_summary:?}"
     );
 }
 
@@ -1016,7 +1172,12 @@ insecure_options:
 }
 
 /// YAML config for branch-based routing using the background filter result.
-fn background_branch_yaml(proxy_port: u16, background_port: u16, default_port: u16) -> String {
+fn background_branch_yaml(
+    proxy_port: u16,
+    background_port: u16,
+    default_port: u16,
+    application_provider: &str,
+) -> String {
     format!(
         r#"
 listeners:
@@ -1027,6 +1188,7 @@ filter_chains:
   - name: main
     filters:
       - filter: openai_responses_format
+        background_mode: selected_upstream
         branch_chains:
           - name: background_branch
             on_result:
@@ -1052,8 +1214,124 @@ filter_chains:
             endpoints:
               - "127.0.0.1:{default_port}"
           - name: "background"
+            http:
+              application_provider: "{application_provider}"
             endpoints:
               - "127.0.0.1:{background_port}"
+      - filter: openai_responses_proxy
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
+
+/// YAML config routing create and lifecycle operations to one OpenAI owner.
+fn openai_background_lifecycle_yaml(proxy_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+        background_mode: selected_upstream
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: "openai"
+      - filter: load_balancer
+        clusters:
+          - name: "openai"
+            http:
+              application_provider: "openai"
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+      - filter: openai_responses_proxy
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
+
+/// YAML config proving that background policy crosses into an IRR step.
+fn irr_background_yaml(proxy_port: u16, backend_port: u16, application_provider: &str) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+        background_mode: selected_upstream
+      - filter: openai_responses_validate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference"
+                    http:
+                      application_provider: "{application_provider}"
+                    endpoints:
+                      - "127.0.0.1:{backend_port}"
+              - filter: openai_responses_proxy
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
+
+/// YAML config proving that local retrieval ownership blocks background mode.
+#[cfg(feature = "store-sqlite")]
+fn stored_background_yaml(proxy_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+        background_mode: selected_upstream
+      - filter: openai_responses_validate
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "openai"
+      - filter: load_balancer
+        clusters:
+          - name: "openai"
+            http:
+              application_provider: "openai"
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+      - filter: openai_responses_proxy
 insecure_options:
   allow_private_endpoints: true
 "#
