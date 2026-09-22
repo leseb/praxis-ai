@@ -53,6 +53,7 @@ fn mode_branch_rejects_background_for_non_openai_upstream() {
         proxy_port,
         stateful_guard.port(),
         default_guard.port(),
+        true,
     ))
     .unwrap();
     let proxy = start_proxy(&config);
@@ -89,7 +90,8 @@ fn mode_branch_stateless_body_not_mutated() {
     let stateful_guard = start_backend_with_shutdown("stateful-path");
     let proxy_port = free_port();
 
-    let config = Config::from_yaml(&mode_branch_yaml(proxy_port, stateful_guard.port(), echo_guard.port())).unwrap();
+    let config =
+        Config::from_yaml(&mode_branch_yaml(proxy_port, stateful_guard.port(), echo_guard.port(), false)).unwrap();
 
     let proxy = start_proxy(&config);
 
@@ -114,6 +116,7 @@ fn mode_branch_chat_completions_skips_branch() {
         proxy_port,
         stateful_guard.port(),
         stateless_guard.port(),
+        false,
     ))
     .unwrap();
 
@@ -144,6 +147,7 @@ fn assert_routes_to(expected_backend: &str, label: &str, body: &str) {
         proxy_port,
         stateful_guard.port(),
         stateless_guard.port(),
+        false,
     ))
     .unwrap();
 
@@ -164,7 +168,24 @@ fn assert_routes_to(expected_backend: &str, label: &str, body: &str) {
 /// Stateful requests (mode=stateful) enter the branch chain and route
 /// to `stateful_port`. Stateless requests (mode=stateless) or
 /// non-Responses requests fall through to `default_port`.
-fn mode_branch_yaml(proxy_port: u16, stateful_port: u16, default_port: u16) -> String {
+///
+/// When `enforce_background` is set, opts into `background_mode:
+/// selected_upstream` and appends `openai_responses_proxy` after the load
+/// balancer so background policy is enforced against the selected upstream.
+/// Mode-classification routing tests leave it unset: the proxy also rejects
+/// non-null `prompt` templates for non-OpenAI upstreams, which would otherwise
+/// mask the routing assertions.
+fn mode_branch_yaml(proxy_port: u16, stateful_port: u16, default_port: u16, enforce_background: bool) -> String {
+    let background_mode_line = if enforce_background {
+        "        background_mode: selected_upstream\n"
+    } else {
+        ""
+    };
+    let proxy_filter_line = if enforce_background {
+        "      - filter: openai_responses_proxy\n"
+    } else {
+        ""
+    };
     format!(
         r#"
 listeners:
@@ -176,8 +197,7 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-        background_mode: selected_upstream
-        branch_chains:
+{background_mode_line}        branch_chains:
           - name: stateful_branch
             on_result:
               filter: openai_responses_format
@@ -204,8 +224,7 @@ filter_chains:
           - name: "stateful"
             endpoints:
               - "127.0.0.1:{stateful_port}"
-      - filter: openai_responses_proxy
-insecure_options:
+{proxy_filter_line}insecure_options:
   allow_private_endpoints: true
 "#
     )
