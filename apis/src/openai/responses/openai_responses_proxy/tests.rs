@@ -273,6 +273,7 @@ async fn background_true_is_rejected_for_openai_hostname_without_provider() {
 }
 
 #[tokio::test]
+#[cfg(feature = "store")]
 async fn local_response_store_rejects_background() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");

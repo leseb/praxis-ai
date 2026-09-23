@@ -191,6 +191,7 @@ pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 /// subsequent polling would be intercepted by the local snapshot store instead
 /// of reaching the provider that owns the asynchronous lifecycle.
 #[derive(Debug)]
+#[cfg(feature = "store")]
 pub(crate) struct LocalResponseStoreConfigured;
 
 /// Legacy test tenant value retained for fixture compatibility.

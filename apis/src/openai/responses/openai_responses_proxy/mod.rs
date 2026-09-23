@@ -53,10 +53,9 @@ use serde::{
 use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
-use super::{
-    LocalResponseStoreConfigured, body_limits::reject_rewritten_body_too_large, error::responses_error_rejection,
-    state::ResponsesState,
-};
+#[cfg(feature = "store")]
+use super::LocalResponseStoreConfigured;
+use super::{body_limits::reject_rewritten_body_too_large, error::responses_error_rejection, state::ResponsesState};
 use crate::{classifier::is_responses_create, json_body::SerializedJson};
 
 // -----------------------------------------------------------------------------
@@ -153,7 +152,10 @@ impl ResponsesProxyFilter {
             return None;
         }
 
+        #[cfg(feature = "store")]
         let local_store_owns_retrieval = ctx.extensions.get::<LocalResponseStoreConfigured>().is_some();
+        #[cfg(not(feature = "store"))]
+        let local_store_owns_retrieval = false;
         if local_store_owns_retrieval || !is_openai_provider(ctx.selected_application_provider()) {
             debug!("rejecting unsupported Responses background mode");
             return Some(FilterAction::Reject(responses_error_rejection(
