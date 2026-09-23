@@ -7,9 +7,10 @@
 //!
 //! The manifest (`docs/architecture/cryptographic-inventory.yaml`) is the stable
 //! inventory backing `docs/architecture/cryptographic-inventory.md`. This check
-//! resolves the runtime graph of the profile of record —
+//! resolves the runtime graph of the profile of record (the shipped production
+//! artifact, `PRAXIS_AI_FEATURES ?= full`) —
 //! `cargo tree -p praxis-ai-proxy --edges normal --no-default-features
-//! --features store-postgres --target <triple>` — on all three tier-1 targets,
+//! --features full --target <triple>` — on all three tier-1 targets,
 //! so the result is host-independent and CI validates the macOS/Windows
 //! declarations even though it runs on Linux. It fails when the manifest and the
 //! resolved graphs disagree, so:
@@ -20,8 +21,9 @@
 //!   `watch_tokens` when one appears);
 //! * a `production` entry cannot go unclassified (missing/unknown `disposition`);
 //! * a pinned provider cannot drift its version, gain a forbidden feature, or lose a required one while the crate name
-//!   stays put (e.g. `aws-lc-rs` gaining `fips`, `rustls` losing `ring`); unlisted features are permitted by design,
-//!   since feature sets grow across patch releases and an exact-set pin would churn on benign additions;
+//!   stays put (e.g. `aws-lc-rs` gaining `fips`, `rustls` regaining `ring`, or `openssl` gaining `vendored`); unlisted
+//!   features are permitted by design, since feature sets grow across patch releases and an exact-set pin would churn
+//!   on benign additions;
 //! * a proc-macro crate (build-host code generator, present under `--edges normal` but not linked into the shipped
 //!   binary — e.g. `zeroize_derive`) cannot be misfiled as runtime-binary content, and a runtime crate cannot hide in
 //!   the build-host `proc_macro` bucket;
@@ -643,7 +645,7 @@ const TREE_ARGS: [&str; 12] = [
     "normal",
     "--no-default-features",
     "--features",
-    "store-postgres",
+    "full",
     "--prefix",
     "depth",
     "--format",

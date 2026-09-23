@@ -5,9 +5,10 @@
 # The prose companion is cryptographic-inventory.md; keep them in sync.
 #
 # Verified by `cargo xtask check-crypto-inventory` (run from `make lint`), which
-# resolves the runtime graph of the profile of record:
+# resolves the runtime graph of the profile of record (the shipped production
+# artifact, `PRAXIS_AI_FEATURES ?= full`):
 #   cargo tree -p praxis-ai-proxy --edges normal \
-#     --no-default-features --features store-postgres --target <triple>
+#     --no-default-features --features full --target <triple>
 # on all three tier-1 targets (x86_64-unknown-linux-gnu, aarch64-apple-darwin,
 # x86_64-pc-windows-msvc), so the result is host-independent and CI validates the
 # macOS/Windows declarations even though it runs on Linux. It fails if:
@@ -173,19 +174,19 @@ watch_tokens:
 # Crypto and crypto-support crates expected in the runtime binary.
 # disposition: validated | non-validated | needs-remediation | n-a | upstream-owned
 production:
-  # --- Transport TLS providers & rustls stack (all execute on `ring`, R1) ---
-  - crate: ring
-    disposition: needs-remediation
-    note: Process-default rustls provider (installed by quixotic-plecostomus-rustls at server start). Executes all data-plane/callout/redis TLS. R1.
+  # --- Transport TLS providers & rustls stack (all execute on OpenSSL, T1) ---
+  - crate: quixotic-plecostomus-rustls-openssl
+    disposition: non-validated
+    note: rustls CryptoProvider adapter (library name `rustls_openssl`) routing all rustls TLS onto OpenSSL libcrypto; installed as the process-default provider by praxis-proxy-tls at start-up (T1). Executes every data-plane/callout/listener TLS primitive.
   - crate: aws-lc-rs
     disposition: non-validated
-    note: Linked via the rustls aws-lc-rs feature but only executes for JWT verify (A1); built WITHOUT the `fips` feature. R1/R2.
+    note: Compiled via the rustls `aws-lc-rs` feature (forced by reqwest) and by jsonwebtoken, but NOT the TLS provider — OpenSSL is. Its only runtime crypto execution is JWT verify (A1); built WITHOUT the `fips` feature.
   - crate: aws-lc-sys
     disposition: non-validated
-    note: C implementation backing aws-lc-rs.
+    note: C implementation backing aws-lc-rs (JWT verify only).
   - crate: rustls
     disposition: non-validated
-    note: TLS 1.2/1.3 core; runs on ring (T2/T4).
+    note: TLS 1.2/1.3 core; the Pingora fork enables `custom-provider` so there is no built-in provider fallback, and it runs on the installed OpenSSL provider (T1/T2/T4).
   - crate: rustls-webpki
     disposition: non-validated
     note: X.509 chain and signature verification (C1/C2).
@@ -213,12 +214,10 @@ production:
     note: PostgreSQL store TLS backend (A10); platform-native stack. #1217 / R4.
   - crate: openssl
     disposition: non-validated
-    platform: linux
-    note: native-tls backend on Linux (A10). #1217.
+    note: libcrypto binding — backs BOTH the rustls OpenSSL provider on all targets (T1-T9, via quixotic-plecostomus-rustls-openssl) AND the native-tls PostgreSQL store backend on Linux (A10). System libcrypto is the intended FIPS-validated module. #1217.
   - crate: openssl-sys
     disposition: non-validated
-    platform: linux
-    note: OpenSSL C bindings for native-tls on Linux.
+    note: OpenSSL C bindings for the rustls OpenSSL provider (all targets) and the Linux native-tls backend. Built against system libcrypto (OPENSSL_NO_VENDOR=1 in the FIPS image).
   - crate: security-framework
     disposition: non-validated
     platform: macos
@@ -321,7 +320,7 @@ production:
     note: Constant-time comparison primitives — used transitively by rustls, and by the optional Basic Auth builtin's credential compare (A12) when the non-default `basic-auth-filter` feature is enabled.
   - crate: untrusted
     disposition: n-a
-    note: ring's safe input parser (support).
+    note: Safe input parser (support); enters via aws-lc-rs and rustls-webpki (ring is absent from the graph).
   # --- Secret handling / SASLprep ---
   - crate: stringprep
     disposition: n-a
@@ -349,13 +348,13 @@ allow:
   - crate: openssl-probe
     note: Locates the system CA-bundle path; performs no crypto.
   - crate: spin
-    note: Spinlock library (ring dependency); not cryptographic.
+    note: Spinlock library (pulled by the regorus policy engine); not cryptographic.
   - crate: praxis-policy-plugin-identity-jwt
     note: praxis-core JWT caller plugin; the primitive executes in aws-lc-rs (A1).
   - crate: praxis-proxy-tls
-    note: praxis-core TLS setup wrapper; the primitive is rustls/ring (T4).
+    note: praxis-core TLS setup wrapper; installs the OpenSSL rustls provider (rustls_openssl) as the process default — the primitive is rustls/OpenSSL (T1).
   - crate: quixotic-plecostomus-rustls
-    note: Pingora rustls wrapper; installs the ring provider, the primitive is rustls/ring (T1).
+    note: Pingora rustls wrapper; installs NO provider and enables rustls `custom-provider` (no built-in fallback); the installed provider is the OpenSSL adapter, so the primitive is rustls/OpenSSL (T1).
 
 # Crypto that must NEVER appear in the runtime binary graph (--edges normal).
 # dev-dependency only.
@@ -401,8 +400,7 @@ proc_macro:
   - crate: aws-smithy-runtime-api-macros
     note: AWS SDK runtime-API macros (no crypto). Build-host code generator.
   - crate: openssl-macros
-    platform: linux
-    note: OpenSSL derive macros (Linux native-tls backend); no crypto. Build-host code generator.
+    note: OpenSSL derive macros (rustls OpenSSL provider on all targets + Linux native-tls backend); no crypto. Build-host code generator.
 
 # Load-bearing provider crates whose VERSION and security-relevant FEATURES are
 # pinned so the provider-selection findings in the prose cannot rot while the
@@ -410,20 +408,27 @@ proc_macro:
 # `forbid_features` entry absent on each target where the crate appears; other
 # (unlisted) features are permitted, since feature sets grow across patch releases
 # and exact-set pinning would churn on benign additions. A provider with no
-# constraints (e.g. `ring`) pins only its version.
+# constraints (e.g. `native-tls`) pins only its version.
 providers:
-  - crate: ring
-    version: "0.17.14"
-    note: Process-default rustls provider; executes all data-plane/callout TLS (T1-T9).
+  - crate: quixotic-plecostomus-rustls-openssl
+    version: "0.4.1"
+    require_features: [tls12]
+    forbid_features: [fips]
+    note: The installed process-default rustls provider (library `rustls_openssl`); routes all rustls TLS onto OpenSSL libcrypto (T1-T9). FIPS is host-activated, not this build feature — the crate's `fips` feature is a no-op and MUST stay unset.
+  - crate: openssl
+    version: "0.10.81"
+    forbid_features: [vendored]
+    note: libcrypto binding backing the rustls OpenSSL provider (all targets) and the Linux native-tls store backend. MUST NOT gain `vendored` — the validated module is the system libcrypto (OPENSSL_NO_VENDOR=1), not a bundled build.
   - crate: aws-lc-rs
     version: "1.18.1"
     require_features: [aws-lc-sys]
     forbid_features: [fips]
-    note: JWT-verify only today (A1). MUST NOT gain `fips` silently — that would change the compliance story; R2 would add it deliberately.
+    note: NOT the TLS provider (OpenSSL is); executes only JWT verify (A1). MUST NOT gain `fips` silently — that would misrepresent the compliance story.
   - crate: rustls
     version: "0.23.45"
-    require_features: [ring, aws_lc_rs]
-    note: Compiled with BOTH providers; `ring` wins at runtime via install_default (T2/T4).
+    require_features: [custom-provider]
+    forbid_features: [ring]
+    note: The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; `ring` MUST stay absent. The `aws-lc-rs` feature is also compiled (forced by reqwest) but is not the TLS executor.
   - crate: jsonwebtoken
     version: "11.1.0"
     require_features: [aws_lc_rs]
