@@ -14,11 +14,6 @@
 //! discriminator is a Responses request rather than unknown JSON. A
 //! `GET /v1/responses` `WebSocket` upgrade is classified from the method,
 //! path, and upgrade headers without inferring body-derived facts.
-//! Rejects `background=true` by default. With `background_mode:
-//! selected_upstream`, publishes the request intent so a downstream
-//! `openai_responses_proxy` can reject upstreams other than OpenAI and local
-//! response-store retrieval, where Praxis cannot preserve the asynchronous
-//! Responses lifecycle.
 //! Promotes classification facts to configurable headers, durable
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
@@ -120,7 +115,7 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use self::config::{BackgroundModePolicy, ResponsesFormatConfig, build_config};
+use self::config::{ResponsesFormatConfig, build_config};
 use crate::{
     classifier::{
         AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_create,
@@ -198,14 +193,6 @@ pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 #[derive(Debug)]
 pub(crate) struct LocalResponseStoreConfigured;
 
-/// Request-scoped background intent shared with nested routing pipelines.
-///
-/// Unlike descriptive filter metadata, request extensions cross IRR step
-/// boundaries, allowing the selected-upstream policy to run inside the step
-/// that owns the concrete load-balancer selection.
-#[derive(Debug)]
-pub(crate) struct BackgroundModeRequested;
-
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
 #[cfg(all(
@@ -241,14 +228,6 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// and mode facts remain absent. An ordinary bodyless `GET /v1/responses`
 /// remains unclassified.
 ///
-/// Requests with `background=true` are rejected by default. With
-/// `background_mode: selected_upstream`, they are published as routing metadata
-/// for a downstream `openai_responses_proxy`. When ordered after upstream
-/// selection, that filter rejects destinations that cannot own the asynchronous
-/// Responses lifecycle and routes backed by the local response store.
-/// Retrieval and cancellation routes must select the same OpenAI lifecycle
-/// owner because those later requests do not repeat the `background` field.
-///
 /// Routing mode for supported Responses API requests: `stateful` when the
 /// request contains `previous_response_id`, non-empty `tools`, `store=true`
 /// (default when omitted), `conversation`, or `prompt.id`;
@@ -268,7 +247,6 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// ```yaml
 /// filter: openai_responses_format
 /// on_invalid: continue
-/// background_mode: selected_upstream
 /// headers:
 ///   format: x-praxis-ai-format
 ///   model: x-praxis-ai-model
@@ -341,10 +319,6 @@ impl HttpFilter for ResponsesFormatFilter {
         );
 
         if let Some(action) = handle_invalid_format(classified.format, &self.config) {
-            return Ok(action);
-        }
-
-        if let Some(action) = handle_background_mode(&classified, &self.config, ctx) {
             return Ok(action);
         }
 
@@ -437,28 +411,6 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
                 "invalid_request_error",
                 message,
             )))
-        },
-    }
-}
-
-/// Reject background mode or publish it for selected-upstream enforcement.
-fn handle_background_mode(
-    classified: &ClassifiedRequest,
-    config: &ResponsesFormatConfig,
-    ctx: &mut HttpFilterContext<'_>,
-) -> Option<FilterAction> {
-    if classified.format != AiRequestFormat::Responses || classified.background != Some(true) {
-        return None;
-    }
-    match config.background_mode {
-        BackgroundModePolicy::Reject => Some(FilterAction::Reject(error::responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "background mode is not supported",
-        ))),
-        BackgroundModePolicy::SelectedUpstream => {
-            ctx.extensions.insert(BackgroundModeRequested);
-            None
         },
     }
 }

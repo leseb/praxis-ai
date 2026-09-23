@@ -96,16 +96,14 @@ when any of these hold:
 - `has_conversation` is true
 - `has_prompt_id` is true
 
-`openai_responses_format` rejects `background: true` by default. Setting
-`background_mode: selected_upstream` publishes it as a routing fact instead.
-The downstream `openai_responses_proxy` rejects it after upstream selection
-unless the cluster's `application_provider` is `openai` or its address host
-is `api.openai.com`. Praxis does not implement the asynchronous Responses
-lifecycle for other upstreams. The proxy also rejects it when
+`openai_responses_proxy` detects `background: true` in the request body and
+rejects it after upstream selection unless the cluster's
+`application_provider` is `openai`. Praxis does not implement the asynchronous
+Responses lifecycle for other upstreams. The proxy also rejects it when
 `openai_response_store` owns retrieval, because local polling cannot observe
-OpenAI's asynchronous state transitions. Pipelines that enable selected-
-upstream background mode must therefore place `openai_responses_proxy` after
-the router and load balancer; an earlier proxy invocation fails closed.
+OpenAI's asynchronous state transitions. Pipelines that permit background mode
+must therefore place `openai_responses_proxy` after the router and load
+balancer; an earlier proxy invocation fails closed.
 
 Allowing the create request proves only that its selected destination
 can own background execution. Routes for later retrieval and

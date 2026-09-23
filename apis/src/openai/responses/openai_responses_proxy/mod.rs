@@ -54,8 +54,8 @@ use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
 use super::{
-    BackgroundModeRequested, LocalResponseStoreConfigured, body_limits::reject_rewritten_body_too_large,
-    error::responses_error_rejection, state::ResponsesState,
+    LocalResponseStoreConfigured, body_limits::reject_rewritten_body_too_large, error::responses_error_rejection,
+    state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::SerializedJson};
 
@@ -80,14 +80,13 @@ use crate::{classifier::is_responses_create, json_body::SerializedJson};
 /// order this filter after its router and load balancer. Missing or different
 /// application metadata fails closed.
 ///
-/// Requests classified with `background: true` are rejected unless the load
-/// balancer selected a cluster whose `application_provider` is `openai` or
-/// whose endpoint host is exactly `api.openai.com`. A configured local response
-/// store always causes rejection because local polling cannot observe OpenAI's
-/// asynchronous state transitions. Because cluster selection happens during
-/// the request-header phase, a pipeline that permits OpenAI background mode
-/// must order this filter after its router and load balancer. Missing or
-/// malformed selected-upstream identity fails closed.
+/// Requests with `background: true` are rejected unless the load balancer
+/// selected a cluster whose `application_provider` is `openai`. A configured
+/// local response store always causes rejection because local polling cannot
+/// observe OpenAI's asynchronous state transitions. Because cluster selection
+/// happens during the request-header phase, a pipeline that permits OpenAI
+/// background mode must order this filter after its router and load balancer.
+/// Missing selected-upstream identity fails closed.
 ///
 /// This filter always advertises the Praxis streaming capability. When the
 /// effective outbound body contains `"stream": true` it selects Praxis's
@@ -132,8 +131,8 @@ impl ResponsesProxyFilter {
     fn reject_prompt_for_non_openai_upstream(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
         let prompt_requested = ctx
             .extensions
-            .get::<PromptTemplateState>()
-            .is_some_and(|state| state.requested);
+            .get::<ProviderOwnedFeatureState>()
+            .is_some_and(|state| state.prompt_requested);
         (prompt_requested && !is_openai_responses_provider(ctx)).then(|| {
             debug!("rejecting prompt template for non-OpenAI Responses backend");
             FilterAction::Reject(responses_error_rejection(
@@ -146,12 +145,16 @@ impl ResponsesProxyFilter {
 
     /// Reject background execution when Praxis cannot preserve its lifecycle.
     fn reject_unsupported_background(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
-        ctx.extensions.get::<BackgroundModeRequested>()?;
+        let background_requested = ctx
+            .extensions
+            .get::<ProviderOwnedFeatureState>()
+            .is_some_and(|state| state.background_requested);
+        if !background_requested {
+            return None;
+        }
 
         let local_store_owns_retrieval = ctx.extensions.get::<LocalResponseStoreConfigured>().is_some();
-        if local_store_owns_retrieval
-            || !selected_upstream_supports_background(ctx.selected_application_provider(), ctx.upstream_addr())
-        {
+        if local_store_owns_retrieval || !is_openai_provider(ctx.selected_application_provider()) {
             debug!("rejecting unsupported Responses background mode");
             return Some(FilterAction::Reject(responses_error_rejection(
                 400,
@@ -256,11 +259,12 @@ impl HttpFilter for ResponsesProxyFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let prompt_requested =
-            is_responses_create(&ctx.request.method, ctx.request.uri.path()) && request_has_prompt_template(ctx, body);
-        ctx.extensions.insert(PromptTemplateState {
-            requested: prompt_requested,
-        });
+        let features = if is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+            request_provider_owned_features(ctx, body)
+        } else {
+            ProviderOwnedFeatureState::default()
+        };
+        ctx.extensions.insert(features);
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
@@ -297,26 +301,29 @@ struct EffectiveResponseMode {
     stream: bool,
 }
 
-/// Allocation-free result of validating a request while locating `prompt`.
-struct PromptTemplateProbe {
+/// Provider-owned request features found without retaining their values.
+#[derive(Default)]
+struct ProviderOwnedFeatureState {
     /// Whether at least one top-level `prompt` value was non-null.
-    present: bool,
+    prompt_requested: bool,
+    /// Whether at least one top-level `background` value was `true`.
+    background_requested: bool,
 }
 
-impl<'de> Deserialize<'de> for PromptTemplateProbe {
+impl<'de> Deserialize<'de> for ProviderOwnedFeatureState {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(PromptTemplateProbeVisitor)
+        deserializer.deserialize_map(ProviderOwnedFeatureVisitor)
     }
 }
 
 /// Streaming visitor that validates the full object without retaining values.
-struct PromptTemplateProbeVisitor;
+struct ProviderOwnedFeatureVisitor;
 
-impl<'de> Visitor<'de> for PromptTemplateProbeVisitor {
-    type Value = PromptTemplateProbe;
+impl<'de> Visitor<'de> for ProviderOwnedFeatureVisitor {
+    type Value = ProviderOwnedFeatureState;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a Responses request object")
@@ -326,43 +333,53 @@ impl<'de> Visitor<'de> for PromptTemplateProbeVisitor {
     where
         A: MapAccess<'de>,
     {
-        let mut present = false;
-        while let Some(field) = map.next_key::<PromptTemplateField>()? {
+        let mut prompt_requested = false;
+        let mut background_requested = false;
+        while let Some(field) = map.next_key::<ProviderOwnedFeatureField>()? {
             match field {
-                PromptTemplateField::Prompt => {
-                    present |= map.next_value::<Option<IgnoredAny>>()?.is_some();
+                ProviderOwnedFeatureField::Prompt => {
+                    prompt_requested |= map.next_value::<Option<IgnoredAny>>()?.is_some();
                 },
-                PromptTemplateField::Other => {
+                ProviderOwnedFeatureField::Background => {
+                    let value = map.next_value::<&serde_json::value::RawValue>()?;
+                    background_requested |= value.get() == "true";
+                },
+                ProviderOwnedFeatureField::Other => {
                     map.next_value::<IgnoredAny>()?;
                 },
             }
         }
-        Ok(PromptTemplateProbe { present })
+        Ok(ProviderOwnedFeatureState {
+            prompt_requested,
+            background_requested,
+        })
     }
 }
 
 /// Top-level field discriminator that never retains field names.
-enum PromptTemplateField {
+enum ProviderOwnedFeatureField {
     /// The OpenAI-managed prompt template field.
     Prompt,
+    /// The OpenAI-owned asynchronous execution field.
+    Background,
     /// Every other request field.
     Other,
 }
 
-impl<'de> Deserialize<'de> for PromptTemplateField {
+impl<'de> Deserialize<'de> for ProviderOwnedFeatureField {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_identifier(PromptTemplateFieldVisitor)
+        deserializer.deserialize_identifier(ProviderOwnedFeatureFieldVisitor)
     }
 }
 
 /// Borrowing visitor for the top-level field discriminator.
-struct PromptTemplateFieldVisitor;
+struct ProviderOwnedFeatureFieldVisitor;
 
-impl Visitor<'_> for PromptTemplateFieldVisitor {
-    type Value = PromptTemplateField;
+impl Visitor<'_> for ProviderOwnedFeatureFieldVisitor {
+    type Value = ProviderOwnedFeatureField;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a JSON object field")
@@ -372,18 +389,12 @@ impl Visitor<'_> for PromptTemplateFieldVisitor {
     where
         E: serde::de::Error,
     {
-        Ok(if v == "prompt" {
-            PromptTemplateField::Prompt
-        } else {
-            PromptTemplateField::Other
+        Ok(match v {
+            "prompt" => ProviderOwnedFeatureField::Prompt,
+            "background" => ProviderOwnedFeatureField::Background,
+            _ => ProviderOwnedFeatureField::Other,
         })
     }
-}
-
-/// Prompt presence captured during body pre-read for header-phase validation.
-struct PromptTemplateState {
-    /// Whether the canonical request carries a non-null `prompt`.
-    requested: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -399,17 +410,27 @@ struct PromptTemplateState {
 /// prompt templates: it cannot carry a prompt that a strict OpenAI-compatible
 /// backend would parse and honor, and rejecting a malformed request belongs to
 /// normal request validation, not this prompt-template guard.
+#[cfg(test)]
 fn raw_request_has_prompt(body: &[u8]) -> bool {
-    serde_json::from_slice::<PromptTemplateProbe>(body).is_ok_and(|probe| probe.present)
+    serde_json::from_slice::<ProviderOwnedFeatureState>(body).is_ok_and(|features| features.prompt_requested)
 }
 
-/// Whether the canonical or passthrough request carries a non-null `prompt`.
-fn request_has_prompt_template(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> bool {
+/// Locate provider-owned fields in the canonical or passthrough request.
+fn request_provider_owned_features(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> ProviderOwnedFeatureState {
     if let Some(state) = ctx.extensions.get::<ResponsesState>() {
-        return state.request_body.get("prompt").is_some_and(|prompt| !prompt.is_null());
+        return ProviderOwnedFeatureState {
+            prompt_requested: state.request_body.get("prompt").is_some_and(|prompt| !prompt.is_null()),
+            background_requested: state
+                .request_body
+                .get("background")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
+        };
     }
 
-    body.as_deref().is_some_and(raw_request_has_prompt)
+    body.as_deref()
+        .and_then(|body| serde_json::from_slice(body).ok())
+        .unwrap_or_default()
 }
 
 /// Whether the selected cluster explicitly supports OpenAI Responses behavior.
@@ -418,21 +439,9 @@ fn is_openai_responses_provider(ctx: &HttpFilterContext<'_>) -> bool {
         && ctx.selected_application_provider() == Some("openai")
 }
 
-/// Whether either selected-upstream identity permits background execution.
-fn selected_upstream_supports_background(provider: Option<&str>, address: Option<&str>) -> bool {
-    is_openai_provider(provider) || is_openai_api_address(address)
-}
-
 /// Whether the selected cluster explicitly identifies OpenAI as its provider.
 fn is_openai_provider(provider: Option<&str>) -> bool {
     provider.is_some_and(|provider| provider.eq_ignore_ascii_case("openai"))
-}
-
-/// Whether the selected upstream address has the exact OpenAI API hostname.
-fn is_openai_api_address(address: Option<&str>) -> bool {
-    address
-        .and_then(|address| address.parse::<http::uri::Authority>().ok())
-        .is_some_and(|authority| authority.host().eq_ignore_ascii_case("api.openai.com"))
 }
 
 /// Align the typed Praxis response mode with the effective serialized request.

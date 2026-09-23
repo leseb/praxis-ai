@@ -230,7 +230,12 @@ async fn background_true_is_rejected_without_selected_openai_upstream() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.extensions.insert(super::super::BackgroundModeRequested);
+    let mut body = Some(Bytes::from_static(br#"{"background":true}"#));
+    let body_action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(body_action, FilterAction::Continue),
+        "body pre-read should capture background intent"
+    );
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -244,11 +249,16 @@ async fn background_true_is_rejected_without_selected_openai_upstream() {
 }
 
 #[tokio::test]
-async fn background_true_is_allowed_for_exact_openai_api_address() {
+async fn background_true_is_rejected_for_openai_hostname_without_provider() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.extensions.insert(super::super::BackgroundModeRequested);
+    let mut body = Some(Bytes::from_static(br#"{"background":true}"#));
+    let body_action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(body_action, FilterAction::Continue),
+        "body pre-read should capture background intent"
+    );
     ctx.upstream = Some(praxis_core::connectivity::Upstream {
         address: std::sync::Arc::from("API.OPENAI.COM:443"),
         authority: None,
@@ -257,25 +267,23 @@ async fn background_true_is_allowed_for_exact_openai_api_address() {
     });
 
     assert!(
-        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
-        "the exact OpenAI API host should permit background mode"
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(rejection) if rejection.status == 400),
+        "an endpoint hostname must not prove OpenAI provider capability"
     );
 }
 
 #[tokio::test]
-async fn local_response_store_rejects_background_for_openai_address() {
+async fn local_response_store_rejects_background() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.extensions.insert(super::super::BackgroundModeRequested);
+    let mut body = Some(Bytes::from_static(br#"{"background":true}"#));
+    let body_action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(body_action, FilterAction::Continue),
+        "body pre-read should capture background intent"
+    );
     ctx.extensions.insert(super::super::LocalResponseStoreConfigured);
-    ctx.upstream = Some(praxis_core::connectivity::Upstream {
-        address: std::sync::Arc::from("api.openai.com:443"),
-        authority: None,
-        connection: std::sync::Arc::new(praxis_core::connectivity::ConnectionOptions::default()),
-        tls: None,
-    });
-
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(rejection) if rejection.status == 400),
         "local retrieval ownership must reject provider-owned background state"
@@ -283,28 +291,11 @@ async fn local_response_store_rejects_background_for_openai_address() {
 }
 
 #[test]
-fn background_support_requires_openai_provider_or_exact_address() {
-    assert!(super::selected_upstream_supports_background(
-        Some("openai"),
-        Some("127.0.0.1:443")
-    ));
-    assert!(super::selected_upstream_supports_background(
-        Some("vllm"),
-        Some("api.openai.com:443")
-    ));
-    assert!(super::selected_upstream_supports_background(
-        Some("OPENAI"),
-        Some("API.OPENAI.COM:443")
-    ));
-    assert!(!super::selected_upstream_supports_background(
-        Some("vllm"),
-        Some("api.openai.com.example:443")
-    ));
-    assert!(!super::selected_upstream_supports_background(
-        None,
-        Some("127.0.0.1:443")
-    ));
-    assert!(!super::selected_upstream_supports_background(None, None));
+fn background_support_requires_openai_provider() {
+    assert!(super::is_openai_provider(Some("openai")));
+    assert!(super::is_openai_provider(Some("OPENAI")));
+    assert!(!super::is_openai_provider(Some("vllm")));
+    assert!(!super::is_openai_provider(None));
 }
 
 #[tokio::test]

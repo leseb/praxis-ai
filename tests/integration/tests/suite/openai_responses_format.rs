@@ -1188,7 +1188,6 @@ filter_chains:
   - name: main
     filters:
       - filter: openai_responses_format
-        background_mode: selected_upstream
         branch_chains:
           - name: background_branch
             on_result:
@@ -1237,7 +1236,6 @@ filter_chains:
   - name: main
     filters:
       - filter: openai_responses_format
-        background_mode: selected_upstream
       - filter: router
         routes:
           - path_prefix: "/v1/responses"
@@ -1268,7 +1266,6 @@ filter_chains:
   - name: main
     filters:
       - filter: openai_responses_format
-        background_mode: selected_upstream
       - filter: openai_responses_validate
       - filter: iterative_request_router
         initial_step: inference
@@ -1310,7 +1307,6 @@ filter_chains:
   - name: main
     filters:
       - filter: openai_responses_format
-        background_mode: selected_upstream
       - filter: openai_responses_validate
       - filter: state_owner
         mode: single_tenant

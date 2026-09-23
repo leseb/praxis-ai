@@ -7,7 +7,7 @@ Validates and enriches Responses API requests.
 
 ## Configuration Notes
 
-Parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct or validate other provider-owned parameter combinations. The preceding classifier rejects `background=true` by default. With `background_mode: selected_upstream`, it publishes the request intent for a downstream `openai_responses_proxy`, ordered after upstream selection, to enforce whether the selected provider can own that asynchronous lifecycle.
+Parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct or validate other provider-owned parameter combinations. A downstream `openai_responses_proxy`, ordered after upstream selection, detects `background=true` and enforces whether the selected provider can own that asynchronous lifecycle.
 
 Must be placed after `openai_responses_format` in the filter chain. Skips non-Responses API requests (those not classified as `openai_responses`).
 

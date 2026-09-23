@@ -7,22 +7,6 @@ use praxis_filter::{FilterError, builtins::http::payload_processing::OnInvalidBe
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
-// Behavior Enums
-// -----------------------------------------------------------------------------
-
-/// Policy for Responses requests that set `background: true`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BackgroundModePolicy {
-    /// Reject background mode before routing, preserving the safe default.
-    #[default]
-    Reject,
-
-    /// Defer the decision to `openai_responses_proxy` after upstream selection.
-    SelectedUpstream,
-}
-
-// -----------------------------------------------------------------------------
 // ResponsesFormatHeaders
 // -----------------------------------------------------------------------------
 
@@ -129,13 +113,6 @@ pub(crate) struct ResponsesFormatConfig {
     #[serde(default = "OnInvalidBehavior::default_continue")]
     pub on_invalid: OnInvalidBehavior,
 
-    /// Policy for Responses requests that set `background: true`.
-    ///
-    /// `selected_upstream` requires `openai_responses_proxy` after the router
-    /// and load balancer, including inside each iterative-router step.
-    #[serde(default)]
-    pub background_mode: BackgroundModePolicy,
-
     /// Header names for promoted classification facts.
     ///
     /// Must not be hop-by-hop, framing, Host, credential, API-key, or
@@ -198,7 +175,6 @@ mod tests {
         let cfg: ResponsesFormatConfig = serde_yaml::from_str("{}").unwrap();
 
         assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
-        assert_eq!(cfg.background_mode, BackgroundModePolicy::Reject);
     }
 
     #[test]
@@ -245,7 +221,6 @@ extra: true
     fn build_config_invalid_header_name_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("not a valid header!".into()),
                 model: default_model_header(),
@@ -264,7 +239,6 @@ extra: true
     fn build_config_valid_custom_headers_ok() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-custom-format".into()),
                 model: Some("x-custom-model".into()),
@@ -279,7 +253,6 @@ extra: true
     fn build_config_authorization_header_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: default_format_header(),
                 model: Some("authorization".into()),
@@ -298,7 +271,6 @@ extra: true
     fn build_config_api_key_header_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: default_format_header(),
                 model: Some("x-api-key".into()),
@@ -317,7 +289,6 @@ extra: true
     fn build_config_unrelated_internal_header_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-praxis-route".into()),
                 model: default_model_header(),
@@ -336,7 +307,6 @@ extra: true
     fn build_config_model_header_rejects_format_routing_fact() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: default_format_header(),
                 model: Some("x-praxis-ai-format".into()),
@@ -355,7 +325,6 @@ extra: true
     fn build_config_format_header_rejects_model_rewrite_fact() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-praxis-ai-effective-model".into()),
                 model: default_model_header(),
@@ -374,7 +343,6 @@ extra: true
     fn build_config_accepts_dedicated_defaults() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders::default(),
         };
         assert!(
@@ -387,7 +355,6 @@ extra: true
     fn build_config_rejects_duplicate_promotion_headers() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            background_mode: BackgroundModePolicy::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-foo".into()),
                 model: Some("X-Foo".into()),

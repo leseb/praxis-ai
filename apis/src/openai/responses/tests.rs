@@ -27,7 +27,6 @@ fn full_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 on_invalid: reject
-background_mode: selected_upstream
 headers:
   format: x-custom-format
   model: x-custom-model
@@ -56,20 +55,6 @@ fn on_invalid_reject_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("on_invalid: reject").unwrap();
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
     assert_eq!(filter.name(), "openai_responses_format", "reject mode should parse");
-}
-
-#[test]
-fn selected_upstream_background_mode_parses() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("background_mode: selected_upstream").unwrap();
-    let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_responses_format");
-}
-
-#[test]
-fn unknown_background_mode_is_rejected() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("background_mode: allow").unwrap();
-    let result = ResponsesFormatFilter::from_config(&yaml);
-    assert!(result.is_err(), "unknown background policy should be rejected");
 }
 
 #[test]
@@ -952,27 +937,13 @@ async fn mode_stateful_when_tools_present() {
 }
 
 #[tokio::test]
-async fn background_true_is_classified_before_upstream_selection() {
-    let ctx = run_filter(
-        "background_mode: selected_upstream",
-        r#"{"input":"test","store":false,"background":true}"#,
-    )
-    .await;
+async fn background_true_is_published_as_classification_metadata() {
+    let ctx = run_filter("{}", r#"{"input":"test","store":false,"background":true}"#).await;
     assert_eq!(
         ctx.get_metadata("openai_responses_format.background"),
         Some("true"),
-        "the classifier must publish background intent for the post-routing proxy policy"
+        "the classifier must publish background intent for routing"
     );
-    assert!(
-        ctx.extensions.get::<BackgroundModeRequested>().is_some(),
-        "background intent must cross nested routing boundaries as a request extension"
-    );
-}
-
-#[tokio::test]
-async fn background_true_is_rejected_by_default() {
-    let action = run_filter_raw("{}", r#"{"input":"test","background":true}"#).await;
-    assert!(matches!(action, FilterAction::Reject(_)));
 }
 
 #[tokio::test]

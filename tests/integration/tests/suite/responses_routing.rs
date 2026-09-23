@@ -174,18 +174,12 @@ fn assert_routes_to(expected_backend: &str, label: &str, body: &str) {
 /// to `stateful_port`. Stateless requests (mode=stateless) or
 /// non-Responses requests fall through to `default_port`.
 ///
-/// When `enforce_background` is set, opts into `background_mode:
-/// selected_upstream` and appends `openai_responses_proxy` after the load
-/// balancer so background policy is enforced against the selected upstream.
+/// When `enforce_background` is set, appends `openai_responses_proxy` after
+/// the load balancer so background policy is enforced against the selected upstream.
 /// Mode-classification routing tests leave it unset: the proxy also rejects
 /// non-null `prompt` templates for non-OpenAI upstreams, which would otherwise
 /// mask the routing assertions.
 fn mode_branch_yaml(proxy_port: u16, stateful_port: u16, default_port: u16, enforce_background: bool) -> String {
-    let background_mode_line = if enforce_background {
-        "        background_mode: selected_upstream\n"
-    } else {
-        ""
-    };
     let proxy_filter_line = if enforce_background {
         "      - filter: openai_responses_proxy\n"
     } else {
@@ -202,7 +196,7 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-{background_mode_line}        branch_chains:
+        branch_chains:
           - name: stateful_branch
             on_result:
               filter: openai_responses_format

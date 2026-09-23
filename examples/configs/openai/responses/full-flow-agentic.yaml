@@ -630,8 +630,11 @@ filter_chains:
                       - "127.0.0.1:3001"
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
-              # Its request hook runs after load-balancer selection. Prompt
-              # templates fail closed unless the selected cluster enables both
+              # REQUIRED ORDER: router -> load_balancer ->
+              # openai_responses_proxy. Do not move this filter before the
+              # load balancer: its request hook reads the selected cluster's
+              # application metadata, which does not exist until selection.
+              # Missing metadata fails closed. Prompt templates require both
               # optional application declarations above.
               - filter: openai_responses_proxy
             on_result:
