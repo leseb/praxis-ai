@@ -4,7 +4,7 @@ scope:
   - messages_native_passthrough
   - responses_agentic_loop
   - responses_native_passthrough
-  - responses_to_chat_completions
+  - openai_responses_to_chat_completions
   - responses_client_tool_compat
 features:
   - id: messages.request.minimal
@@ -192,7 +192,7 @@ features:
         status: synthetic_only
   - id: responses.chat.request
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
@@ -202,7 +202,7 @@ features:
         status: synthetic_only
   - id: responses.chat.response.text
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
@@ -212,7 +212,7 @@ features:
         status: synthetic_only
   - id: responses.chat.web_search
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-web-search
@@ -222,7 +222,7 @@ features:
         status: synthetic_only
   - id: responses.chat.file_search
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-file-search
@@ -267,7 +267,7 @@ features:
         status: synthetic_only
   - id: responses.chat.continuation
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
@@ -276,7 +276,7 @@ features:
         status: synthetic_only
   - id: responses.chat.malformed_compaction
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-malformed-compaction
@@ -285,7 +285,7 @@ features:
         status: synthetic_only
   - id: responses.chat.unrepresentable_parameters
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-unrepresentable-parameters
@@ -294,7 +294,7 @@ features:
         status: synthetic_only
   - id: responses.chat.tools.function_echo
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-tool-echo
@@ -303,7 +303,7 @@ features:
         status: synthetic_only
   - id: responses.chat.structured_output_with_tools
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-structured-output-with-tools
@@ -331,7 +331,7 @@ features:
   - id: responses.client_tool_compat.chat_lower_restore
     scopes:
       - responses_client_tool_compat
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/client-tool-compat-chat
@@ -341,7 +341,7 @@ features:
   - id: responses.client_tool_compat.chat_stream_restore
     scopes:
       - responses_client_tool_compat
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/client-tool-compat-chat-stream

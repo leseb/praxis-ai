@@ -42,9 +42,9 @@ pub use responses::CompactFilter;
 pub use responses::FileResolveFilter;
 #[cfg(feature = "openai-responses")]
 pub use responses::{
-    AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchCalloutFilter,
-    OpenaiResponsesValidateFilter, WebSearchFilter, openai_responses_proxy::ResponsesProxyFilter,
-    responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::OpenaiStreamEventsFilter,
+    AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchDispatchFilter, ResponsesValidateFilter,
+    WebSearchDispatchFilter, responses_proxy::ResponsesProxyFilter,
+    responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::StreamEventsFilter,
 };
 #[cfg(feature = "openai-mcp-tools")]
 pub use responses::{McpDispatchFilter, McpToolResolveFilter};

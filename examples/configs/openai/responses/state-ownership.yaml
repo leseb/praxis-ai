@@ -40,19 +40,19 @@ filter_chains:
       # Publishes the typed operation consumed by openai_conversations.
       - filter: openai_operation
 
-      - filter: openai_responses_format
+      - filter: openai_format
         # Conversation API bodies are handled locally later in this chain.
         on_invalid: continue
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://owned-state.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: openai_conversations
         backend: sqlite
