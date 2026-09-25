@@ -185,15 +185,6 @@ impl io::Write for BoundedJsonCounter {
 #[cfg(feature = "store")]
 pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 
-/// Request-scoped proof that local response retrieval owns this route.
-///
-/// A background create cannot be forwarded while this marker is present:
-/// subsequent polling would be intercepted by the local snapshot store instead
-/// of reaching the provider that owns the asynchronous lifecycle.
-#[derive(Debug)]
-#[cfg(feature = "store")]
-pub(crate) struct LocalResponseStoreConfigured;
-
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
 #[cfg(all(

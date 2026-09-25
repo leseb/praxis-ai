@@ -938,11 +938,24 @@ async fn mode_stateful_when_tools_present() {
 
 #[tokio::test]
 async fn background_true_is_published_as_classification_metadata() {
-    let ctx = run_filter("{}", r#"{"input":"test","store":false,"background":true}"#).await;
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let original = Bytes::from_static(br#"{"input":"test","store":false,"background":true}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
     assert_eq!(
         ctx.get_metadata("openai_responses_format.background"),
         Some("true"),
         "the classifier must publish background intent for routing"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_ref()),
+        "classification must preserve background:true and the original request bytes"
     );
 }
 

@@ -45,28 +45,6 @@ fn mode_branch_routes_stateful_conditions_to_stateful_path() {
 }
 
 #[test]
-fn mode_branch_rejects_background_for_non_openai_upstream() {
-    let stateful_guard = start_backend_with_shutdown("unexpected-stateful-request");
-    let default_guard = start_backend_with_shutdown("unexpected-default-request");
-    let proxy_port = free_port();
-    let config = Config::from_yaml(&mode_branch_yaml(
-        proxy_port,
-        stateful_guard.port(),
-        default_guard.port(),
-        true,
-    ))
-    .unwrap();
-    let proxy = start_proxy(&config);
-
-    let body = r#"{"model":"gpt-4.1","input":"Hello","store":false,"background":true}"#;
-    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
-
-    assert_eq!(parse_status(&raw), 400);
-    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-    assert_eq!(response["error"]["message"], "background mode is not supported");
-}
-
-#[test]
 fn mode_branch_routes_stateless_conditions_to_default_path() {
     let cases = [
         (
@@ -90,13 +68,7 @@ fn mode_branch_stateless_body_not_mutated() {
     let stateful_guard = start_backend_with_shutdown("stateful-path");
     let proxy_port = free_port();
 
-    let config = Config::from_yaml(&mode_branch_yaml(
-        proxy_port,
-        stateful_guard.port(),
-        echo_guard.port(),
-        false,
-    ))
-    .unwrap();
+    let config = Config::from_yaml(&mode_branch_yaml(proxy_port, stateful_guard.port(), echo_guard.port())).unwrap();
 
     let proxy = start_proxy(&config);
 
@@ -121,7 +93,6 @@ fn mode_branch_chat_completions_skips_branch() {
         proxy_port,
         stateful_guard.port(),
         stateless_guard.port(),
-        false,
     ))
     .unwrap();
 
@@ -152,7 +123,6 @@ fn assert_routes_to(expected_backend: &str, label: &str, body: &str) {
         proxy_port,
         stateful_guard.port(),
         stateless_guard.port(),
-        false,
     ))
     .unwrap();
 
@@ -173,18 +143,7 @@ fn assert_routes_to(expected_backend: &str, label: &str, body: &str) {
 /// Stateful requests (mode=stateful) enter the branch chain and route
 /// to `stateful_port`. Stateless requests (mode=stateless) or
 /// non-Responses requests fall through to `default_port`.
-///
-/// When `enforce_background` is set, appends `openai_responses_proxy` after
-/// the load balancer so background policy is enforced against the selected upstream.
-/// Mode-classification routing tests leave it unset: the proxy also rejects
-/// non-null `prompt` templates for non-OpenAI upstreams, which would otherwise
-/// mask the routing assertions.
-fn mode_branch_yaml(proxy_port: u16, stateful_port: u16, default_port: u16, enforce_background: bool) -> String {
-    let proxy_filter_line = if enforce_background {
-        "      - filter: openai_responses_proxy\n"
-    } else {
-        ""
-    };
+fn mode_branch_yaml(proxy_port: u16, stateful_port: u16, default_port: u16) -> String {
     format!(
         r#"
 listeners:
@@ -223,7 +182,7 @@ filter_chains:
           - name: "stateful"
             endpoints:
               - "127.0.0.1:{stateful_port}"
-{proxy_filter_line}insecure_options:
+insecure_options:
   allow_private_endpoints: true
 "#
     )
