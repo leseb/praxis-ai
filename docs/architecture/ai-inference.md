@@ -96,8 +96,8 @@ when any of these hold:
 - `has_conversation` is true
 - `has_prompt_id` is true
 
-The classifier preserves `background: true` and publishes the intent as
-`openai_responses_format.background`. An unconditioned
+The Responses request classifier preserves `background: true` and publishes
+the intent as `openai_responses_format.background`. An unconditioned
 `openai_responses_validate` rejects it before routing or upstream contact
 because a gateway-managed pipeline cannot implement the asynchronous Responses
 lifecycle.
@@ -106,6 +106,7 @@ Provider-aware pipelines bind the logical upstream before request-scoped body
 policy and condition both validation and local storage out for OpenAI:
 
 ```yaml
+- filter: openai_responses_request
 - filter: router
   # routes bind clusters whose load-balancers declare application_provider
 - filter: openai_responses_validate
@@ -117,8 +118,15 @@ policy and condition both validation and local storage out for OpenAI:
   # backend configuration omitted
   conditions:
     - unless:
-        bound_upstream:
-          application_provider: openai
+      bound_upstream:
+        application_provider: openai
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: inference
+      http:
+        application_provider: openai
+      endpoints: ["api.openai.com:443"]
 ```
 
 Praxis automatically runs each dual-phase body filter exactly once: ordinary

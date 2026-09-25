@@ -466,9 +466,30 @@ fn background_true_is_rejected_by_unconditioned_validator() {
 }
 
 #[test]
+fn api_openai_hostname_does_not_override_non_openai_provider() {
+    let proxy_port = free_port();
+    let yaml = non_openai_api_hostname_background_yaml(proxy_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","background":true}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "endpoint hostname must not grant background lifecycle ownership"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["error"]["message"], "background mode is not supported");
+}
+
+#[test]
 #[cfg(feature = "store-sqlite")]
 fn background_true_and_polling_are_forwarded_to_openai_provider() {
     let backend = StatefulCapturingBackend::new(vec![
+        (200, r#"{"id":"resp_background","status":"queued"}"#.to_owned()),
+        (200, r#"{"id":"resp_background","status":"completed"}"#.to_owned()),
         (200, r#"{"id":"resp_background","status":"queued"}"#.to_owned()),
         (200, r#"{"id":"resp_background","status":"completed"}"#.to_owned()),
     ])
@@ -481,33 +502,40 @@ fn background_true_and_polling_are_forwarded_to_openai_provider() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"test","background":true,"store":true}"#;
-    let create = http_send(proxy.addr(), &json_post("/v1/responses", body));
-    assert_eq!(parse_status(&create), 200);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&parse_body(&create)).unwrap()["status"],
-        "queued"
-    );
+    let bodies = [
+        r#"{"model":"gpt-4.1","input":"test","background":true,"store":true,"stream":false}"#,
+        r#"{"model":"gpt-4.1","input":"test","background":true,"store":true,"stream":true}"#,
+    ];
+    for body in bodies {
+        let create = http_send(proxy.addr(), &json_post("/v1/responses", body));
+        assert_eq!(parse_status(&create), 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parse_body(&create)).unwrap()["status"],
+            "queued"
+        );
 
-    let get = format!(
-        "GET /v1/responses/resp_background HTTP/1.1\r\n\
-         Host: localhost:{proxy_port}\r\n\
-         Connection: close\r\n\
-         \r\n"
-    );
-    let poll = http_send(proxy.addr(), &get);
-    assert_eq!(parse_status(&poll), 200);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&parse_body(&poll)).unwrap()["status"],
-        "completed"
-    );
+        let get = format!(
+            "GET /v1/responses/resp_background HTTP/1.1\r\n\
+             Host: localhost:{proxy_port}\r\n\
+             Connection: close\r\n\
+             \r\n"
+        );
+        let poll = http_send(proxy.addr(), &get);
+        assert_eq!(parse_status(&poll), 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parse_body(&poll)).unwrap()["status"],
+            "completed"
+        );
+    }
 
     let captured = backend.requests();
     assert!(
-        captured
-            .iter()
-            .any(|request| request.method == "POST" && request.uri == "/v1/responses" && request.body == body),
-        "OpenAI should receive the unchanged background create"
+        bodies.iter().all(|body| {
+            captured
+                .iter()
+                .any(|request| request.method == "POST" && request.uri == "/v1/responses" && request.body == *body)
+        }),
+        "OpenAI should receive unchanged finite and streaming background creates"
     );
     assert!(
         captured
@@ -1152,7 +1180,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
       - filter: openai_responses_validate
       - filter: router
         routes:
@@ -1169,6 +1197,45 @@ insecure_options:
     )
 }
 
+/// YAML config proving that only the logical provider declaration grants the
+/// background capability, even when the endpoint uses OpenAI's hostname.
+fn non_openai_api_hostname_background_yaml(proxy_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_request
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "not-openai"
+      - filter: openai_responses_validate
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+      - filter: load_balancer
+        cluster_source: bound_upstream
+        clusters:
+          - name: "not-openai"
+            http:
+              application_provider: "foo"
+            endpoints:
+              - "api.openai.com:443"
+          - name: "openai-capable"
+            http:
+              application_provider: "openai"
+            endpoints:
+              - "api.openai.com:443"
+"#
+    )
+}
+
 /// YAML config routing create and lifecycle operations to one OpenAI owner.
 #[cfg(feature = "store-sqlite")]
 fn openai_background_lifecycle_yaml(proxy_port: u16, backend_port: u16, database_url: &str) -> String {
@@ -1181,7 +1248,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
@@ -1229,7 +1296,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
@@ -1291,7 +1358,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
       - filter: state_owner
         mode: single_tenant
         tenant_id: default

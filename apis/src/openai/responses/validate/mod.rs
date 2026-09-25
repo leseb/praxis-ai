@@ -45,16 +45,19 @@ use super::{
 
 /// Validates and enriches Responses API requests.
 ///
-/// Parses the body as [`serde_json::Value`] for targeted field extraction.
-/// Does not deserialize the full body into a typed struct or validate other
-/// provider-owned parameter combinations. Rejects `background=true` because
+/// In a legacy `openai_responses_format` chain, parses the body as
+/// [`serde_json::Value`] for targeted field extraction. After
+/// `openai_responses_request`, uses its initialized [`ResponsesState`] without
+/// parsing again. Does not validate other provider-owned parameter
+/// combinations. Rejects `background=true` because
 /// locally managed pipelines cannot observe a provider-owned asynchronous
 /// lifecycle. A provider-aware pipeline may condition this filter with
 /// `unless: { bound_upstream: { application_provider: openai } }`; Praxis then
 /// runs the same validation once at the bound-upstream body barrier and skips
 /// it for OpenAI-owned passthrough.
 ///
-/// Must be placed after `openai_responses_format` in the filter chain.
+/// Must be placed after `openai_responses_format` or
+/// `openai_responses_request` in the filter chain.
 /// Skips non-Responses API requests (those not classified as
 /// `openai_responses`).
 ///
@@ -63,8 +66,8 @@ use super::{
 /// `responses.background`, `responses.stream`.
 ///
 /// This filter has no filter-specific configuration. Request conditions may
-/// gate it on `bound_upstream`; body buffering is shared with the upstream
-/// `openai_responses_format` classifier.
+/// gate it on `bound_upstream`; body buffering is shared with the preceding
+/// Responses request classifier.
 #[derive(Default)]
 pub struct OpenaiResponsesValidateFilter;
 
@@ -84,25 +87,46 @@ impl OpenaiResponsesValidateFilter {
 
 /// Validate one complete Responses request body in either body phase.
 fn validate_complete_body(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) -> FilterAction {
-    if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
-        trace!("skipping non-responses request");
-        return FilterAction::Release;
-    }
-
-    if is_bodyless_responses_request(&ctx.request.method, ctx.request.uri.path()) {
-        trace!(method = %ctx.request.method, path = ctx.request.uri.path(), "skipping validation for bodyless endpoint");
-        return FilterAction::Release;
-    }
-
-    if background_requested(ctx) {
-        debug!("rejecting unsupported Responses background mode");
-        return reject_invalid("background mode is not supported");
+    if let Some(action) = complete_body_policy(ctx) {
+        return action;
     }
 
     match parse_request_body(body) {
         Ok(parsed) => validate_parsed_body(ctx, parsed),
         Err(action) => action,
     }
+}
+
+/// Apply classification and lifecycle guards before any JSON parsing.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "tracing fields inflate the score for four flat lifecycle guards"
+)]
+fn complete_body_policy(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+    if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        trace!("skipping non-responses request");
+        return Some(FilterAction::Release);
+    }
+
+    if is_bodyless_responses_request(&ctx.request.method, ctx.request.uri.path()) {
+        trace!(method = %ctx.request.method, path = ctx.request.uri.path(), "skipping validation for bodyless endpoint");
+        return Some(FilterAction::Release);
+    }
+
+    if background_requested(ctx) {
+        debug!("rejecting unsupported Responses background mode");
+        return Some(reject_invalid("background mode is not supported"));
+    }
+
+    // The consolidated request processor already parsed, validated, and
+    // initialized this body. In that chain the validator is only the lifecycle
+    // policy boundary, so do not parse again or regenerate request IDs.
+    if ctx.extensions.get::<ResponsesState>().is_some() {
+        trace!("Responses state already initialized; lifecycle policy complete");
+        return Some(FilterAction::Release);
+    }
+
+    None
 }
 
 /// Validate parsed fields and initialize request-scoped Responses state.
@@ -368,6 +392,33 @@ mod tests {
             ctx.filter_metadata.get("responses.stream").map(String::as_str),
             Some("false"),
             "stream should default to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_responses_state_is_not_parsed_or_initialized_twice() {
+        let filter = make_filter();
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("responses.response_id", "resp_existing");
+        ctx.extensions
+            .insert(ResponsesState::from_request_body(serde_json::json!({
+                "model": "gpt-4.1",
+                "input": "already parsed"
+            })));
+        let mut body = Some(Bytes::from_static(b"this would fail a second JSON parse"));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release));
+        assert_eq!(
+            ctx.get_metadata("responses.response_id"),
+            Some("resp_existing"),
+            "the consolidated request processor's state must remain authoritative"
         );
     }
 
