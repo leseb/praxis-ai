@@ -44,7 +44,7 @@ model name. A keyed local server can be started with:
 export VLLM_API_KEY="$(openssl rand -hex 32)"
 vllm serve Qwen/Qwen3-8B \
   --served-model-name qwen3-8b \
-  --max-model-len 16384 \
+  --max-model-len 18432 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
   --reasoning-parser deepseek_r1 \
@@ -68,7 +68,7 @@ docker run --rm --name vllm \
   docker.io/vllm/vllm-openai:latest \
   --model Qwen/Qwen3-8B \
   --served-model-name qwen3-8b \
-  --max-model-len 16384 \
+  --max-model-len 18432 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
   --reasoning-parser deepseek_r1
@@ -81,6 +81,12 @@ run downloads a multi-gigabyte image plus the model weights, and the Hugging
 Face cache mount keeps the weights for later runs.
 
 Use `VLLM_URL=http://127.0.0.1:8000` for either local server.
+
+The 18,432-token window is intentional for Claude Code auto mode. Its
+client-initiated safety classifier reserves 2,112 output tokens independently
+of the main Claude Code output-token setting; a 16,384-token server can reject
+the classifier request before inference. If you lower this value for a smaller
+GPU, do not use auto mode unless the classifier request still fits.
 
 ## 2. Point a Praxis example at vLLM
 

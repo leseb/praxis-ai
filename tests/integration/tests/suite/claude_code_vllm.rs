@@ -110,18 +110,20 @@ const LISTEN_ADDRESS_ENV: &str = "PRAXIS_TEST_LISTEN_ADDRESS";
 /// qualification run and update this constant and the manifest together.
 const CLAUDE_CODE_VERSION: &str = "2.1.278";
 
-/// Output-token ceiling passed to the pinned client for the 16K vLLM context.
+/// Output-token ceiling passed to the pinned client for the 18K vLLM context.
 ///
 /// Claude Code otherwise requests 32K output tokens, which vLLM correctly
-/// rejects before inference when the pinned model server has a 16K total
+/// rejects before inference when the pinned model server has an 18K total
 /// context. The coding task needs only short tool calls and a summary.
 const CLAUDE_CODE_MAX_OUTPUT_TOKENS: &str = "2048";
 
 /// Context window advertised to the pinned client for its compaction policy.
 ///
 /// The client otherwise compacts after each small tool result when this is set
-/// to the backend's 16K generation window. Actual requests remain bounded by
-/// vLLM's 16K limit and the separate 2K output cap.
+/// to the backend's 18K generation window. Actual requests remain bounded by
+/// vLLM's 18K limit and the separate output limits. Auto-mode classifier calls
+/// reserve 2,112 output tokens independently of the main-request cap, which is
+/// why the backend pin needs more than 16K even for this short task.
 const CLAUDE_CODE_MAX_CONTEXT_TOKENS: &str = "32768";
 
 /// Claude Code switch between its server-side and client-initiated auto-mode
@@ -263,7 +265,7 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 ///
 /// PIN: these are the real print-mode headless flags accepted by the pinned
 /// executable. Restricting the available built-ins to the three tools the task
-/// exercises keeps unrelated tool schemas out of the prompt and makes the 16K
+/// exercises keeps unrelated tool schemas out of the prompt and makes the 18K
 /// context pin representative. Re-validate the full set below against the
 /// pinned executable during qualification and adjust here and in the manifest
 /// together.

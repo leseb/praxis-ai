@@ -46,9 +46,10 @@ on:
         default: "120"
         type: string
       max_model_len:
-        description: vLLM --max-model-len (context window).
+        description: >-
+          vLLM --max-model-len. Keep at least 18432 for Claude Code auto mode.
         required: false
-        default: "16384"
+        default: "18432"
         type: string
       instance_type:
         description: EC2 GPU instance type.
