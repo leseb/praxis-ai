@@ -54,20 +54,20 @@ auto_permission_mode = "auto"
 # Force Claude Code to initiate classifier model requests through Praxis.
 auto_mode_server = "0"
 # Claude Code 2.1.278 reserves this fixed output budget for client-initiated
-# classifier requests, independently of max_output_tokens below. The 2026-09-25
-# nightly observed a 14,273-token classifier prompt, so a 16,384-token backend
-# rejected the 16,385-token total. Keep the backend at or above this pinned
-# minimum; 18,432 leaves useful prompt headroom while fitting the A10G's observed
-# 19,808-token KV-cache capacity.
-auto_minimum_backend_context_tokens = 18432
+# classifier requests, independently of max_output_tokens below. vLLM reports
+# an over-limit prompt as "at least" max_model_len - 2,112 + 1 tokens, so the
+# 14,273- and 16,321-token diagnostics observed at 16K and 18K were lower bounds,
+# not the classifier's true prompt size. Match the client's pinned 32K planning
+# window. The vLLM flags below reclaim CUDA-graph memory and dedicate the A10G to
+# this single-request acceptance workload so the window fits.
+auto_minimum_backend_context_tokens = 32768
 # Claude Code 2.1.278 otherwise asks for 32K output tokens. Pin its supported
 # environment overrides to the real vLLM window so the request is valid without
 # overcommitting the 24GB GPU. The acceptance task needs only short tool calls
 # and a final summary.
 max_output_tokens = 2048
-# Keep Claude Code's normal planning context so it does not compact after each
-# small tool result. Actual requests remain bounded by the 18K vLLM window and
-# the separate output limits above.
+# Keep Claude Code's planning context aligned with the real backend window so it
+# does not compact after each small tool result.
 max_context_tokens = 32768
 flags = [
   "--tools", "Read,Edit,Bash",
@@ -100,14 +100,14 @@ served_model_name = "qwen3-8b"
 # pin, so it does not gate the nightly. A follow-up may additionally pass
 # `--revision <sha>` once recorded.
 model_revision = "TBD-at-qualification"
-# Serving parameters. The Claude acceptance window is slightly larger than the
-# GPU full suite's because client-side auto-mode classification needs headroom.
+# Serving parameters. Claude auto-mode classification needs the full planning
+# window advertised to the client.
 tool_call_parser = "hermes"
-context_length = 18432
+context_length = 32768
 seed = 0
 
 # vLLM launch flags recorded for reproducibility. They mirror the GPU full-suite
-# launch except for the larger context window above, and both jobs load identical
+# launch except for its single-request memory tuning, and both jobs load identical
 # Qwen3-8B weights from the shared on-disk HF cache. Native Anthropic Messages
 # serving is on by default in this image; no extra flag enables it, and the
 # default OpenAI Chat Completions surface remains available for the transformed
@@ -122,12 +122,13 @@ seed = 0
 [vllm.launch]
 flags = [
   "--model", "Qwen/Qwen3-8B",
-  "--max-model-len", "18432",
+  "--max-model-len", "32768",
   "--enable-auto-tool-choice",
   "--tool-call-parser", "hermes",
   "--reasoning-parser", "qwen3",
   "--default-chat-template-kwargs", '{"enable_thinking":false}',
-  "--gpu-memory-utilization", "0.9",
+  "--gpu-memory-utilization", "0.97",
+  "--enforce-eager",
   "--seed", "0",
 ]
 

@@ -473,6 +473,7 @@ jobs:
           flag_context = int(flags[max_len_index])
           context = int(vllm["context_length"])
           auto_minimum = int(launch["auto_minimum_backend_context_tokens"])
+          client_context = int(launch["max_context_tokens"])
           if flag_context != context:
               raise SystemExit(
                   "vllm.context_length must match --max-model-len in vllm.launch.flags"
@@ -480,6 +481,10 @@ jobs:
           if context < auto_minimum:
               raise SystemExit(
                   f"vLLM context {context} is below Claude auto-mode minimum {auto_minimum}"
+              )
+          if context < client_context:
+              raise SystemExit(
+                  f"vLLM context {context} is below Claude client context {client_context}"
               )
           exported = {
               "claude_url": claude["url"],
