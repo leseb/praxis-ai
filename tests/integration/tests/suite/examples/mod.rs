@@ -77,6 +77,8 @@ mod openai_responses_to_chat_completions;
 #[cfg(feature = "store-sqlite")]
 mod openai_responses_to_chat_completions_conformance;
 #[cfg(feature = "store-sqlite")]
+mod openai_responses_to_chat_completions_reasoning;
+#[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;
@@ -96,6 +98,7 @@ mod token_counting;
 mod token_rate_limit;
 mod token_usage_headers;
 mod vector_stores_routing;
+mod vertex_gemini;
 mod vllm_agentic_api;
 mod web_search;
 mod web_search_chat_completions;
