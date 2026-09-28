@@ -2,24 +2,36 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! `cargo xtask check-crypto-inventory` — verify the cryptographic inventory
-//! manifest against the actual runtime dependency graph of the production
-//! profile.
+//! manifest against the actual runtime dependency graphs of the shipped
+//! profiles, and generate the prose companion from it.
 //!
-//! The manifest (`docs/architecture/cryptographic-inventory.yaml`) is the stable
-//! inventory backing `docs/architecture/cryptographic-inventory.md`. This check
-//! resolves the runtime graph of the profile of record (the shipped production
-//! artifact, `PRAXIS_AI_FEATURES ?= full`) —
+//! The manifest (`docs/architecture/cryptographic-inventory.yaml`) is the
+//! authoritative inventory; the prose companion
+//! (`docs/architecture/cryptographic-inventory.md`) is generated from it by this
+//! task (`--fix`). The AI proxy ships two build profiles and both are tracked:
+//!
+//! * `full` — the published container image (`PRAXIS_AI_FEATURES ?= full`);
+//! * `fips` — the reduced FIPS runtime, built `--no-default-features` with the feature set shared from
+//!   [`crate::fips::FIPS_FEATURES`].
+//!
+//! For each profile the check resolves
 //! `cargo tree -p praxis-ai-proxy --edges normal --no-default-features
-//! --features full --target <triple>` — on all three tier-1 targets,
-//! so the result is host-independent and CI validates the macOS/Windows
-//! declarations even though it runs on Linux. It fails when the manifest and the
-//! resolved graphs disagree, so:
+//! --features <profile> --target <triple>` on all three tier-1 targets, so the
+//! result is host-independent and CI validates the macOS/Windows declarations
+//! even though it runs on Linux. The edge and runtime-linkage graphs are keyed on
+//! package **identity** (name + version), so two co-resolved versions of one
+//! crate are never merged. The check fails when the manifest and the resolved
+//! graphs disagree, so:
 //!
-//! * a crypto-family-named crate (matched by the manifest's `watch_tokens`) cannot enter a target's runtime graph
-//!   undeclared — the guard is a name tripwire, not a totalizing gate: a genuinely novel crypto crate whose name
-//!   matches no token is caught instead at Cargo.lock / `cargo deny` review, where new dependencies land (widen
-//!   `watch_tokens` when one appears);
-//! * a `production` entry cannot go unclassified (missing/unknown `disposition`);
+//! * a crypto-family-named crate (matched by the manifest's `watch_tokens`, or named exactly on the FIPS denylist
+//!   [`crate::fips::graph::DENIED`]) cannot enter a target's runtime graph undeclared — on *every* profile, so a
+//!   denylisted cipher (e.g. `chacha20poly1305`, `ctr`, `cbc`) whose concatenated name the token split cannot reduce is
+//!   still caught in the published `full` image, not only in `fips`. The guard is a name tripwire, not a totalizing
+//!   gate: a genuinely novel crypto crate whose name matches neither is caught instead at Cargo.lock / `cargo deny`
+//!   review, where new dependencies land (widen `watch_tokens` when one appears);
+//! * a `production` entry cannot go unclassified (missing/unknown `disposition`) or unassigned to a profile;
+//! * a `production` entry cannot appear in a profile it does not declare (a profile leak), nor be declared for a
+//!   profile/target where it is absent (a stale declaration);
 //! * a pinned provider cannot drift its version, gain a forbidden feature, or lose a required one while the crate name
 //!   stays put (e.g. `aws-lc-rs` gaining `fips`, `rustls` regaining `ring`, or `openssl` gaining `vendored`); unlisted
 //!   features are permitted by design, since feature sets grow across patch releases and an exact-set pin would churn
@@ -32,11 +44,13 @@
 //!   linkage is computed by walking the tree from the root and refusing to cross into proc-macro nodes, not by mere
 //!   presence in `--edges normal` output;
 //! * test/build-only cryptography cannot silently link into the runtime binary;
+//! * a crate on Red Hat's FIPS denylist (shared from [`crate::fips::graph::DENIED`]) cannot enter any `fips` graph;
 //! * a crate cannot carry two classifications at once (a duplicate across `production`/`allow`/`proc_macro`/
 //!   `test_only`/`build_only` would let one bucket's guard mask another's).
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fmt::Write as _,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -50,7 +64,12 @@ use serde::Deserialize;
 
 /// CLI arguments for `cargo xtask check-crypto-inventory`.
 #[derive(Parser)]
-pub(crate) struct Args;
+pub(crate) struct Args {
+    /// Regenerate the prose companion from the manifest instead of only checking
+    /// that it is in sync.
+    #[arg(long)]
+    fix: bool,
+}
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -59,8 +78,11 @@ pub(crate) struct Args;
 /// Relative path from the workspace root to the manifest.
 const MANIFEST_REL: &str = "docs/architecture/cryptographic-inventory.yaml";
 
-/// Relative path to the prose companion (referenced in failure output).
+/// Relative path to the generated prose companion.
 const DOC_REL: &str = "docs/architecture/cryptographic-inventory.md";
+
+/// Basename of the manifest, used for the same-directory link in the prose.
+const MANIFEST_BASENAME: &str = "cryptographic-inventory.yaml";
 
 /// Tier-1 targets resolved so the check is host-independent: the graphs come
 /// from the lockfile, not the host, so CI on Linux still validates the
@@ -71,8 +93,27 @@ const TARGETS: [(&str, &str); 3] = [
     ("windows", "x86_64-pc-windows-msvc"),
 ];
 
+/// The shipped build profiles the inventory tracks, in display order.
+const PROFILES: [Profile; 2] = [
+    Profile {
+        label: "full",
+        features: "full",
+        description: "Published container image (`standard` + `openai-all` + `store-postgres`).",
+    },
+    Profile {
+        label: "fips",
+        features: crate::fips::FIPS_FEATURES,
+        description: "Reduced FIPS runtime, built `--no-default-features`.",
+    },
+];
+
+/// Valid profile labels (the `label` of every [`PROFILES`] entry). Kept as a
+/// standalone array so error messages can print the expected set; a unit test
+/// asserts it stays in step with [`PROFILES`].
+const PROFILE_LABELS: [&str; 2] = ["full", "fips"];
+
 /// Dispositions every `production` entry must declare (kept in sync with the
-/// prose legend in the companion document).
+/// generated prose legend, which is rendered from this list).
 const VALID_DISPOSITIONS: [&str; 5] = [
     "validated",
     "non-validated",
@@ -80,6 +121,29 @@ const VALID_DISPOSITIONS: [&str; 5] = [
     "upstream-owned",
     "n-a",
 ];
+
+/// A shipped build profile: a label, its `--features` argument (always built
+/// `--no-default-features`), and a one-line description rendered into the prose.
+struct Profile {
+    /// Manifest/label token (`full` / `fips`).
+    label: &'static str,
+    /// The `--features` argument value.
+    features: &'static str,
+    /// One-line description for the generated companion document.
+    description: &'static str,
+}
+
+/// Human-readable meaning of each disposition, rendered into the prose legend.
+fn disposition_doc(disposition: &str) -> &'static str {
+    match disposition {
+        "validated" => "Executes the intended FIPS-validated module with FIPS mode proven in effect.",
+        "non-validated" => "A real cryptographic primitive whose validated execution is not proven in this build.",
+        "needs-remediation" => "A primitive that should change (e.g. move onto the OpenSSL-backed provider).",
+        "upstream-owned" => "A primitive owned and executed entirely within an upstream dependency.",
+        "n-a" => "Not a security-function primitive (identifier hashing, key zeroization, or a support layer).",
+        _ => "",
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Manifest
@@ -125,10 +189,15 @@ struct Entry {
     crate_name: String,
     /// The host OS this entry is present on (`linux`/`macos`/`windows`).
     ///
-    /// When set, the stale check only applies on that target; an unset platform
-    /// means the crate is expected on every target.
+    /// When set, the checks only apply on that target; an unset platform means
+    /// the crate is expected on every target.
     #[serde(default)]
     platform: Option<String>,
+    /// The build profiles this crate is present in (`full`/`fips`). Required and
+    /// validated for `production` entries; must be empty on the other buckets,
+    /// which are profile-agnostic.
+    #[serde(default)]
+    profiles: Vec<String>,
     /// The classification (`validated`/`non-validated`/…). Required and
     /// validated for `production` entries; advisory elsewhere.
     #[serde(default)]
@@ -153,6 +222,9 @@ struct Provider {
     crate_name: String,
     /// The exact version expected in the lockfile.
     version: String,
+    /// The build profiles this provider is pinned in (`full`/`fips`).
+    #[serde(default)]
+    profiles: Vec<String>,
     /// Features that must all be enabled.
     #[serde(default)]
     require_features: Vec<String>,
@@ -168,6 +240,19 @@ struct Provider {
 // Resolved graph
 // -----------------------------------------------------------------------------
 
+/// A resolved package identity: crate name plus exact version.
+///
+/// Keying the edge and linkage graphs on `(name, version)` keeps two co-resolved
+/// versions of one crate as distinct nodes, so the runtime-linkage walk never
+/// merges a build-host-only copy with a runtime-linked one of the same name.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct PkgId {
+    /// The crate name.
+    name: String,
+    /// The resolved version (without the leading `v`).
+    version: String,
+}
+
 /// Version and enabled features of one crate in a target's runtime graph.
 #[derive(Debug)]
 struct CrateFacts {
@@ -180,27 +265,30 @@ struct CrateFacts {
     is_proc_macro: bool,
 }
 
-/// One resolved target's runtime graph: crate name -> every resolved version.
+/// One resolved `(profile, target)` runtime graph: crate name -> every resolved
+/// version.
 ///
-/// The value is a `Vec` because Cargo can co-resolve several versions of the
-/// same crate; keeping them all is what lets the provider-drift check see a
+/// The `facts` value is a `Vec` because Cargo can co-resolve several versions of
+/// the same crate; keeping them all is what lets the provider-drift check see a
 /// second, upgraded copy of a pinned provider instead of silently accepting the
 /// first occurrence.
 struct TargetGraph {
+    /// Profile label this graph was resolved for (`full`/`fips`).
+    profile: &'static str,
     /// Platform label (`linux`/`macos`/`windows`).
     platform: String,
     /// Resolved crate facts keyed by crate name (one entry per resolved version).
     facts: BTreeMap<String, Vec<CrateFacts>>,
-    /// Crate names actually linked into the runtime binary: reachable from the
-    /// root crate over `--edges normal` edges *without crossing a proc-macro
+    /// Package identities actually linked into the runtime binary: reachable from
+    /// the root crate over `--edges normal` edges *without crossing a proc-macro
     /// node*. Proc-macros and any crate reachable only beneath one (a code
     /// generator's own dependency, e.g. `tiny-keccak` under `const-random-macro`)
     /// run on the build host and are excluded even though `cargo tree` lists them.
-    runtime_linked: BTreeSet<String>,
+    runtime_linked: BTreeSet<PkgId>,
 }
 
 impl TargetGraph {
-    /// Whether the crate appears anywhere in this target's resolved tree
+    /// Whether the crate appears anywhere in this graph's resolved tree
     /// (including build-host-only subtrees). Presence, not runtime linkage — use
     /// [`Self::is_runtime_linked`] to ask what actually ships in the binary.
     fn contains(&self, name: &str) -> bool {
@@ -212,10 +300,12 @@ impl TargetGraph {
         self.facts.get(name).is_some_and(|v| v.iter().any(|f| f.is_proc_macro))
     }
 
-    /// Whether the crate is linked into the runtime binary — reachable from the
-    /// root over normal edges without passing through a proc-macro node.
+    /// Whether any resolved copy of the crate is linked into the runtime binary —
+    /// reachable from the root over normal edges without passing through a
+    /// proc-macro node. The underlying set is instance-precise (keyed on
+    /// [`PkgId`]); this name-level query answers "does this crate ship".
     fn is_runtime_linked(&self, name: &str) -> bool {
-        self.runtime_linked.contains(name)
+        self.runtime_linked.iter().any(|id| id.name == name)
     }
 }
 
@@ -223,10 +313,16 @@ impl TargetGraph {
 // Entry Point
 // -----------------------------------------------------------------------------
 
-/// Verify the manifest against the resolved runtime graphs.
-pub(crate) fn run(_args: Args) {
+/// Verify the manifest against the resolved runtime graphs, then check (or, with
+/// `--fix`, regenerate) the prose companion.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear read → resolve → evaluate → generate/compare flow"
+)]
+pub(crate) fn run(args: &Args) {
     let root = workspace_root();
     let manifest_path = root.join(MANIFEST_REL);
+    let doc_path = root.join(DOC_REL);
 
     let raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|err| {
         eprintln!("failed to read {}: {err}", manifest_path.display());
@@ -237,16 +333,10 @@ pub(crate) fn run(_args: Args) {
         std::process::exit(1);
     });
 
-    let graphs: Vec<TargetGraph> = TARGETS
-        .iter()
-        .map(|(platform, triple)| resolve_target(&root, platform, triple))
-        .collect();
+    let graphs = resolve_graphs(&root);
 
     let violations = evaluate(&manifest, &graphs);
-
-    if violations.is_empty() {
-        print_summary(&manifest, &graphs);
-    } else {
+    if !violations.is_empty() {
         eprintln!("crypto inventory check failed ({} violation(s)):", violations.len());
         for violation in &violations {
             eprintln!("  - {violation}");
@@ -254,21 +344,56 @@ pub(crate) fn run(_args: Args) {
         eprintln!("\nReview {DOC_REL} and update {MANIFEST_REL} to match the change.");
         std::process::exit(1);
     }
+
+    // The manifest is authoritative and internally consistent; the prose is
+    // generated from it, never edited by hand.
+    let content = render_doc(&manifest);
+    if args.fix {
+        std::fs::write(&doc_path, &content).unwrap_or_else(|err| {
+            eprintln!("failed to write {}: {err}", doc_path.display());
+            std::process::exit(1);
+        });
+        println!("wrote {DOC_REL}");
+    } else {
+        let current = std::fs::read_to_string(&doc_path).unwrap_or_default();
+        if current == content {
+            print_summary(&manifest, &graphs);
+        } else {
+            eprintln!("{DOC_REL} is stale");
+            eprintln!("\nrun: cargo xtask check-crypto-inventory --fix");
+            std::process::exit(1);
+        }
+    }
 }
 
-/// Print the success summary: manifest counts plus the resolved target set.
+/// Resolve every `(profile, target)` combination into a [`TargetGraph`].
+fn resolve_graphs(root: &Path) -> Vec<TargetGraph> {
+    let mut graphs = Vec::with_capacity(PROFILES.len() * TARGETS.len());
+    for profile in &PROFILES {
+        for (platform, triple) in TARGETS {
+            graphs.push(resolve_target(root, profile, platform, triple));
+        }
+    }
+    graphs
+}
+
+/// Print the success summary: manifest counts plus the resolved profile/target
+/// set.
 fn print_summary(manifest: &Manifest, graphs: &[TargetGraph]) {
     let union: BTreeSet<&str> = graphs.iter().flat_map(|g| g.facts.keys().map(String::as_str)).collect();
-    let targets: Vec<&str> = graphs.iter().map(|g| g.platform.as_str()).collect();
+    let profiles: Vec<&str> = PROFILES.iter().map(|p| p.label).collect();
+    let targets: Vec<&str> = TARGETS.iter().map(|(p, _)| *p).collect();
     println!(
-        "crypto inventory in sync ({} production, {} allow, {} providers, {} proc-macro, {} test-only, {} build-only; targets: {}; {} crates across targets)",
+        "crypto inventory in sync ({} production, {} allow, {} providers, {} proc-macro, {} test-only, {} build-only; profiles: {}; targets: {}; {} graphs; {} crates across graphs)",
         manifest.production.len(),
         manifest.allow.len(),
         manifest.providers.len(),
         manifest.proc_macro.len(),
         manifest.test_only.len(),
         manifest.build_only.len(),
+        profiles.join("+"),
         targets.join("/"),
+        graphs.len(),
         union.len(),
     );
 }
@@ -277,24 +402,42 @@ fn print_summary(manifest: &Manifest, graphs: &[TargetGraph]) {
 // Evaluation
 // -----------------------------------------------------------------------------
 
-/// Compare the manifest against the resolved per-target `graphs`, returning a
-/// human-readable violation for each mismatch. Pure: all IO happens in [`run`].
+/// Compare the manifest against the resolved per-`(profile, target)` `graphs`,
+/// returning a human-readable violation for each mismatch. Pure: all IO happens
+/// in [`run`].
 fn evaluate(manifest: &Manifest, graphs: &[TargetGraph]) -> Vec<String> {
-    let platforms: Vec<&str> = graphs.iter().map(|g| g.platform.as_str()).collect();
-    let known = platforms.join("/");
-
     let mut out = Vec::new();
     check_duplicates(manifest, &mut out);
+    check_platforms(manifest, &mut out);
+    check_profiles(manifest, &mut out);
     check_dispositions(&manifest.production, &mut out);
     check_notes(manifest, &mut out);
     check_undeclared(manifest, graphs, &mut out);
-    check_stale_production(&manifest.production, graphs, &known, &mut out);
-    check_stale_allow(&manifest.allow, graphs, &known, &mut out);
+    check_stale_production(&manifest.production, graphs, &mut out);
+    check_profile_leak(&manifest.production, graphs, &mut out);
+    check_stale_allow(&manifest.allow, graphs, &mut out);
     check_proc_macro(manifest, graphs, &mut out);
     check_runtime_linkage(manifest, graphs, &mut out);
     check_containment(manifest, graphs, &mut out);
     check_providers(&manifest.providers, graphs, &mut out);
+    check_denied_absent(graphs, &mut out);
     out
+}
+
+/// The `/`-joined list of known platform labels, for error messages.
+fn platform_labels() -> String {
+    TARGETS.iter().map(|(p, _)| *p).collect::<Vec<_>>().join("/")
+}
+
+/// Whether a `platform:`-tagged entry applies to `target`: an untagged entry
+/// applies to every target, a tagged one only to its own.
+fn platform_matches(platform: &Option<String>, target: &str) -> bool {
+    platform.as_deref().is_none_or(|p| p == target)
+}
+
+/// Whether a `production` entry is declared for `profile`.
+fn entry_in_profile(entry: &Entry, profile: &str) -> bool {
+    entry.profiles.iter().any(|p| p == profile)
 }
 
 /// Uniqueness check: every crate must carry exactly one classification. A crate
@@ -306,14 +449,7 @@ fn evaluate(manifest: &Manifest, graphs: &[TargetGraph]) -> Vec<String> {
 /// list.
 fn check_duplicates(manifest: &Manifest, out: &mut Vec<String>) {
     let mut buckets: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let labelled: [(&str, &[Entry]); 5] = [
-        ("production", &manifest.production),
-        ("allow", &manifest.allow),
-        ("proc_macro", &manifest.proc_macro),
-        ("test_only", &manifest.test_only),
-        ("build_only", &manifest.build_only),
-    ];
-    for (label, entries) in labelled {
+    for (label, entries) in labelled_buckets(manifest) {
         for entry in entries {
             buckets.entry(entry.crate_name.as_str()).or_default().push(label);
         }
@@ -328,6 +464,17 @@ fn check_duplicates(manifest: &Manifest, out: &mut Vec<String>) {
         }
     }
     check_provider_overlap(&manifest.providers, &buckets, out);
+}
+
+/// The five mutually-exclusive classification buckets, in a fixed order.
+fn labelled_buckets(manifest: &Manifest) -> [(&'static str, &[Entry]); 5] {
+    [
+        ("production", &manifest.production),
+        ("allow", &manifest.allow),
+        ("proc_macro", &manifest.proc_macro),
+        ("test_only", &manifest.test_only),
+        ("build_only", &manifest.build_only),
+    ]
 }
 
 /// Duplicate sub-check for the pinned providers: a provider may be listed only
@@ -348,6 +495,82 @@ fn check_provider_overlap(providers: &[Provider], buckets: &BTreeMap<&str, Vec<&
                 "pinned provider `{name}` also appears in a non-`production` list ({}) — a provider may only overlap `production`",
                 labels.join(", ")
             ));
+        }
+    }
+}
+
+/// Platform check: any `platform:`-tagged entry (in any bucket) must name a known
+/// target, so a typo like `platfrom: linux` (or an unsupported OS) is caught
+/// rather than silently applying to nothing.
+fn check_platforms(manifest: &Manifest, out: &mut Vec<String>) {
+    let valid: BTreeSet<&str> = TARGETS.iter().map(|(p, _)| *p).collect();
+    let known = platform_labels();
+    for (label, entries) in labelled_buckets(manifest) {
+        for entry in entries {
+            if let Some(platform) = entry.platform.as_deref()
+                && !valid.contains(platform)
+            {
+                out.push(format!(
+                    "`{label}` entry `{}` has unknown platform `{platform}` (expected one of {known})",
+                    entry.crate_name
+                ));
+            }
+        }
+    }
+}
+
+/// Profile check: every `production` entry and pinned provider must declare a
+/// non-empty subset of the known profiles, and the profile-agnostic buckets
+/// (`allow`/`test_only`/`build_only`/`proc_macro`) must not declare any.
+#[expect(clippy::too_many_lines, reason = "one linear pass over each bucket's profile rules")]
+fn check_profiles(manifest: &Manifest, out: &mut Vec<String>) {
+    let valid: BTreeSet<&str> = PROFILES.iter().map(|p| p.label).collect();
+    for entry in &manifest.production {
+        if entry.profiles.is_empty() {
+            out.push(format!(
+                "`production` entry `{}` declares no `profiles` (expected a non-empty subset of {PROFILE_LABELS:?})",
+                entry.crate_name
+            ));
+        }
+        for profile in &entry.profiles {
+            if !valid.contains(profile.as_str()) {
+                out.push(format!(
+                    "`production` entry `{}` has unknown profile `{profile}` (expected one of {PROFILE_LABELS:?})",
+                    entry.crate_name
+                ));
+            }
+        }
+    }
+    for provider in &manifest.providers {
+        if provider.profiles.is_empty() {
+            out.push(format!(
+                "pinned provider `{}` declares no `profiles` (expected a non-empty subset of {PROFILE_LABELS:?})",
+                provider.crate_name
+            ));
+        }
+        for profile in &provider.profiles {
+            if !valid.contains(profile.as_str()) {
+                out.push(format!(
+                    "pinned provider `{}` has unknown profile `{profile}` (expected one of {PROFILE_LABELS:?})",
+                    provider.crate_name
+                ));
+            }
+        }
+    }
+    let non_production: [(&str, &[Entry]); 4] = [
+        ("allow", &manifest.allow),
+        ("test_only", &manifest.test_only),
+        ("build_only", &manifest.build_only),
+        ("proc_macro", &manifest.proc_macro),
+    ];
+    for (label, entries) in non_production {
+        for entry in entries {
+            if !entry.profiles.is_empty() {
+                out.push(format!(
+                    "`{label}` entry `{}` declares `profiles`, but only `production` entries are profile-scoped",
+                    entry.crate_name
+                ));
+            }
         }
     }
 }
@@ -392,25 +615,39 @@ fn check_notes(manifest: &Manifest, out: &mut Vec<String>) {
     }
 }
 
-/// Undeclared-crypto check: a watch-matched crate present in a target's graph
-/// that is not declared applicable to THAT platform in either `production` or
-/// `allow`. Each target is checked against the entries that apply to it, so a
-/// `platform:`-tagged entry (e.g. Linux-only `openssl`) does not silently
-/// suppress the same crate appearing unexpectedly on another target. Resolving
-/// every target from the lockfile keeps the check host-independent.
+/// Undeclared-crypto check: a crypto-relevant crate present in a graph that is not
+/// declared applicable to THAT platform in either `production`, `allow`,
+/// `proc_macro`, or `build_only`. A crate is crypto-relevant when it matches a
+/// `watch_tokens` entry OR is named exactly on the FIPS denylist
+/// [`crate::fips::graph::DENIED`]. The denylist arm closes a hole in the token
+/// tripwire: the split-on-`-`/`_`-then-strip-trailing-digits tokenizer cannot
+/// reduce a separator-less concatenated cipher name (e.g. `chacha20poly1305`) to
+/// its `chacha`/`poly1305` tokens, and mode crates like `ctr`/`cbc` have no token
+/// at all, so without an exact-name check such a crate could link into the
+/// published `full` image undetected ([`check_denied_absent`] only guards `fips`).
+///
+/// Each graph is checked against the entries that apply to it (by name and
+/// platform), so a `platform:`-tagged entry (e.g. Linux-only `openssl`) does not
+/// silently suppress the same crate appearing unexpectedly on another target.
+/// Profile scoping is enforced separately by [`check_profile_leak`]; declaration
+/// here is by name so a known crypto crate (e.g. `sha2`/`hmac`/`md-5`, legitimate
+/// in `full`) is never reported as undeclared merely because it also appears in a
+/// second profile.
 fn check_undeclared(manifest: &Manifest, graphs: &[TargetGraph], out: &mut Vec<String>) {
     let watch: BTreeSet<String> = manifest.watch_tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let denied: BTreeSet<&str> = crate::fips::graph::DENIED.iter().copied().collect();
     for g in graphs {
         for name in g.facts.keys() {
-            if is_watch_match(name, &watch)
+            let crypto_relevant = is_watch_match(name, &watch) || denied.contains(name.as_str());
+            if crypto_relevant
                 && !declared_for(&manifest.production, name, &g.platform)
                 && !declared_for(&manifest.allow, name, &g.platform)
                 && !declared_for(&manifest.proc_macro, name, &g.platform)
                 && !declared_for(&manifest.build_only, name, &g.platform)
             {
                 out.push(format!(
-                    "undeclared crypto crate in the {} resolved tree: `{name}` matches a watch token but is declared in none of `production`, `allow`, `proc_macro`, or `build_only` for that platform",
-                    g.platform
+                    "undeclared crypto crate in the {}/{} resolved tree: `{name}` is crypto-relevant (matches a watch token or the FIPS denylist) but is declared in none of `production`, `allow`, `proc_macro`, or `build_only` for that platform",
+                    g.profile, g.platform
                 ));
             }
         }
@@ -422,59 +659,71 @@ fn check_undeclared(manifest: &Manifest, graphs: &[TargetGraph], out: &mut Vec<S
 fn declared_for(entries: &[Entry], name: &str, platform: &str) -> bool {
     entries
         .iter()
-        .any(|e| e.crate_name == name && e.platform.as_deref().is_none_or(|p| p == platform))
+        .any(|e| e.crate_name == name && platform_matches(&e.platform, platform))
 }
 
-/// Evaluate one `platform:`-tagged entry against the single target it names,
-/// returning a violation if the platform is unknown or the crate is absent from
-/// that target's graph. Shared by the `production` and `allow` stale checks.
-fn stale_tagged(kind: &str, name: &str, platform: &str, graphs: &[TargetGraph], known: &str) -> Option<String> {
-    match graphs.iter().find(|g| g.platform == platform) {
-        None => Some(format!(
-            "`{kind}` entry `{name}` has unknown platform `{platform}` (expected one of {known})"
-        )),
-        Some(g) if !g.contains(name) => Some(format!(
-            "stale `{kind}` entry: `{name}` (platform: {platform}) is declared but absent from the {platform} runtime graph"
-        )),
-        Some(_) => None,
-    }
-}
-
-/// Stale-declaration check: a `production` entry missing from a target it applies
-/// to. A `platform:`-tagged entry is checked on its own target; an untagged entry
-/// must appear on every target.
-fn check_stale_production(entries: &[Entry], graphs: &[TargetGraph], known: &str, out: &mut Vec<String>) {
+/// Stale-declaration check: a `production` entry that is declared for a
+/// `(profile, target)` it applies to but is absent from that resolved graph.
+fn check_stale_production(entries: &[Entry], graphs: &[TargetGraph], out: &mut Vec<String>) {
     for entry in entries {
-        match entry.platform.as_deref() {
-            Some(p) => out.extend(stale_tagged("production", &entry.crate_name, p, graphs, known)),
-            None => {
-                for g in graphs {
-                    if !g.contains(&entry.crate_name) {
-                        out.push(format!(
-                            "stale `production` entry: `{}` (platform: any) is declared but absent from the {} runtime graph",
-                            entry.crate_name, g.platform
-                        ));
-                    }
-                }
-            },
+        for g in graphs {
+            if entry_in_profile(entry, g.profile)
+                && platform_matches(&entry.platform, &g.platform)
+                && !g.contains(&entry.crate_name)
+            {
+                out.push(format!(
+                    "stale `production` entry: `{}` is declared for {}/{} but absent from that runtime graph",
+                    entry.crate_name, g.profile, g.platform
+                ));
+            }
         }
     }
 }
 
-/// Stale-exception check: an `allow` entry that no longer resolves anywhere (it
-/// stops suppressing a real crate and becomes dead documentation).
-fn check_stale_allow(entries: &[Entry], graphs: &[TargetGraph], known: &str, out: &mut Vec<String>) {
+/// Profile-leak check: a `production` entry present in a graph whose profile it
+/// does not declare. The dual of [`check_stale_production`]: stale = declared but
+/// absent; leak = present but not declared. Both use presence (`contains`), so a
+/// missing or an unexpected profile assignment is caught symmetrically.
+fn check_profile_leak(entries: &[Entry], graphs: &[TargetGraph], out: &mut Vec<String>) {
     for entry in entries {
-        match entry.platform.as_deref() {
-            Some(p) => out.extend(stale_tagged("allow", &entry.crate_name, p, graphs, known)),
-            None => {
-                if !graphs.iter().any(|g| g.contains(&entry.crate_name)) {
-                    out.push(format!(
-                        "stale `allow` entry: `{}` is declared but absent from every target's runtime graph",
-                        entry.crate_name
-                    ));
-                }
-            },
+        for g in graphs {
+            if platform_matches(&entry.platform, &g.platform)
+                && g.contains(&entry.crate_name)
+                && !entry_in_profile(entry, g.profile)
+            {
+                out.push(format!(
+                    "profile leak: `{}` is present in the {}/{} runtime graph but the manifest declares it only for [{}]",
+                    entry.crate_name,
+                    g.profile,
+                    g.platform,
+                    entry.profiles.join(", ")
+                ));
+            }
+        }
+    }
+}
+
+/// Stale-exception check: an `allow` entry that no longer resolves on any
+/// applicable graph (it stops suppressing a real crate and becomes dead
+/// documentation). `allow` is profile-agnostic, so presence on any profile's
+/// applicable target keeps it live.
+fn check_stale_allow(entries: &[Entry], graphs: &[TargetGraph], out: &mut Vec<String>) {
+    for entry in entries {
+        let present = graphs
+            .iter()
+            .filter(|g| platform_matches(&entry.platform, &g.platform))
+            .any(|g| g.contains(&entry.crate_name));
+        if !present {
+            match entry.platform.as_deref() {
+                Some(p) => out.push(format!(
+                    "stale `allow` entry: `{}` (platform: {p}) is declared but absent from every {p} runtime graph",
+                    entry.crate_name
+                )),
+                None => out.push(format!(
+                    "stale `allow` entry: `{}` is declared but absent from every runtime graph",
+                    entry.crate_name
+                )),
+            }
         }
     }
 }
@@ -484,15 +733,15 @@ fn check_stale_allow(entries: &[Entry], graphs: &[TargetGraph], known: &str, out
 /// shipped binary, so they must not be counted as runtime-binary content. Both
 /// directions are enforced:
 ///
-/// * every `proc_macro` entry must be present AND actually marked `(proc-macro)` in some target's graph — otherwise a
-///   normal (linked) crate is hiding in the build-host bucket, dodging runtime scrutiny;
+/// * every `proc_macro` entry must be present AND actually marked `(proc-macro)` in some graph — otherwise a normal
+///   (linked) crate is hiding in the build-host bucket, dodging runtime scrutiny;
 /// * no `production` or `allow` entry may be a proc-macro — that would overstate the runtime-binary contents (the
 ///   inaccuracy this check exists to prevent).
 fn check_proc_macro(manifest: &Manifest, graphs: &[TargetGraph], out: &mut Vec<String>) {
     for entry in &manifest.proc_macro {
         if !graphs.iter().any(|g| g.contains(&entry.crate_name)) {
             out.push(format!(
-                "stale `proc_macro` entry: `{}` is absent from every target's runtime graph",
+                "stale `proc_macro` entry: `{}` is absent from every runtime graph",
                 entry.crate_name
             ));
         } else if !graphs.iter().any(|g| g.is_proc_macro(&entry.crate_name)) {
@@ -513,12 +762,12 @@ fn check_proc_macro(manifest: &Manifest, graphs: &[TargetGraph], out: &mut Vec<S
 }
 
 /// Runtime-linkage check: a `production`/`allow` entry that resolves into a
-/// target's tree but is NOT linked into the runtime binary there — reachable
-/// only beneath a proc-macro subtree (a build-host code generator's own
-/// dependency, e.g. `tiny-keccak` under `const-random-macro`) — overstates the
-/// runtime contents and must move to `build_only`. Proc-macro entries are handled
-/// by [`check_proc_macro`] and skipped here, so this fires only on ordinary
-/// crates buried under a code generator.
+/// graph but is NOT linked into the runtime binary there — reachable only beneath
+/// a proc-macro subtree (a build-host code generator's own dependency, e.g.
+/// `tiny-keccak` under `const-random-macro`) — overstates the runtime contents
+/// and must move to `build_only`. Proc-macro entries are handled by
+/// [`check_proc_macro`] and skipped here, so this fires only on ordinary crates
+/// buried under a code generator.
 fn check_runtime_linkage(manifest: &Manifest, graphs: &[TargetGraph], out: &mut Vec<String>) {
     for entry in manifest.production.iter().chain(&manifest.allow) {
         for g in graphs {
@@ -527,8 +776,8 @@ fn check_runtime_linkage(manifest: &Manifest, graphs: &[TargetGraph], out: &mut 
                 && !g.is_proc_macro(&entry.crate_name)
             {
                 out.push(format!(
-                    "`{}` resolves in the {} tree but is reachable only via a proc-macro subtree (build-host only, not linked into the runtime binary) — move it to `build_only`",
-                    entry.crate_name, g.platform
+                    "`{}` resolves in the {}/{} tree but is reachable only via a proc-macro subtree (build-host only, not linked into the runtime binary) — move it to `build_only`",
+                    entry.crate_name, g.profile, g.platform
                 ));
             }
         }
@@ -536,17 +785,17 @@ fn check_runtime_linkage(manifest: &Manifest, graphs: &[TargetGraph], out: &mut 
 }
 
 /// Containment check: dev-only or build-only crypto actually linked into any
-/// target's runtime binary. Keyed on runtime linkage, not mere presence, so a
-/// `build_only` crate that only appears beneath a proc-macro subtree (its
-/// legitimate build-host home) is allowed while a genuine leak into the shipped
-/// binary is still caught.
+/// runtime binary. Keyed on runtime linkage, not mere presence, so a `build_only`
+/// crate that only appears beneath a proc-macro subtree (its legitimate
+/// build-host home) is allowed while a genuine leak into the shipped binary is
+/// still caught.
 fn check_containment(manifest: &Manifest, graphs: &[TargetGraph], out: &mut Vec<String>) {
     for entry in manifest.test_only.iter().chain(&manifest.build_only) {
         for g in graphs {
             if g.is_runtime_linked(&entry.crate_name) {
                 out.push(format!(
-                    "containment regression: `{}` is linked into the {} runtime binary",
-                    entry.crate_name, g.platform
+                    "containment regression: `{}` is linked into the {}/{} runtime binary",
+                    entry.crate_name, g.profile, g.platform
                 ));
             }
         }
@@ -560,49 +809,61 @@ fn check_providers(providers: &[Provider], graphs: &[TargetGraph], out: &mut Vec
     }
 }
 
-/// Verify one pinned provider's version and feature set on every target it
-/// appears in, and that it appears at all — the load-bearing provider-selection
-/// facts cannot rot while the crate name stays put.
+/// Verify one pinned provider's version and feature set on every profile it is
+/// declared in, and that it appears at all in each — the load-bearing
+/// provider-selection facts cannot rot while the crate name stays put.
 fn check_provider(provider: &Provider, graphs: &[TargetGraph], out: &mut Vec<String>) {
-    let mut seen = false;
-    for g in graphs {
-        let Some(instances) = g.facts.get(&provider.crate_name) else {
+    for profile in &provider.profiles {
+        let profile_graphs: Vec<&TargetGraph> = graphs.iter().filter(|g| g.profile == profile.as_str()).collect();
+        if profile_graphs.is_empty() {
             continue;
-        };
-        seen = true;
-        // Every resolved copy must match the pin. An off-version copy is drift on
-        // its own; features are only meaningful on the pinned-version copy.
-        for facts in instances {
-            if facts.version == provider.version {
-                check_provider_features(provider, facts, &g.platform, out);
-            } else {
-                out.push(format!(
-                    "provider drift: `{}` is `{}` in the {} graph but the manifest pins `{}`",
-                    provider.crate_name, facts.version, g.platform, provider.version
-                ));
+        }
+        let mut seen = false;
+        for g in profile_graphs {
+            let Some(instances) = g.facts.get(&provider.crate_name) else {
+                continue;
+            };
+            seen = true;
+            // Every resolved copy must match the pin. An off-version copy is drift
+            // on its own; features are only meaningful on the pinned-version copy.
+            for facts in instances {
+                if facts.version == provider.version {
+                    check_provider_features(provider, facts, g.profile, &g.platform, out);
+                } else {
+                    out.push(format!(
+                        "provider drift: `{}` is `{}` in the {}/{} graph but the manifest pins `{}`",
+                        provider.crate_name, facts.version, g.profile, g.platform, provider.version
+                    ));
+                }
             }
         }
-    }
-    if !seen {
-        out.push(format!(
-            "pinned provider `{}` is absent from every target's runtime graph",
-            provider.crate_name
-        ));
+        if !seen {
+            out.push(format!(
+                "pinned provider `{}` is absent from the {profile} profile runtime graph",
+                provider.crate_name
+            ));
+        }
     }
 }
 
 /// Verify a provider's required features are present and forbidden ones absent
-/// in one target's resolved feature set. Unlisted (extra) features are permitted
+/// in one graph's resolved feature set. Unlisted (extra) features are permitted
 /// by design: feature sets legitimately grow across patch releases, so exact-set
 /// pinning would churn on benign additions. Only the security-relevant invariants
 /// are expressed — as `require_features` (must stay) and `forbid_features` (must
 /// not appear, e.g. `fips`). A provider with no constraints (e.g. `ring`) pins
 /// only its version, because none of its features affect provider selection.
-fn check_provider_features(provider: &Provider, facts: &CrateFacts, platform: &str, out: &mut Vec<String>) {
+fn check_provider_features(
+    provider: &Provider,
+    facts: &CrateFacts,
+    profile: &str,
+    platform: &str,
+    out: &mut Vec<String>,
+) {
     for want in &provider.require_features {
         if !facts.features.contains(want) {
             out.push(format!(
-                "provider drift: `{}` is missing required feature `{want}` in the {platform} graph",
+                "provider drift: `{}` is missing required feature `{want}` in the {profile}/{platform} graph",
                 provider.crate_name
             ));
         }
@@ -610,9 +871,30 @@ fn check_provider_features(provider: &Provider, facts: &CrateFacts, platform: &s
     for deny in &provider.forbid_features {
         if facts.features.contains(deny) {
             out.push(format!(
-                "provider drift: `{}` has forbidden feature `{deny}` enabled in the {platform} graph",
+                "provider drift: `{}` has forbidden feature `{deny}` enabled in the {profile}/{platform} graph",
                 provider.crate_name
             ));
+        }
+    }
+}
+
+/// FIPS denylist check: no crate on Red Hat's denylist (shared with the FIPS
+/// report through [`crate::fips::graph::DENIED`]) may enter a `fips` runtime
+/// graph. This is a defense-in-depth backstop over the profile assignments: even
+/// if a `production` entry were mis-tagged with the `fips` profile, a genuinely
+/// denied crate in the FIPS build is caught here.
+fn check_denied_absent(graphs: &[TargetGraph], out: &mut Vec<String>) {
+    for g in graphs {
+        if g.profile != "fips" {
+            continue;
+        }
+        for &denied in crate::fips::graph::DENIED {
+            if g.contains(denied) {
+                out.push(format!(
+                    "FIPS denylist crate `{denied}` is present in the fips/{} runtime graph (must never enter the FIPS build)",
+                    g.platform
+                ));
+            }
         }
     }
 }
@@ -632,39 +914,276 @@ fn is_watch_match(name: &str, watch: &BTreeSet<String>) -> bool {
 }
 
 // -----------------------------------------------------------------------------
+// Prose generation
+// -----------------------------------------------------------------------------
+
+/// Render the full generated companion document from the manifest. Pure and
+/// deterministic: iterates the manifest in declaration order, so the same
+/// manifest always renders byte-for-byte the same document.
+#[expect(clippy::too_many_lines, reason = "one writeln! per generated document section")]
+fn render_doc(manifest: &Manifest) -> String {
+    let mut out = String::new();
+
+    writeln!(out, "<!-- SPDX-License-Identifier: Apache-2.0 -->").unwrap();
+    writeln!(out, "<!-- Copyright (c) 2026 Praxis Contributors -->").unwrap();
+    writeln!(
+        out,
+        "<!-- Generated by `cargo xtask check-crypto-inventory --fix`. Do not edit"
+    )
+    .unwrap();
+    writeln!(out, "     by hand — edit {MANIFEST_BASENAME} and regenerate. -->").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "# Cryptographic operations inventory").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "This page is generated from the machine-readable manifest").unwrap();
+    writeln!(
+        out,
+        "[`{MANIFEST_BASENAME}`]({MANIFEST_BASENAME}), which is the authoritative source of"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "record for the Praxis AI proxy's production cryptography ([#1220][i1220])."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "`cargo xtask check-crypto-inventory` resolves the runtime dependency graph of"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "each shipped profile on all three tier-1 targets and fails if the manifest and"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "the resolved graphs disagree; run it with `--fix` to regenerate this page."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    render_profiles(&mut out);
+    render_dispositions(&mut out);
+    render_production(manifest, &mut out);
+    render_providers(manifest, &mut out);
+    render_named_bucket(&mut out, "Reviewed non-primitives (`allow`)", &manifest.allow);
+    render_named_bucket(&mut out, "Test-only cryptography (`test_only`)", &manifest.test_only);
+    render_named_bucket(&mut out, "Build-host cryptography (`build_only`)", &manifest.build_only);
+    render_named_bucket(&mut out, "Build-host proc-macros (`proc_macro`)", &manifest.proc_macro);
+    render_watch_tokens(manifest, &mut out);
+    render_maintenance(&mut out);
+
+    writeln!(out).unwrap();
+    writeln!(out, "[i1220]: https://github.com/praxis-proxy/ai/issues/1220").unwrap();
+
+    out
+}
+
+/// Render the build-profiles table.
+fn render_profiles(out: &mut String) {
+    writeln!(out, "## Build profiles").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "The inventory tracks two shipped profiles; every `production` crate and pinned"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "provider is assigned to the profiles it is resolved in. Both are built"
+    )
+    .unwrap();
+    writeln!(out, "`--no-default-features`.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Profile | Cargo features | Description |").unwrap();
+    writeln!(out, "| --- | --- | --- |").unwrap();
+    for profile in &PROFILES {
+        writeln!(
+            out,
+            "| `{}` | `{}` | {} |",
+            profile.label,
+            profile.features,
+            cell(profile.description)
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+/// Render the disposition legend.
+fn render_dispositions(out: &mut String) {
+    writeln!(out, "## Dispositions").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Every `production` primitive carries one disposition:").unwrap();
+    writeln!(out).unwrap();
+    for disposition in VALID_DISPOSITIONS {
+        writeln!(out, "- `{disposition}` — {}", disposition_doc(disposition)).unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+/// Render the production primitives table.
+fn render_production(manifest: &Manifest, out: &mut String) {
+    writeln!(out, "## Production primitives").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Crypto and crypto-support crates resolved into the runtime binary."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Crate | Profiles | Platform | Disposition | Notes |").unwrap();
+    writeln!(out, "| --- | --- | --- | --- | --- |").unwrap();
+    for entry in &manifest.production {
+        writeln!(
+            out,
+            "| `{}` | {} | {} | {} | {} |",
+            entry.crate_name,
+            entry.profiles.join(", "),
+            entry.platform.as_deref().unwrap_or("all"),
+            entry.disposition.as_deref().unwrap_or(""),
+            cell(&entry.note),
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+/// Render the pinned-providers table (no version pins in prose; the manifest is
+/// the authoritative source for versions).
+fn render_providers(manifest: &Manifest, out: &mut String) {
+    writeln!(out, "## Pinned providers").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Providers whose selection is load-bearing: the manifest pins the version and"
+    )
+    .unwrap();
+    writeln!(out, "the security-relevant features so a drift cannot pass unnoticed.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "| Crate | Profiles | Required features | Forbidden features | Notes |"
+    )
+    .unwrap();
+    writeln!(out, "| --- | --- | --- | --- | --- |").unwrap();
+    for provider in &manifest.providers {
+        writeln!(
+            out,
+            "| `{}` | {} | {} | {} | {} |",
+            provider.crate_name,
+            provider.profiles.join(", "),
+            features_cell(&provider.require_features),
+            features_cell(&provider.forbid_features),
+            cell(&provider.note),
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+/// Render a simple `Crate | Notes` bucket table under `title`.
+fn render_named_bucket(out: &mut String, title: &str, entries: &[Entry]) {
+    writeln!(out, "## {title}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Crate | Notes |").unwrap();
+    writeln!(out, "| --- | --- |").unwrap();
+    for entry in entries {
+        writeln!(out, "| `{}` | {} |", entry.crate_name, cell(&entry.note)).unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+/// Render the watch-tokens note.
+fn render_watch_tokens(manifest: &Manifest, out: &mut String) {
+    writeln!(out, "## Watch tokens").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "The check treats a crate as crypto-relevant when its name matches one of these"
+    )
+    .unwrap();
+    writeln!(out, "tokens (split on `-`/`_`, trailing digits stripped):").unwrap();
+    writeln!(out).unwrap();
+    let tokens: Vec<String> = manifest.watch_tokens.iter().map(|t| format!("`{t}`")).collect();
+    writeln!(out, "{}", tokens.join(", ")).unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Render the maintenance note.
+fn render_maintenance(out: &mut String) {
+    writeln!(out, "## Maintenance").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Edit [`{MANIFEST_BASENAME}`]({MANIFEST_BASENAME}) and run:").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "```console").unwrap();
+    writeln!(out, "cargo xtask check-crypto-inventory --fix").unwrap();
+    writeln!(out, "```").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "The same check without `--fix` runs in `make lint` and fails on any drift"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "between the manifest, this page, and the resolved dependency graphs."
+    )
+    .unwrap();
+}
+
+/// Escape one cell of a Markdown table: collapse newlines to spaces and escape
+/// pipes so a `note` cannot break the table layout.
+fn cell(text: &str) -> String {
+    text.replace('\n', " ").replace('|', "\\|").trim().to_owned()
+}
+
+/// Render a feature list into one table cell, or an em dash when empty.
+fn features_cell(features: &[String]) -> String {
+    if features.is_empty() {
+        "—".to_owned()
+    } else {
+        features.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Cargo Graph
 // -----------------------------------------------------------------------------
 
-/// The fixed `cargo tree` arguments describing the profile of record; the
-/// per-target `--target <triple>` pair is appended in [`resolve_target`].
-const TREE_ARGS: [&str; 12] = [
-    "tree",
-    "-p",
-    "praxis-ai-proxy",
-    "--edges",
-    "normal",
-    "--no-default-features",
-    "--features",
-    "full",
-    "--prefix",
-    "depth",
-    "--format",
-    "{p}|{f}",
-];
-
-/// Resolve the runtime (`--edges normal`) dependency graph of the profile of
-/// record for one target triple and return its crate facts.
-fn resolve_target(root: &Path, platform: &str, triple: &str) -> TargetGraph {
+/// Resolve the runtime (`--edges normal`) dependency graph of one profile for one
+/// target triple and return its crate facts.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single cargo-tree invocation with a long argument vector"
+)]
+fn resolve_target(root: &Path, profile: &Profile, platform: &str, triple: &str) -> TargetGraph {
     let output = Command::new("cargo")
         .current_dir(root)
-        .args(TREE_ARGS)
-        .args(["--target", triple])
+        .args([
+            "tree",
+            "-p",
+            "praxis-ai-proxy",
+            "--edges",
+            "normal",
+            "--no-default-features",
+            "--features",
+            profile.features,
+            "--prefix",
+            "depth",
+            "--format",
+            "{p}|{f}",
+            "--target",
+            triple,
+        ])
         .output()
         .expect("failed to run cargo tree");
 
     if !output.status.success() {
         eprintln!(
-            "cargo tree (--target {triple}) failed:\n{}",
+            "cargo tree (profile {}, --target {triple}) failed:\n{}",
+            profile.label,
             String::from_utf8_lossy(&output.stderr)
         );
         std::process::exit(1);
@@ -672,6 +1191,7 @@ fn resolve_target(root: &Path, platform: &str, triple: &str) -> TargetGraph {
 
     let text = String::from_utf8(output.stdout).expect("cargo tree output is not UTF-8");
     TargetGraph {
+        profile: profile.label,
         platform: platform.to_owned(),
         runtime_linked: compute_runtime_linked(&text),
         facts: parse_facts(&text),
@@ -694,6 +1214,16 @@ fn split_depth(line: &str) -> (usize, &str) {
     (digits.parse::<usize>().unwrap_or(0), rest)
 }
 
+/// Parse the `name`/`version` and proc-macro marker out of the `{p}` (left) half
+/// of a formatted line. `{p}` prints `name vX.Y.Z [(source)] [(proc-macro)]`.
+fn parse_pkg(left: &str) -> Option<(PkgId, bool)> {
+    let is_proc_macro = left.contains("(proc-macro)");
+    let mut fields = left.split_whitespace();
+    let name = fields.next()?.to_owned();
+    let version = fields.next().unwrap_or("").trim_start_matches('v').to_owned();
+    Some((PkgId { name, version }, is_proc_macro))
+}
+
 /// Parse `cargo tree --prefix depth --format "{p}|{f}"` output into crate facts.
 ///
 /// Each line is `<depth>name vX.Y.Z [(source)] [(proc-macro)]|feat1,feat2 [(*)]`;
@@ -712,20 +1242,19 @@ fn parse_facts(text: &str) -> BTreeMap<String, Vec<CrateFacts>> {
         }
         let (_, line) = split_depth(trimmed);
         let (left, right) = line.split_once('|').unwrap_or((line, ""));
-        let is_proc_macro = left.contains("(proc-macro)");
-        let mut fields = left.split_whitespace();
-        let Some(name) = fields.next() else { continue };
-        let version = fields.next().unwrap_or("").trim_start_matches('v').to_owned();
+        let Some((id, is_proc_macro)) = parse_pkg(left) else {
+            continue;
+        };
         let features: BTreeSet<String> = right
             .split(',')
             .map(str::trim)
             .filter(|f| !f.is_empty())
             .map(str::to_owned)
             .collect();
-        let versions = facts.entry(name.to_owned()).or_default();
-        if !versions.iter().any(|f| f.version == version) {
+        let versions = facts.entry(id.name).or_default();
+        if !versions.iter().any(|f| f.version == id.version) {
             versions.push(CrateFacts {
-                version,
+                version: id.version,
                 features,
                 is_proc_macro,
             });
@@ -734,43 +1263,44 @@ fn parse_facts(text: &str) -> BTreeMap<String, Vec<CrateFacts>> {
     facts
 }
 
-/// The name-keyed edge set of a `cargo tree --prefix depth` graph, plus the set
-/// of proc-macro nodes and the root crate.
+/// The identity-keyed edge set of a `cargo tree --prefix depth` graph, plus the
+/// set of proc-macro nodes and the root package.
 struct TreeEdges {
-    /// For each crate, the set of crates it depends on (by name).
-    edges: BTreeMap<String, BTreeSet<String>>,
-    /// Crates marked `(proc-macro)` in the graph (build-host code generators).
-    proc_macros: BTreeSet<String>,
-    /// The root crate (`praxis-ai-proxy`), if any line was at depth 0.
-    root: Option<String>,
+    /// For each package identity, the set of package identities it depends on.
+    edges: BTreeMap<PkgId, BTreeSet<PkgId>>,
+    /// Package identities marked `(proc-macro)` (build-host code generators).
+    proc_macros: BTreeSet<PkgId>,
+    /// The root package (`praxis-ai-proxy`), if any line was at depth 0.
+    root: Option<PkgId>,
 }
 
 /// Reconstruct the dependency edges from a `cargo tree --prefix depth` walk.
 ///
 /// `cargo tree --prefix depth` prints a depth-first walk with an integer depth on
 /// every line, so the parent of a line at depth `d` is the most recent line at
-/// depth `d - 1`. That reconstructs a global, name-keyed edge set (a `(*)` repeat
-/// still contributes its parent edge; its children were already printed at the
-/// first, fully expanded occurrence).
+/// depth `d - 1`. That reconstructs a global, identity-keyed edge set (a `(*)`
+/// repeat still contributes its parent edge; its children were already printed at
+/// the first, fully expanded occurrence). Keying on [`PkgId`] rather than the bare
+/// name keeps two co-resolved versions of a crate as distinct nodes.
 fn parse_tree_edges(text: &str) -> TreeEdges {
-    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut proc_macros: BTreeSet<String> = BTreeSet::new();
-    let mut root: Option<String> = None;
-    let mut stack: Vec<String> = Vec::new();
+    let mut edges: BTreeMap<PkgId, BTreeSet<PkgId>> = BTreeMap::new();
+    let mut proc_macros: BTreeSet<PkgId> = BTreeSet::new();
+    let mut root: Option<PkgId> = None;
+    let mut stack: Vec<PkgId> = Vec::new();
     for raw in text.lines() {
-        let Some((depth, name, is_proc_macro)) = parse_tree_line(raw) else {
+        let Some((depth, id, is_proc_macro)) = parse_tree_line(raw) else {
             continue;
         };
         if is_proc_macro {
-            proc_macros.insert(name.to_owned());
+            proc_macros.insert(id.clone());
         }
         if depth == 0 {
-            root.get_or_insert_with(|| name.to_owned());
+            root.get_or_insert_with(|| id.clone());
         } else if let Some(parent) = stack.get(depth - 1) {
-            edges.entry(parent.clone()).or_default().insert(name.to_owned());
+            edges.entry(parent.clone()).or_default().insert(id.clone());
         }
         stack.truncate(depth);
-        stack.push(name.to_owned());
+        stack.push(id);
     }
     TreeEdges {
         edges,
@@ -779,43 +1309,43 @@ fn parse_tree_edges(text: &str) -> TreeEdges {
     }
 }
 
-/// Parse one `cargo tree --prefix depth` line into `(depth, crate name,
+/// Parse one `cargo tree --prefix depth` line into `(depth, package identity,
 /// is-proc-macro)`, or `None` for a blank line. The trailing `(*)` (a subtree
 /// cargo already printed) is stripped before parsing; it still contributes a
 /// parent edge but its children were printed at the first occurrence.
-fn parse_tree_line(raw: &str) -> Option<(usize, &str, bool)> {
+fn parse_tree_line(raw: &str) -> Option<(usize, PkgId, bool)> {
     let trimmed = raw.trim().trim_end_matches("(*)").trim_end();
     if trimmed.is_empty() {
         return None;
     }
     let (depth, line) = split_depth(trimmed);
     let left = line.split_once('|').map_or(line, |(l, _)| l);
-    let is_proc_macro = left.contains("(proc-macro)");
-    let name = left.split_whitespace().next()?;
-    Some((depth, name, is_proc_macro))
+    let (id, is_proc_macro) = parse_pkg(left)?;
+    Some((depth, id, is_proc_macro))
 }
 
-/// Compute the set of crates linked into the runtime binary: reachable from the
-/// root crate over `--edges normal` edges without passing through a proc-macro
-/// node.
+/// Compute the set of package identities linked into the runtime binary:
+/// reachable from the root package over `--edges normal` edges without passing
+/// through a proc-macro node.
 ///
-/// A breadth-first walk from the root collects every reachable crate while
+/// A breadth-first walk from the root collects every reachable package while
 /// refusing to enter proc-macro nodes — so a proc-macro (a build-host code
 /// generator) and anything reachable *only* beneath one (e.g. `tiny-keccak` under
 /// `const-random-macro`) is excluded, while a crate that is *also* reachable by a
-/// normal path stays linked.
-fn compute_runtime_linked(text: &str) -> BTreeSet<String> {
+/// normal path stays linked. Keying on [`PkgId`] means a build-host-only copy of a
+/// crate is never conflated with a runtime-linked copy of the same name.
+fn compute_runtime_linked(text: &str) -> BTreeSet<PkgId> {
     let TreeEdges {
         edges,
         proc_macros,
         root,
     } = parse_tree_edges(text);
-    let mut linked: BTreeSet<String> = BTreeSet::new();
+    let mut linked: BTreeSet<PkgId> = BTreeSet::new();
     let Some(root) = root else { return linked };
     if proc_macros.contains(&root) {
         return linked;
     }
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue: VecDeque<PkgId> = VecDeque::new();
     linked.insert(root.clone());
     queue.push_back(root);
     while let Some(node) = queue.pop_front() {
@@ -858,6 +1388,20 @@ fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A synthetic package identity for tests (version is irrelevant to the
+    /// name-level queries most tests exercise).
+    fn pkg(name: &str) -> PkgId {
+        PkgId {
+            name: name.to_owned(),
+            version: "0.0.0".to_owned(),
+        }
+    }
+
+    /// The crate names of a runtime-linked set, for name-level assertions.
+    fn linked_names(linked: &BTreeSet<PkgId>) -> BTreeSet<String> {
+        linked.iter().map(|id| id.name.clone()).collect()
+    }
+
     /// Assert no crate appears in more than one classification list. Providers
     /// intentionally overlap `production`, so they are excluded.
     fn assert_no_duplicate_entries(manifest: &Manifest) {
@@ -878,6 +1422,7 @@ mod tests {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "inline YAML fixture")]
     fn sample_manifest() -> Manifest {
         // No `providers:` block here — provider drift has its own focused tests
         // so the name-based tests can build graphs from plain crate names.
@@ -885,16 +1430,20 @@ mod tests {
 watch_tokens: [sha, md, hmac, rustls, ring, openssl, aws, rand]
 production:
   - crate: sha2
+    profiles: [full]
     disposition: non-validated
     note: test
   - crate: rustls
+    profiles: [full, fips]
     disposition: non-validated
     note: test
   - crate: openssl
+    profiles: [full, fips]
     disposition: non-validated
     platform: linux
     note: test
   - crate: security-framework
+    profiles: [full, fips]
     disposition: non-validated
     platform: macos
     note: test
@@ -910,12 +1459,13 @@ build_only:
         serde_yaml::from_str(yaml).expect("sample manifest parses")
     }
 
-    /// Build a target graph from bare crate names (version/features irrelevant).
-    /// Every name is treated as a normal, runtime-linked crate; proc-macro /
-    /// build-host-only crates are layered on via [`insert_proc_macro`] /
-    /// [`insert_build_host_only`].
+    /// Build a `full`-profile target graph from bare crate names (version/features
+    /// irrelevant). Every name is treated as a normal, runtime-linked crate;
+    /// proc-macro / build-host-only crates are layered on via [`insert_proc_macro`]
+    /// / [`insert_build_host_only`].
     fn names_tg(platform: &str, names: &[&str]) -> TargetGraph {
         TargetGraph {
+            profile: "full",
             platform: platform.to_owned(),
             facts: names
                 .iter()
@@ -930,7 +1480,7 @@ build_only:
                     )
                 })
                 .collect(),
-            runtime_linked: names.iter().map(|n| (*n).to_owned()).collect(),
+            runtime_linked: names.iter().map(|n| pkg(n)).collect(),
         }
     }
 
@@ -945,7 +1495,7 @@ build_only:
                 is_proc_macro: true,
             }],
         );
-        g.runtime_linked.remove(name);
+        g.runtime_linked.remove(&pkg(name));
     }
 
     /// Insert `name` into `g` as an ordinary crate that is present in the tree but
@@ -960,11 +1510,11 @@ build_only:
                 is_proc_macro: false,
             }],
         );
-        g.runtime_linked.remove(name);
+        g.runtime_linked.remove(&pkg(name));
     }
 
-    /// Build a target graph with `normal` crates plus `proc_macros` marked as
-    /// build-host proc-macros.
+    /// Build a `full`-profile target graph with `normal` crates plus `proc_macros`
+    /// marked as build-host proc-macros.
     fn tg_with(platform: &str, normal: &[&str], proc_macros: &[&str]) -> TargetGraph {
         let mut g = names_tg(platform, normal);
         for name in proc_macros {
@@ -973,7 +1523,7 @@ build_only:
         g
     }
 
-    /// The three-target graph set for a clean sample tree.
+    /// The three-target `full`-profile graph set for a clean sample tree.
     fn clean_graphs() -> Vec<TargetGraph> {
         vec![
             names_tg(
@@ -990,6 +1540,19 @@ build_only:
             names_tg("macos", &["sha2", "rustls", "security-framework", "serde"]),
             names_tg("windows", &["sha2", "rustls", "serde"]),
         ]
+    }
+
+    /// A `fips`-profile graph from bare crate names.
+    fn fips_tg(platform: &str, names: &[&str]) -> TargetGraph {
+        let mut g = names_tg(platform, names);
+        g.profile = "fips";
+        g
+    }
+
+    #[test]
+    fn profile_labels_match_profiles() {
+        let labels: Vec<&str> = PROFILES.iter().map(|p| p.label).collect();
+        assert_eq!(labels, PROFILE_LABELS, "PROFILE_LABELS must mirror PROFILES");
     }
 
     #[test]
@@ -1047,8 +1610,49 @@ build_only:
     }
 
     #[test]
+    fn denylisted_cipher_without_watch_token_is_flagged_in_full_profile() {
+        // Regression: the token split (on `-`/`_`, then strip trailing digits)
+        // cannot reduce the separator-less name `chacha20poly1305` to its
+        // `chacha`/`poly1305` tokens, and `ctr`/`cbc` have no token at all, so the
+        // watch tripwire alone misses them. Because they are on
+        // `fips::graph::DENIED`, the exact-name arm of `check_undeclared` still
+        // catches them in the published `full` image, where `check_denied_absent`
+        // (fips-only) does not run.
+        let watch: BTreeSet<String> = sample_manifest()
+            .watch_tokens
+            .iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        assert!(
+            !is_watch_match("chacha20poly1305", &watch),
+            "precondition: the watch tripwire alone must miss chacha20poly1305"
+        );
+        assert!(!is_watch_match("ctr", &watch), "precondition: ctr has no watch token");
+
+        let mut graphs = clean_graphs();
+        for name in ["chacha20poly1305", "ctr", "cbc"] {
+            graphs[0].facts.insert(
+                name.to_owned(),
+                vec![CrateFacts {
+                    version: "0.0.0".to_owned(),
+                    features: BTreeSet::new(),
+                    is_proc_macro: false,
+                }],
+            );
+            graphs[0].runtime_linked.insert(pkg(name));
+        }
+        let violations = evaluate(&sample_manifest(), &graphs);
+        for name in ["chacha20poly1305", "ctr", "cbc"] {
+            assert!(
+                violations.iter().any(|v| v.contains(name) && v.contains("undeclared")),
+                "denylisted cipher `{name}` must be flagged undeclared in the full profile: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn untagged_production_entry_missing_everywhere_is_flagged() {
-        // rustls (platform any) removed from all three graphs -> stale on each.
+        // rustls (platform any, profiles full) removed from all three graphs.
         let graphs = vec![
             names_tg("linux", &["sha2", "openssl", "openssl-macros", "aws-smithy-types"]),
             names_tg("macos", &["sha2", "security-framework"]),
@@ -1107,6 +1711,7 @@ build_only:
         manifest.production.push(Entry {
             crate_name: "made-up".to_owned(),
             platform: Some("solaris".to_owned()),
+            profiles: vec!["full".to_owned()],
             disposition: Some("n-a".to_owned()),
             note: "test".to_owned(),
         });
@@ -1120,11 +1725,119 @@ build_only:
     }
 
     #[test]
+    fn missing_profiles_on_production_is_flagged() {
+        let mut manifest = sample_manifest();
+        manifest.production.push(Entry {
+            crate_name: "newprim".to_owned(),
+            platform: None,
+            profiles: Vec::new(),
+            disposition: Some("n-a".to_owned()),
+            note: "test".to_owned(),
+        });
+        let violations = evaluate(&manifest, &clean_graphs());
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("newprim") && v.contains("profiles")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_profile_on_production_is_flagged() {
+        let mut manifest = sample_manifest();
+        manifest.production.push(Entry {
+            crate_name: "newprim".to_owned(),
+            platform: None,
+            profiles: vec!["turbo".to_owned()],
+            disposition: Some("n-a".to_owned()),
+            note: "test".to_owned(),
+        });
+        let violations = evaluate(&manifest, &clean_graphs());
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("unknown profile") && v.contains("turbo")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn profiles_on_non_production_bucket_is_flagged() {
+        let mut manifest = sample_manifest();
+        manifest.allow.push(Entry {
+            crate_name: "openssl-probe".to_owned(),
+            platform: None,
+            profiles: vec!["full".to_owned()],
+            disposition: None,
+            note: String::new(),
+        });
+        let violations = evaluate(&manifest, &clean_graphs());
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("openssl-probe") && v.contains("profile")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn full_only_entry_present_in_fips_graph_is_a_profile_leak() {
+        // sha2 is declared full-only; appearing in a fips graph is a leak.
+        let mut graphs = clean_graphs();
+        graphs.push(fips_tg("linux", &["rustls", "openssl", "sha2"]));
+        let violations = evaluate(&sample_manifest(), &graphs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("profile leak") && v.contains("sha2")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn full_only_entry_absent_from_fips_graph_is_not_stale() {
+        // sha2 (full-only) legitimately absent from a fips graph must be quiet.
+        let mut graphs = clean_graphs();
+        graphs.push(fips_tg("linux", &["rustls", "openssl"]));
+        let violations = evaluate(&sample_manifest(), &graphs);
+        assert!(
+            !violations.iter().any(|v| v.contains("sha2")),
+            "full-only crate absent from fips must be quiet: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn fips_denylist_crate_in_fips_graph_is_flagged() {
+        // aws-lc-rs is on the FIPS denylist; its presence in a fips graph fails.
+        let mut graphs = clean_graphs();
+        graphs.push(fips_tg("linux", &["rustls", "openssl", "aws-lc-rs"]));
+        let violations = evaluate(&sample_manifest(), &graphs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("FIPS denylist") && v.contains("aws-lc-rs")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn fips_denylist_crate_in_full_graph_is_not_flagged_by_denylist() {
+        // sha2 in a full graph is fine — the denylist only guards fips graphs.
+        let violations = evaluate(&sample_manifest(), &clean_graphs());
+        assert!(
+            !violations.iter().any(|v| v.contains("FIPS denylist")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn missing_disposition_is_flagged() {
         let mut manifest = sample_manifest();
         manifest.production.push(Entry {
             crate_name: "sha2".to_owned(),
             platform: None,
+            profiles: vec!["full".to_owned()],
             disposition: None,
             note: "test".to_owned(),
         });
@@ -1141,6 +1854,7 @@ build_only:
         manifest.production.push(Entry {
             crate_name: "sha2".to_owned(),
             platform: None,
+            profiles: vec!["full".to_owned()],
             disposition: Some("bogus".to_owned()),
             note: "test".to_owned(),
         });
@@ -1159,6 +1873,7 @@ build_only:
         manifest.production.push(Entry {
             crate_name: "sha2".to_owned(),
             platform: None,
+            profiles: vec!["full".to_owned()],
             disposition: Some("n-a".to_owned()),
             note: "  ".to_owned(),
         });
@@ -1174,6 +1889,7 @@ build_only:
 watch_tokens: [aws]
 production:
   - crate: aws-lc-rs
+    profiles: [full]
     disposition: non-validated
     note: test
 allow: []
@@ -1182,6 +1898,7 @@ build_only: []
 providers:
   - crate: aws-lc-rs
     version: \"1.18.1\"
+    profiles: [full]
     forbid_feature: [fips]
     note: test
 ";
@@ -1201,7 +1918,7 @@ providers:
                 is_proc_macro: false,
             }],
         );
-        graphs[0].runtime_linked.insert("rcgen".to_owned());
+        graphs[0].runtime_linked.insert(pkg("rcgen"));
         let violations = evaluate(&sample_manifest(), &graphs);
         assert!(
             violations
@@ -1223,7 +1940,7 @@ providers:
                 is_proc_macro: false,
             }],
         );
-        graphs[2].runtime_linked.insert("sha3".to_owned());
+        graphs[2].runtime_linked.insert(pkg("sha3"));
         let violations = evaluate(&sample_manifest(), &graphs);
         assert!(
             violations
@@ -1242,6 +1959,7 @@ providers:
         manifest.build_only.push(Entry {
             crate_name: "tiny-keccak".to_owned(),
             platform: None,
+            profiles: Vec::new(),
             disposition: None,
             note: "build-host only".to_owned(),
         });
@@ -1263,6 +1981,7 @@ providers:
         manifest.allow.push(Entry {
             crate_name: "tiny-keccak".to_owned(),
             platform: None,
+            profiles: Vec::new(),
             disposition: None,
             note: String::new(),
         });
@@ -1284,6 +2003,7 @@ providers:
         manifest.build_only.push(Entry {
             crate_name: "sha2".to_owned(), // already a `production` entry
             platform: None,
+            profiles: Vec::new(),
             disposition: None,
             note: "dup".to_owned(),
         });
@@ -1305,7 +2025,7 @@ providers:
                     2shared v1.0.0|\n\
                     1pm-crate v1.0.0 (proc-macro)|\n\
                     2under-pm v1.0.0|\n";
-        let linked = compute_runtime_linked(text);
+        let linked = linked_names(&compute_runtime_linked(text));
         assert!(linked.contains("root"), "{linked:?}");
         assert!(linked.contains("normal-a"), "{linked:?}");
         assert!(linked.contains("shared"), "{linked:?}");
@@ -1325,13 +2045,39 @@ providers:
                     2dual v1.0.0|\n\
                     1normal-b v1.0.0|\n\
                     2dual v1.0.0|\n";
-        let linked = compute_runtime_linked(text);
+        let linked = linked_names(&compute_runtime_linked(text));
         assert!(linked.contains("normal-b"), "{linked:?}");
         assert!(
             linked.contains("dual"),
             "reachable via a normal path stays linked: {linked:?}"
         );
         assert!(!linked.contains("pm-crate"), "{linked:?}");
+    }
+
+    #[test]
+    fn compute_runtime_linked_distinguishes_coresolved_versions() {
+        // Two versions of `dep`: v1 under a normal path (linked), v2 only beneath a
+        // proc-macro (build-host only). Identity keying keeps them apart.
+        let text = "0root v1.0.0|\n\
+                    1normal-a v1.0.0|\n\
+                    2dep v1.0.0|\n\
+                    1pm-crate v1.0.0 (proc-macro)|\n\
+                    2dep v2.0.0|\n";
+        let linked = compute_runtime_linked(text);
+        assert!(
+            linked.contains(&PkgId {
+                name: "dep".to_owned(),
+                version: "1.0.0".to_owned()
+            }),
+            "v1 under a normal path is linked: {linked:?}"
+        );
+        assert!(
+            !linked.contains(&PkgId {
+                name: "dep".to_owned(),
+                version: "2.0.0".to_owned()
+            }),
+            "v2 only beneath a proc-macro is not linked: {linked:?}"
+        );
     }
 
     fn proc_macro_manifest() -> Manifest {
@@ -1341,9 +2087,11 @@ providers:
 watch_tokens: [sha, rustls, zeroize]
 production:
   - crate: sha2
+    profiles: [full]
     disposition: non-validated
     note: test
   - crate: rustls
+    profiles: [full]
     disposition: non-validated
     note: test
 allow: []
@@ -1460,6 +2208,7 @@ proc_macro:
 watch_tokens: [aws]
 production:
   - crate: aws-lc-rs
+    profiles: [full]
     disposition: non-validated
     note: test
 allow: []
@@ -1468,6 +2217,7 @@ build_only: []
 providers:
   - crate: aws-lc-rs
     version: \"1.18.1\"
+    profiles: [full]
     require_features: [aws-lc-sys]
     forbid_features: [fips]
     note: test
@@ -1475,7 +2225,7 @@ providers:
         serde_yaml::from_str(yaml).expect("provider manifest parses")
     }
 
-    /// Three-target graphs where `aws-lc-rs` resolves at the given
+    /// Three `full`-profile graphs where `aws-lc-rs` resolves at the given
     /// `(version, &[features])` instances on every target.
     fn provider_graphs(instances: &[(&str, &[&str])]) -> Vec<TargetGraph> {
         let build = || {
@@ -1493,9 +2243,10 @@ providers:
             .map(|(platform, _)| {
                 let facts = [("aws-lc-rs".to_owned(), build())].into_iter().collect();
                 TargetGraph {
+                    profile: "full",
                     platform: (*platform).to_owned(),
                     facts,
-                    runtime_linked: ["aws-lc-rs".to_owned()].into_iter().collect(),
+                    runtime_linked: [pkg("aws-lc-rs")].into_iter().collect(),
                 }
             })
             .collect()
@@ -1624,6 +2375,51 @@ providers:
     }
 
     #[test]
+    fn render_doc_is_deterministic() {
+        let manifest = sample_manifest();
+        assert_eq!(render_doc(&manifest), render_doc(&manifest));
+    }
+
+    #[test]
+    fn render_doc_lists_content_and_generated_header() {
+        let doc = render_doc(&provider_manifest());
+        assert!(doc.contains("Generated by"), "{doc}");
+        assert!(doc.contains("aws-lc-rs"), "{doc}");
+        assert!(doc.contains("## Build profiles"), "{doc}");
+        assert!(doc.contains("## Pinned providers"), "{doc}");
+        // No dependency version pins in the prose.
+        assert!(!doc.contains("1.18.1"), "prose must not pin versions: {doc}");
+    }
+
+    #[test]
+    fn render_doc_escapes_pipes_in_notes() {
+        let mut manifest = sample_manifest();
+        manifest.production.push(Entry {
+            crate_name: "pipey".to_owned(),
+            platform: None,
+            profiles: vec!["full".to_owned()],
+            disposition: Some("n-a".to_owned()),
+            note: "a | b".to_owned(),
+        });
+        let doc = render_doc(&manifest);
+        assert!(doc.contains("a \\| b"), "pipe escaped in cell: {doc}");
+    }
+
+    #[test]
+    fn generated_doc_matches_committed() {
+        let root = workspace_root();
+        let raw = std::fs::read_to_string(root.join(MANIFEST_REL)).expect("manifest readable");
+        let manifest: Manifest = serde_yaml::from_str(&raw).expect("real manifest parses");
+        let generated = render_doc(&manifest);
+        let committed = std::fs::read_to_string(root.join(DOC_REL)).unwrap_or_default();
+        assert_eq!(
+            generated, committed,
+            "companion document is stale — run `cargo xtask check-crypto-inventory --fix`"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one assertion block per manifest invariant")]
     fn real_manifest_parses_and_is_internally_consistent() {
         let root = workspace_root();
         let raw = std::fs::read_to_string(root.join(MANIFEST_REL)).expect("manifest readable");
@@ -1645,6 +2441,34 @@ providers:
                 "{} has missing/invalid disposition {disp:?}",
                 entry.crate_name
             );
+        }
+
+        // Every production entry and pinned provider declares a valid, non-empty
+        // profiles set.
+        let valid_profiles: BTreeSet<&str> = PROFILE_LABELS.iter().copied().collect();
+        for entry in &manifest.production {
+            assert!(!entry.profiles.is_empty(), "{} has no profiles", entry.crate_name);
+            for profile in &entry.profiles {
+                assert!(
+                    valid_profiles.contains(profile.as_str()),
+                    "{} has invalid profile {profile}",
+                    entry.crate_name
+                );
+            }
+        }
+        for provider in &manifest.providers {
+            assert!(
+                !provider.profiles.is_empty(),
+                "provider {} has no profiles",
+                provider.crate_name
+            );
+            for profile in &provider.profiles {
+                assert!(
+                    valid_profiles.contains(profile.as_str()),
+                    "provider {} has invalid profile {profile}",
+                    provider.crate_name
+                );
+            }
         }
 
         // Every pinned provider is also tracked as a production primitive.

@@ -2,26 +2,47 @@
 # Copyright (c) 2026 Praxis Contributors
 #
 # Machine-readable cryptographic inventory for the Praxis AI proxy (#1220).
-# The prose companion is cryptographic-inventory.md; keep them in sync.
+# This manifest is the AUTHORITATIVE source of record; the prose companion
+# cryptographic-inventory.md is GENERATED from it by
+# `cargo xtask check-crypto-inventory --fix` — never hand-edit the .md.
+#
+# The AI proxy ships two build profiles and the inventory tracks BOTH:
+#   * full — the published container image (`PRAXIS_AI_FEATURES ?= full`,
+#     `standard` + `openai-all` + `store-postgres`);
+#   * fips — the reduced FIPS runtime, built `--no-default-features` with the
+#     feature set shared from `xtask/src/fips.rs::FIPS_FEATURES`
+#     (openai-responses,aws-sigv4-filter).
+# Every `production` crate and every pinned `providers` entry declares the
+# `profiles:` it is resolved in.
 #
 # Verified by `cargo xtask check-crypto-inventory` (run from `make lint`), which
-# resolves the runtime graph of the profile of record (the shipped production
-# artifact, `PRAXIS_AI_FEATURES ?= full`):
+# resolves the runtime graph of each profile:
 #   cargo tree -p praxis-ai-proxy --edges normal \
-#     --no-default-features --features full --target <triple>
+#     --no-default-features --features <profile> --target <triple>
 # on all three tier-1 targets (x86_64-unknown-linux-gnu, aarch64-apple-darwin,
-# x86_64-pc-windows-msvc), so the result is host-independent and CI validates the
-# macOS/Windows declarations even though it runs on Linux. It fails if:
+# x86_64-pc-windows-msvc) — six graphs in all — so the result is host-independent
+# and CI validates the macOS/Windows and FIPS declarations even though it runs on
+# Linux/full. The edge and runtime-linkage graphs are keyed on package IDENTITY
+# (name + version), so two co-resolved versions of one crate are never merged. It
+# fails if:
 #   * a crate appears in more than one classification list — production/allow/
 #     proc_macro/test_only/build_only — or a provider spills outside `production`
 #                                                       (duplicate classification);
+#   * a `platform:`-tagged entry names an OS outside {linux, macos, windows}
+#                                                       (unknown platform);
+#   * a `production` entry or `providers` entry declares no `profiles`, or one
+#     outside {full, fips}; or a non-`production` bucket declares `profiles`
+#                                                       (profile misfile);
 #   * a crate whose name matches `watch_tokens` appears in a target's tree but is
 #     declared for that platform in none of `production`, `allow`, `proc_macro`,
 #     or `build_only` — a `platform:`-tagged entry only covers its own target
 #                                                       (undeclared crypto);
-#   * a `production` entry is absent from a target it applies to — a `platform:`
-#     entry on its own target, or an untagged entry on any target
-#                                                       (stale / drifted);
+#   * a `production` entry is absent from a (profile, target) it applies to
+#                                                       (stale declaration);
+#   * a `production` entry is present in a graph whose profile it does NOT declare
+#                                                       (profile leak);
+#   * an `allow` entry is absent from every platform-matching runtime graph
+#                                                       (stale exception);
 #   * a `production` entry has no `disposition`, or one outside the documented
 #     set                                               (unclassified);
 #   * a `providers:` entry drifts: wrong version, a missing `require_features`,
@@ -33,7 +54,10 @@
 #     it is not linked into the runtime binary            (runtime-linkage misfile);
 #   * a `test_only` or `build_only` crate is actually linked into any target's
 #     runtime binary (reachable from the root without crossing a proc-macro node)
-#                                                       (containment regression).
+#                                                       (containment regression);
+#   * a crate on Red Hat's FIPS denylist (shared from
+#     `xtask/src/fips/graph.rs::DENIED`) appears in any `fips` graph
+#                                                       (FIPS denylist).
 #
 # `watch_tokens` are matched against each crate name after splitting on '-' and
 # '_' and stripping trailing digits from each part (so `sha2` -> `sha`,
@@ -173,174 +197,218 @@ watch_tokens:
 
 # Crypto and crypto-support crates expected in the runtime binary.
 # disposition: validated | non-validated | needs-remediation | n-a | upstream-owned
+# profiles: the build profiles the crate is resolved in (full | fips).
 production:
   # --- Transport TLS providers & rustls stack (all execute on OpenSSL, T1) ---
   - crate: quixotic-plecostomus-rustls-openssl
+    profiles: [full, fips]
     disposition: non-validated
     note: rustls CryptoProvider adapter (library name `rustls_openssl`) routing all rustls TLS onto OpenSSL libcrypto; installed as the process-default provider by praxis-proxy-tls at start-up (T1). Executes every data-plane/callout/listener TLS primitive.
   - crate: aws-lc-rs
+    profiles: [full]
     disposition: non-validated
-    note: Compiled via the rustls `aws-lc-rs` feature (forced by reqwest) and by jsonwebtoken, but NOT the TLS provider — OpenSSL is. Its only runtime crypto execution is JWT verify (A1); built WITHOUT the `fips` feature.
+    note: Compiled solely via jsonwebtoken's `aws_lc_rs` feature — NOT by rustls or reqwest, which run on the installed OpenSSL provider (rustls resolves without the `aws-lc-rs` feature; reqwest uses `rustls-no-provider`). It is NOT the TLS provider — OpenSSL is. Its only runtime crypto execution is JWT verify (A1); built WITHOUT the `fips` feature. Full profile only (jsonwebtoken is not in the FIPS feature set).
   - crate: aws-lc-sys
+    profiles: [full]
     disposition: non-validated
-    note: C implementation backing aws-lc-rs (JWT verify only).
+    note: C implementation backing aws-lc-rs (JWT verify only). Full profile only.
   - crate: rustls
+    profiles: [full, fips]
     disposition: non-validated
     note: TLS 1.2/1.3 core; the Pingora fork enables `custom-provider` so there is no built-in provider fallback, and it runs on the installed OpenSSL provider (T1/T2/T4).
   - crate: rustls-webpki
+    profiles: [full, fips]
     disposition: non-validated
     note: X.509 chain and signature verification (C1/C2).
   - crate: rustls-native-certs
+    profiles: [full, fips]
     disposition: n-a
     note: OS trust-store loader (C5).
   - crate: rustls-pemfile
+    profiles: [full, fips]
     disposition: n-a
     note: PEM decode for listener cert/key (C3).
   - crate: rustls-pki-types
+    profiles: [full, fips]
     disposition: n-a
     note: Cert/key types; zeroizes key buffers (C3).
   - crate: rustls-platform-verifier
+    profiles: [full]
     disposition: non-validated
-    note: reqwest default-path certificate verifier (C1).
+    note: reqwest default-path certificate verifier (C1). Full profile only (reqwest is not in the FIPS feature set).
   - crate: tokio-rustls
+    profiles: [full, fips]
     disposition: non-validated
     note: TLS stream adapter.
   - crate: hyper-rustls
+    profiles: [full]
     disposition: non-validated
-    note: reqwest / redis TLS connector.
+    note: reqwest / redis TLS connector. Full profile only.
   # --- PostgreSQL store TLS backend (native-tls; diverges from data plane) ---
+  # NOTE: cert-only SQLx mTLS is tracked as follow-up #1335 (not blocking #1220).
   - crate: native-tls
+    profiles: [full]
     disposition: non-validated
-    note: PostgreSQL store TLS backend (A10); platform-native stack. #1217 / R4.
+    note: "PostgreSQL store TLS backend (A10); platform-native stack. Full profile only (store-postgres). #1217 / R4."
   - crate: openssl
+    profiles: [full, fips]
     disposition: non-validated
-    note: libcrypto binding — backs BOTH the rustls OpenSSL provider on all targets (T1-T9, via quixotic-plecostomus-rustls-openssl) AND the native-tls PostgreSQL store backend on Linux (A10). System libcrypto is the intended FIPS-validated module. #1217.
+    note: "libcrypto binding — backs BOTH the rustls OpenSSL provider on all targets (T1-T9, via quixotic-plecostomus-rustls-openssl) AND the native-tls PostgreSQL store backend on Linux (A10, full only). System libcrypto is the intended FIPS-validated module. #1217."
   - crate: openssl-sys
+    profiles: [full, fips]
     disposition: non-validated
     note: OpenSSL C bindings for the rustls OpenSSL provider (all targets) and the Linux native-tls backend. Built against system libcrypto (OPENSSL_NO_VENDOR=1 in the FIPS image).
   - crate: security-framework
+    profiles: [full, fips]
     disposition: non-validated
     platform: macos
-    note: native-tls backend on macOS (A10).
+    note: rustls-native-certs trust-store backend on macOS (both profiles); also the native-tls backend in the full profile (A10).
   - crate: security-framework-sys
+    profiles: [full, fips]
     disposition: non-validated
     platform: macos
-    note: Security.framework bindings for native-tls on macOS.
+    note: Security.framework bindings for rustls-native-certs (both profiles) and native-tls (full) on macOS.
   - crate: schannel
+    profiles: [full, fips]
     disposition: non-validated
     platform: windows
-    note: native-tls backend on Windows (A10).
+    note: Windows trust-store / TLS backend for the rustls-native-certs loader (both profiles) and native-tls (full) on Windows (A10).
   # --- SQLx PostgreSQL driver (SCRAM / MD5 / cleartext auth callers) ---
   - crate: sqlx
+    profiles: [full]
     disposition: non-validated
-    note: SQLx facade for the PostgreSQL store client (A5-A11).
+    note: SQLx facade for the PostgreSQL store client (A5-A11). Full profile only (store-postgres).
   - crate: sqlx-core
+    profiles: [full]
     disposition: non-validated
-    note: SQLx core.
+    note: SQLx core. Full profile only.
   - crate: sqlx-postgres
+    profiles: [full]
     disposition: non-validated
-    note: PostgreSQL driver — SCRAM-SHA-256 / legacy MD5 / cleartext auth + TLS (A5-A11). #1217.
+    note: "PostgreSQL driver — SCRAM-SHA-256 / legacy MD5 / cleartext auth + TLS (A5-A11). Full profile only. #1217."
   # --- RustCrypto hashing / MAC / KDF primitives ---
   - crate: sha2
+    profiles: [full]
     disposition: non-validated
-    note: SHA-256 — MCP approval fingerprint (H1), SigV4 payload digest (A4), PG SCRAM (A5), routing/telemetry hashes (H2-H6), upstream default-policy session-identity binding (P1) and Valkey session-store key derivation (P2), optional Basic Auth password digest (A12, non-default feature). R3 / R7 / #814 / #1217.
+    note: "SHA-256 — PostgreSQL SCRAM auth (A5) and store-side digests. Full profile only; in-repo digests (SigV4 payload H1/A4, MCP approval fingerprint, routing/telemetry hashes) execute on OpenSSL EVP via apis::hash, NOT this crate. R3 / R7 / #1217."
   - crate: md-5
+    profiles: [full]
     disposition: non-validated
-    note: MD5 — legacy PostgreSQL md5 auth (A8). #1217.
+    note: "MD5 — legacy PostgreSQL md5 auth (A8). Full profile only. #1217."
   - crate: hmac
+    profiles: [full]
     disposition: non-validated
-    note: HMAC-SHA256 — SigV4 signing (A3), PG SCRAM (A5), OAuth delegated-token cache-key derivation (A2). #814 / #1217.
+    note: "HMAC-SHA256 — PostgreSQL SCRAM auth (A5). Full profile only; in-repo SigV4 signing (A3) and OAuth cache-key derivation execute on OpenSSL EVP via apis::hash, NOT this crate. #1217."
   - crate: hkdf
+    profiles: [full]
     disposition: n-a
-    note: HKDF — sqlx PgAdvisoryLock key derivation; compiled but NOT invoked by the AI store.
+    note: HKDF — sqlx PgAdvisoryLock key derivation; compiled but NOT invoked by the AI store. Full profile only.
   - crate: blake2
+    profiles: [full, fips]
     disposition: n-a
     note: BLAKE2b-128 Pingora HTTP cache key (non-secret). Upstream-owned.
   # --- RNG / CSPRNG ---
   - crate: chacha20
+    profiles: [full, fips]
     disposition: non-validated
-    note: ChaCha CSPRNG backing `rand` and the PG SCRAM nonce (A7, R-1).
+    note: ChaCha CSPRNG backing `rand`.
   - crate: rand
+    profiles: [full, fips]
     disposition: non-validated
-    note: RNG — load-balancer selection (R-1), PG SCRAM nonce (A7).
+    note: RNG — load-balancer selection (R-1); PG SCRAM nonce (A7, full only).
   - crate: rand_chacha
+    profiles: [full, fips]
     disposition: non-validated
     note: ChaCha CSPRNG core for `rand`.
   - crate: rand_core
+    profiles: [full, fips]
     disposition: non-validated
     note: RNG traits.
   - crate: rand_xoshiro
+    profiles: [full, fips]
     disposition: n-a
     note: Non-crypto statistical sampling in metrics-util.
   - crate: getrandom
+    profiles: [full, fips]
     disposition: non-validated
-    note: OS CSPRNG entropy source — PG SCRAM nonce (A7), OAuth cache-key secret (R-4), ring/rustls randoms.
-  # --- SigV4 signing (#814) ---
-  - crate: aws-sigv4
-    disposition: non-validated
-    note: HMAC-SHA256 SigV4 signing (A3/A4). #814.
+    note: OS CSPRNG entropy source — rustls/rustls-webpki randoms; PG SCRAM nonce (A7) and OAuth cache-key secret in the full profile.
   # --- JWT (identity-jwt plugin; executes on aws-lc-rs) ---
   - crate: jsonwebtoken
+    profiles: [full]
     disposition: non-validated
-    note: JWT signature verify (decode-only) via aws-lc-rs (A1); praxis-core identity-jwt builds only DecodingKey, never signs. R2.
+    note: JWT signature verify (decode-only) via aws-lc-rs (A1); praxis-core identity-jwt builds only DecodingKey, never signs. Full profile only. R2.
   - crate: signature
+    profiles: [full]
     disposition: non-validated
-    note: RustCrypto signature traits on the JWT path (A1).
+    note: RustCrypto signature traits on the JWT path (A1). Full profile only.
   - crate: pem
+    profiles: [full]
     disposition: n-a
-    note: PEM decode for JWT keys (C7).
+    note: PEM decode for JWT keys (C7). Full profile only.
   - crate: simple_asn1
+    profiles: [full]
     disposition: n-a
-    note: ASN.1 DER for JWT keys (C7).
+    note: ASN.1 DER for JWT keys (C7). Full profile only.
   # --- X.509 / ASN.1 structural parsing (upstream mTLS / CA extraction) ---
   - crate: x509-parser
+    profiles: [full, fips]
     disposition: upstream-owned
     note: X.509 v3 structural parse (C6).
   - crate: der-parser
+    profiles: [full, fips]
     disposition: upstream-owned
     note: DER parse under x509-parser (C6).
   - crate: asn1-rs
+    profiles: [full, fips]
     disposition: upstream-owned
     note: ASN.1 runtime under x509-parser (C6).
   - crate: oid-registry
+    profiles: [full, fips]
     disposition: upstream-owned
     note: OID registry for x509-parser (C6).
   # --- RustCrypto primitive-support layer (no standalone operation) ---
   - crate: const-oid
+    profiles: [full]
     disposition: n-a
-    note: OID constants for RustCrypto digest support.
+    note: OID constants for RustCrypto digest support on the JWT/SCRAM path. Full profile only.
   - crate: crypto-common
+    profiles: [full, fips]
     disposition: n-a
-    note: RustCrypto primitive-support traits.
+    note: RustCrypto primitive-support traits (enters via blake2/digest).
   - crate: digest
+    profiles: [full, fips]
     disposition: n-a
-    note: RustCrypto digest support layer (sha2/hmac/hkdf/md-5/blake2).
+    note: RustCrypto digest support layer (blake2 in both profiles; sha2/hmac/hkdf/md-5 in full).
   - crate: subtle
+    profiles: [full, fips]
     disposition: n-a
     note: Constant-time comparison primitives — used transitively by rustls, and by the optional Basic Auth builtin's credential compare (A12) when the non-default `basic-auth-filter` feature is enabled.
   - crate: untrusted
+    profiles: [full, fips]
     disposition: n-a
-    note: Safe input parser (support); enters via aws-lc-rs and rustls-webpki (ring is absent from the graph).
+    note: Safe input parser (support); enters via rustls-webpki (both) and aws-lc-rs (full). Ring is absent from the graph.
   # --- Secret handling / SASLprep ---
   - crate: stringprep
+    profiles: [full]
     disposition: n-a
-    note: RFC 4013 SASLprep for PG SCRAM (A6). #1217.
+    note: "RFC 4013 SASLprep for PG SCRAM (A6). Full profile only. #1217."
   - crate: secrecy
+    profiles: [full, fips]
     disposition: n-a
     note: Secret value wrapping (credential_inject, PG password A9).
   - crate: zeroize
+    profiles: [full, fips]
     disposition: n-a
     note: Key/secret memory zeroization (C3, rustls-pki-types).
 
 # Crates matched by `watch_tokens` that are NOT crypto primitives we track:
-# naming coincidences, wrapper/caller crates, and non-crypto support.
+# naming coincidences, wrapper/caller crates, and non-crypto support. These are
+# profile-agnostic (declaring `profiles:` here is rejected).
 allow:
   - crate: aws-credential-types
     note: AWS credential value types (holds secrets, no primitive).
   - crate: aws-smithy-async
     note: AWS SDK async-runtime plumbing (no crypto).
-  - crate: aws-smithy-http
-    note: AWS SDK HTTP plumbing (no crypto).
   - crate: aws-smithy-runtime-api
     note: AWS SDK runtime API (no crypto).
   - crate: aws-smithy-types
@@ -357,8 +425,12 @@ allow:
     note: Pingora rustls wrapper; installs NO provider and enables rustls `custom-provider` (no built-in fallback); the installed provider is the OpenSSL adapter, so the primitive is rustls/OpenSSL (T1).
 
 # Crypto that must NEVER appear in the runtime binary graph (--edges normal).
-# dev-dependency only.
+# dev-dependency only. Profile-agnostic.
 test_only:
+  - crate: aws-sigv4
+    note: "The AWS SigV4 reference implementation the in-repo OpenSSL-backed signer is checked against (filters/src/aws/signing.rs); a dev-dependency of praxis-ai-filters, never linked into the runtime binary. #814 / #1351."
+  - crate: aws-smithy-http
+    note: AWS SDK HTTP plumbing pulled only by the dev-only aws-sigv4; absent from every `--edges normal` graph. Dev-only.
   - crate: rcgen
     note: Self-signed test cert/key generation (tests/utils/src/net/tls.rs). Dev-only.
   - crate: yasna
@@ -377,6 +449,7 @@ test_only:
 # The check computes runtime linkage by walking the tree from the root and
 # refusing to cross proc-macro nodes; containment fires only on a genuine link
 # into the binary, so these entries stay quiet while a real leak is still caught.
+# Profile-agnostic.
 build_only:
   - crate: sha3
     note: Cedar grammar parser-table hashing via the lalrpop build-dependency. Build host only.
@@ -390,6 +463,7 @@ build_only:
 # shipped binary. Tracked here (not in `production`/`allow`) so the runtime-binary
 # inventory is not overstated. The check verifies each is actually a `(proc-macro)`
 # in the resolved graph and forbids any runtime-list entry from being a proc-macro.
+# Profile-agnostic.
 proc_macro:
   - crate: asn1-rs-derive
     note: ASN.1 derive macros for asn1-rs/x509-parser (C6). Build-host code generator.
@@ -405,34 +479,41 @@ proc_macro:
 # Load-bearing provider crates whose VERSION and security-relevant FEATURES are
 # pinned so the provider-selection findings in the prose cannot rot while the
 # crate name stays put. Every `require_features` entry must be present and every
-# `forbid_features` entry absent on each target where the crate appears; other
-# (unlisted) features are permitted, since feature sets grow across patch releases
-# and exact-set pinning would churn on benign additions. A provider with no
-# constraints (e.g. `native-tls`) pins only its version.
+# `forbid_features` entry absent on each profile/target where the crate appears;
+# other (unlisted) features are permitted, since feature sets grow across patch
+# releases and exact-set pinning would churn on benign additions. A provider with
+# no constraints (e.g. `native-tls`) pins only its version. `profiles:` scopes the
+# pin to the profiles the provider is resolved in.
 providers:
   - crate: quixotic-plecostomus-rustls-openssl
     version: "0.4.1"
+    profiles: [full, fips]
     require_features: [tls12]
     forbid_features: [fips]
     note: The installed process-default rustls provider (library `rustls_openssl`); routes all rustls TLS onto OpenSSL libcrypto (T1-T9). FIPS is host-activated, not this build feature — the crate's `fips` feature is a no-op and MUST stay unset.
   - crate: openssl
     version: "0.10.81"
+    profiles: [full, fips]
     forbid_features: [vendored]
     note: libcrypto binding backing the rustls OpenSSL provider (all targets) and the Linux native-tls store backend. MUST NOT gain `vendored` — the validated module is the system libcrypto (OPENSSL_NO_VENDOR=1), not a bundled build.
   - crate: aws-lc-rs
     version: "1.18.1"
+    profiles: [full]
     require_features: [aws-lc-sys]
     forbid_features: [fips]
-    note: NOT the TLS provider (OpenSSL is); executes only JWT verify (A1). MUST NOT gain `fips` silently — that would misrepresent the compliance story.
+    note: NOT the TLS provider (OpenSSL is); executes only JWT verify (A1) in the full profile. MUST NOT gain `fips` silently — that would misrepresent the compliance story.
   - crate: rustls
     version: "0.23.45"
+    profiles: [full, fips]
     require_features: [custom-provider]
     forbid_features: [ring]
-    note: The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; `ring` MUST stay absent. The `aws-lc-rs` feature is also compiled (forced by reqwest) but is not the TLS executor.
+    note: The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; `ring` MUST stay absent. rustls resolves WITHOUT the `aws-lc-rs` feature (its features are custom-provider/log/logging/std/tls12); aws-lc-rs enters the full profile only through jsonwebtoken, never as the TLS executor.
   - crate: jsonwebtoken
     version: "11.1.0"
+    profiles: [full]
     require_features: [aws_lc_rs]
-    note: JWT signature verify executes on aws-lc-rs (A1).
+    note: JWT signature verify executes on aws-lc-rs (A1). Full profile only.
   - crate: native-tls
     version: "0.2.18"
-    note: PostgreSQL store TLS backend — diverges from the rustls data plane (A10; #1217 / R4).
+    profiles: [full]
+    note: "PostgreSQL store TLS backend — diverges from the rustls data plane (A10; #1217 / R4). Full profile only."
