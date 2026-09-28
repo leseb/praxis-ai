@@ -196,7 +196,7 @@ fn run_dev(command: Command) {
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
         Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
         Command::CheckChatCompletionsRegistry => openai_conformance::run_chat_completions_registry_check(),
-        Command::CheckCryptoInventory(args) => check_crypto_inventory::run(args),
+        Command::CheckCryptoInventory(args) => check_crypto_inventory::run(&args),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),
