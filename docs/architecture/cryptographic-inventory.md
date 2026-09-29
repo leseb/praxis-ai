@@ -9,13 +9,13 @@ This page is generated from the machine-readable manifest
 [`cryptographic-inventory.yaml`](cryptographic-inventory.yaml), which is the authoritative source of
 record for the Praxis AI proxy's production cryptography ([#1220][i1220]).
 `cargo xtask check-crypto-inventory` resolves the runtime dependency graph of
-each shipped profile on all three tier-1 targets and fails if the manifest and
-the resolved graphs disagree; run it with `--fix` to regenerate this page.
+each shipped profile and fails if the manifest and the resolved graphs disagree;
+run it with `--fix` to regenerate this page.
 
 ## Build profiles
 
-The inventory tracks two shipped profiles; every `production` crate and pinned
-provider is assigned to the profiles it is resolved in. Both are built
+The inventory tracks two shipped profiles; every operation and pinned provider is
+assigned to the profiles it is resolved in. Both are built
 `--no-default-features`.
 
 | Profile | Cargo features | Description |
@@ -25,7 +25,7 @@ provider is assigned to the profiles it is resolved in. Both are built
 
 ## Dispositions
 
-Every `production` primitive carries one disposition:
+Every operation carries one disposition:
 
 - `validated` — Executes the intended FIPS-validated module with FIPS mode proven in effect.
 - `non-validated` — A real cryptographic primitive whose validated execution is not proven in this build.
@@ -33,81 +33,11 @@ Every `production` primitive carries one disposition:
 - `upstream-owned` — A primitive owned and executed entirely within an upstream dependency.
 - `n-a` — Not a security-function primitive (identifier hashing, key zeroization, or a support layer).
 
-## Production primitives
-
-Crypto and crypto-support crates resolved into the runtime binary.
-
-| Crate | Profiles | Platform | Disposition | Notes |
-| --- | --- | --- | --- | --- |
-| `quixotic-plecostomus-rustls-openssl` | full, fips | all | non-validated | rustls CryptoProvider adapter (library name `rustls_openssl`) routing all rustls TLS onto OpenSSL libcrypto; installed as the process-default provider by praxis-proxy-tls at start-up (T1). Executes every data-plane/callout/listener TLS primitive. |
-| `aws-lc-rs` | full | all | non-validated | Compiled solely via jsonwebtoken's `aws_lc_rs` feature — NOT by rustls or reqwest, which run on the installed OpenSSL provider (rustls resolves without the `aws-lc-rs` feature; reqwest uses `rustls-no-provider`). It is NOT the TLS provider — OpenSSL is. Its only runtime crypto execution is JWT verify (A1); built WITHOUT the `fips` feature. Full profile only (jsonwebtoken is not in the FIPS feature set). |
-| `aws-lc-sys` | full | all | non-validated | C implementation backing aws-lc-rs (JWT verify only). Full profile only. |
-| `rustls` | full, fips | all | non-validated | TLS 1.2/1.3 core; the Pingora fork enables `custom-provider` so there is no built-in provider fallback, and it runs on the installed OpenSSL provider (T1/T2/T4). |
-| `rustls-webpki` | full, fips | all | non-validated | X.509 chain and signature verification (C1/C2). |
-| `rustls-native-certs` | full, fips | all | n-a | OS trust-store loader (C5). |
-| `rustls-pemfile` | full, fips | all | n-a | PEM decode for listener cert/key (C3). |
-| `rustls-pki-types` | full, fips | all | n-a | Cert/key types; zeroizes key buffers (C3). |
-| `rustls-platform-verifier` | full | all | non-validated | reqwest default-path certificate verifier (C1). Full profile only (reqwest is not in the FIPS feature set). |
-| `tokio-rustls` | full, fips | all | non-validated | TLS stream adapter. |
-| `hyper-rustls` | full | all | non-validated | reqwest / redis TLS connector. Full profile only. |
-| `native-tls` | full | all | non-validated | PostgreSQL store TLS backend (A10); platform-native stack. Full profile only (store-postgres). #1217 / R4. |
-| `openssl` | full, fips | all | non-validated | libcrypto binding — backs BOTH the rustls OpenSSL provider on all targets (T1-T9, via quixotic-plecostomus-rustls-openssl) AND the native-tls PostgreSQL store backend on Linux (A10, full only). System libcrypto is the intended FIPS-validated module. #1217. |
-| `openssl-sys` | full, fips | all | non-validated | OpenSSL C bindings for the rustls OpenSSL provider (all targets) and the Linux native-tls backend. Built against system libcrypto (OPENSSL_NO_VENDOR=1 in the FIPS image). |
-| `security-framework` | full, fips | macos | non-validated | rustls-native-certs trust-store backend on macOS (both profiles); also the native-tls backend in the full profile (A10). |
-| `security-framework-sys` | full, fips | macos | non-validated | Security.framework bindings for rustls-native-certs (both profiles) and native-tls (full) on macOS. |
-| `schannel` | full, fips | windows | non-validated | Windows trust-store / TLS backend for the rustls-native-certs loader (both profiles) and native-tls (full) on Windows (A10). |
-| `sqlx` | full | all | non-validated | SQLx facade for the PostgreSQL store client (A5-A11). Full profile only (store-postgres). |
-| `sqlx-core` | full | all | non-validated | SQLx core. Full profile only. |
-| `sqlx-postgres` | full | all | non-validated | PostgreSQL driver — SCRAM-SHA-256 / legacy MD5 / cleartext auth + TLS (A5-A11). Full profile only. #1217. |
-| `sha2` | full | all | non-validated | SHA-256 — PostgreSQL SCRAM auth (A5) and store-side digests. Full profile only; in-repo digests (SigV4 payload H1/A4, MCP approval fingerprint, routing/telemetry hashes) execute on OpenSSL EVP via apis::hash, NOT this crate. R3 / R7 / #1217. |
-| `md-5` | full | all | non-validated | MD5 — legacy PostgreSQL md5 auth (A8). Full profile only. #1217. |
-| `hmac` | full | all | non-validated | HMAC-SHA256 — PostgreSQL SCRAM auth (A5). Full profile only; in-repo SigV4 signing (A3) and OAuth cache-key derivation execute on OpenSSL EVP via apis::hash, NOT this crate. #1217. |
-| `hkdf` | full | all | n-a | HKDF — sqlx PgAdvisoryLock key derivation; compiled but NOT invoked by the AI store. Full profile only. |
-| `blake2` | full, fips | all | n-a | BLAKE2b-128 Pingora HTTP cache key (non-secret). Upstream-owned. |
-| `chacha20` | full, fips | all | non-validated | ChaCha CSPRNG backing `rand`. |
-| `rand` | full, fips | all | non-validated | RNG — load-balancer selection (R-1); PG SCRAM nonce (A7, full only). |
-| `rand_chacha` | full, fips | all | non-validated | ChaCha CSPRNG core for `rand`. |
-| `rand_core` | full, fips | all | non-validated | RNG traits. |
-| `rand_xoshiro` | full, fips | all | n-a | Non-crypto statistical sampling in metrics-util. |
-| `getrandom` | full, fips | all | non-validated | OS CSPRNG entropy source — rustls/rustls-webpki randoms; PG SCRAM nonce (A7) and OAuth cache-key secret in the full profile. |
-| `jsonwebtoken` | full | all | non-validated | JWT signature verify (decode-only) via aws-lc-rs (A1); praxis-core identity-jwt builds only DecodingKey, never signs. Full profile only. R2. |
-| `signature` | full | all | non-validated | RustCrypto signature traits on the JWT path (A1). Full profile only. |
-| `pem` | full | all | n-a | PEM decode for JWT keys (C7). Full profile only. |
-| `simple_asn1` | full | all | n-a | ASN.1 DER for JWT keys (C7). Full profile only. |
-| `x509-parser` | full, fips | all | upstream-owned | X.509 v3 structural parse (C6). |
-| `der-parser` | full, fips | all | upstream-owned | DER parse under x509-parser (C6). |
-| `asn1-rs` | full, fips | all | upstream-owned | ASN.1 runtime under x509-parser (C6). |
-| `oid-registry` | full, fips | all | upstream-owned | OID registry for x509-parser (C6). |
-| `const-oid` | full | all | n-a | OID constants for RustCrypto digest support on the JWT/SCRAM path. Full profile only. |
-| `crypto-common` | full, fips | all | n-a | RustCrypto primitive-support traits (enters via blake2/digest). |
-| `digest` | full, fips | all | n-a | RustCrypto digest support layer (blake2 in both profiles; sha2/hmac/hkdf/md-5 in full). |
-| `subtle` | full, fips | all | n-a | Constant-time comparison primitives — used transitively by rustls, and by the optional Basic Auth builtin's credential compare (A12) when the non-default `basic-auth-filter` feature is enabled. |
-| `untrusted` | full, fips | all | n-a | Safe input parser (support); enters via rustls-webpki (both) and aws-lc-rs (full). Ring is absent from the graph. |
-| `stringprep` | full | all | n-a | RFC 4013 SASLprep for PG SCRAM (A6). Full profile only. #1217. |
-| `secrecy` | full, fips | all | n-a | Secret value wrapping (credential_inject, PG password A9). |
-| `zeroize` | full, fips | all | n-a | Key/secret memory zeroization (C3, rustls-pki-types). |
-
-## Pinned providers
-
-Providers whose selection is load-bearing: the manifest pins the version and
-the security-relevant features so a drift cannot pass unnoticed.
-
-| Crate | Profiles | Required features | Forbidden features | Notes |
-| --- | --- | --- | --- | --- |
-| `quixotic-plecostomus-rustls-openssl` | full, fips | `tls12` | `fips` | The installed process-default rustls provider (library `rustls_openssl`); routes all rustls TLS onto OpenSSL libcrypto (T1-T9). FIPS is host-activated, not this build feature — the crate's `fips` feature is a no-op and MUST stay unset. |
-| `openssl` | full, fips | — | `vendored` | libcrypto binding backing the rustls OpenSSL provider (all targets) and the Linux native-tls store backend. MUST NOT gain `vendored` — the validated module is the system libcrypto (OPENSSL_NO_VENDOR=1), not a bundled build. |
-| `aws-lc-rs` | full | `aws-lc-sys` | `fips` | NOT the TLS provider (OpenSSL is); executes only JWT verify (A1) in the full profile. MUST NOT gain `fips` silently — that would misrepresent the compliance story. |
-| `rustls` | full, fips | `custom-provider` | `ring`, `aws_lc_rs` | The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; both bundled rustls backends MUST stay absent. `ring` and `aws_lc_rs` are forbidden — the latter is rustls' canonical aws-lc-rs feature that its `aws-lc-rs`/`fips`/`prefer-post-quantum` features all pull in, so forbidding it keeps rustls off a bundled provider even if one of those aliases is enabled. rustls resolves WITHOUT any of them (its features are custom-provider/log/logging/std/tls12); aws-lc-rs enters the full profile only through jsonwebtoken, never as the TLS executor. |
-| `jsonwebtoken` | full | `aws_lc_rs` | — | JWT signature verify executes on aws-lc-rs (A1). Full profile only. |
-| `native-tls` | full | — | — | PostgreSQL store TLS backend — diverges from the rustls data plane (A10; #1217 / R4). Full profile only. |
-
 ## Cryptographic operations
 
-Every production-reachable cryptographic operation: where it is used, for
-what algorithm, under whose ownership, by which crates, and what remediation
-it requires. The crate-centric table above answers "what cryptographic code
-can ship"; this one answers "where is cryptography actually used". Each
-operation's crates are cross-checked against the `production` inventory.
+Every production-reachable cryptographic operation: where it is used, for what
+algorithm, under whose ownership, by which crates, and what remediation it
+requires. Each operation's crates are cross-checked against the resolved graphs.
 
 | ID | Operation | Owner | Caller | Algorithm | Provider | Crates | Profiles | Disposition | Remediation | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -155,7 +85,25 @@ operation's crates are cross-checked against the `production` inventory.
 | R-4 | OAuth delegator cache-key secret (per-process) | praxis-proxy/policy (upstream oauth-delegator) | praxis-policy-plugin-delegator-oauth cache/key.rs KeySecret::random() | 32-byte per-process secret from the OS CSPRNG (keys the A2 HMAC-SHA256) | getrandom (OS CSPRNG) | `getrandom` | full | upstream-owned |  | 32-byte per-process secret drawn from the OS CSPRNG (getrandom) that keys the A2 HMAC in the upstream oauth-delegator policy plugin. No state/nonce/PKCE. Full-only. Upstream-maintained. |
 | R-5 | Prometheus metrics-exporter sampling RNG | metrics-exporter-prometheus (upstream) via praxis-proxy-protocol | metrics-util 0.20.4 (histogram/quantile sampling) via metrics-exporter-prometheus -> praxis-proxy-protocol | ChaCha-based CSPRNG draw (rand 0.9.x -> rand_chacha), OS-seeded | rand 0.9.x -> rand_chacha (OS-seeded); metrics sampling, not the validated DRBG | `rand_chacha` | full, fips | n-a |  | Sampling RNG internal to the Prometheus metrics exporter (metrics-util -> metrics-exporter-prometheus -> praxis-proxy-protocol). The sole consumer of the rand 0.9.x line (and thus rand_chacha) in the graph. Metrics sampling only; not a security function and not the validated DRBG. |
 
+## Pinned providers
+
+Providers whose selection is load-bearing: the manifest pins the version and the
+security-relevant features so a drift cannot pass unnoticed.
+
+| Crate | Profiles | Required features | Forbidden features | Notes |
+| --- | --- | --- | --- | --- |
+| `quixotic-plecostomus-rustls-openssl` | full, fips | `tls12` | `fips` | The installed process-default rustls provider (library `rustls_openssl`); routes all rustls TLS onto OpenSSL libcrypto (T1-T9). FIPS is host-activated, not this build feature — the crate's `fips` feature is a no-op and MUST stay unset. |
+| `openssl` | full, fips | — | `vendored` | libcrypto binding backing the rustls OpenSSL provider (all targets) and the Linux native-tls store backend. MUST NOT gain `vendored` — the validated module is the system libcrypto (OPENSSL_NO_VENDOR=1), not a bundled build. |
+| `aws-lc-rs` | full | `aws-lc-sys` | `fips` | NOT the TLS provider (OpenSSL is); executes only JWT verify (A1) in the full profile. MUST NOT gain `fips` silently — that would misrepresent the compliance story. |
+| `rustls` | full, fips | `custom-provider` | `ring`, `aws_lc_rs` | The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; both bundled rustls backends MUST stay absent. `ring` and `aws_lc_rs` are forbidden — the latter is rustls' canonical aws-lc-rs feature that its `aws-lc-rs`/`fips`/`prefer-post-quantum` features all pull in, so forbidding it keeps rustls off a bundled provider even if one of those aliases is enabled. rustls resolves WITHOUT any of them (its features are custom-provider/log/logging/std/tls12); aws-lc-rs enters the full profile only through jsonwebtoken, never as the TLS executor. |
+| `jsonwebtoken` | full | `aws_lc_rs` | — | JWT signature verify executes on aws-lc-rs (A1). Full profile only. |
+| `native-tls` | full | — | — | PostgreSQL store TLS backend — diverges from the rustls data plane (A10; #1217 / R4). Full profile only. |
+
 ## Reviewed non-primitives (`allow`)
+
+Crypto-family-named crates that resolve into a runtime graph but are not
+standalone operations — support layers, code generators, and FFI companions,
+each reviewed and documented so the drift alarm stays quiet.
 
 | Crate | Notes |
 | --- | --- |
@@ -168,34 +116,19 @@ operation's crates are cross-checked against the `production` inventory.
 | `praxis-policy-plugin-identity-jwt` | praxis-core JWT caller plugin; the primitive executes in aws-lc-rs (A1). |
 | `praxis-proxy-tls` | praxis-core TLS setup wrapper; installs the OpenSSL rustls provider (rustls_openssl) as the process default — the primitive is rustls/OpenSSL (T1). |
 | `quixotic-plecostomus-rustls` | Pingora rustls wrapper; installs NO provider and enables rustls `custom-provider` (no built-in fallback); the installed provider is the OpenSSL adapter, so the primitive is rustls/OpenSSL (T1). |
-
-## Test-only cryptography (`test_only`)
-
-| Crate | Notes |
-| --- | --- |
-| `aws-sigv4` | The AWS SigV4 reference implementation the in-repo OpenSSL-backed signer is checked against (filters/src/aws/signing.rs); a dev-dependency of praxis-ai-filters, never linked into the runtime binary. #814 / #1351. |
-| `aws-smithy-http` | AWS SDK HTTP plumbing pulled only by the dev-only aws-sigv4; absent from every `--edges normal` graph. Dev-only. |
-| `rcgen` | Self-signed test cert/key generation (tests/utils/src/net/tls.rs). Dev-only. |
-| `yasna` | DER writer for rcgen. Dev-only. |
-| `sha1` | WebSocket accept-key digest (tungstenite via praxis-test-utils). Dev-only. |
-
-## Build-host cryptography (`build_only`)
-
-| Crate | Notes |
-| --- | --- |
-| `sha3` | Cedar grammar parser-table hashing via the lalrpop build-dependency. Build host only. |
-| `keccak` | Keccak-f for sha3 on the lalrpop build path. Build host only. |
-| `tiny-keccak` | Keccak-f for ahash's const-random compile-time seed; reachable only beneath const-random-macro (a proc-macro), so it executes on the build host and is not linked into the runtime binary. |
-
-## Build-host proc-macros (`proc_macro`)
-
-| Crate | Notes |
-| --- | --- |
+| `const-oid` | OID constants for RustCrypto digest support on the JWT/SCRAM path (full). |
+| `crypto-common` | RustCrypto primitive-support traits (enters via blake2/digest). |
+| `digest` | RustCrypto digest support layer (blake2 in both profiles; sha2/hmac/hkdf/md-5 in full). |
+| `untrusted` | Safe input parser (support); enters via rustls-webpki (both) and aws-lc-rs (full). Ring is absent from the graph. |
+| `hkdf` | HKDF — sqlx PgAdvisoryLock key derivation; compiled but NOT invoked by the AI store (full). |
+| `blake2` | BLAKE2b-128 Pingora HTTP cache key (non-secret). Upstream-owned; not a security function. |
+| `rand_xoshiro` | Non-crypto statistical sampling in metrics-util (both profiles). |
 | `asn1-rs-derive` | ASN.1 derive macros for asn1-rs/x509-parser (C6). Build-host code generator. |
 | `asn1-rs-impl` | ASN.1 impl macros for asn1-rs/x509-parser (C6). Build-host code generator. |
-| `zeroize_derive` | Derive macro for `Zeroize`; the runtime primitive is `zeroize`. Build-host code generator. |
+| `zeroize_derive` | Derive macro for `Zeroize`; the runtime primitive is `zeroize` (C3). Build-host code generator. |
 | `aws-smithy-runtime-api-macros` | AWS SDK runtime-API macros (no crypto). Build-host code generator. |
-| `openssl-macros` | OpenSSL derive macros (rustls OpenSSL provider on all targets + Linux native-tls backend); no crypto. Build-host code generator. |
+| `openssl-macros` | OpenSSL derive macros (rustls OpenSSL provider + Linux native-tls backend); no crypto. Build-host code generator. |
+| `tiny-keccak` | Keccak-f for ahash's const-random compile-time seed; reached only beneath const-random-macro (a proc-macro), so it executes on the build host and is not linked into the runtime binary. |
 
 ## Watch tokens
 
