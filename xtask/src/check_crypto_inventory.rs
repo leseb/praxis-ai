@@ -49,6 +49,22 @@
 //!   real primitive by definition, so it must be tracked in `production`, not silenced as an exception;
 //! * a crate cannot carry two classifications at once (a duplicate across `production`/`allow`/`proc_macro`/
 //!   `test_only`/`build_only` would let one bucket's guard mask another's).
+//!
+//! # Known limitations
+//!
+//! This check is a maintained map of the production cryptographic operations and a drift alarm — deliberately *not* a
+//! second implementation of Cargo's dependency resolver. Two edge cases are known and intentionally deferred; they are
+//! legitimate but complex relative to their practical value (candidate follow-ups, not blockers):
+//!
+//! * **Same-version feature unification.** Provider `require_features`/`forbid_features` are validated against the
+//!   feature set `cargo tree --edges features` reports for each profile/target — i.e. Cargo's own already-unified
+//!   resolution. The check does not independently re-derive that union across every activation path of a single crate
+//!   version, so it trusts the resolver's output rather than recomputing it. In practice the two agree (the graph the
+//!   check reads *is* the resolver's output); the unmodeled case is a hypothetical divergence between them.
+//! * **Host vs. runtime identity granularity.** Runtime linkage is computed structurally — walk from the root, refuse
+//!   to cross proc-macro nodes — which cleanly separates build-host code generators from runtime-linked crates. It does
+//!   not model finer distinctions such as a crate that executes only in a build script, or one that runs on the build
+//!   host in one profile and the target in another; such a crate is classified by its dominant linkage.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1045,6 +1061,9 @@ fn looks_like_reference(remediation: &str) -> bool {
 /// with the crate-centric `production` list (#1220).
 ///
 /// Enforces, for the declared `operations`:
+/// 0. **non-empty inventory** — at least one operation must be declared. The inventory is a maintained map of the
+///    production cryptographic operations and a drift alarm; an empty `operations` set is a defect, not a valid
+///    opt-out.
 /// 1. **unique ids and complete fields** — every operation has a unique `id` and non-empty
 ///    `name`/`caller`/`algorithm`/`provider`/`note`, a non-empty `crates` list, a non-empty `profiles` list over
 ///    `{full, fips}`, and a `disposition` in [`VALID_DISPOSITIONS`];
@@ -1055,9 +1074,7 @@ fn looks_like_reference(remediation: &str) -> bool {
 ///    actionable remediation reference ([`looks_like_reference`]);
 /// 4. **coverage** — every non-`n-a` `production` primitive is referenced by at least one operation's `crates` list or
 ///    is listed in `operation_exempt` with a reason (so a real primitive can never enter the runtime with no documented
-///    operation). Coverage is enforced only when at least one operation is declared: an empty `operations` set has
-///    nothing to be complete against, so the manifest-shape guards above still apply while a fixture or opted-out
-///    manifest is not forced to enumerate operations.
+///    operation).
 ///
 /// `operation_exempt` entries are validated too: each must name a real
 /// `production` crate and carry a non-empty reason.
@@ -1066,6 +1083,12 @@ fn looks_like_reference(remediation: &str) -> bool {
     reason = "one linear validation pass per operation invariant"
 )]
 fn check_operations(manifest: &Manifest, out: &mut Vec<String>) {
+    if manifest.operations.is_empty() {
+        out.push(
+            "operations inventory is empty: at least one cryptographic operation must be declared (the inventory is a maintained map and drift alarm, not an opt-out)".to_owned(),
+        );
+    }
+
     let valid_disp: BTreeSet<&str> = VALID_DISPOSITIONS.iter().copied().collect();
     let valid_profiles: BTreeSet<&str> = PROFILE_LABELS.iter().copied().collect();
 
@@ -1161,7 +1184,10 @@ fn check_operations(manifest: &Manifest, out: &mut Vec<String>) {
 /// [`check_operations`] to keep each pass small): each exemption must name a real
 /// `production` crate and carry a non-empty reason, and every non-`n-a`
 /// `production` primitive must be referenced by an operation or explicitly
-/// exempted. Coverage is skipped when no operations are declared.
+/// exempted. The coverage sweep is skipped when no operations are declared — not
+/// as an opt-out (an empty `operations` set is already flagged as a hard error by
+/// [`check_operations`]) but so that one clear "inventory is empty" violation is
+/// not buried under an "uncovered primitive" line for every production crate.
 #[expect(clippy::too_many_lines, reason = "one linear pass over exemptions then coverage")]
 fn check_operation_coverage(
     manifest: &Manifest,
@@ -1187,7 +1213,9 @@ fn check_operation_coverage(
     }
 
     // Coverage: every non-`n-a` production primitive must be referenced by an
-    // operation or explicitly exempted. Skipped when no operations are declared.
+    // operation or explicitly exempted. The empty case is already flagged as a
+    // hard error by `check_operations`; skip the per-crate sweep here so that one
+    // clear violation is not buried under an "uncovered" line for every primitive.
     if manifest.operations.is_empty() {
         return;
     }
@@ -1853,6 +1881,18 @@ production:
     disposition: non-validated
     platform: macos
     note: test
+operations:
+  - id: OP1
+    name: fixture digest
+    owner: test
+    caller: test
+    algorithm: test
+    provider: test
+    crates: [sha2, rustls, openssl, security-framework]
+    profiles: [full]
+    disposition: non-validated
+    remediation: \"#1220\"
+    note: test
 allow:
   - crate: aws-smithy-types
   - crate: openssl-macros
@@ -2412,12 +2452,19 @@ operation_exempt:
     }
 
     #[test]
-    fn empty_operations_skips_coverage() {
-        // No operations declared: the manifest-shape guards still run, but coverage
-        // is not enforced (nothing to be complete against), so the non-`n-a`
-        // primitives are not reported as uncovered.
+    fn empty_operations_is_flagged() {
+        // No operations declared: the inventory is a maintained map and drift
+        // alarm, so an empty set is a hard error — flagged with one clear
+        // violation, not buried under an "uncovered primitive" line per crate.
         let violations = op_violations("operations: []\n");
-        assert!(violations.is_empty(), "empty operations must be quiet: {violations:?}");
+        assert!(
+            violations.iter().any(|v| v.contains("operations inventory is empty")),
+            "empty operations must be flagged: {violations:?}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.contains("referenced by no operation")),
+            "the empty error must not be buried under per-crate coverage noise: {violations:?}"
+        );
     }
 
     #[test]
@@ -2911,6 +2958,7 @@ providers:
         );
     }
 
+    #[expect(clippy::too_many_lines, reason = "inline YAML fixture")]
     fn proc_macro_manifest() -> Manifest {
         // `zeroize_derive` matches the `zeroize` token and is declared as a
         // build-host proc-macro; `sha2`/`rustls` are ordinary runtime primitives.
@@ -2924,6 +2972,18 @@ production:
   - crate: rustls
     profiles: [full]
     disposition: non-validated
+    note: test
+operations:
+  - id: OP1
+    name: fixture digest
+    owner: test
+    caller: test
+    algorithm: test
+    provider: test
+    crates: [sha2, rustls]
+    profiles: [full]
+    disposition: non-validated
+    remediation: \"#1220\"
     note: test
 allow: []
 test_only: []
@@ -3031,6 +3091,7 @@ proc_macro:
         );
     }
 
+    #[expect(clippy::too_many_lines, reason = "inline YAML fixture")]
     fn provider_manifest() -> Manifest {
         // aws-lc-rs is both a production primitive and a pinned provider (as in
         // the real manifest), so the undeclared check stays quiet and only the
@@ -3041,6 +3102,18 @@ production:
   - crate: aws-lc-rs
     profiles: [full]
     disposition: non-validated
+    note: test
+operations:
+  - id: OP1
+    name: fixture verify
+    owner: test
+    caller: test
+    algorithm: test
+    provider: test
+    crates: [aws-lc-rs]
+    profiles: [full]
+    disposition: non-validated
+    remediation: \"#1220\"
     note: test
 allow: []
 test_only: []

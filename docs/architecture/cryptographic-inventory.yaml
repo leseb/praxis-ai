@@ -513,8 +513,8 @@ providers:
     version: "0.23.45"
     profiles: [full, fips]
     require_features: [custom-provider]
-    forbid_features: [ring]
-    note: The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; `ring` MUST stay absent. rustls resolves WITHOUT the `aws-lc-rs` feature (its features are custom-provider/log/logging/std/tls12); aws-lc-rs enters the full profile only through jsonwebtoken, never as the TLS executor.
+    forbid_features: [ring, aws_lc_rs]
+    note: The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; both bundled rustls backends MUST stay absent. `ring` and `aws_lc_rs` are forbidden — the latter is rustls' canonical aws-lc-rs feature that its `aws-lc-rs`/`fips`/`prefer-post-quantum` features all pull in, so forbidding it keeps rustls off a bundled provider even if one of those aliases is enabled. rustls resolves WITHOUT any of them (its features are custom-provider/log/logging/std/tls12); aws-lc-rs enters the full profile only through jsonwebtoken, never as the TLS executor.
   - crate: jsonwebtoken
     version: "11.1.0"
     profiles: [full]
@@ -806,6 +806,16 @@ operations:
     disposition: non-validated
     remediation: "#1217"
     note: "PostgreSQL store mutual TLS: client presents a PEM cert/key, asymmetric client-auth negotiated in the handshake, via sqlx-postgres native-tls. Full-only (#1217)."
+  - id: A12
+    name: "HTTP Basic Auth credential verification"
+    owner: "praxis-proxy-filter (praxis core basic_auth builtin)"
+    caller: "praxis-proxy-filter 0.7.1 builtins/http/security/basic_auth/filter.rs:253 hash_password; :237 verify_password_hash"
+    algorithm: "unsalted SHA-256 password digest compared in constant time; dummy-hash compare when the user is unknown (timing-safe miss)"
+    provider: "OpenSSL EVP (hash MessageDigest::sha256) + subtle::ConstantTimeEq; not a RustCrypto digest"
+    crates: [openssl, openssl-sys, subtle]
+    profiles: [full, fips]
+    disposition: upstream-owned
+    note: "HTTP Basic Auth credential check in the praxis core basic_auth builtin: hashes the presented password with OpenSSL EVP SHA-256 and compares it to the stored digest with subtle constant-time equality (dummy compare on unknown user). Compiled into both profiles — the praxis-filter dependency enables `basic-auth-filter` unconditionally — while the AI proxy only registers the filter under the experimental `basic-auth-filter` server feature. Upstream-maintained."
   - id: H1
     name: "MCP approval target-identity fingerprint"
     owner: "praxis-ai (apis/openai/responses/mcp_dispatch)"
