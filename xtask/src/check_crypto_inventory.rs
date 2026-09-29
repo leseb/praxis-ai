@@ -44,7 +44,9 @@
 //!   linkage is computed by walking the tree from the root and refusing to cross into proc-macro nodes, not by mere
 //!   presence in `--edges normal` output;
 //! * test/build-only cryptography cannot silently link into the runtime binary;
-//! * a crate on Red Hat's FIPS denylist (shared from [`crate::fips::graph::DENIED`]) cannot enter any `fips` graph;
+//! * a crate on Red Hat's FIPS denylist (shared from [`crate::fips::graph::DENIED`]) cannot enter any `fips` graph, nor
+//!   be laundered into the runtime-linked `allow` ("reviewed non-primitive") bucket on any profile — a denied name is a
+//!   real primitive by definition, so it must be tracked in `production`, not silenced as an exception;
 //! * a crate cannot carry two classifications at once (a duplicate across `production`/`allow`/`proc_macro`/
 //!   `test_only`/`build_only` would let one bucket's guard mask another's).
 
@@ -175,6 +177,18 @@ struct Manifest {
     /// Load-bearing providers whose version and features are pinned.
     #[serde(default)]
     providers: Vec<Provider>,
+    /// Production-reachable cryptographic operations — the operation-level
+    /// companion to `production` (#1220). Empty is permitted (the profile/graph
+    /// guards still run); when populated, [`check_operations`] enforces unique
+    /// ids, complete fields, profile consistency against the referenced crates,
+    /// remediation links for non-compliant dispositions, and coverage of every
+    /// real primitive.
+    #[serde(default)]
+    operations: Vec<Operation>,
+    /// Production primitives deliberately exempt from operation coverage, each
+    /// with a reason.
+    #[serde(default)]
+    operation_exempt: Vec<OperationExempt>,
 }
 
 /// One crate entry in the manifest.
@@ -234,6 +248,83 @@ struct Provider {
     /// Human-readable rationale for the pin. Validated non-empty.
     #[serde(default)]
     note: String,
+}
+
+/// One production-reachable cryptographic operation: a caller invoking a
+/// primitive through a specific implementation provider.
+///
+/// This is the operation-level companion to the crate-centric [`production`]
+/// inventory. The two answer different questions and neither subsumes the other:
+/// `production` answers "what cryptographic code can ship" (drift-guarded against
+/// the resolved dependency graph); `operations` answers "where is cryptography
+/// used, for what algorithm, under whose ownership, and what remediation is
+/// required" (#1220's acceptance criterion). An operation's `crates` tie it back
+/// to the `production` entries that implement it, so [`check_operations`] can
+/// prove the two stay consistent (every referenced crate exists and is resolved
+/// in the operation's profiles, and every real primitive is covered by an
+/// operation).
+///
+/// `deny_unknown_fields` makes a mistyped key a hard parse error rather than a
+/// silently dropped field.
+///
+/// [`production`]: Manifest::production
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Operation {
+    /// Stable operation identifier (e.g. `A3`, `H1`, `T1`). Must be unique.
+    id: String,
+    /// Short human-readable operation name.
+    name: String,
+    /// The component/repository responsible for the operation and its remediation
+    /// (e.g. `praxis-ai (this repo)`, `praxis-core tls`, `praxis-proxy/policy
+    /// (upstream)`). Distinct from `caller` (where it is invoked) and `provider`
+    /// (what executes the primitive): an in-repo caller can invoke an
+    /// upstream-owned primitive.
+    owner: String,
+    /// Who invokes the operation, ideally with a `file:line` anchor (in this repo
+    /// or an upstream dependency).
+    caller: String,
+    /// The algorithm(s) the operation executes.
+    algorithm: String,
+    /// Human-readable label for the implementation provider (e.g.
+    /// `OpenSSL EVP via apis::hash`, `aws-lc-rs via jsonwebtoken`).
+    provider: String,
+    /// The `production` crate names that implement or support this operation.
+    /// Every entry must be a declared `production` crate, and each is validated to
+    /// be resolved in every profile the operation declares.
+    crates: Vec<String>,
+    /// The build profiles the operation executes in (`full`/`fips`).
+    profiles: Vec<String>,
+    /// The operation's disposition (same vocabulary as `production`:
+    /// [`VALID_DISPOSITIONS`]).
+    disposition: String,
+    /// Remediation reference. Required (non-empty and pointing at an issue,
+    /// docs path, or upstream repo — see [`looks_like_reference`]) when the
+    /// disposition is non-compliant (`non-validated` or `needs-remediation`).
+    #[serde(default)]
+    remediation: String,
+    /// Human-readable rationale/context. Validated non-empty.
+    #[serde(default)]
+    note: String,
+}
+
+/// A `production` primitive deliberately NOT tied to an [`Operation`], with a
+/// stated reason.
+///
+/// The coverage arm of [`check_operations`] requires every non-`n-a` production
+/// primitive to be referenced by an operation; this bucket is the explicit escape
+/// hatch for a real primitive that legitimately carries no standalone operation
+/// of its own (e.g. a support crate surfaced only transitively). Keeping the
+/// exemption explicit — rather than loosening the coverage check — means the gap
+/// is reviewed and documented instead of silent.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationExempt {
+    /// The production crate name being exempted from operation coverage.
+    #[serde(rename = "crate")]
+    crate_name: String,
+    /// Why this primitive carries no standalone operation. Validated non-empty.
+    reason: String,
 }
 
 // -----------------------------------------------------------------------------
@@ -421,6 +512,8 @@ fn evaluate(manifest: &Manifest, graphs: &[TargetGraph]) -> Vec<String> {
     check_containment(manifest, graphs, &mut out);
     check_providers(&manifest.providers, graphs, &mut out);
     check_denied_absent(graphs, &mut out);
+    check_denied_not_allowed(manifest, &mut out);
+    check_operations(manifest, &mut out);
     out
 }
 
@@ -899,6 +992,224 @@ fn check_denied_absent(graphs: &[TargetGraph], out: &mut Vec<String>) {
     }
 }
 
+/// Denylist-classification check: a crate on Red Hat's FIPS denylist
+/// ([`crate::fips::graph::DENIED`]) is by definition a real cryptographic
+/// primitive, so it can never be a "reviewed non-primitive". It must live in
+/// `production` (carrying a disposition, note, and profile assignment), never in
+/// `allow`.
+///
+/// Without this guard the `allow` bucket is an escape hatch for the *`full`*
+/// profile: [`check_undeclared`]'s denylist arm is silenced the moment a crate
+/// is declared in any bucket (including `allow`), and [`check_denied_absent`]
+/// only inspects the `fips` graph — so a denied primitive that ships in `full`
+/// (e.g. `sha2`/`hmac`/`md-5`, or a newly-pulled `aes-gcm`) could be laundered
+/// into `allow` and pass unnoticed. This is a manifest-level guard (no graph
+/// needed): a denied name in `allow` is wrong regardless of which profile
+/// resolves it. `test_only`/`build_only` are not covered here because they
+/// legitimately hold denied dev/build-host crypto (`sha1`/`sha3`) and
+/// [`check_containment`] already proves they never link into the runtime binary;
+/// `proc_macro` is likewise backstopped by [`check_proc_macro`].
+fn check_denied_not_allowed(manifest: &Manifest, out: &mut Vec<String>) {
+    let denied: BTreeSet<&str> = crate::fips::graph::DENIED.iter().copied().collect();
+    for entry in &manifest.allow {
+        if denied.contains(entry.crate_name.as_str()) {
+            out.push(format!(
+                "FIPS denylist crate `{}` is declared in `allow` — a denylisted primitive is never a reviewed non-primitive; move it to `production` with a disposition",
+                entry.crate_name
+            ));
+        }
+    }
+}
+
+/// The dispositions that are non-compliant in a FIPS inventory: a real primitive
+/// whose validated execution is not proven (`non-validated`), or one that should
+/// change (`needs-remediation`). Operations carrying either MUST cite a
+/// remediation reference. `validated`/`n-a`/`upstream-owned` are not required to
+/// (compliant, non-primitive, or owned and tracked elsewhere).
+const NON_COMPLIANT_DISPOSITIONS: [&str; 2] = ["non-validated", "needs-remediation"];
+
+/// Whether `remediation` cites something actionable: an issue (`#<digit>`), a URL
+/// (`http`), a docs path (`.md`), or an upstream repo (`praxis-proxy/`). Used to
+/// reject a bare non-empty string (e.g. `"TODO"`) as a remediation "link".
+fn looks_like_reference(remediation: &str) -> bool {
+    remediation.contains("http")
+        || remediation.contains(".md")
+        || remediation.contains("praxis-proxy/")
+        || remediation
+            .as_bytes()
+            .windows(2)
+            .any(|w| matches!(w, [b'#', d] if d.is_ascii_digit()))
+}
+
+/// Operations check: validate the operation-level inventory and its consistency
+/// with the crate-centric `production` list (#1220).
+///
+/// Enforces, for the declared `operations`:
+/// 1. **unique ids and complete fields** — every operation has a unique `id` and non-empty
+///    `name`/`caller`/`algorithm`/`provider`/`note`, a non-empty `crates` list, a non-empty `profiles` list over
+///    `{full, fips}`, and a `disposition` in [`VALID_DISPOSITIONS`];
+/// 2. **profile consistency** — every crate an operation references is a declared `production` entry, and is resolved
+///    in every profile the operation declares (an operation cannot claim to run in a profile one of its implementing
+///    crates is absent from);
+/// 3. **remediation links** — an operation whose disposition is non-compliant ([`NON_COMPLIANT_DISPOSITIONS`]) cites an
+///    actionable remediation reference ([`looks_like_reference`]);
+/// 4. **coverage** — every non-`n-a` `production` primitive is referenced by at least one operation's `crates` list or
+///    is listed in `operation_exempt` with a reason (so a real primitive can never enter the runtime with no documented
+///    operation). Coverage is enforced only when at least one operation is declared: an empty `operations` set has
+///    nothing to be complete against, so the manifest-shape guards above still apply while a fixture or opted-out
+///    manifest is not forced to enumerate operations.
+///
+/// `operation_exempt` entries are validated too: each must name a real
+/// `production` crate and carry a non-empty reason.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear validation pass per operation invariant"
+)]
+fn check_operations(manifest: &Manifest, out: &mut Vec<String>) {
+    let valid_disp: BTreeSet<&str> = VALID_DISPOSITIONS.iter().copied().collect();
+    let valid_profiles: BTreeSet<&str> = PROFILE_LABELS.iter().copied().collect();
+
+    // production crate name -> the profiles it is resolved in (unioned across any
+    // platform-split entries of the same name).
+    let mut prod_profiles: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for entry in &manifest.production {
+        let set = prod_profiles.entry(entry.crate_name.as_str()).or_default();
+        for p in &entry.profiles {
+            set.insert(p.as_str());
+        }
+    }
+
+    // Per-operation field, profile, and remediation validation.
+    let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+    for op in &manifest.operations {
+        let id = op.id.trim();
+        let label = if id.is_empty() { "<empty id>" } else { id };
+        if id.is_empty() {
+            out.push("operation has an empty `id`".to_owned());
+        } else if !seen_ids.insert(id) {
+            out.push(format!("operation id `{id}` is declared more than once"));
+        }
+        if op.name.trim().is_empty() {
+            out.push(format!("operation `{label}` has an empty `name`"));
+        }
+        if op.owner.trim().is_empty() {
+            out.push(format!("operation `{label}` has an empty `owner`"));
+        }
+        if op.caller.trim().is_empty() {
+            out.push(format!("operation `{label}` has an empty `caller`"));
+        }
+        if op.algorithm.trim().is_empty() {
+            out.push(format!("operation `{label}` has an empty `algorithm`"));
+        }
+        if op.provider.trim().is_empty() {
+            out.push(format!("operation `{label}` has an empty `provider`"));
+        }
+        if op.note.trim().is_empty() {
+            out.push(format!("operation `{label}` has an empty `note`"));
+        }
+        if !valid_disp.contains(op.disposition.as_str()) {
+            out.push(format!(
+                "operation `{label}` has missing/invalid disposition `{}` (expected one of {VALID_DISPOSITIONS:?})",
+                op.disposition
+            ));
+        }
+        if op.profiles.is_empty() {
+            out.push(format!("operation `{label}` declares no `profiles`"));
+        }
+        for p in &op.profiles {
+            if !valid_profiles.contains(p.as_str()) {
+                out.push(format!(
+                    "operation `{label}` declares invalid profile `{p}` (expected one of {PROFILE_LABELS:?})"
+                ));
+            }
+        }
+        // A crate-backed operation must name its crates. An `n-a` operation may
+        // reference none: it documents non-cryptographic hashing implemented on
+        // the standard library (reviewed and dispositioned out of scope), which
+        // has no entry in the crate-centric manifest.
+        if op.crates.is_empty() && op.disposition != "n-a" {
+            out.push(format!("operation `{label}` references no `crates`"));
+        }
+        for crate_name in &op.crates {
+            match prod_profiles.get(crate_name.as_str()) {
+                None => out.push(format!(
+                    "operation `{label}` references crate `{crate_name}` which is not a `production` entry"
+                )),
+                Some(crate_profiles) => {
+                    for p in &op.profiles {
+                        if valid_profiles.contains(p.as_str()) && !crate_profiles.contains(p.as_str()) {
+                            out.push(format!(
+                                "operation `{label}` declares profile `{p}` but its crate `{crate_name}` is not resolved in that profile"
+                            ));
+                        }
+                    }
+                },
+            }
+        }
+        if NON_COMPLIANT_DISPOSITIONS.contains(&op.disposition.as_str()) && !looks_like_reference(&op.remediation) {
+            out.push(format!(
+                "operation `{label}` has disposition `{}` but no remediation reference (cite an issue #NNN, a docs path, or an upstream repo)",
+                op.disposition
+            ));
+        }
+    }
+
+    check_operation_coverage(manifest, &prod_profiles, out);
+}
+
+/// `operation_exempt` validation plus coverage (extracted from
+/// [`check_operations`] to keep each pass small): each exemption must name a real
+/// `production` crate and carry a non-empty reason, and every non-`n-a`
+/// `production` primitive must be referenced by an operation or explicitly
+/// exempted. Coverage is skipped when no operations are declared.
+#[expect(clippy::too_many_lines, reason = "one linear pass over exemptions then coverage")]
+fn check_operation_coverage(
+    manifest: &Manifest,
+    prod_profiles: &BTreeMap<&str, BTreeSet<&str>>,
+    out: &mut Vec<String>,
+) {
+    // `operation_exempt` validation: real crate + non-empty reason.
+    let mut exempt: BTreeSet<&str> = BTreeSet::new();
+    for ex in &manifest.operation_exempt {
+        if !prod_profiles.contains_key(ex.crate_name.as_str()) {
+            out.push(format!(
+                "operation_exempt crate `{}` is not a `production` entry",
+                ex.crate_name
+            ));
+        }
+        if ex.reason.trim().is_empty() {
+            out.push(format!(
+                "operation_exempt crate `{}` has an empty `reason`",
+                ex.crate_name
+            ));
+        }
+        exempt.insert(ex.crate_name.as_str());
+    }
+
+    // Coverage: every non-`n-a` production primitive must be referenced by an
+    // operation or explicitly exempted. Skipped when no operations are declared.
+    if manifest.operations.is_empty() {
+        return;
+    }
+    let referenced: BTreeSet<&str> = manifest
+        .operations
+        .iter()
+        .flat_map(|op| op.crates.iter().map(String::as_str))
+        .collect();
+    for entry in &manifest.production {
+        if entry.disposition.as_deref() == Some("n-a") {
+            continue;
+        }
+        let name = entry.crate_name.as_str();
+        if !referenced.contains(name) && !exempt.contains(name) {
+            out.push(format!(
+                "production primitive `{name}` (disposition `{}`) is referenced by no operation and is not in `operation_exempt`",
+                entry.disposition.as_deref().unwrap_or("")
+            ));
+        }
+    }
+}
+
 /// Whether `name` matches any watch token, using the same tokenization the
 /// manifest documents: split on `-`/`_`, then also compare each part with its
 /// trailing digits stripped (so `sha2` matches `sha`, `md-5` matches `md`).
@@ -967,6 +1278,7 @@ fn render_doc(manifest: &Manifest) -> String {
     render_dispositions(&mut out);
     render_production(manifest, &mut out);
     render_providers(manifest, &mut out);
+    render_operations(manifest, &mut out);
     render_named_bucket(&mut out, "Reviewed non-primitives (`allow`)", &manifest.allow);
     render_named_bucket(&mut out, "Test-only cryptography (`test_only`)", &manifest.test_only);
     render_named_bucket(&mut out, "Build-host cryptography (`build_only`)", &manifest.build_only);
@@ -1081,6 +1393,100 @@ fn render_providers(manifest: &Manifest, out: &mut String) {
         .unwrap();
     }
     writeln!(out).unwrap();
+}
+
+/// Render the operations inventory: one row per production-reachable
+/// cryptographic operation, tying each caller to its algorithm, provider,
+/// implementing crates, profiles, disposition, and remediation. Rendered only
+/// when the manifest declares operations.
+#[expect(clippy::too_many_lines, reason = "one writeln! per operation table column set")]
+fn render_operations(manifest: &Manifest, out: &mut String) {
+    if manifest.operations.is_empty() {
+        return;
+    }
+    writeln!(out, "## Cryptographic operations").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Every production-reachable cryptographic operation: where it is used, for"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "what algorithm, under whose ownership, by which crates, and what remediation"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "it requires. The crate-centric table above answers \"what cryptographic code"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "can ship\"; this one answers \"where is cryptography actually used\". Each"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "operation's crates are cross-checked against the `production` inventory."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "| ID | Operation | Owner | Caller | Algorithm | Provider | Crates | Profiles | Disposition | Remediation | Notes |"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
+    .unwrap();
+    for op in &manifest.operations {
+        // `n-a` std operations reference no crypto crate; show an em dash there.
+        let crates = if op.crates.is_empty() {
+            "—".to_owned()
+        } else {
+            op.crates
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            cell(&op.id),
+            cell(&op.name),
+            cell(&op.owner),
+            cell(&op.caller),
+            cell(&op.algorithm),
+            cell(&op.provider),
+            cell(&crates),
+            op.profiles.join(", "),
+            cell(&op.disposition),
+            cell(&op.remediation),
+            cell(&op.note),
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+
+    if !manifest.operation_exempt.is_empty() {
+        writeln!(
+            out,
+            "Production primitives with no standalone operation (support layers), exempt"
+        )
+        .unwrap();
+        writeln!(out, "from operation coverage with a reason:").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "| Crate | Reason |").unwrap();
+        writeln!(out, "| --- | --- |").unwrap();
+        for ex in &manifest.operation_exempt {
+            writeln!(out, "| `{}` | {} |", ex.crate_name, cell(&ex.reason)).unwrap();
+        }
+        writeln!(out).unwrap();
+    }
 }
 
 /// Render a simple `Crate | Notes` bucket table under `title`.
@@ -1648,6 +2054,431 @@ build_only:
                 "denylisted cipher `{name}` must be flagged undeclared in the full profile: {violations:?}"
             );
         }
+    }
+
+    #[test]
+    fn fused_separator_less_crypto_names_match_as_whole_tokens() {
+        // Regression: the token split (on `-`/`_`, then strip trailing digits)
+        // cannot reduce these separator-less names to their family tokens
+        // (`secp256k1`/`salsa`/`poly1305`/`schnorr`), so the manifest lists them as
+        // whole crate names in `watch_tokens`. Assert both halves: the whole-name
+        // arm matches, and the family-token split genuinely does not (the reason the
+        // whole names are needed).
+        let fused = ["libsecp256k1", "xsalsa20poly1305", "schnorrkel"];
+        let whole: BTreeSet<String> = fused.iter().map(|t| (*t).to_owned()).collect();
+        for name in fused {
+            assert!(
+                is_watch_match(name, &whole),
+                "fused name `{name}` must match as a whole watch token"
+            );
+        }
+        let family: BTreeSet<String> = ["secp256k1", "salsa", "poly1305", "schnorr"]
+            .iter()
+            .map(|t| (*t).to_owned())
+            .collect();
+        for name in fused {
+            assert!(
+                !is_watch_match(name, &family),
+                "precondition: the token split cannot reduce `{name}` to a family token"
+            );
+        }
+    }
+
+    #[test]
+    fn denylisted_crate_in_allow_bucket_is_flagged() {
+        // Regression: the `allow` bucket must not be an escape hatch for the
+        // `full` profile. A crate on `fips::graph::DENIED` (a real primitive) that
+        // is filed under `allow` silences `check_undeclared`'s denylist arm
+        // (declared-in-a-bucket), and `check_denied_absent` only inspects `fips`
+        // graphs — so without `check_denied_not_allowed` a denied cipher shipping
+        // in `full` (e.g. `aes-gcm`) would pass. Both crates are present in the
+        // graph so `check_stale_allow` stays quiet and the only signal is the new
+        // denylist-classification guard.
+        let yaml = "
+watch_tokens: [aws]
+production: []
+allow:
+  - crate: aes-gcm
+  - crate: aws-smithy-types
+test_only: []
+build_only: []
+";
+        let manifest: Manifest = serde_yaml::from_str(yaml).expect("manifest parses");
+        let graphs = vec![names_tg("linux", &["aes-gcm", "aws-smithy-types"])];
+        let violations = evaluate(&manifest, &graphs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("aes-gcm") && v.contains("allow") && v.contains("denylist")),
+            "a denylisted crate in `allow` must be flagged: {violations:?}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.contains("aws-smithy-types")),
+            "a genuine non-primitive in `allow` must not be flagged: {violations:?}"
+        );
+    }
+
+    /// Shared production block for the operations tests: two non-`n-a` primitives
+    /// (`openssl` in both profiles, `jsonwebtoken` full-only) and one `n-a` support
+    /// crate (`zeroize`). Each test appends its own `operations:` (and optional
+    /// `operation_exempt:`) block.
+    const OPS_PROD: &str = "
+watch_tokens: [sha, openssl, jwt, aws, ring, zeroize]
+production:
+  - crate: openssl
+    profiles: [full, fips]
+    disposition: non-validated
+    note: t
+  - crate: jsonwebtoken
+    profiles: [full]
+    disposition: non-validated
+    note: t
+  - crate: zeroize
+    profiles: [full, fips]
+    disposition: n-a
+    note: t
+allow: []
+test_only: []
+build_only: []
+";
+
+    /// Run only the operations guard against a manifest built from [`OPS_PROD`]
+    /// plus the caller-supplied `operations`/`operation_exempt` tail.
+    fn op_violations(tail: &str) -> Vec<String> {
+        let yaml = format!("{OPS_PROD}{tail}");
+        let manifest: Manifest = serde_yaml::from_str(&yaml).expect("manifest parses");
+        let mut out = Vec::new();
+        check_operations(&manifest, &mut out);
+        out
+    }
+
+    #[test]
+    fn operations_clean_manifest_passes() {
+        // openssl -> T1, jsonwebtoken -> A1; zeroize is `n-a` and needs no
+        // operation. Non-compliant dispositions carry remediation references.
+        let violations = op_violations(
+            "operations:
+  - id: T1
+    name: TLS on OpenSSL
+    owner: praxis-core tls
+    caller: server/src/server.rs:65
+    algorithm: TLS 1.2/1.3
+    provider: OpenSSL libcrypto
+    crates: [openssl]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: docs/fips.md
+    note: t
+  - id: A1
+    name: JWT verify
+    owner: praxis-proxy/policy (upstream)
+    caller: identity-jwt config.rs
+    algorithm: RS256/ES256 verify
+    provider: aws-lc-rs via jsonwebtoken
+    crates: [jsonwebtoken]
+    profiles: [full]
+    disposition: non-validated
+    remediation: \"#1220\"
+    note: t
+",
+        );
+        assert!(violations.is_empty(), "clean operations manifest: {violations:?}");
+    }
+
+    #[test]
+    fn operation_duplicate_id_is_flagged() {
+        let violations = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [openssl]
+    profiles: [full]
+    disposition: n-a
+    note: t
+  - id: T1
+    name: b
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [jsonwebtoken]
+    profiles: [full]
+    disposition: n-a
+    note: t
+",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("T1") && v.contains("more than once")),
+            "duplicate id must be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn operation_empty_required_field_is_flagged() {
+        // Empty owner (a required field distinct from caller/provider).
+        let violations = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: \"\"
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [openssl]
+    profiles: [full]
+    disposition: n-a
+    note: t
+",
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("T1") && v.contains("owner")),
+            "empty owner must be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn operation_references_unknown_crate_is_flagged() {
+        let violations = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [ring]
+    profiles: [full]
+    disposition: n-a
+    note: t
+",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("ring") && v.contains("not a `production` entry")),
+            "unknown crate must be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn operation_profile_absent_from_crate_is_flagged() {
+        // jsonwebtoken is full-only; an op claiming it runs in `fips` is a leak.
+        let violations = op_violations(
+            "operations:
+  - id: A1
+    name: JWT
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [jsonwebtoken]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: \"#1220\"
+    note: t
+",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("A1") && v.contains("fips") && v.contains("jsonwebtoken")),
+            "profile the crate is absent from must be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "inline YAML fixture")]
+    fn operation_non_compliant_without_remediation_is_flagged() {
+        // non-validated but no remediation reference at all.
+        let missing = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [openssl]
+    profiles: [full]
+    disposition: non-validated
+    note: t
+",
+        );
+        assert!(
+            missing.iter().any(|v| v.contains("T1") && v.contains("remediation")),
+            "missing remediation must be flagged: {missing:?}"
+        );
+        // A bare non-reference string ("TODO") does not count as a link.
+        let bare = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [openssl]
+    profiles: [full]
+    disposition: non-validated
+    remediation: TODO
+    note: t
+",
+        );
+        assert!(
+            bare.iter().any(|v| v.contains("T1") && v.contains("remediation")),
+            "bare remediation string must be rejected: {bare:?}"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "inline YAML fixture")]
+    fn uncovered_primitive_is_flagged_and_exemption_satisfies_it() {
+        // Only openssl is covered; jsonwebtoken (non-`n-a`) is referenced by no op.
+        let uncovered = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [openssl]
+    profiles: [full]
+    disposition: n-a
+    note: t
+",
+        );
+        assert!(
+            uncovered
+                .iter()
+                .any(|v| v.contains("jsonwebtoken") && v.contains("referenced by no operation")),
+            "uncovered primitive must be flagged: {uncovered:?}"
+        );
+        // Exempting it (with a reason) clears the coverage gap.
+        let exempted = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [openssl]
+    profiles: [full]
+    disposition: n-a
+    note: t
+operation_exempt:
+  - crate: jsonwebtoken
+    reason: support layer under aws-lc-rs
+",
+        );
+        assert!(
+            !exempted.iter().any(|v| v.contains("jsonwebtoken")),
+            "an explicit exemption must satisfy coverage: {exempted:?}"
+        );
+    }
+
+    #[test]
+    fn operation_exempt_unknown_crate_is_flagged() {
+        let violations = op_violations(
+            "operations:
+  - id: T1
+    name: a
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: [openssl, jsonwebtoken]
+    profiles: [full]
+    disposition: n-a
+    note: t
+operation_exempt:
+  - crate: nonexistent
+    reason: r
+",
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("nonexistent") && v.contains("not a `production` entry")),
+            "exempting a non-production crate must be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn empty_operations_skips_coverage() {
+        // No operations declared: the manifest-shape guards still run, but coverage
+        // is not enforced (nothing to be complete against), so the non-`n-a`
+        // primitives are not reported as uncovered.
+        let violations = op_violations("operations: []\n");
+        assert!(violations.is_empty(), "empty operations must be quiet: {violations:?}");
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "inline YAML fixture")]
+    fn na_operation_may_reference_no_crates_but_others_must() {
+        // An `n-a` std/non-crypto operation legitimately references no crypto
+        // crate (e.g. a SipHash `DefaultHasher` change-detection digest).
+        let na = op_violations(
+            "operations:
+  - id: S1
+    name: SipHash affinity digest
+    owner: praxis-ai apis
+    caller: stream_events/mod.rs:1582
+    algorithm: SipHash-1-3
+    provider: Rust std DefaultHasher
+    crates: []
+    profiles: [full]
+    disposition: n-a
+    note: t
+",
+        );
+        assert!(
+            !na.iter()
+                .any(|v| v.contains("S1") && v.contains("references no `crates`")),
+            "an n-a op may reference no crates: {na:?}"
+        );
+        // A crate-backed disposition with no crates is still a defect.
+        let bad = op_violations(
+            "operations:
+  - id: S1
+    name: x
+    owner: o
+    caller: c
+    algorithm: alg
+    provider: p
+    crates: []
+    profiles: [full]
+    disposition: non-validated
+    remediation: \"#1220\"
+    note: t
+",
+        );
+        assert!(
+            bad.iter()
+                .any(|v| v.contains("S1") && v.contains("references no `crates`")),
+            "a non-`n-a` op with no crates must be flagged: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn looks_like_reference_accepts_links_and_rejects_prose() {
+        assert!(looks_like_reference("#1217"));
+        assert!(looks_like_reference("see #1217 for details"));
+        assert!(looks_like_reference("https://example.com/x"));
+        assert!(looks_like_reference("docs/fips.md"));
+        assert!(looks_like_reference("upstream praxis-proxy/policy"));
+        assert!(!looks_like_reference(""));
+        assert!(!looks_like_reference("TODO"));
+        assert!(!looks_like_reference("fix later"));
+        // A `#` with no following digit is not an issue reference.
+        assert!(!looks_like_reference("section #"));
     }
 
     #[test]
@@ -2484,5 +3315,15 @@ providers:
         // The canonical SHA token guards against an empty/malformed token list.
         let watch: BTreeSet<String> = manifest.watch_tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
         assert!(watch.contains("sha"), "expected canonical token present");
+
+        // The operation-level inventory (#1220) is populated and internally
+        // consistent: unique ids, complete fields, profiles that match the
+        // referenced crates, remediation for non-compliant dispositions, and
+        // coverage of every real primitive. `check_operations` needs no graph, so
+        // it runs here directly.
+        assert!(!manifest.operations.is_empty(), "operations inventory populated");
+        let mut op_out = Vec::new();
+        check_operations(&manifest, &mut op_out);
+        assert!(op_out.is_empty(), "operations inventory inconsistent: {op_out:?}");
     }
 }
