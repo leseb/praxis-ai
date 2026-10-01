@@ -1320,8 +1320,7 @@ def _write_openai_background_passthrough_config(
     praxis_port: int, db_path: str, backend_port: int
 ) -> str:
     """Build a provider-bound passthrough whose lifecycle owner is OpenAI."""
-    return _persist_config(
-        f"""
+    config = f"""
 listeners:
   - name: ai-gateway
     address: "127.0.0.1:{praxis_port}"
@@ -1345,7 +1344,7 @@ filter_chains:
                 application_provider: openai
       - filter: openai_response_store
         backend: sqlite
-        database_url: "sqlite://{db_path}?mode=rwc"
+        database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
         conditions:
@@ -1364,7 +1363,7 @@ filter_chains:
 insecure_options:
   allow_private_endpoints: true
 """
-    )
+    return _persist_config(_patch_store_backend(config, db_path))
 
 
 def _write_agentic_config(
