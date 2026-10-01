@@ -248,9 +248,7 @@ fn initialized_state_action(ctx: &HttpFilterContext<'_>) -> Option<FilterAction>
     // `openai_responses_request` already parsed and initialized create state.
     // In that chain this filter is only the request-scoped lifecycle boundary,
     // so do not parse again or regenerate response and conversation IDs.
-    if ctx.extensions.get::<ResponsesState>().is_some()
-        && ctx.get_metadata("responses.response_id").is_some()
-    {
+    if ctx.extensions.get::<ResponsesState>().is_some() && ctx.get_metadata("responses.response_id").is_some() {
         trace!("Responses state already initialized; lifecycle policy complete");
         return Some(FilterAction::Release);
     }
@@ -551,9 +549,7 @@ mod tests {
                 "model": "before-step-rewrite",
                 "input": "hello"
             })));
-        let mut body = Some(Bytes::from_static(
-            br#"{"model":"after-step-rewrite","input":"hello"}"#,
-        ));
+        let mut body = Some(Bytes::from_static(br#"{"model":"after-step-rewrite","input":"hello"}"#));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
