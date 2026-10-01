@@ -5,9 +5,9 @@
 # state management) or `stateful` (needs conversation history, tools,
 # or persistence).
 #
-# Both modes use the same inference backend. The difference is whether
-# the request passes through the stateful filter chain (orchestration,
-# persistence, tool dispatch) or bypasses it entirely.
+# Both modes use the same inference endpoint through distinct logical clusters.
+# Stateful-only filters can be conditioned on the promoted mode header before
+# the shared load balancer as orchestration and persistence are added.
 #
 # A request is stateful if any of:
 # - previous_response_id is set
@@ -28,38 +28,26 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: reject
-        branch_chains:
-          - name: stateful
-            on_result:
-              filter: openai_responses_format
-              key: mode
-              result: stateful
-            chains:
-              - name: stateful-chain
-                filters:
-                  # Placeholder: the full stateful chain would include
-                  # request_validate, response_store, rehydrate,
-                  # openai_tool_parse, openai_responses_proxy, stream_events,
-                  # tool_dispatch, reasoning, etc.
-                  #
-                  # For now, proxy to the same backend. Future
-                  # filters will be inserted here as they land.
-                  - filter: router
-                    routes:
-                      - path_prefix: "/"
-                        cluster: "inference-backend"
-            rejoin: shared_load_balancer
+        headers:
+          mode: x-praxis-responses-mode
 
-      # Stateless: no branch matched — proxy directly to backend
-      # with zero additional filter processing.
+      # Validate before routing so both modes share the fail-closed background
+      # policy. Body filters cannot be placed inside branch chains.
+      - filter: openai_responses_validate
       - filter: router
         routes:
           - path_prefix: "/"
+            headers:
+              x-praxis-responses-mode: "stateful"
+            cluster: "stateful-inference-backend"
+          - path_prefix: "/"
             cluster: "inference-backend"
-      - name: shared_load_balancer
-        filter: load_balancer
+      - filter: load_balancer
         clusters:
           - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "stateful-inference-backend"
             endpoints:
               - "127.0.0.1:3001"
 

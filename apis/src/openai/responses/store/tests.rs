@@ -322,6 +322,43 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executing_store_rejects_background_create() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.background", "true");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","background":true}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = expect_reject(action);
+
+    assert_eq!(rejection.status, 400);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["message"], "background mode is not supported");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_metadata_does_not_reject_non_responses_body_on_create_path() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
+    ctx.set_metadata("openai_responses_format.background", "true");
+    let mut body = Some(Bytes::from_static(
+        br#"{"messages":[{"role":"user","content":"hi"}],"background":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "store policy must require Responses classification, not only the endpoint path"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // on_request Bypass
 // -----------------------------------------------------------------------------

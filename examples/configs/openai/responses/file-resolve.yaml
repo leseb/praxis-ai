@@ -45,6 +45,8 @@ filter_chains:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
 
+      - filter: openai_responses_validate
+
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
         allow_pre_security_callout: true

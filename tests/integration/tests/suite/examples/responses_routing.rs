@@ -57,6 +57,6 @@ fn responses_routing_example_forwards_stateful_to_backend() {
     assert_eq!(
         parse_body(&raw),
         body,
-        "stateful should also reach the backend (same backend, different filter path)"
+        "stateful should also reach the backend through its logical cluster"
     );
 }

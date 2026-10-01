@@ -26,6 +26,7 @@ filter_chains:
   - name: main
     filters:
       - filter: openai_responses_format
+      - filter: openai_responses_validate
 
       - filter: router
         routes:

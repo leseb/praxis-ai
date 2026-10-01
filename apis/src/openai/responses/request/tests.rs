@@ -147,22 +147,24 @@ async fn a_model_only_create_is_classified_from_the_endpoint() {
     );
 }
 
-/// Background rejection keys off the published format, so a body without a
-/// discriminator must not slip past it.
+/// Background intent is classification data even when body heuristics find no
+/// discriminator; request-scoped policy runs in the following validator.
 #[tokio::test]
-async fn a_model_only_background_create_is_still_rejected() {
+async fn a_model_only_background_create_is_preserved() {
     let filter = default_filter();
     let request = create_request();
-    let action = run(
-        filter.as_ref(),
-        &request,
-        &json!({"model": "gpt-5", "background": true}),
-    )
-    .await;
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-5", "background": true})).unwrap(),
+    ));
 
-    assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "an undiscriminated create body must not bypass the background rejection"
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.get_metadata("openai_responses_format.background"),
+        Some("true"),
+        "the authoritative create endpoint must publish background intent"
     );
 }
 
@@ -415,19 +417,21 @@ async fn conflicting_history_selectors_are_rejected() {
 }
 
 #[tokio::test]
-async fn background_mode_is_rejected_before_upstream_contact() {
+async fn background_mode_is_preserved_for_request_scoped_policy() {
     let filter = default_filter();
     let request = create_request();
-    let action = run(
-        filter.as_ref(),
-        &request,
-        &json!({"model": "gpt-4.1", "input": "hi", "background": true}),
-    )
-    .await;
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "background": true})).unwrap(),
+    ));
 
-    assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "Praxis does not implement the asynchronous Responses lifecycle"
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.get_metadata("responses.background"),
+        Some("true"),
+        "the request processor must not consume provider-owned background policy"
     );
 }
 

@@ -820,6 +820,24 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         pass
 
     def _forward(self):
+        if self.command == "GET" and self.path == (
+            "/v1/responses/__praxis_readiness__"
+        ):
+            payload = b'{"error":{"message":"not found"}}'
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if self.command == "GET" and self.path.startswith(
+            "/v1/responses/resp_sdk_background_"
+        ):
+            response_id = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
+            self._send_background_response(None, response_id=response_id)
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         request_body = None
@@ -829,6 +847,9 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                 type(self).forwarded_bodies.append(request_body)
             except json.JSONDecodeError:
                 pass
+        if request_body and request_body.get("background") is True:
+            self._send_background_response(request_body)
+            return
         if request_body and request_body.get("model") in {
             "sdk-conversation-stream",
             "sdk-conversation-tool-stream",
@@ -859,6 +880,51 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+
+    def _send_background_response(self, request_body, *, response_id=None):
+        """Serve a provider-owned background create or retrieval lifecycle."""
+        response_id = response_id or f"resp_sdk_background_{time.time_ns()}"
+        model = request_body.get("model", "gpt-5") if request_body else "gpt-5"
+        response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": model,
+            "status": "completed" if request_body is None else "queued",
+            "background": True,
+            "output": [],
+        }
+
+        if request_body and request_body.get("stream"):
+            created = {**response, "status": "in_progress"}
+            completed = {**response, "status": "completed"}
+            events = [
+                {
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": created,
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": completed,
+                },
+            ]
+            payload = b"".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in events
+            ) + b"data: [DONE]\n\n"
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
 
     def _send_conversation_response(self, request_body):
         """Serve native Responses without a model so append/hydration is deterministic."""
@@ -1248,6 +1314,57 @@ def _write_witness_config(
 
     path = _persist_config(config)
     return path
+
+
+def _write_openai_background_passthrough_config(
+    praxis_port: int, db_path: str, backend_port: int
+) -> str:
+    """Build a provider-bound passthrough whose lifecycle owner is OpenAI."""
+    return _persist_config(
+        f"""
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:{praxis_port}"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      - filter: openai_responses_format
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: openai
+      - filter: openai_responses_validate
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://{db_path}?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+      - filter: load_balancer
+        cluster_source: bound_upstream
+        clusters:
+          - name: openai
+            http:
+              application_provider: openai
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+
+insecure_options:
+  allow_private_endpoints: true
+"""
+    )
 
 
 def _write_agentic_config(
@@ -1768,6 +1885,62 @@ def _witness_proxy_session(
             with open(log_path) as f:
                 print(
                     f"\n=== Witness backend Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture()
+def openai_background_passthrough_client(tmp_path_factory, request):
+    """SDK client whose create and lifecycle requests share one OpenAI owner."""
+    ResponsesWitnessHandler.forwarded_bodies = []
+    forwarded = ResponsesWitnessHandler.forwarded_bodies
+    backend_port = _free_port()
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", backend_port), ResponsesWitnessHandler
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("openai-background-passthrough")
+    config_path = _write_openai_background_passthrough_config(
+        port, str(db_dir / "responses.db"), backend_port
+    )
+    binary = _find_binary()
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test",
+            max_retries=0,
+            timeout=300,
+        )
+        yield client, forwarded
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        thread.join()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as handle:
+                print(
+                    "\n=== OpenAI background passthrough Praxis logs ===\n"
+                    f"{handle.read()}",
                     file=sys.stderr,
                 )
         os.unlink(config_path)
@@ -3352,6 +3525,54 @@ class TestOpenAIResponsesVLLM:
             "message": "background mode is not supported",
             "param": None,
             "type": "invalid_request_error",
+        }
+
+    def test_openai_bound_background_create_stream_and_poll(
+        self, openai_background_passthrough_client
+    ):
+        """The official SDK observes the provider-owned lifecycle unchanged."""
+        client, forwarded = openai_background_passthrough_client
+
+        queued = client.responses.create(
+            model="gpt-5",
+            input="SDK finite background passthrough",
+            background=True,
+            store=True,
+        )
+        assert queued.status == "queued"
+        assert queued.background is True
+        completed = client.responses.retrieve(queued.id)
+        assert completed.status == "completed"
+        assert completed.id == queued.id
+
+        stream = client.responses.create(
+            model="gpt-5",
+            input="SDK streaming background passthrough",
+            background=True,
+            store=True,
+            stream=True,
+        )
+        events = list(stream)
+        assert [event.type for event in events] == [
+            "response.created",
+            "response.completed",
+        ]
+        streamed = events[-1].response
+        assert streamed.status == "completed"
+        assert streamed.background is True
+        retrieved = client.responses.retrieve(streamed.id)
+        assert retrieved.status == "completed"
+        assert retrieved.id == streamed.id
+
+        background_creates = [
+            body
+            for body in forwarded
+            if body.get("background") is True and body.get("model") == "gpt-5"
+        ]
+        assert len(background_creates) == 2
+        assert {body.get("stream", False) for body in background_creates} == {
+            False,
+            True,
         }
 
     @pytest.mark.critical_vllm

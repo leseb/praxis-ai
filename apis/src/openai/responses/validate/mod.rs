@@ -36,6 +36,7 @@ use super::{
     extract_conversation_id,
     state::ResponsesState,
 };
+use crate::classifier::is_responses_create;
 
 /// Configuration for `openai_responses_validate`.
 #[derive(Debug, Default, Deserialize)]
@@ -52,13 +53,16 @@ struct OpenaiResponsesValidateConfig {}
 
 /// Validates and enriches Responses API requests.
 ///
-/// Parses the body as [`serde_json::Value`] for targeted field extraction.
-/// Does not deserialize the full body into a typed struct or validate other
-/// provider-owned parameter combinations. It rejects unsupported
-/// `background=true` only after logical provider binding, so an OpenAI-owned
-/// passthrough request can preserve that provider-owned field.
+/// In a legacy `openai_responses_format` chain, parses the body as
+/// [`serde_json::Value`] for targeted field extraction. After
+/// `openai_responses_request`, uses its initialized `ResponsesState` without
+/// parsing again. Does not validate other provider-owned parameter
+/// combinations. It rejects unsupported `background=true` only after logical
+/// provider binding, so an OpenAI-owned passthrough request can preserve that
+/// provider-owned field.
 ///
-/// Must be placed after `openai_responses_format` in the filter chain.
+/// Must be placed after `openai_responses_format` or
+/// `openai_responses_request` in the filter chain.
 /// Skips non-Responses API requests (those not classified as
 /// `openai_responses`).
 ///
@@ -120,7 +124,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if let Some(action) = early_validation_action(ctx, end_of_stream) {
+        if let Some(action) = complete_body_policy(ctx, end_of_stream) {
             return Ok(action);
         }
 
@@ -187,26 +191,71 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Return the lifecycle action for requests that should not enter JSON validation.
-fn early_validation_action(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> Option<FilterAction> {
+/// Apply request-scoped lifecycle policy before any duplicate JSON parsing.
+fn complete_body_policy(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> Option<FilterAction> {
     if !end_of_stream {
         return Some(FilterAction::Continue);
     }
+
+    non_responses_action(ctx)
+        .or_else(|| background_action(ctx))
+        .or_else(|| non_create_action(ctx))
+        .or_else(|| initialized_state_action(ctx))
+}
+
+/// Release traffic that the classifier did not identify as Responses.
+fn non_responses_action(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
     if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
         trace!("skipping non-responses request");
         return Some(FilterAction::Release);
     }
-    if is_bodyless_responses_request(&ctx.request.method, ctx.request.uri.path()) {
-        trace!(method = %ctx.request.method, path = ctx.request.uri.path(), "skipping validation for bodyless endpoint");
-        return Some(FilterAction::Release);
-    }
-    (ctx.get_metadata("openai_responses_format.background") == Some("true")).then(|| {
-        FilterAction::Reject(responses_error_rejection(
+
+    None
+}
+
+/// Reject a background create owned by the gateway.
+fn background_action(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+    if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && ctx.get_metadata("openai_responses_format.background") == Some("true")
+    {
+        debug!("rejecting unsupported Responses background mode");
+        return Some(FilterAction::Reject(responses_error_rejection(
             400,
             "invalid_request_error",
             "background mode is not supported",
-        ))
-    })
+        )));
+    }
+
+    None
+}
+
+/// Release every non-create operation without initializing create state.
+fn non_create_action(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+    if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+        trace!(
+            method = %ctx.request.method,
+            path = ctx.request.uri.path(),
+            "skipping create validation for non-create Responses operation"
+        );
+        return Some(FilterAction::Release);
+    }
+
+    None
+}
+
+/// Release create state already initialized by `openai_responses_request`.
+fn initialized_state_action(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+    // `openai_responses_request` already parsed and initialized create state.
+    // In that chain this filter is only the request-scoped lifecycle boundary,
+    // so do not parse again or regenerate response and conversation IDs.
+    if ctx.extensions.get::<ResponsesState>().is_some()
+        && ctx.get_metadata("responses.response_id").is_some()
+    {
+        trace!("Responses state already initialized; lifecycle policy complete");
+        return Some(FilterAction::Release);
+    }
+
+    None
 }
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
@@ -244,23 +293,6 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
             "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
         ))
     })
-}
-
-/// Check whether a Responses endpoint has no JSON request body to validate.
-///
-/// Assumes the format classifier already confirmed this is a Responses API path.
-fn is_bodyless_responses_request(method: &http::Method, path: &str) -> bool {
-    match *method {
-        http::Method::GET | http::Method::DELETE => true,
-        http::Method::POST => {
-            let path = path.strip_suffix('/').unwrap_or(path);
-            path.strip_prefix("/v1/responses/").is_some_and(|rest| {
-                rest.strip_suffix("/cancel")
-                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-            })
-        },
-        _ => false,
-    }
 }
 
 /// Build a 400 rejection with a Responses API error body.
@@ -471,6 +503,87 @@ mod tests {
     #[tokio::test]
     async fn rejects_background_from_classifier_metadata() {
         let action = run_filter_raw(r#"{"input": "Hi"}"#, &[("openai_responses_format.background", "true")]).await;
+        assert_background_unsupported(action);
+    }
+
+    #[tokio::test]
+    async fn initialized_request_state_is_not_parsed_or_replaced() {
+        let filter = OpenaiResponsesValidateFilter;
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("responses.response_id", "resp_existing");
+        ctx.extensions
+            .insert(ResponsesState::from_request_body(serde_json::json!({
+                "model": "gpt-4.1",
+                "input": "already parsed"
+            })));
+        let mut body = Some(Bytes::from_static(b"this would fail a second JSON parse"));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release));
+        assert_eq!(ctx.get_metadata("responses.response_id"), Some("resp_existing"));
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.request_body.get("input"))
+                .and_then(serde_json::Value::as_str),
+            Some("already parsed"),
+            "the validator must remain only a lifecycle-policy boundary after request initialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn carried_irr_state_is_reparsed_when_step_metadata_was_cleared() {
+        let filter = OpenaiResponsesValidateFilter;
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.extensions
+            .insert(ResponsesState::from_request_body(serde_json::json!({
+                "model": "before-step-rewrite",
+                "input": "hello"
+            })));
+        let mut body = Some(Bytes::from_static(
+            br#"{"model":"after-step-rewrite","input":"hello"}"#,
+        ));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release));
+        assert!(ctx.get_metadata("responses.response_id").is_some());
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.request_body.get("model"))
+                .and_then(serde_json::Value::as_str),
+            Some("after-step-rewrite"),
+            "IRR clears step metadata, so the validator must rebuild state from the effective step body"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialized_request_state_does_not_bypass_background_policy() {
+        let filter = OpenaiResponsesValidateFilter;
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.background", "true");
+        ctx.extensions.insert(ResponsesState::default());
+        let mut body = Some(Bytes::from_static(br#"{"background":true}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
         assert_background_unsupported(action);
     }
 
@@ -816,21 +929,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_input_tokens_still_validates_body() {
+    async fn non_create_operations_do_not_initialize_create_state() {
+        for (path, mut body) in [
+            ("/v1/responses/input_tokens", None),
+            (
+                "/v1/responses/compact/",
+                Some(Bytes::from_static(br#"{"input":"compact this"}"#)),
+            ),
+        ] {
+            let filter = make_filter();
+            let req = Box::leak(Box::new(crate::test_utils::make_request(http::Method::POST, path)));
+            let mut ctx = crate::test_utils::make_filter_context(req);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+            let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+            assert!(matches!(action, FilterAction::Release));
+            assert!(ctx.extensions.get::<ResponsesState>().is_none());
+            assert!(
+                !ctx.filter_metadata.contains_key("responses.response_id"),
+                "{path} must not initialize create-only metadata"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_still_rejects_when_required_body_is_absent() {
         let filter = make_filter();
         let req = Box::leak(Box::new(crate::test_utils::make_request(
             http::Method::POST,
-            "/v1/responses/input_tokens",
+            "/v1/responses",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
         ctx.set_metadata("openai_responses_format.format", "openai_responses");
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-        assert!(
-            matches!(action, FilterAction::Reject(_)),
-            "POST /input_tokens without body should be rejected, not released"
-        );
+        assert!(matches!(action, FilterAction::Reject(_)));
     }
 
     // -------------------------------------------------------------------------

@@ -14,7 +14,8 @@
 //!   `previous_response_id`). Resolves the store from the per-request registry, which the serving runtime provisions.
 //!   Rejects with a 500 response when a request that requires the store (persistence or rehydration) finds none
 //!   provisioned. `GET` and `DELETE` endpoints owned by the store also reject rather than falling through to the
-//!   upstream.
+//!   upstream. The request-body phase rejects background creates because local retrieval cannot observe a provider's
+//!   asynchronous lifecycle.
 //!
 //! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
 //!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
@@ -114,6 +115,10 @@ const NO_REPLAY_LOG_MESSAGE: &str = "This response has no replayable event strea
 /// without a complete replay log returns 400 for `stream=true`. This endpoint
 /// does not follow generation in progress. If the original foreground connection
 /// drops, generation and replay are not guaranteed to complete.
+///
+/// If this filter executes for a background create, it rejects the request.
+/// Local retrieval cannot observe a provider-owned asynchronous lifecycle. A
+/// provider-aware OpenAI passthrough should condition the store out entirely.
 ///
 /// # YAML
 ///
@@ -704,6 +709,13 @@ fn should_skip(ctx: &HttpFilterContext<'_>) -> bool {
         || !is_responses_create(&ctx.request.method, ctx.request.uri.path())
 }
 
+/// Whether this executing store owns a background Responses create.
+fn background_requested(ctx: &HttpFilterContext<'_>) -> bool {
+    is_responses_format(ctx)
+        && is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && ctx.get_metadata("openai_responses_format.background") == Some("true")
+}
+
 /// Check whether this request should initialize the store.
 fn should_init_store_for_request(ctx: &HttpFilterContext<'_>) -> bool {
     request_will_persist_response(ctx) || request_needs_rehydrate_store(ctx)
@@ -1049,6 +1061,10 @@ impl HttpFilter for ResponseStoreFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
+        }
+        if background_requested(ctx) {
+            debug!("rejecting background create owned by local response store");
+            return Ok(FilterAction::Reject(reject_background()));
         }
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
@@ -1573,6 +1589,11 @@ fn reject_not_found(id: &str) -> Rejection {
 /// Build a 400 rejection for invalid client-supplied parameters.
 fn reject_invalid_input(message: &str) -> Rejection {
     responses_error_rejection(400, "invalid_request_error", message)
+}
+
+/// Reject a lifecycle that local retrieval cannot observe.
+fn reject_background() -> Rejection {
+    responses_error_rejection(400, "invalid_request_error", "background mode is not supported")
 }
 
 /// Build a 500 rejection for internal store failures.

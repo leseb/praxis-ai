@@ -3,8 +3,10 @@
 # vLLM Agentic API: https://github.com/vllm-project/agentic-api
 #
 # Agentic API owns previous_response_id hydration, response persistence,
-# web-search credentials, tool execution, and the model loop. Praxis only
-# classifies and routes this traffic, preserving the original request body.
+# web-search credentials, tool execution, and the model loop. Praxis classifies
+# and routes foreground traffic while preserving the original request body.
+# Background execution remains disabled because only an
+# `application_provider: openai` binding owns that lifecycle end to end.
 #
 # This pipeline intentionally does not include openai_response_store,
 # openai_responses_rehydrate, responses_proxy, openai_web_search,
@@ -20,6 +22,8 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
+
+      - filter: openai_responses_validate
 
       - filter: router
         routes:
