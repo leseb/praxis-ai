@@ -48,8 +48,6 @@ filter_chains:
           model: ~
           stream: ~
 
-      - filter: openai_responses_validate
-
       - name: body_classifiers
         filter: router
         routes:

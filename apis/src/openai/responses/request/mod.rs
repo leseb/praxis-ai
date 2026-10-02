@@ -10,9 +10,8 @@
 //! metadata, the promoted headers and filter results, the proxy-owned
 //! identifiers, and [`ResponsesState`].
 //!
-//! The original `background` field is preserved and published as request
-//! classification metadata. Request-scoped lifecycle policy belongs to
-//! `openai_responses_validate`, not this classifier and state initializer.
+//! Create requests with `background=true` are rejected, because Praxis does not
+//! implement the asynchronous Responses lifecycle.
 //!
 //! This replaces the pair of `openai_responses_format` and
 //! `openai_responses_validate`. Those two each parsed the
@@ -65,12 +64,10 @@ const FILTER_NAME: &str = "openai_responses_request";
 
 /// Processes a Responses request body once and initializes state.
 ///
-/// Replaces the classification, parsing, and state-initialization work of the
-/// `openai_responses_format` and `openai_responses_validate` pair.
-/// Configuration is unchanged from `openai_responses_format`. This filter must
-/// be top-level, before any `iterative_request_router`. A following
-/// `openai_responses_validate` is required as the background lifecycle guard;
-/// it does not parse initialized create state again.
+/// Replaces the `openai_responses_format` and `openai_responses_validate` pair.
+/// Configuration is unchanged from `openai_responses_format`, so a chain that
+/// ran both swaps them for this one filter and keeps the same `on_invalid` and
+/// `headers` settings.
 ///
 /// The operation is recognized from the request head, and the registry decides
 /// which operations carry a body worth parsing: create, compact, and input
@@ -78,9 +75,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// and the `WebSocket` handshake — are released untouched, as is Conversations
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
-/// Preserves `background=true` and publishes it under the existing
-/// `openai_responses_format` and `responses` metadata namespaces. The required
-/// following `openai_responses_validate` filter owns request-scoped rejection.
+/// Rejects `background=true` with a 400, matching `openai_responses_format`,
+/// because Praxis does not implement the asynchronous Responses lifecycle.
 ///
 /// Promotes `openai_responses_format.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates
@@ -161,6 +157,10 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             Ok(pair) => pair,
             Err(format) => return handle_unclassifiable(ctx, format, &self.config),
         };
+
+        if let Some(action) = super::handle_unsupported_background(&classified) {
+            return Ok(action);
+        }
 
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
             return Ok(action);

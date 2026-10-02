@@ -42,8 +42,6 @@ filter_chains:
     filters:
       - filter: openai_responses_request
 
-      - filter: openai_responses_validate
-
       - filter: state_owner
         mode: single_tenant
         tenant_id: default

@@ -11,8 +11,6 @@ For a stored response created with `stream: true`, `GET /v1/responses/{id}?strea
 
 Replay becomes available only after the original response and event log are persisted. A GET before the response is stored returns 404; a stored response without a complete replay log returns 400 for `stream=true`. This endpoint does not follow generation in progress. If the original foreground connection drops, generation and replay are not guaranteed to complete.
 
-If this filter executes for a background create, it rejects the request. Local retrieval cannot observe a provider-owned asynchronous lifecycle. A provider-aware OpenAI passthrough should condition the store out entirely.
-
 ## Configuration
 
 | Field | Type | Required | Description |

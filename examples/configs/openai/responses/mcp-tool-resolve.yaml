@@ -98,8 +98,6 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
-
       - filter: openai_tool_parse
 
       - filter: openai_mcp_tool_resolve

@@ -96,57 +96,12 @@ when any of these hold:
 - `has_conversation` is true
 - `has_prompt_id` is true
 
-The classifier preserves `background: true` and publishes it as
-request metadata. Lifecycle policy is enforced after logical
-provider binding, not during classification.
+Requests with `background: true` are rejected before mode
+classification because Praxis does not implement the
+asynchronous Responses lifecycle.
 
 Stateful mode influences routing decisions (e.g.
 directing to clusters with response store access).
-
-### Background Lifecycle Ownership
-
-Provider ownership comes from the logical `BoundUpstream` selected by the
-router. Endpoint hostname, SNI, authority, and socket address do not grant
-background capability. A managed pipeline rejects `background: true`; a route
-whose bound `application_provider` is `openai` skips the gateway-owned validator
-and store, forwarding the original body to the provider that also owns polling
-and cancellation.
-
-```yaml
-- filter: openai_responses_format
-- filter: router
-  # routes bind clusters whose load-balancers declare application_provider
-- filter: openai_responses_validate
-  conditions:
-    - unless:
-        bound_upstream:
-          application_provider: openai
-- filter: openai_response_store
-  # backend configuration omitted
-  conditions:
-    - unless:
-        bound_upstream:
-          application_provider: openai
-- filter: load_balancer
-  cluster_source: bound_upstream
-  clusters:
-    - name: inference
-      http:
-        application_provider: openai
-      endpoints: ["api.openai.com:443"]
-```
-
-Praxis automatically chooses one request-body phase for each dual-phase filter.
-Ordinary pipelines use the pre-read phase. A condition that references
-`bound_upstream` defers the same operation to the logical-binding barrier. The
-OpenAI path skips both filters; managed providers execute them, and the validator
-rejects background before the store, IRR, or backend. If an ungated local store
-does execute, it independently rejects background because local retrieval cannot
-observe provider state transitions.
-
-Allowing a create request is only safe when later retrieval and cancellation
-requests route to the same OpenAI lifecycle owner. Those requests do not carry
-the create body's `background` field.
 
 ## StreamBuffer Body Access
 
@@ -191,9 +146,7 @@ headers, metadata, and filter results.
 Parses Responses API request JSON, enriches filter metadata,
 and generates cryptographically random response and
 conversation IDs with `resp_` and `conv_` prefixes.
-It owns the gateway's fail-closed background policy. Provider-owned parameter
-combinations pass through unchanged when the filter executes; an OpenAI-bound
-pipeline skips the filter entirely.
+Provider-owned parameter combinations pass through unchanged.
 
 ### `anthropic_messages_format`
 
@@ -216,9 +169,7 @@ variable sources.
 ### `openai_response_store`
 
 Persists non-streaming Responses API responses. See
-[Response Store](response-store.md) for details. If it executes for a background
-create, it rejects the request because local retrieval cannot track the
-provider's asynchronous lifecycle.
+[Response Store](response-store.md) for details.
 
 ## Key Files
 

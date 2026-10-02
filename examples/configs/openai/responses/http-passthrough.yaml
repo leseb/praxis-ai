@@ -10,11 +10,9 @@
 #      promotes `x-praxis-ai-format: openai_responses` for the
 #      router. `on_invalid: continue` lets non-Responses traffic
 #      reach the router without being rejected.
-#   2. `openai_responses_validate` rejects gateway-unsupported background
-#      execution while leaving foreground request bodies unchanged.
-#   3. The router sends every `/v1/responses*` request to the
+#   2. The router sends every `/v1/responses*` request to the
 #      `inference-backend` cluster.
-#   4. The load balancer points at the test backend (and any
+#   3. The load balancer points at the test backend (and any
 #      additional inference endpoints the test wires up).
 #
 # No state, persistence, or WebSocket is enabled. WebSocket upgrades
@@ -49,8 +47,6 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
-
-      - filter: openai_responses_validate
 
       - filter: router
         routes:

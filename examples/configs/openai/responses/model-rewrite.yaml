@@ -34,8 +34,6 @@ filter_chains:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
 
-      - filter: openai_responses_validate
-
       - filter: openai_responses_model_rewrite
         default_model: "llama-3.3-70b"
         model_aliases:

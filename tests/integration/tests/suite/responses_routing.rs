@@ -57,7 +57,7 @@ fn mode_branch_rejects_background_before_upstream() {
     .unwrap();
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"Hello","background":true}"#;
+    let body = r#"{"model":"gpt-4.1","input":"Hello","store":false,"background":true}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(parse_status(&raw), 400);
@@ -159,11 +159,11 @@ fn assert_routes_to(expected_backend: &str, label: &str, body: &str) {
     );
 }
 
-/// YAML config with mode-based logical-cluster routing.
+/// YAML config with mode-based branch chain routing.
 ///
-/// Stateful requests (mode=stateful) route to `stateful_port`. Stateless
-/// requests (mode=stateless) or non-Responses requests fall through to
-/// `default_port`. Validation executes before either route is contacted.
+/// Stateful requests (mode=stateful) enter the branch chain and route
+/// to `stateful_port`. Stateless requests (mode=stateless) or
+/// non-Responses requests fall through to `default_port`.
 fn mode_branch_yaml(proxy_port: u16, stateful_port: u16, default_port: u16) -> String {
     format!(
         r#"
@@ -176,20 +176,29 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-        headers:
-          mode: x-praxis-responses-mode
+        branch_chains:
+          - name: stateful_branch
+            on_result:
+              filter: openai_responses_format
+              key: mode
+              result: stateful
+            rejoin: shared_load_balancer
+            chains:
+              - name: stateful_chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "stateful"
       # Classification preserves provider-owned fields. The managed-path
       # validator owns rejection of unsupported background execution.
       - filter: openai_responses_validate
       - filter: router
         routes:
           - path_prefix: "/"
-            headers:
-              x-praxis-responses-mode: "stateful"
-            cluster: "stateful"
-          - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:

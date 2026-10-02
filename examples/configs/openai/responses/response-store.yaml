@@ -60,8 +60,6 @@ filter_chains:
       - filter: openai_responses_request
         on_invalid: reject
 
-      - filter: openai_responses_validate
-
       - filter: state_owner
         mode: single_tenant
         tenant_id: default

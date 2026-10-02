@@ -38,8 +38,6 @@ filter_chains:
       - filter: openai_responses_request
         on_invalid: reject
 
-      - filter: openai_responses_validate
-
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 1

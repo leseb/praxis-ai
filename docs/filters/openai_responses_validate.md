@@ -7,9 +7,9 @@ Validates and enriches Responses API requests.
 
 ## Configuration Notes
 
-In a legacy `openai_responses_format` chain, parses the body as [`serde_json::Value`] for targeted field extraction. After `openai_responses_request`, uses its initialized `ResponsesState` without parsing again. Does not validate other provider-owned parameter combinations. It rejects unsupported `background=true` only after logical provider binding, so an OpenAI-owned passthrough request can preserve that provider-owned field.
+Parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct or validate other provider-owned parameter combinations. It rejects unsupported `background=true` only after logical provider binding, so an OpenAI-owned passthrough request can preserve that provider-owned field.
 
-Must be placed after `openai_responses_format` or `openai_responses_request` in the filter chain. After `openai_responses_request`, it is a required fail-closed lifecycle guard and may only be unconditional or exempt an OpenAI-bound upstream with `unless bound_upstream.application_provider: openai`. Skips non-Responses API requests (those not classified as `openai_responses`).
+Must be placed after `openai_responses_format` in the filter chain. Skips non-Responses API requests (those not classified as `openai_responses`).
 
 Generates metadata: `responses.response_id` (format: `resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, `responses.stream`.
 

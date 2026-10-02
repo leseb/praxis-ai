@@ -67,7 +67,8 @@
 #      The filters then run once against the buffered request. The OpenAI route
 #      is true passthrough; on managed routes openai_responses_validate checks
 #      JSON, initializes ResponsesState, and rejects gateway-unsupported fields
-#      such as background=true.
+#      such as background=true. Prompt-template compatibility is checked later,
+#      after load-balancer selection, by openai_responses_proxy.
 #
 #   4. On managed routes, openai_tool_parse parses the tools array and
 #      tool_choice from Responses API requests and promotes summary facts

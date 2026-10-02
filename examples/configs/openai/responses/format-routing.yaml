@@ -59,8 +59,6 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
-
       - filter: router
         routes:
           - path: "/v1/responses"

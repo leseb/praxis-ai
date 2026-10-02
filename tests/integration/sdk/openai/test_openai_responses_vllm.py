@@ -820,33 +820,6 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         pass
 
     def _forward(self):
-        if self.command == "GET" and self.path == (
-            "/v1/responses/__praxis_readiness__"
-        ):
-            payload = b'{"error":{"message":"not found"}}'
-            self.send_response(404)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        if self.command == "GET" and self.path.startswith(
-            "/v1/responses/resp_sdk_background_"
-        ):
-            response_id = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
-            self._send_background_response(None, response_id=response_id)
-            return
-
-        if self.command == "POST" and self.path.startswith(
-            "/v1/responses/resp_sdk_background_"
-        ) and self.path.endswith("/cancel"):
-            response_id = self.path.rsplit("/", 2)[-2]
-            self._send_background_response(
-                None, response_id=response_id, status="cancelled"
-            )
-            return
-
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         request_body = None
@@ -890,23 +863,19 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                         self.wfile.flush()
 
-    def _send_background_response(
-        self, request_body, *, response_id=None, status=None
-    ):
-        """Serve a provider-owned background create or retrieval lifecycle."""
-        response_id = response_id or f"resp_sdk_background_{time.time_ns()}"
-        model = request_body.get("model", "gpt-5") if request_body else "gpt-5"
+    def _send_background_response(self, request_body):
+        """Serve a provider-owned background create response."""
         response = {
-            "id": response_id,
+            "id": f"resp_sdk_background_{time.time_ns()}",
             "object": "response",
             "created_at": int(time.time()),
-            "model": model,
-            "status": status or ("completed" if request_body is None else "queued"),
+            "model": request_body.get("model", "gpt-5"),
+            "status": "queued",
             "background": True,
             "output": [],
         }
 
-        if request_body and request_body.get("stream"):
+        if request_body.get("stream"):
             created = {**response, "status": "in_progress"}
             completed = {**response, "status": "completed"}
             events = [
@@ -1291,7 +1260,6 @@ def _write_witness_config(
     backend_port: int,
     search_port: int | None = None,
     max_event_bytes: int | None = None,
-    openai_owns_responses: bool = False,
 ) -> str:
     """Patch full-flow-agentic.yaml to route the native backend through the shim.
 
@@ -1306,18 +1274,6 @@ def _write_witness_config(
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
-    if openai_owns_responses:
-        managed_fallback = (
-            '          - path_prefix: "/v1/responses"\n'
-            "            headers:\n"
-            '              x-praxis-ai-format: "openai_responses"\n'
-            '            cluster: "inference-backend"\n'
-        )
-        assert config.count(managed_fallback) == 1
-        config = config.replace(
-            managed_fallback,
-            managed_fallback.replace("inference-backend", "openai-responses-backend"),
-        )
     if search_port is not None:
         search_anchor = "api_key: test-key\n                # Require the per-user key"
         assert config.count(search_anchor) == 1
@@ -1799,11 +1755,7 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
 
 
 def _witness_proxy_session(
-    tmp_path_factory,
-    request,
-    search_port=None,
-    max_event_bytes=None,
-    openai_owns_responses=False,
+    tmp_path_factory, request, search_port=None, max_event_bytes=None
 ):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
@@ -1824,12 +1776,7 @@ def _witness_proxy_session(
     db_dir = tmp_path_factory.mktemp("responses-witness")
     db_path = str(db_dir / "responses.db")
     config_path = _write_witness_config(
-        port,
-        db_path,
-        backend_port,
-        search_port=search_port,
-        max_event_bytes=max_event_bytes,
-        openai_owns_responses=openai_owns_responses,
+        port, db_path, backend_port, search_port, max_event_bytes
     )
     binary = _find_binary()
 
@@ -1874,12 +1821,8 @@ def _witness_proxy_session(
 
 @pytest.fixture()
 def witness_backend_client(tmp_path_factory, request):
-    """Function-scoped full-flow witness proxy."""
-    yield from _witness_proxy_session(
-        tmp_path_factory,
-        request,
-        openai_owns_responses=getattr(request, "param", False),
-    )
+    """Function-scoped witness proxy with the stock rehydrate config."""
+    yield from _witness_proxy_session(tmp_path_factory, request)
 
 
 @pytest.fixture()
@@ -3457,15 +3400,8 @@ class TestOpenAIResponsesVLLM:
             "type": "invalid_request_error",
         }
 
-    @pytest.mark.parametrize(
-        "witness_backend_client",
-        [pytest.param(True, id="openai-owns-responses")],
-        indirect=True,
-    )
-    def test_openai_bound_background_create_stream_poll_and_cancel(
-        self, witness_backend_client
-    ):
-        """The official SDK observes the provider-owned lifecycle unchanged."""
+    def test_openai_bound_background_create_and_stream(self, witness_backend_client):
+        """The stock full-flow pipeline preserves OpenAI-owned background creates."""
         client, forwarded = witness_backend_client
 
         queued = client.responses.create(
@@ -3476,12 +3412,6 @@ class TestOpenAIResponsesVLLM:
         )
         assert queued.status == "queued"
         assert queued.background is True
-        completed = client.responses.retrieve(queued.id)
-        assert completed.status == "completed"
-        assert completed.id == queued.id
-        cancelled = client.responses.cancel(queued.id)
-        assert cancelled.status == "cancelled"
-        assert cancelled.id == queued.id
 
         stream = client.responses.create(
             model="gpt-5",
@@ -3498,9 +3428,6 @@ class TestOpenAIResponsesVLLM:
         streamed = events[-1].response
         assert streamed.status == "completed"
         assert streamed.background is True
-        retrieved = client.responses.retrieve(streamed.id)
-        assert retrieved.status == "completed"
-        assert retrieved.id == streamed.id
 
         background_creates = [
             body

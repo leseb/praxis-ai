@@ -105,8 +105,6 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
-
       - filter: openai_response_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
