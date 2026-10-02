@@ -9,7 +9,8 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http::Method;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterEntry, FilterPipeline, FilterRegistry, HttpFilter, SubRequestResponseMode,
+    BodyAccess, BodyMode, FilterAction, FilterEntry, FilterPipeline, FilterRegistry, HttpFilter,
+    SelectedUpstreamBodyOutcome, SubRequestResponseMode,
 };
 use serde_json::json;
 
@@ -42,12 +43,13 @@ fn from_config_rejects_unknown_fields() {
 }
 
 #[test]
-fn body_access_is_read_write() {
+fn body_rewrite_runs_after_upstream_selection() {
     let filter = make_filter();
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
     assert_eq!(
-        filter.request_body_access(),
+        filter.selected_upstream_request_body_access(),
         BodyAccess::ReadWrite,
-        "openai_proxy must declare ReadWrite to modify the body"
+        "openai_proxy must rewrite only after upstream selection"
     );
 }
 
@@ -59,7 +61,7 @@ fn body_mode_is_stream_buffer() {
             assert_eq!(
                 max_bytes,
                 Some(67_108_864),
-                "StreamBuffer should default to the 64 MiB ceiling; the raw cap is governed by body_limits"
+                "StreamBuffer should default to the 64 MiB ceiling; the pipeline clamps it to body_limits"
             );
         },
         other => panic!("openai_proxy must use StreamBuffer, got {other:?}"),
@@ -105,10 +107,13 @@ async fn selects_streaming_from_effective_passthrough_body() {
         br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "streaming passthrough should continue"
     );
     assert_eq!(
@@ -130,10 +135,13 @@ async fn preserves_buffered_mode_when_stream_is_false_or_absent() {
         ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
         let mut body = Some(Bytes::copy_from_slice(original));
 
-        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        let action = filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap();
 
         assert!(
-            matches!(action, FilterAction::Continue),
+            matches!(action, SelectedUpstreamBodyOutcome::Continue),
             "non-streaming request should continue"
         );
         assert_eq!(
@@ -164,10 +172,13 @@ async fn uses_rebuilt_state_body_not_client_intent_metadata() {
         br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "rebuilt buffered request should continue"
     );
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
@@ -194,10 +205,13 @@ async fn selects_streaming_for_rebuilt_effective_body() {
         br#"{"model":"gpt-4.1","input":"hello","stream":false}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "rebuilt streaming request should continue"
     );
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
@@ -225,9 +239,12 @@ async fn passthrough_without_state() {
     let original = r#"{"model":"gpt-4o","input":"hello"}"#;
     let mut body = Some(Bytes::from(original));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "should continue without ResponsesState"
     );
     assert_eq!(
@@ -245,14 +262,12 @@ async fn prompt_template_is_rejected_without_selected_openai_upstream() {
     let original = Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#);
     let mut body = Some(original.clone());
 
-    let body_action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(body_action, FilterAction::Continue),
-        "prompt detection should complete before upstream validation"
-    );
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("a prompt template must fail closed for a backend without the capability");
     };
     assert_eq!(rejection.status, 400, "unsupported prompt must return HTTP 400");
@@ -284,15 +299,13 @@ async fn prompt_template_in_canonical_state_is_rejected_by_default() {
     })));
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"rewritten"}"#));
 
-    let body_action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(body_action, FilterAction::Continue),
-        "canonical prompt detection should complete before upstream validation"
-    );
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 400),
+        matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 400),
         "canonical state must remain authoritative even when the current bytes omit prompt"
     );
 }
@@ -305,15 +318,14 @@ async fn null_prompt_is_allowed_by_default() {
     let original = Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello","prompt":null}"#);
     let mut body = Some(original.clone());
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "a null prompt should remain a valid passthrough request"
-    );
-    assert!(
-        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
-        "a null prompt must not require an OpenAI upstream"
     );
     assert_eq!(
         body.as_deref(),
@@ -419,15 +431,6 @@ async fn openai_responses_metadata_preserves_prompt_template_passthrough_body() 
     );
     let mut body = Some(original.clone());
 
-    let action = pipeline
-        .execute_http_request_body(&mut ctx, &mut body, true)
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "OpenAI prompt passthrough body detection should continue"
-    );
     assert!(
         matches!(
             pipeline.execute_http_request(&mut ctx).await.unwrap(),
@@ -449,6 +452,14 @@ async fn openai_responses_metadata_preserves_prompt_template_passthrough_body() 
         ctx.upstream.as_ref().unwrap().address.as_ref(),
         "127.0.0.1:443",
         "endpoint identity remains independent from application capability"
+    );
+    let action = pipeline
+        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an upstream declared as OpenAI Responses must allow prompt templates"
     );
     assert_eq!(
         body.as_deref(),
@@ -473,21 +484,20 @@ async fn openai_responses_metadata_preserves_prompt_template_in_rebuilt_state() 
         br#"{"model":"gpt-4.1","input":"hello","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#,
     ));
 
-    let action = pipeline
-        .execute_http_request_body(&mut ctx, &mut body, true)
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "state-backed OpenAI prompt detection should continue"
-    );
     assert!(
         matches!(
             pipeline.execute_http_request(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ),
         "an upstream declared as OpenAI Responses must allow a rebuilt prompt request"
+    );
+    let action = pipeline
+        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "state-backed OpenAI prompt processing should continue"
     );
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
@@ -498,6 +508,65 @@ async fn openai_responses_metadata_preserves_prompt_template_in_rebuilt_state() 
         rebuilt["prompt"]["variables"]["name"], "Ada",
         "rebuilt request must preserve prompt variables"
     );
+}
+
+#[tokio::test]
+async fn native_openai_backend_preserves_provider_compaction_in_rebuilt_state() {
+    let pipeline = make_prompt_pipeline(Some("openai_responses"), Some("openai"), "127.0.0.1:443");
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let provider_compaction = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-opaque-state",
+        "provider_field": {"opaque": true}
+    });
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+        "previous_response_id": "resp_provider"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![
+        provider_compaction.clone(),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+        }),
+    ];
+    state.provider_compaction_ids.insert("cmp_provider".to_owned());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"continue"}],"previous_response_id":"resp_provider"}"#,
+    ));
+
+    let body_action = pipeline
+        .execute_http_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(body_action, FilterAction::Continue));
+    let mut downstream_body: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    downstream_body["model"] = json!("rewritten-model");
+    body = Some(Bytes::from(serde_json::to_vec(&downstream_body).unwrap()));
+    assert!(matches!(
+        pipeline.execute_http_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let selected_action = pipeline
+        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(matches!(selected_action, FilterAction::Continue));
+
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["model"], "rewritten-model",
+        "selected serialization must retain downstream body changes"
+    );
+    assert_eq!(rebuilt["input"][0], provider_compaction);
+    assert_eq!(rebuilt["input"][1]["content"], "continue");
+    assert!(rebuilt.get("previous_response_id").is_none());
 }
 
 #[tokio::test]
@@ -513,17 +582,19 @@ async fn prompt_template_requires_openai_responses_protocol_and_provider() {
         let mut ctx = make_filter_context(&req);
         let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123"}}"#));
 
-        let body_action = pipeline
-            .execute_http_request_body(&mut ctx, &mut body, true)
-            .await
-            .unwrap();
-        assert!(
-            matches!(body_action, FilterAction::Continue),
-            "prompt detection should complete before provider validation"
-        );
         assert!(
             matches!(
                 pipeline.execute_http_request(&mut ctx).await.unwrap(),
+                FilterAction::Continue
+            ),
+            "routing should select the declared backend"
+        );
+        assert!(
+            matches!(
+                pipeline
+                    .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+                    .await
+                    .unwrap(),
                 FilterAction::Reject(_)
             ),
             "prompt templates require exact OpenAI Responses protocol and provider metadata"
@@ -538,15 +609,6 @@ async fn routed_openai_responses_pipeline_allows_prompt_template_for_non_openai_
     let mut ctx = make_filter_context(&req);
     let original = Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123"}}"#);
     let mut body = Some(original.clone());
-
-    let body_action = pipeline
-        .execute_http_request_body(&mut ctx, &mut body, true)
-        .await
-        .unwrap();
-    assert!(
-        matches!(body_action, FilterAction::Continue),
-        "the assembled pipeline must continue after processing the complete request body"
-    );
 
     let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
     assert!(
@@ -572,6 +634,14 @@ async fn routed_openai_responses_pipeline_allows_prompt_template_for_non_openai_
         Some("openai"),
         "the selected cluster must declare the OpenAI provider"
     );
+    let body_action = pipeline
+        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(body_action, FilterAction::Continue),
+        "the selected-upstream body phase must allow the OpenAI prompt"
+    );
     assert_eq!(
         body.as_deref(),
         Some(original.as_ref()),
@@ -592,16 +662,171 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
 }"#;
     let mut body = Some(Bytes::copy_from_slice(original));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "initialized scalar request should continue"
     );
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert!(
         ctx.request_headers_to_set.is_empty(),
         "byte-exact first-pass forwarding must not synthesize content-length"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_projects_state_owned_tools_and_tool_choice() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "tools": [{"type": "custom", "name": "apply_patch"}]
+    }));
+    state.request_body["tools"] = json!([{"type": "function", "name": "apply_patch"}]);
+    state.request_body["tool_choice"] = json!("auto");
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","tools":[{"type":"custom","name":"apply_patch"}]}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after projecting state-owned tools"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["tools"][0]["type"], "function",
+        "selected backend should receive the state-owned function tool"
+    );
+    assert_eq!(
+        rebuilt["tool_choice"], "auto",
+        "selected backend should receive the state-owned tool choice"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_preserves_later_input_filter_edit() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [{"type": "message", "role": "user", "content": "before filter"}]
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    // Simulate a later body filter changing the live input after the state
+    // snapshot was created.
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"after filter"}]}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after preserving the filtered input"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"], "after filter",
+        "selected backend must receive the live input produced by the later body filter"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_preserves_agentic_results_after_later_input_edit() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [{"type": "message", "role": "user", "content": "before filter"}]
+    }));
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "tool result"
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"after filter"}]}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after preserving the filtered input and tool result"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"], "after filter",
+        "selected backend must receive the live input edit"
+    );
+    assert_eq!(
+        selected_backend_body["input"][1]["type"], "function_call_output",
+        "selected backend must retain the accumulated agentic tool result"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_keeps_selector_only_body_valid_when_adding_state_fields() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "previous_response_id": "resp_previous",
+        "tools": [{"type": "function", "name": "lookup"}],
+        "tool_choice": "auto"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![json!({"role": "user", "content": "continue"})];
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"previous_response_id":"resp_previous"}"#));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selector-only rebuild should produce a valid backend request"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["input"][0]["content"], "continue",
+        "selector-only rebuild should add the current input"
+    );
+    assert_eq!(
+        rebuilt["tools"][0]["name"], "lookup",
+        "selector-only rebuild should add state-owned tools"
+    );
+    assert_eq!(
+        rebuilt["tool_choice"], "auto",
+        "selector-only rebuild should add the state-owned tool choice"
     );
 }
 
@@ -619,10 +844,13 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
     ctx.extensions.insert(ResponsesState::from_request_body(parsed));
     let mut body = Some(Bytes::copy_from_slice(original));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "provider previous_response_id passthrough should continue"
     );
     assert_eq!(body.as_deref(), Some(original.as_slice()));
@@ -653,10 +881,13 @@ async fn rebuild_preserves_provider_previous_response_id_without_rehydrate() {
         br#"{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_provider"}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "rebuilt previous_response_id request should continue"
     );
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
@@ -677,29 +908,18 @@ async fn rebuild_serializes_from_state_request_body() {
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(br#"{"model":"client-model","input":"hello"}"#.as_slice()));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "state-backed rebuild should continue"
     );
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(outbound["model"], "client-model", "serializes from state.request_body");
     assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn not_end_of_stream_continues() {
-    let filter = make_filter();
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
-    let mut body = Some(Bytes::from(r#"{"input":"partial"}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "non-EOS should return Continue"
-    );
 }
 
 #[tokio::test]
@@ -726,9 +946,12 @@ async fn rebuilds_body_with_conversation_history() {
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4o","input":"What did I say?","previous_response_id":"resp_abc123"}"#,
     ));
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "should continue after rebuilding body"
     );
 
@@ -770,7 +993,10 @@ async fn does_not_set_content_length_header() {
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4o","input":"test","previous_response_id":"resp_abc123"}"#,
     ));
-    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let _action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
         ctx.extra_request_headers
@@ -803,7 +1029,10 @@ async fn preserves_other_request_fields() {
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4o","input":"test","temperature":0.7,"stream":true,"previous_response_id":"resp_abc123"}"#,
     ));
-    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let _action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(rebuilt["temperature"], 0.7, "temperature should be preserved");
@@ -833,11 +1062,78 @@ async fn rejects_oversized_rebuilt_body_with_413() {
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4o","input":"hello","previous_response_id":"resp_abc123"}"#,
     ));
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(&action, FilterAction::Reject(r) if r.status == 413),
+        matches!(&action, SelectedUpstreamBodyOutcome::Reject(r) if r.status == 413),
         "should reject with 413 when rebuilt body exceeds max_rewritten_body_bytes"
     );
+}
+
+#[tokio::test]
+async fn rejects_selected_rebuild_above_effective_request_body_limit() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_rewritten_body_bytes: 4096").unwrap();
+    let filter = super::ResponsesProxyFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.request_body_mode = BodyMode::StreamBuffer { max_bytes: Some(128) };
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "previous_response_id": "resp_abc123"
+    }));
+    state.messages.push(json!({
+        "role": "user",
+        "content": "x".repeat(512)
+    }));
+    state.history_rehydrated = true;
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+
+    let original = Bytes::from_static(br#"{"model":"gpt-4o","input":"hello","previous_response_id":"resp_abc123"}"#);
+    let mut body = Some(original.clone());
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 413),
+        "selected rebuilds must reject projections above the effective request body limit"
+    );
+    assert_eq!(
+        body.as_ref(),
+        Some(&original),
+        "an oversized selected projection must not be committed to the upstream body"
+    );
+}
+
+#[test]
+fn serialized_body_cap_uses_conservative_native_projection() {
+    let opaque_state = "opaque-provider-state".repeat(512);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "continue",
+        "previous_response_id": "resp_provider"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": opaque_state
+    })];
+    state.provider_compaction_ids.insert("cmp_provider".to_owned());
+
+    let translated = super::serialize_outbound_body(&state, false).unwrap().len();
+    let native = super::serialize_outbound_body(&state, true).unwrap().len();
+    assert!(
+        native > translated,
+        "native opaque state should exceed translated summary size"
+    );
+    assert_eq!(super::serialized_outbound_body_len(&state).unwrap(), native);
 }
 
 #[tokio::test]
@@ -858,9 +1154,12 @@ async fn strips_conversation_from_outbound_body() {
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4o","input":"hello","conversation":{"id":"conv_abc123"}}"#,
     ));
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "conversation stripping should continue"
     );
 
@@ -894,9 +1193,12 @@ async fn strips_locally_consumed_history_selectors() {
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4o","input":"hello","previous_response_id":"resp_abc123","conversation":"conv_xyz789"}"#,
     ));
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "identifier stripping should continue"
     );
 
@@ -917,9 +1219,12 @@ async fn passthrough_preserves_conversation_in_body() {
         r#"{"model":"gpt-4.1","input":"hello","conversation":{"id":"conv_native"}}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "passthrough conversation should continue"
     );
 
@@ -954,10 +1259,13 @@ async fn rebuilt_body_preserves_conversation_without_local_rehydration() {
         r#"{"model":"gpt-4o","input":"hello","conversation":{"id":"conv_native"}}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "rebuilt request should continue to the provider"
     );
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
@@ -992,10 +1300,13 @@ async fn rebuilt_provider_conversation_continuation_sends_only_new_items() {
         r#"{"model":"gpt-4o","input":"weather in SF","conversation":{"id":"conv_native"}}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "provider-owned continuation should continue to the provider"
     );
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
@@ -1017,9 +1328,12 @@ async fn passthrough_none_body() {
     let mut ctx = make_filter_context(&req);
     let mut body: Option<Bytes> = None;
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "None body should return Continue"
     );
     assert!(body.is_none(), "None body should remain None");
@@ -1033,9 +1347,12 @@ async fn passthrough_invalid_json_body() {
     let original = b"not valid json {{{";
     let mut body = Some(Bytes::from_static(original));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "invalid JSON body should return Continue"
     );
     assert_eq!(
@@ -1058,9 +1375,12 @@ async fn rebuild_non_object_request_body_passes_through() {
     ctx.extensions.insert(state);
 
     let mut body = Some(Bytes::from(r#"["not","an","object"]"#));
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "non-object request_body should continue"
     );
 
@@ -1092,7 +1412,10 @@ async fn rebuild_does_not_set_content_type_header() {
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4o","input":"test","previous_response_id":"resp_abc123"}"#,
     ));
-    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let _action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
         ctx.extra_request_headers
@@ -1112,7 +1435,7 @@ fn messages_for_backend_borrows_when_no_compaction() {
         json!({"role": "user", "content": "hello"}),
         json!({"role": "assistant", "content": "hi"}),
     ];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert!(
         matches!(result, std::borrow::Cow::Borrowed(_)),
         "should borrow when no compaction items"
@@ -1124,7 +1447,7 @@ fn messages_for_backend_borrows_when_no_compaction() {
 fn messages_for_backend_translates_compaction_item() {
     let encoded = base64::engine::general_purpose::STANDARD.encode("summary text");
     let msgs = vec![json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded})];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert!(
         matches!(result, std::borrow::Cow::Owned(_)),
         "summary insertion must return an owned input array"
@@ -1144,10 +1467,62 @@ fn messages_for_backend_mixed_items() {
         json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded}),
         json!({"role": "user", "content": "hello"}),
     ];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert_eq!(result.len(), 2);
     assert_eq!(result[0]["role"], "assistant");
     assert_eq!(result[1]["role"], "user");
+}
+
+#[test]
+fn messages_for_native_backend_preserves_provider_compaction_item() {
+    let item = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-opaque-state",
+        "provider_field": {"opaque": true}
+    });
+    let msgs = vec![item.clone(), json!({"role": "user", "content": "continue"})];
+    let provider_ids = std::collections::HashSet::from(["cmp_provider".to_owned()]);
+    let result = super::messages_for_backend(&msgs, true, &provider_ids);
+
+    assert!(
+        matches!(result, std::borrow::Cow::Borrowed(_)),
+        "native Responses backends must receive the original item array"
+    );
+    assert_eq!(
+        result[0], item,
+        "provider compaction state must remain byte-equivalent as JSON"
+    );
+}
+
+#[test]
+fn messages_for_native_backend_preserves_idless_provider_compaction_item() {
+    let item = json!({
+        "type": "compaction",
+        "encrypted_content": "provider-opaque-state"
+    });
+    let messages = [item.clone()];
+    let result = super::messages_for_backend(&messages, true, &std::collections::HashSet::new());
+
+    assert!(
+        matches!(result, std::borrow::Cow::Borrowed(_)),
+        "native Responses backends must preserve valid ID-less compaction items"
+    );
+    assert_eq!(result[0], item);
+}
+
+#[test]
+fn messages_for_native_backend_translates_local_compaction_item() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("local summary");
+    let msgs = vec![json!({
+        "type": "compaction",
+        "id": "compact_local",
+        "encrypted_content": encoded
+    })];
+    let result = super::messages_for_backend(&msgs, true, &std::collections::HashSet::new());
+
+    assert_eq!(result[0]["role"], "assistant");
+    assert_eq!(result[0]["content"], "[Previous conversation summary]\n\nlocal summary");
 }
 
 #[tokio::test]
@@ -1181,9 +1556,12 @@ async fn compacted_outbound_serializes_resolved_file_data_not_file_url() {
         br#"{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[{"type":"input_file","file_url":"https://files.internal/secret.bin"}]}],"previous_response_id":"resp_prev"}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "compaction rewrite should continue with the resolved current-turn body"
     );
 

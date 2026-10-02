@@ -267,11 +267,13 @@ fn validate_rewritten_body_limit(limit: usize) -> Result<(), FilterError> {
 /// It must be non-zero and within the max body bytes ceiling.
 fn validate_max_reasoning_bytes(value: usize, max_rewritten_body_bytes: usize) -> Result<(), FilterError> {
     if value == 0 {
-        return Err("responses_to_chat_completions: reasoning.max_reasoning_bytes must be greater than 0".into());
+        return Err(
+            "openai_responses_to_chat_completions: reasoning.max_reasoning_bytes must be greater than 0".into(),
+        );
     }
     if value > max_rewritten_body_bytes {
         return Err(format!(
-            "responses_to_chat_completions: reasoning.max_reasoning_bytes ({value}) must not exceed max_rewritten_body_bytes ({max_rewritten_body_bytes})"
+            "openai_responses_to_chat_completions: reasoning.max_reasoning_bytes ({value}) must not exceed max_rewritten_body_bytes ({max_rewritten_body_bytes})"
         )
         .into());
     }
