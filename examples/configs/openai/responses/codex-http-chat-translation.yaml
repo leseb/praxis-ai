@@ -29,14 +29,14 @@ listeners:
 filter_chains:
   - name: codex-chat-provider
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_validate
+      - filter: openai_responses_validate
 
       - filter: iterative_request_router
         initial_step: selected-provider

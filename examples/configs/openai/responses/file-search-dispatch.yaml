@@ -106,7 +106,7 @@ filter_chains:
               # below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
-              - filter: openai_proxy
+              - filter: openai_responses_proxy
                 name: inference
               - filter: headers
                 request_set:

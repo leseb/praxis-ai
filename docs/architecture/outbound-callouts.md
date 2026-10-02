@@ -23,7 +23,7 @@ origin.
 | `openai_file_resolve` Files API | Configured `files_api_url` via `outbound_chain` | `allow_private_upstreams` | No-follow | Headers named by `forward_headers` plus `outbound_chain` mutations |
 | `openai_file_resolve` `file_url` fetch | Request-derived URL via `SubRequestClient` | Exact `allowed_file_url_origins` | No-follow | Anonymous; no downstream headers |
 | `openai_file_search_dispatch` | Configured `vector_store_url` | `allow_private_url` | No-follow | Only headers named by `forward_headers` |
-| `openai_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
+| `openai_responses_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
 | `ai_guardrails` with NeMo | Configured `endpoint` | Global `allow_private_upstreams` | No-follow | Configured `outbound_chain`; no downstream headers by default |
 | `http_callout` | Configured `target.url` | `allow_private_addresses` | No-follow | Configured static headers plus allowed `forward_headers` |
 | `external_metering` balance check and usage report | Configured `metering_url` via `SubRequestClient` | `allow_private_endpoint` | No-follow | Anonymous; no downstream headers |

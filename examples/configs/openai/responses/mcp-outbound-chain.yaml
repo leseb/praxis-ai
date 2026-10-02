@@ -76,7 +76,7 @@ filter_chains:
                 - name: x-mcp-outbound-probe
                   value: praxis-outbound
 
-      - filter: openai_proxy
+      - filter: openai_responses_proxy
         name: inference
 
       - filter: router

@@ -347,7 +347,7 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
 ///
 /// The `iterative_request_router` runner moves request extensions into each
 /// step but builds a fresh `filter_metadata` map, so metadata set by pre-IRR
-/// filters (e.g. `openai_format`) is not visible here. `ResponsesState`
+/// filters (e.g. `openai_responses_format`) is not visible here. `ResponsesState`
 /// is created pre-IRR and travels through extensions, so fall back to it for
 /// format and stream detection — mirroring how `openai_responses_to_chat_completions`
 /// resolves `request_is_streaming`. `IterationState` is inserted by the IRR
@@ -371,9 +371,10 @@ fn arm_decision_for(ctx: &HttpFilterContext<'_>) -> ArmDecision {
         .unwrap_or(false);
     let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
         && (typed_streaming
-            || ctx.get_metadata("openai_format.format") == Some("openai_responses")
+            || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
             || has_responses_state);
-    let is_streaming = typed_streaming || ctx.get_metadata("openai_format.stream") == Some("true") || body_stream;
+    let is_streaming =
+        typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
     let inside_irr = ctx.extensions.get::<IterationState>().is_some();
     arm_decision(is_responses && is_streaming, inside_irr)
 }
@@ -2264,7 +2265,7 @@ fn emit_deferred_terminal(
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
     // #937: `response_object` is now canonical and the client-visible terminal
     // frame is appended below as a deferred, non-end-of-stream chunk. Signal the
-    // pre-IRR `openai_store` to persist BEFORE it releases that chunk so
+    // pre-IRR `openai_responses_store` to persist BEFORE it releases that chunk so
     // completion is never observed before the record is durable. Only this
     // deferred path sets the flag; a buffered local completion
     // (`encode_local_completion`) persists at end-of-stream and must not.
@@ -2330,7 +2331,7 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 /// echoed as `null` after a rehydrated turn stripped it from the upstream request
 /// (#1150). It MUST mirror whichever path owns the client-visible terminal, or a
 /// later GET disagrees with what the client streamed:
-/// - upstream streaming: the wire is rewritten by `openai_rehydrate`, so the caller passes
+/// - upstream streaming: the wire is rewritten by `openai_responses_rehydrate`, so the caller passes
 ///   `state.previous_response_id_stream_restore_armed` — the filter's own `eligible_previous_response_id_stream`
 ///   decision, which declines validator-bearing and non-200 streams the store must therefore also leave alone (issue
 ///   #1150 review);

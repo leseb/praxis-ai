@@ -4553,7 +4553,7 @@ async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
     // body-phase stash survives into the header phase.
     ctx.current_filter_id = Some(0);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
-    ctx.set_metadata("openai_format.stream", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
     ctx.set_metadata("responses.response_id", "resp_listing_failure");
 
     let body_json = serde_json::json!({
@@ -4646,7 +4646,7 @@ async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
     assert_eq!(failed_response["error"]["code"], "server_error");
 
     // The requested model must be echoed in every snapshot. No
-    // `openai_format.model` metadata is set here, so this exercises
+    // `openai_responses_format.model` metadata is set here, so this exercises
     // the `ResponsesState.request_body` fallback branch.
     let created_response = &events[0].1["response"];
     assert_eq!(
@@ -4655,7 +4655,7 @@ async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
     );
     assert_eq!(failed_response["model"], "gpt-4o-mini", "failed snapshot echoes model");
 
-    // No `openai_format.store` metadata is set, so the effective store
+    // No `openai_responses_format.store` metadata is set, so the effective store
     // is the OpenAI default (true). The snapshot must advertise that so a caller
     // who later retrieves the persisted failure sees a consistent resource.
     assert_eq!(
@@ -5166,7 +5166,7 @@ fn streaming_failure_snapshot_drops_oversized_options() {
 }
 
 /// Building the terminal failure must publish the failed snapshot directly into
-/// `ResponsesState.response_object`, the field `openai_store` reads to
+/// `ResponsesState.response_object`, the field `openai_responses_store` reads to
 /// persist streaming responses. In `agentic-loop.yaml` `openai_stream_events`
 /// runs *after* this filter (nested in the `iterative_request_router`), so the
 /// short-circuiting `TerminalResponse` means `stream_events` never accumulates the
@@ -5202,8 +5202,8 @@ fn build_failure_populates_response_object_state() {
 }
 
 /// When no `ResponsesState` exists yet -- a valid pipeline of
-/// `openai_store` + this filter *without*
-/// `openai_validate`/`openai_rehydrate` to build state up
+/// `openai_responses_store` + this filter *without*
+/// `openai_responses_validate`/`openai_responses_rehydrate` to build state up
 /// front -- the terminal-failure build must still CREATE the state and populate
 /// `response_object`, or the store would have nothing to persist and the failure
 /// would be lost. `get_or_insert_with` (not `get_mut`) is what makes this work.

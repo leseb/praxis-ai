@@ -17,7 +17,7 @@
 //! pipeline.
 //!
 //! Runs after `openai_file_resolve` (which resolves `file_id` to
-//! inline `file_data`) and before `openai_proxy` (which
+//! inline `file_data`) and before `openai_responses_proxy` (which
 //! rebuilds the body from state). Parts without inline `file_data`
 //! (unresolved `file_id` or `file_url`) are skipped — this filter
 //! does not perform network I/O.
@@ -150,7 +150,7 @@ impl HttpFilter for DocExtractFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
@@ -398,7 +398,7 @@ fn extract_history(
 }
 
 /// Enforce the body limit against the exact request shape that
-/// `openai_proxy` will later serialize from state.
+/// `openai_responses_proxy` will later serialize from state.
 fn reject_oversized_state_body(
     ctx: &HttpFilterContext<'_>,
     max_rewritten_body_bytes: usize,

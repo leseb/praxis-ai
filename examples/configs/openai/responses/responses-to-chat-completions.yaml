@@ -6,11 +6,11 @@
 # /v1/chat/completions.
 #
 # Request order:
-#   1. openai_format classifies the client request.
-#   2. openai_validate performs the canonical JSON parse and
+#   1. openai_responses_format classifies the client request.
+#   2. openai_responses_validate performs the canonical JSON parse and
 #      creates ResponsesState for downstream enrichment and translation.
-#   3. openai_store initializes the shared response store.
-#   4. openai_rehydrate resolves previous_response_id into the
+#   3. openai_responses_store initializes the shared response store.
+#   4. openai_responses_rehydrate resolves previous_response_id into the
 #      complete message history required by Chat Completions.
 #   5. iterative_request_router runs one inference step (max_iterations: 1)
 #      that composes the translated stream and reaches the backend:
@@ -31,10 +31,10 @@
 #
 #   openai_responses_to_chat_completions -> openai_stream_events
 #
-# then the pre-IRR openai_store runs last. The Chat response (finite
+# then the pre-IRR openai_responses_store runs last. The Chat response (finite
 # or streamed) is therefore translated into a client-visible Responses
 # resource, its terminal resource is accumulated by openai_stream_events, and
-# openai_store then decides whether to persist it.
+# openai_responses_store then decides whether to persist it.
 
 listeners:
   - name: responses-chat-gateway
@@ -44,26 +44,26 @@ listeners:
 filter_chains:
   - name: responses-chat-translation
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_validate
+      - filter: openai_responses_validate
 
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_rehydrate
+      - filter: openai_responses_rehydrate
 
       - filter: iterative_request_router
         initial_step: inference

@@ -75,7 +75,7 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
 /// The filter consumes the classification metadata and `ResponsesState`
-/// produced by `openai_format` and `openai_validate`.
+/// produced by `openai_responses_format` and `openai_responses_validate`.
 /// It converts the enriched request to Chat Completions wire format, converts
 /// finite successful Chat responses back to Responses resources, and
 /// normalizes finite provider errors while preserving their HTTP status.
@@ -93,7 +93,7 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// change from `/v1/responses` to `/v1/chat/completions`.
 ///
 /// Requests using `previous_response_id` require
-/// `openai_store` and `openai_rehydrate` earlier in the
+/// `openai_responses_store` and `openai_responses_rehydrate` earlier in the
 /// request pipeline. The filter fails closed if stored history has not been
 /// resolved, preventing a continuation from silently losing prior turns.
 /// For finite web-search loops, place `openai_web_search_dispatch` and
@@ -124,9 +124,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// protocol layer reconciles a single chain-wide response body mode with no
 /// per-filter provenance, so this downgrade cannot be scoped to one neighbor: it
 /// overrides every response filter's `StreamBuffer` requirement, not only
-/// `openai_store`'s. Only compose response-body filters after this one
+/// `openai_responses_store`'s. Only compose response-body filters after this one
 /// that tolerate incremental fragments; `openai_stream_events` and
-/// `openai_store` are compatible because they persist streamed turns
+/// `openai_responses_store` are compatible because they persist streamed turns
 /// from the accumulator, not a buffered body, whereas any other response-body
 /// rewriter needing the complete buffered body would instead receive fragments.
 ///
@@ -281,7 +281,7 @@ impl ResponsesToChatCompletionsFilter {
         };
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
         // Downgrade the reconciled pipeline body mode to `Stream`. A downstream
-        // `openai_store` declares `StreamBuffer`, so without this the
+        // `openai_responses_store` declares `StreamBuffer`, so without this the
         // protocol layer buffers the raw first chunk and, when the store
         // releases the stream, flushes that raw chunk verbatim — discarding this
         // filter's translation of it. Opting out of buffering lets each
@@ -289,7 +289,7 @@ impl ResponsesToChatCompletionsFilter {
         // turns from the `openai_stream_events` accumulator, not the body buffer.
         //
         // This body mode is reconciled chain-wide with no per-filter provenance,
-        // so the downgrade cannot be scoped to `openai_store`: it applies
+        // so the downgrade cannot be scoped to `openai_responses_store`: it applies
         // to every response filter. Composing any other downstream response-body
         // rewriter that needs the complete buffered body is therefore unsupported
         // (see the filter's "Response body mode" documentation).
@@ -530,7 +530,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
     if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
         return Some(SelectedUpstreamBodyOutcome::Continue);
     }
-    match ctx.get_metadata("openai_format.format") {
+    match ctx.get_metadata("openai_responses_format.format") {
         Some("openai_responses") => None,
         Some(format) => {
             trace!(
@@ -548,7 +548,10 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
             None
         },
         None => {
-            warn!(prerequisite = "openai_format", "request pipeline state is unavailable");
+            warn!(
+                prerequisite = "openai_responses_format",
+                "request pipeline state is unavailable"
+            );
             Some(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()))
         },
     }
@@ -561,7 +564,7 @@ fn translate_canonical_state(
 ) -> Result<serde_json::Value, SelectedUpstreamBodyOutcome> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         warn!(
-            prerequisite = "openai_validate",
+            prerequisite = "openai_responses_validate",
             "request pipeline state is unavailable"
         );
         return Err(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()));
@@ -623,7 +626,7 @@ fn reject_incompatible_reasoning(
 fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), SelectedUpstreamBodyOutcome> {
     if state.previous_response_id.is_some() && !state.history_rehydrated {
         warn!(
-            prerequisite = "openai_rehydrate",
+            prerequisite = "openai_responses_rehydrate",
             "previous_response_id was not resolved before Chat Completions translation"
         );
         return Err(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()));
@@ -633,7 +636,7 @@ fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), Sel
 
 /// Return the client stream preference captured by the classifier.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_format.stream").map_or_else(
+    ctx.get_metadata("openai_responses_format.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()

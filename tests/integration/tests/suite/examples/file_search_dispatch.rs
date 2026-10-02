@@ -247,7 +247,7 @@ fn file_search_callout_example_without_tools_passthrough() {
 
 // #313 §7.1 / #1046: the buffered file-search-dispatch example fails closed on
 // `stream:true`. The proxy auto-derives the streaming transport from the
-// client's `stream:true`, so `openai_proxy` runs a Streaming
+// client's `stream:true`, so `openai_responses_proxy` runs a Streaming
 // sub-request. Because this buffered pipeline has no `openai_stream_events` in
 // the step, a loop-terminal error could not reach the client after the stream
 // commits, so the loop owner (`openai_agentic_loop`) fails closed with a 500

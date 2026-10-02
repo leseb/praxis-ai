@@ -230,7 +230,7 @@ fn passthrough_without_state_on_response_body() {
 
 #[tokio::test]
 async fn on_request_rejects_typed_streaming_without_logical_stream() {
-    // openai_proxy already selected the typed streaming transport for
+    // openai_responses_proxy already selected the typed streaming transport for
     // this round, but openai_stream_events published no logical-stream marker
     // (the filter is absent from this step, so nothing armed a finalizer). A
     // loop-terminal error could not reach the client, so this must fail closed

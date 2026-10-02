@@ -241,7 +241,7 @@ pipeline:
         note: 'GET /v1/responses + Upgrade: websocket -> openai_responses (WebSocket handshake)'
       S10:
         state: active
-        note: head-based match -> openai_responses create; the Chat/unclassified body is ignored here and discriminated later by openai_format
+        note: head-based match -> openai_responses create; the Chat/unclassified body is ignored here and discriminated later by openai_responses_format
       S11:
         state: passthrough
         note: /v1/prompts|/v1/embeddings|/v1/files|/v1/vector_stores are not in any operation registry; strips routing headers
@@ -251,10 +251,10 @@ pipeline:
       S13:
         state: active
         note: POST /v1/responses -> openai_responses (create); vllm-chat head is classified here, provider chosen at the router
-  - id: openai_format
-    name: openai_format
+  - id: openai_responses_format
+    name: openai_responses_format
     group: classification
-    filter_type: openai_format
+    filter_type: openai_responses_format
     phase: request-phase classifier; promotes internal x-praxis-* routing headers
     config:
       on_invalid: continue
@@ -466,10 +466,10 @@ pipeline:
       S13:
         state: inert
         note: bound provider=vllm (managed), not direct; branch not taken
-  - id: openai_validate
-    name: openai_validate
+  - id: openai_responses_validate
+    name: openai_responses_validate
     group: classification
-    filter_type: openai_validate
+    filter_type: openai_responses_validate
     phase: request-phase; JSON syntax + ID generation; gated unless bound_upstream.application_provider=openai
     config:
       conditions:
@@ -617,10 +617,10 @@ pipeline:
       S13:
         state: passthrough
         note: no conversation field
-  - id: openai_store
-    name: openai_store
+  - id: openai_responses_store
+    name: openai_responses_store
     group: store
-    filter_type: openai_store
+    filter_type: openai_responses_store
     phase: request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order); gated unless bound_upstream.application_provider=openai
     config:
       backend: sqlite
@@ -670,10 +670,10 @@ pipeline:
       S13:
         state: inert
         note: backend registered but store:false -> no persistence
-  - id: openai_rehydrate
-    name: openai_rehydrate
+  - id: openai_responses_rehydrate
+    name: openai_responses_rehydrate
     group: context
-    filter_type: openai_rehydrate
+    filter_type: openai_responses_rehydrate
     phase: request-phase; loads and prepends prior history; gated unless bound_upstream.application_provider=openai
     config:
       conditions:
@@ -893,7 +893,7 @@ pipeline:
       conditions:
       - 'when path_prefix: /v1/responses'
       - 'unless path: /v1/responses'
-    promotes: fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai
+    promotes: fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_responses_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai
     scenarios:
       S1:
         state: inert
@@ -918,7 +918,7 @@ pipeline:
         note: path is exactly /v1/responses (create); the unless gate excludes it
       S8:
         state: skipped
-        note: openai_store already served the GET retrieve
+        note: openai_responses_store already served the GET retrieve
       S9:
         state: skipped
         note: direct-services terminal branch ran first
@@ -1413,10 +1413,10 @@ pipeline:
       S13:
         state: active
         note: selects chat-completions-backend 127.0.0.1:3001 (openai_chat_completions); publishes protocol
-  - id: openai_proxy
-    name: openai_proxy
+  - id: openai_responses_proxy
+    name: openai_responses_proxy
     group: irr-step
-    filter_type: openai_proxy
+    filter_type: openai_responses_proxy
     phase: IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Responses (selected_upstream.application_protocol=openai_responses); response-phase handles buffered/streamed
     config:
       conditions:
@@ -1638,7 +1638,7 @@ pipeline:
     - 127.0.0.1:3001
     definedIn: router route (path_prefix /v1/responses) + IRR-step load_balancer (cluster_source:bound_upstream)
     routedBy: router binds managed native Responses for gpt-4.1/default models; the IRR inference step resolves it on 3001
-    note: application_provider vllm; the IRR-step load_balancer publishes application_protocol openai_responses so openai_proxy fires
+    note: application_provider vllm; the IRR-step load_balancer publishes application_protocol openai_responses so openai_responses_proxy fires
   - name: openai-responses-backend
     endpoints:
     - 127.0.0.1:3001
@@ -1650,7 +1650,7 @@ pipeline:
     - 127.0.0.1:3001
     definedIn: router route (model vllm-chat) + IRR-step load_balancer (cluster_source:bound_upstream)
     routedBy: router binds this when x-praxis-ai-model is vllm-chat; the IRR inference step resolves it on 3001
-    note: application_provider vllm, application_protocol openai_chat_completions -> openai_responses_to_chat_completions + path_rewrite fire instead of openai_proxy
+    note: application_provider vllm, application_protocol openai_chat_completions -> openai_responses_to_chat_completions + path_rewrite fire instead of openai_responses_proxy
   - name: prompts-api
     endpoints:
     - 127.0.0.1:9998
@@ -1735,7 +1735,7 @@ scen_meta:
     - inference-backend
     services: []
   S2:
-    narr: <b>Streaming create.</b> openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_store persists on the reverse path.
+    narr: <b>Streaming create.</b> openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_responses_store persists on the reverse path.
     clusters:
     - inference-backend
     services: []
@@ -1745,7 +1745,7 @@ scen_meta:
     - inference-backend
     services: []
   S4:
-    narr: <b>Multi-turn.</b> openai_rehydrate loads the prior response via previous_response_id and prepends its history, then one inference round runs.
+    narr: <b>Multi-turn.</b> openai_responses_rehydrate loads the prior response via previous_response_id and prepends its history, then one inference round runs.
     clusters:
     - inference-backend
     services: []
@@ -1769,7 +1769,7 @@ scen_meta:
     services:
     - Brave Search
   S8:
-    narr: <b>GET retrieve.</b> openai_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.
+    narr: <b>GET retrieve.</b> openai_responses_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.
     clusters: []
     services: []
   S9:
@@ -1814,12 +1814,12 @@ wire:
     - 'content-type: application/json'
     - 'x-request-id: req_d1561f573ba741d7adf74a0ad57445f0'
     resBody: "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_001\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hello! How can I help you today?\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 17,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 9,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 26\n  }\n}"
-    notes: 'Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.'
+    notes: 'Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_responses_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.'
     provenance:
     - examples/configs/openai/responses/full-flow-agentic.yaml:202-205
     - examples/configs/openai/responses/full-flow-agentic.yaml:192-198
     - tests/integration/fixtures/inference/recordings/openai/responses/native-basic-nonstream.json:51-144
-    - tests/integration/tests/suite/examples/openai_store.rs:20,48-78
+    - tests/integration/tests/suite/examples/openai_responses_store.rs:20,48-78
   S2:
     reqMethod: POST
     reqPath: /v1/responses
@@ -1895,7 +1895,7 @@ wire:
     - 'tests/integration/fixtures/inference/recordings/openai/responses/native-basic-stream.json:54-107 (native OpenAI lifecycle frame shapes: message item content[], content_part output_text part, terminal response object with usage)'
     - tests/integration/tests/suite/examples/openai_stream_events.rs:63-157 (openai_stream_events composes ONE lifecycle + populates response_object for SQLite persistence; asserts content-type text/event-stream and response.completed present)
     - 'tests/integration/sdk/openai/test_openai_responses_vllm.py:255-293,2540-2556 (SDK stream contract: response.created first, monotonic integer sequence_number, content_part.added/done + output_item.added/done + output_text.done present, deltas concatenate to terminal output_text, terminal completed carries usage)'
-    - examples/configs/openai/responses/full-flow-agentic.yaml:207-210,512-659 (streaming create curl example; IRR step with openai_stream_events + openai_proxy typed streaming; store PRE-IRR persists accumulated response_object)
+    - examples/configs/openai/responses/full-flow-agentic.yaml:207-210,512-659 (streaming create curl example; IRR step with openai_stream_events + openai_responses_proxy typed streaming; store PRE-IRR persists accumulated response_object)
   S3:
     reqMethod: POST
     reqPath: /v1/responses
@@ -1927,7 +1927,7 @@ wire:
     - 'content-type: application/json'
     - 'x-request-id: req_a72c0f9e4b8d4f1e9c2a1b3d5e6f7a80'
     resBody: "{\n  \"id\": \"resp_ghi789\",\n  \"object\": \"response\",\n  \"created_at\": 1010,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": \"resp_abc123\",\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_003\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"You just asked: \\\"Hello, world!\\\"\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 24,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 8,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 32\n  }\n}"
-    notes: 'Multi-turn continuation. previous_response_id is a stateful marker: openai_rehydrate loads resp_abc123''s stored history (owner-scoped by x-auth-tenant/x-auth-user) and prepends it into the upstream input array, stripping previous_response_id from the outbound body so the backend echoes null. The rehydrate filter then restores the caller''s previous_response_id (resp_abc123) into the returned object (issue #932), so the client always sees the id it sent.'
+    notes: 'Multi-turn continuation. previous_response_id is a stateful marker: openai_responses_rehydrate loads resp_abc123''s stored history (owner-scoped by x-auth-tenant/x-auth-user) and prepends it into the upstream input array, stripping previous_response_id from the outbound body so the backend echoes null. The rehydrate filter then restores the caller''s previous_response_id (resp_abc123) into the returned object (issue #932), so the client always sees the id it sent.'
     provenance:
     - examples/configs/openai/responses/full-flow-agentic.yaml:217-220
     - examples/configs/openai/responses/full-flow-agentic.yaml:60-72
@@ -2025,15 +2025,15 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hi there\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 9,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 4,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 13\n  }\n}"
-    notes: openai_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.
+    notes: openai_responses_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.
     provenance:
     - apis/src/openai/responses/store/filter.rs:838-844 (GET handled in on_request before IRR)
     - apis/src/openai/responses/store/filter.rs:1040-1047 (returns record.response_object verbatim, content-type application/json, status 200)
     - apis/src/openai/responses/store/filter.rs:1034-1037 (owner-scoped via require_state_owner)
-    - tests/integration/tests/suite/examples/openai_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)
+    - tests/integration/tests/suite/examples/openai_responses_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:33 (FIRST_RESPONSE_JSON completed shape), 441-452 (GET stored streamed resource, status/output asserted)
     - 'tests/integration/tests/suite/codex_http.rs:1105-1114 (OpenResponses usage: input_tokens_details.cached_tokens + output_tokens_details.reasoning_tokens required)'
-    - examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)
+    - examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_responses_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)
   S9:
     reqMethod: GET
     reqPath: /v1/responses
@@ -2072,7 +2072,7 @@ wire:
     resHeaders:
     - 'Connection: close'
     resBody: ''
-    notes: 'A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_format, so none of the router''s /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.'
+    notes: 'A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_responses_format, so none of the router''s /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.'
     provenance:
     - 'examples/configs/openai/responses/full-flow-agentic.yaml (router routes: every /v1/responses route requires x-praxis-ai-format:openai_responses or upgrade:websocket, so a non-Responses POST /v1/responses matches nothing)'
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:489-520 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)
@@ -2111,7 +2111,7 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_openai_direct\",\n  \"object\": \"response\",\n  \"status\": \"queued\",\n  \"background\": true,\n  \"output\": []\n}"
-    notes: 'model gpt-5 makes openai_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_validate, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider''s response (status:queued) is returned verbatim without gateway composition.'
+    notes: 'model gpt-5 makes openai_responses_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_responses_validate, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider''s response (status:queued) is returned verbatim without gateway composition.'
     provenance:
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:365-410 (full_flow_openai_provider_is_direct_passthrough: 200, provider response returned verbatim, backend gets one /v1/responses request with body === client request)
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:413-439 (full_flow_managed_provider_rejects_background_before_forwarding: the managed path rejects background:true with 400, contrasting the direct passthrough)
@@ -2130,10 +2130,10 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_bound\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"vllm-chat\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"translated\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 3,\n    \"output_tokens\": 1,\n    \"total_tokens\": 4\n  }\n}"
-    notes: 'model vllm-chat makes openai_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_proxy inert and instead fires openai_responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path openai_responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object=="response" and output[0].content[0].text=="translated"; the id shown is gateway-generated (openai_validate ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.'
+    notes: 'model vllm-chat makes openai_responses_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires openai_responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path openai_responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object=="response" and output[0].content[0].text=="translated"; the id shown is gateway-generated (openai_responses_validate ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.'
     provenance:
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding: 200, response.object==response + output text "translated"; backend gets one /v1/chat/completions request whose body has messages and no input)
-    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; openai_responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_proxy gated when openai_responses)'
+    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; openai_responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)'
 timeline:
   S1:
     summary: 'A no-tools create crosses the wire in exactly one inference round: client POST /v1/responses {model,input} -> IRR forwards the create to inference-backend 127.0.0.1:3001 -> the model returns a final assistant message with NO tool-call items -> the gateway ships that Responses object back byte-for-byte. The IRR transition is owned solely by openai_agentic_loop (full-flow-agentic.yaml:608-613): it parses each model response and publishes a single continuation signal action=loop|done, routed at :646-658 (`key: action, value: loop, next: inference` re-enters inference; the `default: true / done: true` branch finalizes). A plain assistant message has no hosted-tool items, so the loop does NOT publish action=loop and the default done branch finalizes after the first pass (mechanic mirrored by the injected on_result at openai_agentic_loop.rs:6919-6923, whose comment states ''IRR terminates after the first pass via the default `done: true` branch''). This is why tool scenarios need extra rounds and this one does not: hosted-tool items make the loop publish action=loop -> next: inference, adding a re-entry round after the callout (file_search two-round trip full_flow_agentic.rs:1189-1305 with one vector-store callout at :1283; MCP two-round trip openai_agentic_loop.rs:250-428 with model_reqs.len()==2 at :366), whereas a plain message — or even a client-owned function_call — returns after a single model request (openai_agentic_loop.rs:60-61 and :139-143). NOTE: the S1 passthrough test itself only asserts status + byte-equal body; forwarded-body and header-projection details are grounded in sibling tests, cited per step.'
@@ -2223,7 +2223,7 @@ timeline:
       kind: request
       title: IRR round-1 inference request carries the file_search tool
       channel: POST http://127.0.0.1:3001/v1/responses
-      note: 'VERIFIED. openai_proxy (config :645) rebuilds the outbound body from ResponsesState. S5 asserts per-round inference headers at :1261-1279: authorization: bearer search-key (client key preserved), projected x-tenant-id: integration-tenant + x-user-id: integration-user (project_state_owner_headers, config :532-534), and NO x-auth-tenant:/x-auth-user: (raw ingress identity stripped at the IRR boundary). Router path /v1/responses -> cluster inference-backend endpoint 127.0.0.1:3001 (config :624-639). The exact wire body is NOT asserted by S5; shown faithful to the client input+tools it is rebuilt from.'
+      note: 'VERIFIED. openai_responses_proxy (config :645) rebuilds the outbound body from ResponsesState. S5 asserts per-round inference headers at :1261-1279: authorization: bearer search-key (client key preserved), projected x-tenant-id: integration-tenant + x-user-id: integration-user (project_state_owner_headers, config :532-534), and NO x-auth-tenant:/x-auth-user: (raw ingress identity stripped at the IRR boundary). Router path /v1/responses -> cluster inference-backend endpoint 127.0.0.1:3001 (config :624-639). The exact wire body is NOT asserted by S5; shown faithful to the client input+tools it is rebuilt from.'
       bodyKind: json
       body: '{"model": "gpt-4.1", "input": "What do the documents say about Q4?", "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}]}'
       provenance:
@@ -2487,7 +2487,7 @@ timeline:
       kind: response
       title: Composed /v1/responses object returned to client
       channel: 200 http://localhost:8080/v1/responses
-      note: Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_store (yaml:372-379) persists it for GET /v1/responses/{id}.
+      note: Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_responses_store (yaml:372-379) persists it for GET /v1/responses/{id}.
       bodyKind: json
       body: '{"id":"resp_2","object":"response","status":"completed","output":[…,{"type":"mcp_call","id":"call_abc","server_label":"weather","name":"get_weather","output":"mock result for get_weather"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The weather in SF is 72F and sunny."}]}]}'
       provenance:
@@ -2519,7 +2519,7 @@ timeline:
       kind: request
       title: IRR inference round 1 — proxy rebuilds outbound Responses body
       channel: POST http://127.0.0.1:3001/v1/responses
-      note: openai_proxy rebuilds the outbound body from ResponsesState and routes to inference-backend (127.0.0.1:3001). The test asserts the backend received exactly 2 requests (this is req[0]); round-1 body is not asserted verbatim, so this is the rebuilt body faithful to the client input.
+      note: openai_responses_proxy rebuilds the outbound body from ResponsesState and routes to inference-backend (127.0.0.1:3001). The test asserts the backend received exactly 2 requests (this is req[0]); round-1 body is not asserted verbatim, so this is the rebuilt body faithful to the client input.
       bodyKind: json
       body: '{"model":"gpt-4.1","input":"Search for Rust 2025 edition features","tools":[{"type":"web_search_preview"}], …}'
       provenance:

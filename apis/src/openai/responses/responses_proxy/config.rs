@@ -15,7 +15,7 @@ use crate::openai::responses::body_limits::validate_size_limit;
 /// Deserialized YAML config for the Responses proxy filter.
 ///
 /// ```yaml
-/// filter: openai_proxy
+/// filter: openai_responses_proxy
 /// max_rewritten_body_bytes: 10485760
 /// ```
 #[derive(Debug, Deserialize)]
@@ -50,6 +50,10 @@ fn default_max_rewritten_body_bytes() -> usize {
 
 /// Validate the parsed configuration.
 pub(super) fn build_config(cfg: ResponsesProxyConfig) -> Result<ResponsesProxyConfig, FilterError> {
-    validate_size_limit("openai_proxy", "max_rewritten_body_bytes", cfg.max_rewritten_body_bytes)?;
+    validate_size_limit(
+        "openai_responses_proxy",
+        "max_rewritten_body_bytes",
+        cfg.max_rewritten_body_bytes,
+    )?;
     Ok(cfg)
 }

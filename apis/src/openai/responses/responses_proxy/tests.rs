@@ -25,14 +25,22 @@ use crate::test_utils::{make_filter_context, make_request};
 fn from_config_accepts_null() {
     let yaml = serde_yaml::Value::Null;
     let filter = super::ResponsesProxyFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_proxy", "filter name should be openai_proxy");
+    assert_eq!(
+        filter.name(),
+        "openai_responses_proxy",
+        "filter name should be openai_responses_proxy"
+    );
 }
 
 #[test]
 fn from_config_accepts_empty_mapping() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = super::ResponsesProxyFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_proxy", "filter name should be openai_proxy");
+    assert_eq!(
+        filter.name(),
+        "openai_responses_proxy",
+        "filter name should be openai_responses_proxy"
+    );
 }
 
 #[test]
@@ -49,7 +57,7 @@ fn body_rewrite_runs_after_upstream_selection() {
     assert_eq!(
         filter.selected_upstream_request_body_access(),
         BodyAccess::ReadWrite,
-        "openai_proxy must rewrite only after upstream selection"
+        "openai_responses_proxy must rewrite only after upstream selection"
     );
 }
 
@@ -64,7 +72,7 @@ fn body_mode_is_stream_buffer() {
                 "StreamBuffer should default to the 64 MiB ceiling; the pipeline clamps it to body_limits"
             );
         },
-        other => panic!("openai_proxy must use StreamBuffer, got {other:?}"),
+        other => panic!("openai_responses_proxy must use StreamBuffer, got {other:?}"),
     }
 }
 
@@ -72,7 +80,7 @@ fn body_mode_is_stream_buffer() {
 fn always_advertises_streaming_capability() {
     assert!(
         make_filter().may_select_streaming_subrequest_response(),
-        "openai_proxy must always declare the Praxis streaming capability so \
+        "openai_responses_proxy must always declare the Praxis streaming capability so \
          transport follows the effective request, without an operator opt-in"
     );
 }
@@ -102,7 +110,7 @@ async fn selects_streaming_from_effective_passthrough_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_format.stream", "false");
+    ctx.set_metadata("openai_responses_format.stream", "false");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
     ));
@@ -157,7 +165,7 @@ async fn uses_rebuilt_state_body_not_client_intent_metadata() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_format.stream", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -191,7 +199,7 @@ async fn selects_streaming_for_rebuilt_effective_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_format.stream", "false");
+    ctx.set_metadata("openai_responses_format.stream", "false");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -1665,13 +1673,13 @@ fn make_prompt_pipeline(
     - name: target
 {application}      endpoints:
         - "{endpoint}"
-- filter: openai_proxy
+- filter: openai_responses_proxy
 "#
     );
     let mut registry = FilterRegistry::with_builtins();
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_proxy" => super::ResponsesProxyFilter::from_config
+        http "openai_responses_proxy" => super::ResponsesProxyFilter::from_config
     );
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&yaml).unwrap();
     FilterPipeline::build(&mut entries, &registry).unwrap()

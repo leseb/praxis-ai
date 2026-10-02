@@ -8,7 +8,7 @@
 #
 # This config uses the streaming step order mandated by §5 of the #313 spec:
 # `openai_stream_events` is REQUIRED ahead of `openai_file_search_dispatch` and
-# `openai_proxy`. It always composes the current IRR execution into
+# `openai_responses_proxy`. It always composes the current IRR execution into
 # one logical Responses stream. The proxy derives
 # the streaming transport automatically from the effective outbound `stream:
 # true`; there is no operator opt-in. Typed streaming commits response.completed
@@ -112,7 +112,7 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
-              - filter: openai_proxy
+              - filter: openai_responses_proxy
               - filter: headers
                 request_set:
                   - name: Content-Type

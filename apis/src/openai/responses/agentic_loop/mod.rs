@@ -64,7 +64,7 @@
 //!
 //! For tool execution, it must appear after `openai_web_search_dispatch`,
 //! `openai_mcp_dispatch`, and `openai_file_search_dispatch` and before
-//! `openai_proxy`. Response filters execute in reverse
+//! `openai_responses_proxy`. Response filters execute in reverse
 //! order, so the owner parses and classifies each round's output
 //! *before* the dispatchers run, routing every call to the vector the
 //! matching dispatcher consumes. Because the owner is the sole filter
@@ -86,7 +86,7 @@
 //!       - filter: openai_file_search_dispatch
 //!       - filter: openai_agentic_loop
 //!         max_infer_iters: 10
-//!       - filter: openai_proxy
+//!       - filter: openai_responses_proxy
 //!       - filter: router
 //!         routes:
 //!           - cluster: model-backend
@@ -107,7 +107,7 @@
 //!
 //! Requires [`ResponsesState`] in request extensions. Without it
 //! the filter passes through silently. State is created by
-//! `openai_validate` for every Responses API create
+//! `openai_responses_validate` for every Responses API create
 //! request.
 
 mod config;

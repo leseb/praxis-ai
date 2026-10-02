@@ -176,7 +176,7 @@ def _patch_store_backend(config: str, db_path: str) -> str:
 
 
 def _enable_response_store_compression(config: str) -> str:
-    """Append a zstd compression block to the openai_store filter."""
+    """Append a zstd compression block to the openai_responses_store filter."""
     anchor = (
         "        responses_table: openai_responses\n"
         "        conversations_table: openai_conversations\n"
@@ -1363,7 +1363,7 @@ def _write_agentic_config(
     # requires for the loopback provider callout — no test-time injection needed.
     if translate_to_chat:
         config = config.replace(
-            "              - filter: openai_proxy\n"
+            "              - filter: openai_responses_proxy\n"
             "              - filter: router",
             "              - filter: openai_responses_to_chat_completions\n"
             "              - filter: path_rewrite\n"
@@ -6869,8 +6869,8 @@ listeners:
 filter_chains:
   - name: file-search-pipeline
     filters:
-      - filter: openai_format
-      - filter: openai_validate
+      - filter: openai_responses_format
+      - filter: openai_responses_validate
       - filter: openai_tool_parse
       - filter: iterative_request_router
         initial_step: inference
@@ -6911,7 +6911,7 @@ filter_chains:
               # continuation signal (action=loop|done).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
-              - filter: openai_proxy
+              - filter: openai_responses_proxy
                 name: inference
               - filter: headers
                 request_set:
@@ -7579,7 +7579,7 @@ class TestFileSearchStreamingVLLM:
 
     Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
     example config: openai_stream_events(logical_stream) + openai_file_search_dispatch
-    + openai_proxy (streaming transport auto-derived from
+    + openai_responses_proxy (streaming transport auto-derived from
     stream=True). vLLM emits a private
     function_call(name=file_search), which the callout suppresses and replaces
     with a synthesized file_search_call lifecycle, runs the OGX search, and
@@ -8816,7 +8816,7 @@ def model_rewrite_client(model_rewrite_proxy):
 
 
 class TestModelRewriteChatCompletionsVLLM:
-    """openai_model_rewrite applied to POST /v1/chat/completions.
+    """openai_responses_model_rewrite applied to POST /v1/chat/completions.
 
     A gateway advertises one client-facing model name while the selected
     backend requires its own. The filter rewrites the top-level `model`

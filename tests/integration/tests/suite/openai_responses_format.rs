@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `openai_format` classifier filter.
+//! Integration tests for the `openai_responses_format` classifier filter.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -829,7 +829,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
         on_invalid: continue
       - filter: router
         routes:
@@ -871,7 +871,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
         on_invalid: continue
       - filter: router
         routes:
@@ -899,7 +899,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
         on_invalid: reject
       - filter: router
         routes:
@@ -927,7 +927,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
       - filter: router
         routes:
           - path_prefix: "/"
@@ -954,7 +954,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
       - filter: router
         routes:
           - path_prefix: "/"
@@ -981,11 +981,11 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
         branch_chains:
           - name: responses_branch
             on_result:
-              filter: openai_format
+              filter: openai_responses_format
               key: format
               result: openai_responses
             rejoin: shared_load_balancer
@@ -1026,11 +1026,11 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
         branch_chains:
           - name: background_branch
             on_result:
-              filter: openai_format
+              filter: openai_responses_format
               key: background
               result: "true"
             rejoin: shared_load_balancer
@@ -1043,7 +1043,7 @@ filter_chains:
                         cluster: "background"
       # Classification preserves provider-owned fields. The managed-path
       # validator owns rejection of unsupported background execution.
-      - filter: openai_validate
+      - filter: openai_responses_validate
       - filter: router
         routes:
           - path_prefix: "/"
@@ -1074,7 +1074,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
       - filter: router
         routes:
           - path_prefix: "/"
@@ -1115,7 +1115,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
+      - filter: openai_responses_format
       - filter: router
         routes:
           - path_prefix: "/"

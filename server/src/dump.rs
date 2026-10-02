@@ -551,7 +551,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_store
+      - filter: openai_responses_store
         backend: postgres
         database_url: "postgres://user:super-secret-db-pass@localhost:5432/praxis"
         responses_table: openai_responses
@@ -590,7 +590,7 @@ filter_chains:
             chains:
               - name: inline_store
                 filters:
-                  - filter: openai_store
+                  - filter: openai_responses_store
                     backend: postgres
                     database_url: "postgres://user:super-secret-db-pass@localhost:5432/praxis"
                     responses_table: openai_responses

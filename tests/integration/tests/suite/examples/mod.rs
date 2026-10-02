@@ -62,7 +62,6 @@ mod openai_doc_extract;
 mod openai_embeddings_routing;
 #[cfg(feature = "openai-file-resolve-filter")]
 mod openai_file_resolve;
-mod openai_format;
 #[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_dispatch;
 #[cfg(feature = "openai-mcp-tools")]
@@ -71,18 +70,19 @@ mod openai_mcp_outbound_chain;
 mod openai_mcp_streaming;
 #[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_tool_resolve;
-mod openai_model_rewrite;
 mod openai_prompts_routing;
-mod openai_proxy;
 #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
+mod openai_responses_format;
+mod openai_responses_model_rewrite;
+mod openai_responses_proxy;
 #[cfg(feature = "store-sqlite")]
-mod openai_store;
+mod openai_responses_store;
 #[cfg(feature = "store-postgres")]
-mod openai_store_postgres;
+mod openai_responses_store_postgres;
 #[cfg(feature = "store-postgres")]
-mod openai_store_postgres_mtls;
-mod openai_validate;
+mod openai_responses_store_postgres_mtls;
+mod openai_responses_validate;
 // The state-ownership example selects the SQLite store backend.
 #[cfg(feature = "store-sqlite")]
 mod openai_responses_to_chat_completions;

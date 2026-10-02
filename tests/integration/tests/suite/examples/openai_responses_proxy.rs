@@ -15,7 +15,7 @@ use praxis_test_utils::{
 // -----------------------------------------------------------------------------
 
 #[test]
-fn openai_proxy_example_forwards_to_backend() {
+fn openai_responses_proxy_example_forwards_to_backend() {
     let backend_guard = start_backend_with_shutdown("inference-ok");
     let proxy_port = free_port();
 
@@ -38,7 +38,7 @@ fn openai_proxy_example_forwards_to_backend() {
 }
 
 #[test]
-fn openai_proxy_example_preserves_json_response() {
+fn openai_responses_proxy_example_preserves_json_response() {
     let json_response = r#"{"id":"resp_abc","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"Hi!"}]}]}"#;
     let backend_guard = start_backend_with_shutdown(json_response);
     let proxy_port = free_port();
@@ -62,7 +62,7 @@ fn openai_proxy_example_preserves_json_response() {
 }
 
 #[test]
-fn openai_proxy_example_preserves_native_conversation() {
+fn openai_responses_proxy_example_preserves_native_conversation() {
     let backend_guard = start_capturing_backend("inference-ok");
     let proxy_port = free_port();
 
@@ -85,7 +85,7 @@ fn openai_proxy_example_preserves_native_conversation() {
 }
 
 #[test]
-fn openai_proxy_example_rejects_prompt_templates_for_generic_backend() {
+fn openai_responses_proxy_example_rejects_prompt_templates_for_generic_backend() {
     let backend_guard = start_backend_with_shutdown("must-not-be-contacted");
     let proxy_port = free_port();
 
@@ -137,7 +137,7 @@ filter_chains:
               application_provider: "openai"
             endpoints:
               - "127.0.0.1:{}"
-      - filter: openai_proxy
+      - filter: openai_responses_proxy
 insecure_options:
   allow_private_endpoints: true
 "#,
@@ -162,7 +162,7 @@ insecure_options:
 }
 
 #[test]
-fn openai_proxy_example_forwards_subresource_paths() {
+fn openai_responses_proxy_example_forwards_subresource_paths() {
     let backend_guard = start_backend_with_shutdown("subresource-ok");
     let proxy_port = free_port();
 

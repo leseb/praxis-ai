@@ -621,7 +621,7 @@ impl HttpFilter for McpToolResolveFilter {
         // `TerminalResponse` returned from a body-phase hook is discarded as
         // `Continue`. Consuming the stash exactly once yields the terminal SSE;
         // routing it through the response phase lets `openai_stream_events` and
-        // `openai_store` observe and persist the failed response.
+        // `openai_responses_store` observe and persist the failed response.
         Ok(consume_pending_list_tools_failure(ctx).unwrap_or(FilterAction::Continue))
     }
 
@@ -1150,7 +1150,7 @@ struct PendingListToolsFailure {
     /// synthesized failure snapshot. Captured here -- rather than read from
     /// `ResponsesState` in the header phase -- so the caller's real options are
     /// echoed even in a pipeline without
-    /// `openai_validate`/`openai_rehydrate` (which never
+    /// `openai_responses_validate`/`openai_responses_rehydrate` (which never
     /// builds that state), and so a large `instructions`/`metadata` cannot be
     /// amplified across the snapshots. `None` when the body is unparseable,
     /// carries no echoable field, or the whitelisted subset exceeds
@@ -1266,7 +1266,7 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
 /// to callers; the terminal `response.failed` event carries the request failure
 /// instead. Emitting as a `TerminalResponse` (rather than `Reject`) runs the
 /// already-executed request-phase filters on the response path, so
-/// `openai_stream_events` accumulates the failure and `openai_store`
+/// `openai_stream_events` accumulates the failure and `openai_responses_store`
 /// persists it for later retrieval when `store` is enabled.
 #[expect(
     clippy::too_many_lines,
@@ -1282,9 +1282,9 @@ fn build_list_tools_failure_response(
     // Effective storage mirrors the store filter's own gate exactly: persist
     // unless the caller set `store: false`. Explicit-true and omitted both store
     // (the OpenAI default). `openai_stream_events` accumulates this failure into
-    // `ResponsesState` and `openai_store` persists it, so this flag must
+    // `ResponsesState` and `openai_responses_store` persists it, so this flag must
     // match what the caller observes on retrieval.
-    let store = ctx.get_metadata("openai_format.store") != Some("false");
+    let store = ctx.get_metadata("openai_responses_format.store") != Some("false");
     let response_id = ctx
         .get_metadata("responses.response_id")
         .or_else(|| {
@@ -1304,7 +1304,7 @@ fn build_list_tools_failure_response(
     // or streamed failure reports the same configuration a real Responses object
     // would. Sourcing them from the captured descriptor -- rather than
     // `ResponsesState.request_body` -- keeps fidelity correct even in a pipeline
-    // without `openai_validate`/`openai_rehydrate` (which
+    // without `openai_responses_validate`/`openai_responses_rehydrate` (which
     // never builds that state), and bounds the size so a large
     // `instructions`/`metadata` is not amplified across the snapshots. `None` (no
     // echoable field, or over the cap) falls back to API defaults.
@@ -1314,7 +1314,7 @@ fn build_list_tools_failure_response(
     // even when no `ResponsesState` was built (e.g. no validate/rehydrate in the
     // pipeline); fall back to the captured options, then to an empty string.
     let model = ctx
-        .get_metadata("openai_format.model")
+        .get_metadata("openai_responses_format.model")
         .or_else(|| {
             options
                 .and_then(|body| body.get("model"))
@@ -1433,7 +1433,7 @@ fn build_list_tools_failure_response(
     );
 
     // Publish the terminal failed resource directly into the shared state so
-    // `openai_store` can persist it. Streaming persistence reads
+    // `openai_responses_store` can persist it. Streaming persistence reads
     // `ResponsesState.response_object`, which is normally populated by
     // `openai_stream_events` accumulating the terminal frame on the response
     // phase. But this filter's short-circuiting `TerminalResponse` means any
@@ -1441,9 +1441,9 @@ fn build_list_tools_failure_response(
     // cannot rely on `openai_stream_events` to populate the field:
     //   * In `agentic-loop.yaml`, `openai_stream_events` is nested in the iterative_request_router that follows this
     //     filter, so it never runs.
-    //   * A pipeline with `openai_store` + this filter but without `openai_validate`/`openai_rehydrate` never builds a
-    //     `ResponsesState` up front, yet still persists purely from `response_object` (the store reads only that field,
-    //     not `request_body`).
+    //   * A pipeline with `openai_responses_store` + this filter but without
+    //     `openai_responses_validate`/`openai_responses_rehydrate` never builds a `ResponsesState` up front, yet still
+    //     persists purely from `response_object` (the store reads only that field, not `request_body`).
     // `get_or_insert_with` therefore both creates the state when absent and
     // writes the snapshot, making persistence independent of pipeline ordering
     // and of which upstream filters ran. When `openai_stream_events` *does* run
@@ -1462,7 +1462,7 @@ fn build_list_tools_failure_response(
     // of a failure, so it must pool like any normal Responses stream) and runs
     // the response-phase filters that already executed in the request phase. That
     // response-phase pass is the point: `openai_stream_events` accumulates the
-    // terminal `response.failed` into `ResponsesState` and `openai_store`
+    // terminal `response.failed` into `ResponsesState` and `openai_responses_store`
     // persists it, so a caller with `store` enabled can retrieve the failed
     // response afterwards. The failure was stashed during the body pre-read and
     // this response is built once here in the header phase, after the full request
@@ -2385,12 +2385,12 @@ impl<'a> McpToolIndex<'a> {
 ///
 /// When a state already exists (e.g. from rehydration),
 /// synchronizes `request_body`, `tools`, and `tool_choice` so
-/// downstream filters (`openai_proxy`) use the
+/// downstream filters (`openai_responses_proxy`) use the
 /// rewritten body.
 ///
 /// Skips state creation when the body carries
 /// `previous_response_id` to avoid the downstream rebuild
-/// path in `openai_proxy` which would strip it.
+/// path in `openai_responses_proxy` which would strip it.
 fn write_state(
     ctx: &mut HttpFilterContext<'_>,
     parsed: serde_json::Value,
@@ -2872,7 +2872,8 @@ fn has_mcp_tools(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Check whether the request is streaming.
 fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_format.stream").is_some_and(|v| v == "true")
+    ctx.get_metadata("openai_responses_format.stream")
+        .is_some_and(|v| v == "true")
 }
 
 /// Whether the entry carries per-entry credentials that

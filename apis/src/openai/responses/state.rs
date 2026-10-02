@@ -5,7 +5,7 @@
 //!
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
-//! validate → rehydrate → `openai_tool_parse` → `openai_proxy` →
+//! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
 //! `stream_events` → `openai_agentic_loop` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
@@ -310,9 +310,9 @@ pub(crate) enum McpApprovalState {
 
 /// Request-scoped state shared across Responses API filters.
 ///
-/// Created by `openai_validate` for every Responses API
+/// Created by `openai_responses_validate` for every Responses API
 /// create request. When `previous_response_id` is present,
-/// `openai_rehydrate` replaces it with an enriched
+/// `openai_responses_rehydrate` replaces it with an enriched
 /// version that includes conversation history. Uses
 /// [`serde_json::Value`] for flexibility while the Responses API
 /// types stabilize; can be refactored to typed structs later
@@ -361,7 +361,7 @@ pub(crate) struct ResponsesState {
     /// emitted as a *deferred, non-end-of-stream* chunk for this logical stream.
     ///
     /// #937: `openai_stream_events` defers the terminal frame until the inner
-    /// IRR stream ends, then surfaces it to the pre-IRR `openai_store`
+    /// IRR stream ends, then surfaces it to the pre-IRR `openai_responses_store`
     /// as an ordinary non-end-of-stream chunk — ahead of the empty
     /// end-of-stream callback where streaming persistence historically ran. Left
     /// uncoordinated, a client could observe `response.completed` for a record a
@@ -483,7 +483,7 @@ pub(crate) struct ResponsesState {
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
     /// history. `openai_agentic_loop` appends tool results during agentic
-    /// loops. `openai_proxy` reads this as the authoritative
+    /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
@@ -527,7 +527,7 @@ pub(crate) struct ResponsesState {
 
     /// Whether the store filter armed persistence for this exchange.
     ///
-    /// Set by `openai_store` during the request phase only after it
+    /// Set by `openai_responses_store` during the request phase only after it
     /// initializes and registers a backend AND classifies this request as one
     /// whose response will be persisted. `mcp_dispatch` reads this
     /// exchange-scoped marker before emitting an `mcp_approval_request`: unlike
@@ -546,7 +546,7 @@ pub(crate) struct ResponsesState {
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
     ///
-    /// Set in the response header phase by `openai_rehydrate`
+    /// Set in the response header phase by `openai_responses_rehydrate`
     /// (`arm_streaming_restore`) to the result of `eligible_previous_response_id_stream`:
     /// `true` only for a `200 OK`, identity-coded, validator-free event stream from
     /// a rehydrated turn carrying a caller id. The persistence source
@@ -1054,7 +1054,7 @@ impl ResponsesState {
     /// `openai_client_tool_compat` lowers rich client tools into
     /// `request_body["tools"]` **only**, leaving canonical [`Self::tools`] holding
     /// the original rich types for response-side restore. Provider-body consumers
-    /// (`openai_proxy`, `openai_responses_to_chat_completions`) must read the
+    /// (`openai_responses_proxy`, `openai_responses_to_chat_completions`) must read the
     /// outbound tools through this accessor so they translate the lowered view, not
     /// the canonical rich tools that a function-only backend cannot accept.
     ///

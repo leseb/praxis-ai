@@ -412,7 +412,7 @@ fn canonicalize_preserves_backend_previous_response_id_without_rehydration() {
 #[test]
 fn canonicalize_skips_previous_response_id_when_wire_rewrite_declined() {
     // #1150 review: for a validator-bearing or non-200 event stream,
-    // `openai_rehydrate` declines the wire rewrite and leaves the
+    // `openai_responses_rehydrate` declines the wire rewrite and leaves the
     // streamed terminal's `previous_response_id` as the backend-echoed `null`.
     // Canonicalization is the persistence source and MUST make the same decision,
     // or a later GET returns a `previous_response_id` the streamed response never
@@ -678,8 +678,8 @@ async fn on_request_rejects_streaming_responses_outside_irr() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -735,8 +735,8 @@ async fn does_not_arm_for_non_streaming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "false".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -751,8 +751,8 @@ async fn does_not_arm_for_non_responses_format() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_chat_completions".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -771,8 +771,8 @@ async fn does_not_arm_for_other_responses_routes() {
         let filter = make_filter();
         let req = make_request(method, path);
         let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-        ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-        ctx.set_metadata("openai_format.stream", "true".to_owned());
+        ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+        ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
         ctx.current_filter_id = Some(0);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
@@ -4766,8 +4766,8 @@ async fn tool_call_argument_bytes_cap_enforced() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -4811,8 +4811,8 @@ async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -4857,8 +4857,8 @@ async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -4907,8 +4907,8 @@ async fn tool_call_argument_bytes_within_limit() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -5020,8 +5020,8 @@ async fn on_request_keeps_accept_encoding_when_not_arming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "false".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -5122,8 +5122,8 @@ async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -5301,8 +5301,8 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -6664,8 +6664,8 @@ fn make_armed_context_with_filter(
 ) -> (StreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
     (filter, ctx)

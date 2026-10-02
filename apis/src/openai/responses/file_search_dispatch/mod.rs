@@ -486,7 +486,7 @@ impl HttpFilter for FileSearchDispatchFilter {
 
     fn response_body_mode(&self) -> BodyMode {
         // Declaring `Stream` keeps this filter composable in an iterative-router
-        // step with `openai_proxy`, which always advertises the
+        // step with `openai_responses_proxy`, which always advertises the
         // streaming capability and requires every response-body filter in its
         // step to use `BodyMode::Stream` (or reject streaming) rather than
         // silently buffer. The filter implements no `on_response_body`, so it is a
@@ -540,7 +540,7 @@ impl HttpFilter for FileSearchDispatchFilter {
 /// fires only while `request_body["tools"]` still carries a hosted
 /// `{"type":"file_search"}` entry, so continuation rounds (already lowered) and
 /// requests without hosted file search are no-ops. It mutates only
-/// `state.request_body` — the outbound body `openai_proxy` serializes —
+/// `state.request_body` — the outbound body `openai_responses_proxy` serializes —
 /// and leaves `state.tools`/`state.tool_choice` holding the hosted configuration
 /// the dispatcher and response normalizer read. Rejections reuse the Chat
 /// Completions translation's validation so both backends reject the same

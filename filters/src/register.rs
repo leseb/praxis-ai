@@ -323,11 +323,11 @@ fn register_vertex_filters(registry: &mut FilterRegistry) {
 fn register_openai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
+        http "openai_responses_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_model_rewrite" => praxis_ai_apis::openai::ModelRewriteFilter::from_config
+        http "openai_responses_model_rewrite" => praxis_ai_apis::openai::ModelRewriteFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -399,12 +399,12 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_validate" => praxis_ai_apis::openai::ResponsesValidateFilter::from_config
+        http "openai_responses_validate" => praxis_ai_apis::openai::ResponsesValidateFilter::from_config
     );
     #[cfg(feature = "store")]
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
+        http "openai_responses_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
     );
     #[cfg(feature = "openai-compact")]
     register_compact(registry, subrequest_client);
@@ -418,7 +418,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     #[cfg(feature = "store")]
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
+        http "openai_responses_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -426,7 +426,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
+        http "openai_responses_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -588,7 +588,7 @@ fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Optio
         .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_resolve'"));
 }
 
-/// Register `openai_compact` with the shared client when
+/// Register `openai_responses_compact` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
 #[cfg(feature = "openai-compact")]
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
@@ -597,16 +597,16 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
         let client = client.clone();
         registry
             .register(
-                "openai_compact",
+                "openai_responses_compact",
                 praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
                     praxis_ai_apis::openai::CompactFilter::from_config_with_client(config, client.clone())
                 })),
             )
-            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_compact'"));
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_responses_compact'"));
     } else {
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_compact" => praxis_ai_apis::openai::CompactFilter::from_config
+            http "openai_responses_compact" => praxis_ai_apis::openai::CompactFilter::from_config
         );
     }
 }
@@ -693,8 +693,8 @@ mod tests {
             "state_owner",
             "project_state_owner_headers",
             "callout_credentials",
-            "openai_format",
-            "openai_model_rewrite",
+            "openai_responses_format",
+            "openai_responses_model_rewrite",
             "openai_tool_parse",
             "openai_operation",
             "a2a",
@@ -717,7 +717,7 @@ mod tests {
     fn build_ai_registry_includes_responses_request_when_enabled() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
-        for name in ["openai_responses_request", "openai_validate"] {
+        for name in ["openai_responses_request", "openai_responses_validate"] {
             assert!(
                 names.contains(&name),
                 "expected {name} in registry when openai-responses is enabled"
@@ -810,8 +810,8 @@ provider:
     /// Every opt-in filter paired with whether its cargo feature is enabled.
     const OPTIONAL_FILTERS: &[(&str, bool)] = &[
         ("aws_sigv4_sign", cfg!(feature = "aws-sigv4-filter")),
-        ("openai_validate", cfg!(feature = "openai-responses")),
-        ("openai_proxy", cfg!(feature = "openai-responses")),
+        ("openai_responses_validate", cfg!(feature = "openai-responses")),
+        ("openai_responses_proxy", cfg!(feature = "openai-responses")),
         ("openai_stream_events", cfg!(feature = "openai-responses")),
         (
             "openai_responses_to_chat_completions",
@@ -823,10 +823,10 @@ provider:
         ("openai_file_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_web_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_file_resolve", cfg!(feature = "openai-file-resolve-filter")),
-        ("openai_store", cfg!(feature = "store")),
-        ("openai_rehydrate", cfg!(feature = "store")),
+        ("openai_responses_store", cfg!(feature = "store")),
+        ("openai_responses_rehydrate", cfg!(feature = "store")),
         ("openai_conversations", cfg!(feature = "openai-conversations")),
-        ("openai_compact", cfg!(feature = "openai-compact")),
+        ("openai_responses_compact", cfg!(feature = "openai-compact")),
         ("openai_mcp_tool_resolve", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_dispatch", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_streaming_selector", cfg!(feature = "openai-mcp-tools")),

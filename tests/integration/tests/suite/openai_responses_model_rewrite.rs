@@ -443,8 +443,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
-      - filter: openai_model_rewrite
+      - filter: openai_responses_format
+      - filter: openai_responses_model_rewrite
         default_model: "llama-3.3-70b"
         model_aliases:
           codex-mini-latest: "llama-3.3-70b"
@@ -475,8 +475,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
-      - filter: openai_model_rewrite
+      - filter: openai_responses_format
+      - filter: openai_responses_model_rewrite
         default_model: "llama-3.3-70b"
         model_aliases:
           codex-mini-latest: "llama-3.3-70b"
@@ -508,8 +508,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
-      - filter: openai_model_rewrite
+      - filter: openai_responses_format
+      - filter: openai_responses_model_rewrite
         default_model: "llama-3.3-70b"
         model_aliases:
           codex-mini-latest: "llama-3.3-70b"
@@ -539,8 +539,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
-      - filter: openai_model_rewrite
+      - filter: openai_responses_format
+      - filter: openai_responses_model_rewrite
         model_aliases:
           codex-mini-latest: "llama-3.3-70b"
           "codex-*": "llama-3.3-70b"

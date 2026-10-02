@@ -422,15 +422,15 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "anthropic_messages_to_chat_completions"
             | "anthropic_messages_to_chat_completions_stream"
             | "iterative_request_router"
-            | "openai_proxy"
+            | "openai_responses_proxy"
             | "path_rewrite"
-            | "openai_format"
+            | "openai_responses_format"
             | "openai_responses_request"
-            | "openai_validate"
+            | "openai_responses_validate"
             | "openai_client_tool_compat"
             | "state_owner"
-            | "openai_store"
-            | "openai_rehydrate"
+            | "openai_responses_store"
+            | "openai_responses_rehydrate"
             | "openai_stream_events"
             | "openai_tool_parse"
             | "openai_chat_completions_to_bedrock_converse"
@@ -2701,7 +2701,7 @@ mod tests {
             .expect("test filter config should parse")
         };
         let safe_config: Config = parse_config(
-            "      - filter: openai_format\n      - filter: openai_validate\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_store\n      - filter: openai_rehydrate\n      - filter: openai_stream_events\n      - filter: openai_responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_responses_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: openai_responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 

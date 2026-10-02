@@ -132,7 +132,7 @@ pub(crate) fn is_responses_create(method: &http::Method, path: &str) -> bool {
 /// Returns `true` only for `POST /v1/chat/completions`. Kept separate from
 /// [`is_responses_create`] so Responses API filters keep their current endpoint
 /// semantics; only filters that are genuinely endpoint-agnostic, such as
-/// `openai_model_rewrite`, accept both.
+/// `openai_responses_model_rewrite`, accept both.
 pub(crate) fn is_chat_completions_create(method: &http::Method, path: &str) -> bool {
     method == http::Method::POST && path == "/v1/chat/completions"
 }

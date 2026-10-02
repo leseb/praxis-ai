@@ -241,8 +241,8 @@ const RESERVED_HOSTED_TOOL_NAMES: [&str; 2] = ["file_search", "web_search"];
 /// serialized, and restores after the upstream body is captured and before the
 /// agentic loop parses it. The outbound serializer is either:
 ///
-/// - `openai_proxy` for a native Responses backend — the proxy serializes its body from `state.request_body`, which
-///   already holds the lowered tools; or
+/// - `openai_responses_proxy` for a native Responses backend — the proxy serializes its body from `state.request_body`,
+///   which already holds the lowered tools; or
 /// - `openai_responses_to_chat_completions` for a function-only **Chat Completions** backend (§ issue #1206) — r2c
 ///   reads the outbound tools through `ResponsesState::request_tools` / `request_tool_choice`, which return the lowered
 ///   `request_body` view, so the backend receives valid `function` declarations while canonical `state.tools` stays
@@ -488,7 +488,7 @@ impl HttpFilter for ClientToolCompatFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         // Lowering mutates `ResponsesState`; the outbound body is serialized by
-        // `openai_proxy`. The raw request bytes are not needed here.
+        // `openai_responses_proxy`. The raw request bytes are not needed here.
         BodyAccess::ReadOnly
     }
 
@@ -716,7 +716,7 @@ fn restore_request_tools_and_choice(state: &mut ResponsesState, tools: Vec<Value
 /// Return the client's stream preference: the classifier metadata first, falling
 /// back to the request body's `stream` flag.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_format.stream").map_or_else(
+    ctx.get_metadata("openai_responses_format.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()

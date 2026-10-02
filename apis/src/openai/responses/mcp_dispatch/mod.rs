@@ -1016,7 +1016,9 @@ async fn discover_pending_connectors(
     {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
-            let streaming = ctx.get_metadata("openai_format.stream").is_some_and(|v| v == "true");
+            let streaming = ctx
+                .get_metadata("openai_responses_format.stream")
+                .is_some_and(|v| v == "true");
             Ok(resolve_error_action(ctx, &err, streaming, body))
         },
     }

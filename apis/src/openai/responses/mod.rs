@@ -21,7 +21,7 @@
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
 //!
-//! The `openai_validate` filter runs after the classifier
+//! The `openai_responses_validate` filter runs after the classifier
 //! to validate JSON syntax, reject conflicting history selectors, and
 //! extract additional fields without rejecting provider-owned parameter
 //! combinations.
@@ -298,13 +298,13 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_format
+/// filter: openai_responses_format
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_format
+/// filter: openai_responses_format
 /// on_invalid: continue
 /// headers:
 ///   format: x-praxis-ai-format
@@ -326,8 +326,8 @@ impl ResponsesFormatFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ResponsesFormatConfig = parse_filter_config("openai_format", config)?;
-        let validated = build_config("openai_format", cfg)?;
+        let cfg: ResponsesFormatConfig = parse_filter_config("openai_responses_format", config)?;
+        let validated = build_config("openai_responses_format", cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
 }
@@ -335,7 +335,7 @@ impl ResponsesFormatFilter {
 #[async_trait]
 impl HttpFilter for ResponsesFormatFilter {
     fn name(&self) -> &'static str {
-        "openai_format"
+        "openai_responses_format"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -391,7 +391,7 @@ impl HttpFilter for ResponsesFormatFilter {
 
         write_metadata(ctx, &classified, mode);
         promote_headers(ctx, &classified, &self.config, mode);
-        promote_filter_results(ctx, "openai_format", &classified, mode)?;
+        promote_filter_results(ctx, "openai_responses_format", &classified, mode)?;
 
         Ok(FilterAction::Release)
     }
@@ -512,12 +512,12 @@ fn compute_mode(classified: &ClassifiedRequest) -> Option<&'static str> {
 
 /// Write durable metadata that persists across all Pingora lifecycle phases.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest, mode: Option<&str>) {
-    ctx.set_metadata("openai_format.format", classified.format.as_str());
+    ctx.set_metadata("openai_responses_format.format", classified.format.as_str());
     write_optional_metadata(ctx, classified);
     write_boolean_metadata(ctx, classified);
 
     if let Some(m) = mode {
-        ctx.set_metadata("openai_format.mode", m);
+        ctx.set_metadata("openai_responses_format.mode", m);
     }
 }
 
@@ -526,39 +526,45 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.set_metadata("openai_format.model", model.clone());
+        ctx.set_metadata("openai_responses_format.model", model.clone());
     }
 
     if let Some(stream) = classified.stream {
-        ctx.set_metadata("openai_format.stream", if stream { "true" } else { "false" });
+        ctx.set_metadata("openai_responses_format.stream", if stream { "true" } else { "false" });
     }
 
     if let Some(store) = classified.store {
-        ctx.set_metadata("openai_format.store", if store { "true" } else { "false" });
+        ctx.set_metadata("openai_responses_format.store", if store { "true" } else { "false" });
     }
 
     if let Some(background) = classified.background {
-        ctx.set_metadata("openai_format.background", if background { "true" } else { "false" });
+        ctx.set_metadata(
+            "openai_responses_format.background",
+            if background { "true" } else { "false" },
+        );
     }
 
     if let Some(max_output_tokens) = classified.max_output_tokens {
-        ctx.set_metadata("openai_format.max_output_tokens", max_output_tokens.to_string());
+        ctx.set_metadata(
+            "openai_responses_format.max_output_tokens",
+            max_output_tokens.to_string(),
+        );
     }
 }
 
 /// Write boolean presence flags to metadata.
 fn write_boolean_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     if classified.has_previous_response_id {
-        ctx.set_metadata("openai_format.has_previous_response_id", "true");
+        ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
     }
     if classified.has_conversation {
-        ctx.set_metadata("openai_format.has_conversation", "true");
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
     }
     if classified.has_tools {
-        ctx.set_metadata("openai_format.has_tools", "true");
+        ctx.set_metadata("openai_responses_format.has_tools", "true");
     }
     if classified.has_prompt_id {
-        ctx.set_metadata("openai_format.has_prompt_id", "true");
+        ctx.set_metadata("openai_responses_format.has_prompt_id", "true");
     }
 }
 

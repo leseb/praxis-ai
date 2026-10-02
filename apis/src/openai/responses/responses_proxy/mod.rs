@@ -93,13 +93,13 @@ use crate::{classifier::is_responses_create, json_body::SerializedJson};
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_proxy
+/// filter: openai_responses_proxy
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_proxy
+/// filter: openai_responses_proxy
 /// max_rewritten_body_bytes: 67108864
 /// ```
 ///
@@ -110,7 +110,7 @@ use crate::{classifier::is_responses_create, json_body::SerializedJson};
 ///
 /// let yaml = serde_yaml::Value::Null;
 /// let filter = ResponsesProxyFilter::from_config(&yaml).unwrap();
-/// assert_eq!(filter.name(), "openai_proxy");
+/// assert_eq!(filter.name(), "openai_responses_proxy");
 /// ```
 pub struct ResponsesProxyFilter {
     /// Parsed and validated configuration.
@@ -147,7 +147,7 @@ impl ResponsesProxyFilter {
         let cfg: ResponsesProxyConfig = if config.is_null() {
             ResponsesProxyConfig::default()
         } else {
-            parse_filter_config("openai_proxy", config)?
+            parse_filter_config("openai_responses_proxy", config)?
         };
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
@@ -160,7 +160,7 @@ impl ResponsesProxyFilter {
         preserve_native_compaction: bool,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let serialized = serialize_outbound_body(state, preserve_native_compaction)
-            .map_err(|e| -> FilterError { format!("openai_proxy: {e}").into() })?;
+            .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
             debug!(
                 body_bytes = serialized.len(),
@@ -200,7 +200,7 @@ impl ResponsesProxyFilter {
         preserve_native_compaction: bool,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let members = scan_top_level_object(body).map_err(|error| -> FilterError {
-            format!("openai_proxy: invalid selected request body: {error}").into()
+            format!("openai_responses_proxy: invalid selected request body: {error}").into()
         })?;
         let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
             state.messages.get(state.provider_history_len..).unwrap_or_default()
@@ -271,13 +271,13 @@ impl ResponsesProxyFilter {
         let input_replacement = serde_json::to_vec(
             messages_for_backend(messages, preserve_native_compaction, provider_compaction_ids.as_ref()).as_ref(),
         )
-        .map_err(|error| -> FilterError { format!("openai_proxy: {error}").into() })?;
+        .map_err(|error| -> FilterError { format!("openai_responses_proxy: {error}").into() })?;
         let stream_replacement = state
             .request_body
             .get("stream")
             .map(serde_json::to_vec)
             .transpose()
-            .map_err(|error| -> FilterError { format!("openai_proxy: {error}").into() })?;
+            .map_err(|error| -> FilterError { format!("openai_responses_proxy: {error}").into() })?;
 
         let mut serialized = Vec::with_capacity(body.len());
         serialized.push(b'{');
@@ -401,13 +401,13 @@ fn selected_state_field(state: &ResponsesState, field: TopLevelField) -> Result<
     };
     serde_json::to_vec(value)
         .map(Some)
-        .map_err(|error| format!("openai_proxy: {error}").into())
+        .map_err(|error| format!("openai_responses_proxy: {error}").into())
 }
 
 /// Borrow a validated byte range from the selected request body.
 fn selected_body_slice(body: &[u8], start: usize, end: usize) -> Result<&[u8], FilterError> {
     body.get(start..end)
-        .ok_or_else(|| "openai_proxy: invalid selected request body range".into())
+        .ok_or_else(|| "openai_responses_proxy: invalid selected request body range".into())
 }
 
 /// Parse only the selected body's `input` member for reconciliation.
@@ -418,8 +418,9 @@ fn selected_input_messages(
     let Some(member) = members.iter().rev().find(|member| member.name == TopLevelField::Input) else {
         return Ok(None);
     };
-    let value = serde_json::from_slice(selected_body_slice(body, member.value_start, member.value_end)?)
-        .map_err(|error| -> FilterError { format!("openai_proxy: invalid selected input: {error}").into() })?;
+    let value = serde_json::from_slice(selected_body_slice(body, member.value_start, member.value_end)?).map_err(
+        |error| -> FilterError { format!("openai_responses_proxy: invalid selected input: {error}").into() },
+    )?;
     Ok(Some(normalize_input_owned(value)))
 }
 
@@ -587,7 +588,7 @@ fn scan_json_value(body: &[u8], start: usize) -> Result<usize, &'static str> {
 #[async_trait]
 impl HttpFilter for ResponsesProxyFilter {
     fn name(&self) -> &'static str {
-        "openai_proxy"
+        "openai_responses_proxy"
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
@@ -682,7 +683,7 @@ impl HttpFilter for ResponsesProxyFilter {
         let serialized = match self.serialize_selected_body(current_body, state, preserve_native_compaction)? {
             Ok(bytes) => bytes,
             Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
-            Err(_) => return Err("openai_proxy: invalid selected-upstream body outcome".into()),
+            Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
         };
 
         if let Some(limit) = effective_request_body_limit(ctx)

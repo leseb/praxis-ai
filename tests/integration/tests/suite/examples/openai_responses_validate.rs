@@ -16,7 +16,7 @@ use praxis_test_utils::{
 // -----------------------------------------------------------------------------
 
 #[test]
-fn openai_validate_example_forwards_valid_responses_request() {
+fn openai_responses_validate_example_forwards_valid_responses_request() {
     let backend_guard = start_backend_with_shutdown("ok");
     let proxy_port = free_port();
 
@@ -37,7 +37,7 @@ fn openai_validate_example_forwards_valid_responses_request() {
 }
 
 #[test]
-fn openai_validate_example_rejects_streaming_background_before_upstream() {
+fn openai_responses_validate_example_rejects_streaming_background_before_upstream() {
     let backend_guard = start_backend_with_shutdown("unexpected-upstream-request");
     let proxy_port = free_port();
 
@@ -58,7 +58,7 @@ fn openai_validate_example_rejects_streaming_background_before_upstream() {
 }
 
 #[test]
-fn openai_validate_example_accepts_minimal_request() {
+fn openai_responses_validate_example_accepts_minimal_request() {
     let backend_guard = start_backend_with_shutdown("ok");
     let proxy_port = free_port();
 
@@ -177,8 +177,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_format
-      - filter: openai_validate
+      - filter: openai_responses_format
+      - filter: openai_responses_validate
       - filter: router
         routes:
           - path_prefix: "/"
