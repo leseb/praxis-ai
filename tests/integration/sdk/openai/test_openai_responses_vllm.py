@@ -829,6 +829,9 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                 type(self).forwarded_bodies.append(request_body)
             except json.JSONDecodeError:
                 pass
+        if request_body and request_body.get("background") is True:
+            self._send_background_response(request_body)
+            return
         if request_body and request_body.get("model") in {
             "sdk-conversation-stream",
             "sdk-conversation-tool-stream",
@@ -859,6 +862,49 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+
+    def _send_background_response(self, request_body):
+        """Serve a provider-owned background create response."""
+        response = {
+            "id": f"resp_sdk_background_{time.time_ns()}",
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": request_body.get("model", "gpt-5"),
+            "status": "queued",
+            "background": True,
+            "output": [],
+        }
+
+        if request_body.get("stream"):
+            created = {**response, "status": "in_progress"}
+            completed = {**response, "status": "completed"}
+            events = [
+                {
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": created,
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": completed,
+                },
+            ]
+            payload = b"".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in events
+            ) + b"data: [DONE]\n\n"
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
 
     def _send_conversation_response(self, request_body):
         """Serve native Responses without a model so append/hydration is deterministic."""
@@ -3352,6 +3398,46 @@ class TestOpenAIResponsesVLLM:
             "message": "background mode is not supported",
             "param": None,
             "type": "invalid_request_error",
+        }
+
+    def test_openai_bound_background_create_and_stream(self, witness_backend_client):
+        """The stock full-flow pipeline preserves OpenAI-owned background creates."""
+        client, forwarded = witness_backend_client
+
+        queued = client.responses.create(
+            model="gpt-5",
+            input="SDK finite background passthrough",
+            background=True,
+            store=True,
+        )
+        assert queued.status == "queued"
+        assert queued.background is True
+
+        stream = client.responses.create(
+            model="gpt-5",
+            input="SDK streaming background passthrough",
+            background=True,
+            store=True,
+            stream=True,
+        )
+        events = list(stream)
+        assert [event.type for event in events] == [
+            "response.created",
+            "response.completed",
+        ]
+        streamed = events[-1].response
+        assert streamed.status == "completed"
+        assert streamed.background is True
+
+        background_creates = [
+            body
+            for body in forwarded
+            if body.get("background") is True and body.get("model") == "gpt-5"
+        ]
+        assert len(background_creates) == 2
+        assert {body.get("stream", False) for body in background_creates} == {
+            False,
+            True,
         }
 
     @pytest.mark.critical_vllm
@@ -8416,7 +8502,10 @@ class _FileUrlStubHandler(BaseHTTPRequestHandler):
     credentialed outbound chain never runs for client-supplied URLs.
     """
 
+    requests: ClassVar[int] = 0
+
     def do_GET(self):
+        type(self).requests += 1
         if self.headers.get("x-file-callout") is not None:
             self.send_response(403)
             self.end_headers()
@@ -8491,6 +8580,7 @@ def file_resolve_stub_env(tmp_path_factory, request):
     ``(client, files_stub, backend, file_url)``.
     """
     _FilesApiStubHandler.callout_headers = []
+    _FileUrlStubHandler.requests = 0
     _FileResolveBackendHandler.captured = []
 
     files_port = _free_port()
@@ -8604,6 +8694,44 @@ class TestFileResolveOutboundChain:
         assert files_stub.callout_headers, "Files API stub should receive callouts"
         assert all(h == "file-resolve" for h in files_stub.callout_headers), (
             files_stub.callout_headers
+        )
+
+    def test_repeated_file_references_reuse_source_specific_cache(
+        self, file_resolve_stub_env
+    ):
+        client, files_stub, backend, file_url = file_resolve_stub_env
+
+        response = client.responses.create(
+            model="gpt-4.1",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": _FILE_RESOLVE_ID},
+                        {"type": "input_file", "file_id": _FILE_RESOLVE_ID},
+                        {"type": "input_file", "file_url": file_url},
+                        {"type": "input_file", "file_url": file_url},
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        assert response.status == "completed", "file resolution should complete"
+        assert len(backend.captured) == 1, "one Responses request should reach the backend"
+        content = backend.captured[0]["input"][0]["content"]
+        assert [part["file_data"] for part in content] == [
+            _FILE_RESOLVE_B64,
+            _FILE_RESOLVE_B64,
+            f"data:text/plain;base64,{_FILE_RESOLVE_B64}",
+            f"data:text/plain;base64,{_FILE_RESOLVE_B64}",
+        ], "repeated file IDs and URLs should inline in input order"
+        assert len(files_stub.callout_headers) == 2, (
+            "one metadata and one content fetch should serve both file_id parts"
+        )
+        assert _FileUrlStubHandler.requests == 1, (
+            "repeated file_url parts should share one fetch"
         )
 
 
