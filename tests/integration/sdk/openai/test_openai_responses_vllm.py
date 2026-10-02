@@ -1291,6 +1291,7 @@ def _write_witness_config(
     backend_port: int,
     search_port: int | None = None,
     max_event_bytes: int | None = None,
+    openai_owns_responses: bool = False,
 ) -> str:
     """Patch full-flow-agentic.yaml to route the native backend through the shim.
 
@@ -1305,6 +1306,18 @@ def _write_witness_config(
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
+    if openai_owns_responses:
+        managed_fallback = (
+            '          - path_prefix: "/v1/responses"\n'
+            "            headers:\n"
+            '              x-praxis-ai-format: "openai_responses"\n'
+            '            cluster: "inference-backend"\n'
+        )
+        assert config.count(managed_fallback) == 1
+        config = config.replace(
+            managed_fallback,
+            managed_fallback.replace("inference-backend", "openai-responses-backend"),
+        )
     if search_port is not None:
         search_anchor = "api_key: test-key\n                # Require the per-user key"
         assert config.count(search_anchor) == 1
@@ -1325,56 +1338,6 @@ def _write_witness_config(
 
     path = _persist_config(config)
     return path
-
-
-def _write_openai_background_passthrough_config(
-    praxis_port: int, db_path: str, backend_port: int
-) -> str:
-    """Build a provider-bound passthrough whose lifecycle owner is OpenAI."""
-    config = f"""
-listeners:
-  - name: ai-gateway
-    address: "127.0.0.1:{praxis_port}"
-    filter_chains: [responses-pipeline]
-
-filter_chains:
-  - name: responses-pipeline
-    filters:
-      - filter: openai_responses_format
-      - filter: state_owner
-        mode: single_tenant
-        tenant_id: default
-      - filter: router
-        routes:
-          - path_prefix: "/v1/responses"
-            cluster: openai
-      - filter: openai_responses_validate
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
-      - filter: openai_response_store
-        backend: sqlite
-        database_url: "sqlite://responses.db?mode=rwc"
-        responses_table: openai_responses
-        conversations_table: openai_conversations
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
-      - filter: load_balancer
-        cluster_source: bound_upstream
-        clusters:
-          - name: openai
-            http:
-              application_provider: openai
-            endpoints:
-              - "127.0.0.1:{backend_port}"
-
-insecure_options:
-  allow_private_endpoints: true
-"""
-    return _persist_config(_patch_store_backend(config, db_path))
 
 
 def _write_agentic_config(
@@ -1836,7 +1799,11 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
 
 
 def _witness_proxy_session(
-    tmp_path_factory, request, search_port=None, max_event_bytes=None
+    tmp_path_factory,
+    request,
+    search_port=None,
+    max_event_bytes=None,
+    openai_owns_responses=False,
 ):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
@@ -1857,7 +1824,12 @@ def _witness_proxy_session(
     db_dir = tmp_path_factory.mktemp("responses-witness")
     db_path = str(db_dir / "responses.db")
     config_path = _write_witness_config(
-        port, db_path, backend_port, search_port, max_event_bytes
+        port,
+        db_path,
+        backend_port,
+        search_port=search_port,
+        max_event_bytes=max_event_bytes,
+        openai_owns_responses=openai_owns_responses,
     )
     binary = _find_binary()
 
@@ -1901,65 +1873,13 @@ def _witness_proxy_session(
 
 
 @pytest.fixture()
-def openai_background_passthrough_client(tmp_path_factory, request):
-    """SDK client whose create and lifecycle requests share one OpenAI owner."""
-    ResponsesWitnessHandler.forwarded_bodies = []
-    forwarded = ResponsesWitnessHandler.forwarded_bodies
-    backend_port = _free_port()
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", backend_port), ResponsesWitnessHandler
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-
-    port = _free_port()
-    db_dir = tmp_path_factory.mktemp("openai-background-passthrough")
-    config_path = _write_openai_background_passthrough_config(
-        port, str(db_dir / "responses.db"), backend_port
-    )
-    binary = _find_binary()
-    log_path = str(db_dir / "praxis.log")
-    log_file = open(log_path, "w")
-    started = False
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-    )
-    try:
-        _wait_for_proxy(port, proc, log_path)
-        started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            max_retries=0,
-            timeout=300,
-        )
-        yield client, forwarded
-    finally:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        log_file.close()
-        server.shutdown()
-        thread.join()
-        if not started or request.session.testsfailed > 0:
-            with open(log_path) as handle:
-                print(
-                    "\n=== OpenAI background passthrough Praxis logs ===\n"
-                    f"{handle.read()}",
-                    file=sys.stderr,
-                )
-        os.unlink(config_path)
-
-
-@pytest.fixture()
 def witness_backend_client(tmp_path_factory, request):
-    """Function-scoped witness proxy with the stock rehydrate config."""
-    yield from _witness_proxy_session(tmp_path_factory, request)
+    """Function-scoped full-flow witness proxy."""
+    yield from _witness_proxy_session(
+        tmp_path_factory,
+        request,
+        openai_owns_responses=getattr(request, "param", False),
+    )
 
 
 @pytest.fixture()
@@ -3537,11 +3457,16 @@ class TestOpenAIResponsesVLLM:
             "type": "invalid_request_error",
         }
 
-    def test_openai_bound_background_create_stream_and_poll(
-        self, openai_background_passthrough_client
+    @pytest.mark.parametrize(
+        "witness_backend_client",
+        [pytest.param(True, id="openai-owns-responses")],
+        indirect=True,
+    )
+    def test_openai_bound_background_create_stream_poll_and_cancel(
+        self, witness_backend_client
     ):
         """The official SDK observes the provider-owned lifecycle unchanged."""
-        client, forwarded = openai_background_passthrough_client
+        client, forwarded = witness_backend_client
 
         queued = client.responses.create(
             model="gpt-5",
