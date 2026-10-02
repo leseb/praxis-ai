@@ -588,7 +588,12 @@ fn chunk_bytes(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, clippy::too_many_lines, reason = "tests")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
     use crate::bedrock::eventstream::build_frame;
