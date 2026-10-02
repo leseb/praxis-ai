@@ -531,12 +531,14 @@ fn provider_aware_background_pipeline_passes_production_validation() {
 
 #[test]
 #[cfg(feature = "store-sqlite")]
-fn background_create_and_polling_are_forwarded_to_openai_provider() {
+fn background_create_polling_and_cancellation_are_forwarded_to_openai_provider() {
     let backend = StatefulCapturingBackend::new(vec![
         (200, r#"{"id":"resp_background","status":"queued"}"#.to_owned()),
         (200, r#"{"id":"resp_background","status":"completed"}"#.to_owned()),
+        (200, r#"{"id":"resp_background","status":"cancelled"}"#.to_owned()),
         (200, r#"{"id":"resp_background","status":"queued"}"#.to_owned()),
         (200, r#"{"id":"resp_background","status":"completed"}"#.to_owned()),
+        (200, r#"{"id":"resp_background","status":"cancelled"}"#.to_owned()),
     ])
     .start_with_shutdown();
     let temp = tempfile::tempdir().unwrap();
@@ -573,6 +575,20 @@ fn background_create_and_polling_are_forwarded_to_openai_provider() {
             serde_json::from_str::<serde_json::Value>(&parse_body(&poll)).unwrap()["status"],
             "completed"
         );
+
+        let cancel = format!(
+            "POST /v1/responses/resp_background/cancel HTTP/1.1\r\n\
+             Host: localhost:{proxy_port}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\
+             \r\n"
+        );
+        let cancelled = http_send(proxy.addr(), &cancel);
+        assert_eq!(parse_status(&cancelled), 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parse_body(&cancelled)).unwrap()["status"],
+            "cancelled"
+        );
     }
 
     let captured = backend.requests();
@@ -591,6 +607,14 @@ fn background_create_and_polling_are_forwarded_to_openai_provider() {
             .count(),
         2,
         "polling must reach the same OpenAI lifecycle owner"
+    );
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|request| { request.method == "POST" && request.uri == "/v1/responses/resp_background/cancel" })
+            .count(),
+        2,
+        "cancellation must reach the same OpenAI lifecycle owner"
     );
 }
 

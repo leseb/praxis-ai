@@ -62,7 +62,10 @@ struct OpenaiResponsesValidateConfig {}
 /// provider-owned field.
 ///
 /// Must be placed after `openai_responses_format` or
-/// `openai_responses_request` in the filter chain.
+/// `openai_responses_request` in the filter chain. After
+/// `openai_responses_request`, it is a required fail-closed lifecycle guard and
+/// may only be unconditional or exempt an OpenAI-bound upstream with
+/// `unless bound_upstream.application_provider: openai`.
 /// Skips non-Responses API requests (those not classified as
 /// `openai_responses`).
 ///

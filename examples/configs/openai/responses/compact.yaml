@@ -55,6 +55,8 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
+      - filter: openai_responses_validate
+
       - filter: openai_tool_parse
 
       - filter: state_owner

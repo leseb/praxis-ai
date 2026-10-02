@@ -838,6 +838,15 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             self._send_background_response(None, response_id=response_id)
             return
 
+        if self.command == "POST" and self.path.startswith(
+            "/v1/responses/resp_sdk_background_"
+        ) and self.path.endswith("/cancel"):
+            response_id = self.path.rsplit("/", 2)[-2]
+            self._send_background_response(
+                None, response_id=response_id, status="cancelled"
+            )
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         request_body = None
@@ -881,7 +890,9 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                         self.wfile.flush()
 
-    def _send_background_response(self, request_body, *, response_id=None):
+    def _send_background_response(
+        self, request_body, *, response_id=None, status=None
+    ):
         """Serve a provider-owned background create or retrieval lifecycle."""
         response_id = response_id or f"resp_sdk_background_{time.time_ns()}"
         model = request_body.get("model", "gpt-5") if request_body else "gpt-5"
@@ -890,7 +901,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             "object": "response",
             "created_at": int(time.time()),
             "model": model,
-            "status": "completed" if request_body is None else "queued",
+            "status": status or ("completed" if request_body is None else "queued"),
             "background": True,
             "output": [],
         }
@@ -3543,6 +3554,9 @@ class TestOpenAIResponsesVLLM:
         completed = client.responses.retrieve(queued.id)
         assert completed.status == "completed"
         assert completed.id == queued.id
+        cancelled = client.responses.cancel(queued.id)
+        assert cancelled.status == "cancelled"
+        assert cancelled.id == queued.id
 
         stream = client.responses.create(
             model="gpt-5",

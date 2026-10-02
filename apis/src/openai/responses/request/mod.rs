@@ -67,10 +67,10 @@ const FILTER_NAME: &str = "openai_responses_request";
 ///
 /// Replaces the classification, parsing, and state-initialization work of the
 /// `openai_responses_format` and `openai_responses_validate` pair.
-/// Configuration is unchanged from `openai_responses_format`. Pipelines that
-/// enforce background lifecycle policy retain a following
-/// `openai_responses_validate`, which does not parse initialized create state
-/// again.
+/// Configuration is unchanged from `openai_responses_format`. This filter must
+/// be top-level, before any `iterative_request_router`. A following
+/// `openai_responses_validate` is required as the background lifecycle guard;
+/// it does not parse initialized create state again.
 ///
 /// The operation is recognized from the request head, and the registry decides
 /// which operations carry a body worth parsing: create, compact, and input
@@ -79,8 +79,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
 /// Preserves `background=true` and publishes it under the existing
-/// `openai_responses_format` and `responses` metadata namespaces. A following
-/// `openai_responses_validate` filter owns any request-scoped rejection.
+/// `openai_responses_format` and `responses` metadata namespaces. The required
+/// following `openai_responses_validate` filter owns request-scoped rejection.
 ///
 /// Promotes `openai_responses_format.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates

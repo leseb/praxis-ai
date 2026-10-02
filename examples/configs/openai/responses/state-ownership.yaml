@@ -46,6 +46,8 @@ filter_chains:
         # on_invalid still governs malformed create bodies.
         on_invalid: continue
 
+      - filter: openai_responses_validate
+
       - filter: openai_response_store
         backend: sqlite
         database_url: "sqlite://owned-state.db?mode=rwc"

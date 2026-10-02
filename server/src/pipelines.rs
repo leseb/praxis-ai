@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry, InsecureOptions, Listener};
+use praxis_core::config::{ChainRef, Condition, Config, FailureMode, FilterEntry, InsecureOptions, Listener};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
 use praxis_tls::ClientCertMode;
@@ -179,6 +179,10 @@ fn build_listener_pipelines(
         }
         #[cfg(not(feature = "store"))]
         let _ = &gate_store_traffic;
+
+        // Pipeline construction consumes entry conditions, so validate this
+        // security contract against the original configuration first.
+        validate_responses_lifecycle_guard(listener, &entries)?;
 
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
@@ -378,6 +382,106 @@ fn validate_unconditional_closed(
         .into());
     }
     Ok(())
+}
+
+/// Keep `openai_responses_request` fail-closed for gateway-owned background
+/// lifecycle handling.
+///
+/// The request filter preserves `background=true` so provider-owned routes can
+/// forward it unchanged. Every such classifier therefore needs a later
+/// validator that either runs unconditionally or skips only an upstream bound
+/// to the OpenAI provider. Any other condition could let a managed route bypass
+/// the lifecycle guard.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks nesting, ordering, failure mode, and the sole safe provider exemption"
+)]
+fn validate_responses_lifecycle_guard(
+    listener: &Listener,
+    entries: &[FilterEntry],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if entries
+        .iter()
+        .any(|entry| config_contains_filter(&entry.config, "openai_responses_request"))
+    {
+        return Err(format!(
+            "listener '{}': openai_responses_request must be top-level; place it before iterative_request_router with a following openai_responses_validate lifecycle guard",
+            listener.name
+        )
+        .into());
+    }
+
+    for request_index in entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.filter_type == "openai_responses_request").then_some(index))
+    {
+        let validators = entries
+            .iter()
+            .skip(request_index + 1)
+            .filter(|entry| entry.filter_type == "openai_responses_validate")
+            .collect::<Vec<_>>();
+
+        if validators.is_empty() {
+            return Err(format!(
+                "listener '{}': openai_responses_request requires a following openai_responses_validate lifecycle guard",
+                listener.name
+            )
+            .into());
+        }
+        if !validators.iter().any(|entry| is_safe_responses_lifecycle_guard(entry)) {
+            return Err(format!(
+                "listener '{}': the openai_responses_validate following openai_responses_request must be fail-closed and either unconditional or conditioned only with 'unless bound_upstream.application_provider: openai'",
+                listener.name
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Search filter-specific configuration for a nested filter entry.
+///
+/// This covers IRR steps and outbound filter chains. Branch chains are typed
+/// separately and already rejected by core pipeline validation when they carry
+/// body filters.
+fn config_contains_filter(value: &serde_yaml::Value, filter_type: &str) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => mapping.iter().any(|(key, nested)| {
+            (key.as_str() == Some("filter") && nested.as_str() == Some(filter_type))
+                || config_contains_filter(nested, filter_type)
+        }),
+        serde_yaml::Value::Sequence(sequence) => sequence
+            .iter()
+            .any(|nested| config_contains_filter(nested, filter_type)),
+        _ => false,
+    }
+}
+
+/// Whether a validator covers every gateway-owned route without broadening the
+/// sole provider-owned exemption.
+fn is_safe_responses_lifecycle_guard(entry: &FilterEntry) -> bool {
+    if entry.failure_mode != FailureMode::Closed {
+        return false;
+    }
+
+    match entry.conditions.as_slice() {
+        [] => true,
+        [Condition::Unless(matcher)] => {
+            matcher.grpc.is_none()
+                && matcher.path.is_none()
+                && matcher.path_prefix.is_none()
+                && matcher.methods.is_none()
+                && matcher.headers.is_none()
+                && matcher.selected_upstream.is_none()
+                && matcher.bound_upstream.as_ref().is_some_and(|upstream| {
+                    upstream.application_protocol.is_none()
+                        && upstream.application_provider.as_deref() == Some("openai")
+                })
+        },
+        _ => false,
+    }
 }
 
 /// Run pipeline ordering validation; either fail or warn depending
@@ -874,6 +978,164 @@ filter_chains:
     }
 
     #[test]
+    fn responses_request_rejects_missing_lifecycle_guard() {
+        let (listener, entries) =
+            responses_lifecycle_parts("      - filter: openai_responses_request\n      - filter: request_id\n");
+
+        let err = validate_responses_lifecycle_guard(&listener, &entries)
+            .expect_err("a request classifier without a later lifecycle guard must fail");
+
+        assert!(err.to_string().contains("requires a following"), "{err}");
+    }
+
+    #[test]
+    fn responses_request_accepts_unconditional_lifecycle_guard() {
+        let (listener, entries) = responses_lifecycle_parts(
+            "      - filter: openai_responses_request\n      - filter: openai_responses_validate\n",
+        );
+
+        validate_responses_lifecycle_guard(&listener, &entries).expect("unconditional validator must be accepted");
+    }
+
+    #[test]
+    fn responses_request_accepts_openai_provider_exemption() {
+        let (listener, entries) = responses_lifecycle_parts(
+            r#"      - filter: openai_responses_request
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: openai
+      - filter: openai_responses_validate
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+      - filter: load_balancer
+        cluster_source: bound_upstream
+        clusters:
+          - name: openai
+            http:
+              application_provider: openai
+            endpoints: ["api.openai.com:443"]
+"#,
+        );
+
+        validate_responses_lifecycle_guard(&listener, &entries)
+            .expect("the exact OpenAI provider exemption must be accepted");
+    }
+
+    #[test]
+    fn responses_request_rejects_narrowed_or_fail_open_lifecycle_guard() {
+        for unsafe_fields in [
+            "        failure_mode: open\n",
+            "        conditions:\n          - when:\n              methods: [GET]\n",
+        ] {
+            let filters = format!(
+                "      - filter: openai_responses_request\n      - filter: openai_responses_validate\n{unsafe_fields}"
+            );
+            let (listener, entries) = responses_lifecycle_parts(&filters);
+
+            let err = validate_responses_lifecycle_guard(&listener, &entries)
+                .expect_err("a bypassable lifecycle guard must fail");
+
+            assert!(err.to_string().contains("must be fail-closed"), "{err}");
+        }
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn resolve_pipelines_rejects_bypassable_responses_lifecycle_guard() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: responses
+    address: "127.0.0.1:8080"
+    filter_chains: [responses]
+filter_chains:
+  - name: responses
+    filters:
+      - filter: openai_responses_request
+      - filter: openai_responses_validate
+        conditions:
+          - when:
+              methods: [GET]
+"#,
+        )
+        .expect("Responses lifecycle config should parse");
+        let client = test_client();
+        let registry = crate::build_full_registry(&client);
+
+        let result = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &client,
+        );
+
+        assert!(
+            result.is_err(),
+            "pipeline resolution must reject a bypassable lifecycle guard"
+        );
+        let err = result.err().expect("error was asserted");
+        assert!(err.to_string().contains("must be fail-closed"), "{err}");
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn resolve_pipelines_rejects_responses_request_nested_in_irr() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: responses
+    address: "127.0.0.1:8080"
+    filter_chains: [responses]
+filter_chains:
+  - name: responses
+    filters:
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_responses_request
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: backend
+              - filter: load_balancer
+                clusters:
+                  - name: backend
+                    endpoints: ["127.0.0.1:8000"]
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+"#,
+        )
+        .expect("nested Responses request config should parse");
+        let client = test_client();
+        let registry = crate::build_full_registry(&client);
+
+        let result = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &client,
+        );
+
+        assert!(
+            result.is_err(),
+            "pipeline resolution must reject a nested request filter"
+        );
+        let err = result.err().expect("error was asserted");
+        assert!(err.to_string().contains("must be top-level"), "{err}");
+    }
+
+    #[test]
     fn resolve_pipelines_rejects_misaligned_clusters() {
         let config = Config::from_yaml(
             r#"
@@ -1108,6 +1370,24 @@ filter_chains:
 "#
         ))
         .expect("provider boundary config should parse");
+        (config.listeners[0].clone(), config.filter_chains[0].filters.clone())
+    }
+
+    /// Parse one listener and return its Responses lifecycle entries.
+    fn responses_lifecycle_parts(filters: &str) -> (Listener, Vec<FilterEntry>) {
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: responses
+    address: "127.0.0.1:8080"
+    filter_chains: [responses]
+filter_chains:
+  - name: responses
+    filters:
+{filters}
+"#
+        ))
+        .expect("Responses lifecycle config should parse");
         (config.listeners[0].clone(), config.filter_chains[0].filters.clone())
     }
 
