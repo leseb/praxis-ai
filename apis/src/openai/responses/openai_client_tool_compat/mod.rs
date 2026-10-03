@@ -783,7 +783,7 @@ fn request_lowering_reservation(state: &ResponsesState) -> Option<usize> {
             reserve = reserve
                 .checked_add(retained_json_bytes(tool)?.checked_mul(SOURCE_COPIES)?)?
                 .checked_add(ITEM_OVERHEAD)?;
-            reserve = reserve.checked_add(namespace_fanout_reservation(tool)?)?;
+            reserve = reserve.checked_add(namespace_fanout_reservation(tool, LoweringSource::Declaration)?)?;
         }
         if let Some(choice) = state.request_body.get("tool_choice") {
             reserve = reserve.checked_add(retained_json_bytes(choice)?.checked_mul(SOURCE_COPIES)?)?;
@@ -799,11 +799,16 @@ fn request_lowering_reservation(state: &ResponsesState) -> Option<usize> {
 /// including members discovered inside a tool-search output. The source JSON
 /// contains this header only once, so its ordinary source-copy factor alone
 /// cannot bound the fanout.
-fn namespace_fanout_reservation(tool: &Value) -> Option<usize> {
+fn namespace_fanout_reservation(tool: &Value, source: LoweringSource) -> Option<usize> {
     if tool.get("type").and_then(Value::as_str) != Some("namespace") {
         return Some(0);
     }
-    let members = tool.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
+    let members = tool.get("tools").and_then(Value::as_array).map_or(0, |members| {
+        members
+            .iter()
+            .filter(|member| source == LoweringSource::Discovery || !is_deferred_declaration(member))
+            .count()
+    });
     let header = retained_json_bytes(tool.get("name").unwrap_or(&Value::Null))?
         .checked_add(retained_json_bytes(tool.get("description").unwrap_or(&Value::Null))?)?;
     header.checked_mul(members)?.checked_mul(32)
@@ -853,7 +858,7 @@ fn discovered_namespace_reservation(output: &Value) -> Option<usize> {
         .into_iter()
         .flatten()
         .try_fold(0_usize, |used, tool| {
-            used.checked_add(namespace_fanout_reservation(tool)?)
+            used.checked_add(namespace_fanout_reservation(tool, LoweringSource::Discovery)?)
         })
 }
 

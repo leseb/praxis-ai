@@ -1365,6 +1365,49 @@ async fn nonterminal_discovery_does_not_reserve_namespace_fanout() {
 }
 
 #[tokio::test]
+async fn withheld_namespace_members_do_not_reserve_description_fanout() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let members: Vec<Value> = (0..96)
+        .map(|index| json!({"type": "function", "name": format!("f{index}"), "parameters": {}, "defer_loading": true}))
+        .collect();
+    let parsed = json!({
+        "model": "m", "store": false, "input": "hi",
+        "tools": [{
+            "type": "namespace", "name": "n", "description": "d".repeat(16_384), "tools": members
+        }]
+    });
+    let raw = serde_json::to_vec(&parsed).expect("request serializes");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 1000000").unwrap();
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+    assert!(super::super::initial_budget_rejection(&ctx, &raw).is_none());
+    super::super::insert_budgeted_responses_state(&mut ctx, parsed, "resp_test").expect("initial parsed state fits");
+    let mut body = Some(Bytes::from(raw));
+    let agentic = super::super::AgenticLoopFilter::from_config(&config).unwrap();
+    assert!(matches!(
+        agentic.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.can_retain_payload(request_lowering_reservation(state).unwrap()),
+        "withheld members do not repeat the namespace description"
+    );
+    assert!(matches!(
+        filter().on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.request_body["tools"],
+        json!([]),
+        "all deferred members stay withheld"
+    );
+    assert!(state.can_retain_payload(0));
+}
+
+#[tokio::test]
 async fn already_lowered_request_does_not_reserve_original_tools_again() {
     let request = make_request(http::Method::POST, "/v1/responses");
     let parsed = json!({
