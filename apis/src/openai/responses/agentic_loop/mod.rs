@@ -1247,11 +1247,21 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
     let Some(old_usage_bytes) = super::state::retained_json_bytes(&state.usage) else {
         return false;
     };
+    let Some(incoming_usage_bytes) = response
+        .get("usage")
+        .filter(|usage| !usage.is_null())
+        .map_or(Some(0), super::state::retained_json_bytes)
+    else {
+        return false;
+    };
 
     // The parsed response and this helper's usage projection coexist with all
-    // prior-round state. Admit that construction peak before cloning usage.
+    // prior-round state. Merging can clone every incoming usage value into the
+    // projection, so reserve both the old tree and incoming values before the
+    // first allocation. The exact merged size is checked below.
     if !response_bytes
         .checked_add(old_usage_bytes)
+        .and_then(|bytes| bytes.checked_add(incoming_usage_bytes))
         .is_some_and(|bytes| state.can_retain_payload(bytes))
     {
         return false;
@@ -1265,11 +1275,15 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
         return false;
     };
     let usage_growth = new_usage_bytes.saturating_sub(old_usage_bytes);
+    // The later commit merges into state.usage while the old value and copied
+    // output items are live. Replacing an existing usage value can temporarily
+    // own the whole incoming value even when final usage barely grows.
+    let usage_commit_staging = usage_growth.max(incoming_usage_bytes);
     let mut copied_item_bytes = 0_usize;
 
     let Some(output) = response.get("output").and_then(Value::as_array) else {
         return response_bytes
-            .checked_add(usage_growth)
+            .checked_add(usage_commit_staging)
             .zip(old_response_bytes.checked_add(old_usage_bytes))
             .zip(response_bytes.checked_add(new_usage_bytes))
             .is_some_and(|((peak_added, final_removed), final_added)| {
@@ -1315,7 +1329,7 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
     // final replacement must fit independently.
     response_bytes
         .checked_add(copied_item_bytes)
-        .and_then(|bytes| bytes.checked_add(usage_growth))
+        .and_then(|bytes| bytes.checked_add(usage_commit_staging))
         .zip(old_response_bytes.checked_add(old_usage_bytes))
         .zip(
             response_bytes
