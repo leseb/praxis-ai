@@ -2710,3 +2710,23 @@ async fn default_dialect_leaves_reasoning_content_unextracted() {
     assert_eq!(output[0]["type"], "message");
     assert!(output.iter().all(|item| item["type"] != "reasoning"));
 }
+
+#[test]
+fn outbound_chat_translation_rejects_before_allocating_near_retained_limit() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi"}));
+    let message = json!({"role":"assistant", "content":"x".repeat(16_384)});
+    state.messages.push(message.clone());
+    state.persisted_messages.push(message);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    context.extensions.insert(state);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let result = filter.translated_request_bytes(&mut context).unwrap();
+    assert!(matches!(result, Err(SelectedUpstreamBodyOutcome::Reject(rejection)) if rejection.status == 502));
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}

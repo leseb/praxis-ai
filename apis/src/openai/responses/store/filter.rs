@@ -228,10 +228,11 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let response_bytes = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .and_then(|state| retained_json_bytes(&state.response_object));
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            trace!("skipping streaming persistence: no Responses state");
+            return Ok(FilterAction::Continue);
+        };
+        let response_bytes = retained_json_bytes(&state.response_object);
         if !response_bytes.is_some_and(|bytes| persistence_construction_fits(ctx, bytes)) {
             return Ok(persistence_budget_failure(ctx, true, body));
         }
@@ -2317,6 +2318,34 @@ mod encode_replay_event_tests {
         encode_replay_event, persistence_budget_failure, persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
+
+    #[test]
+    fn streaming_persistence_without_response_state_keeps_final_chunk() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from("default"),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        ctx.extensions.insert(super::ResponseStoreRequestState {
+            owner: Some(StateOwner::from_trusted_parts("t", "i", "s").unwrap()),
+            ..Default::default()
+        });
+        let frame = Bytes::from_static(b"event: response.completed\ndata: {}\n\n");
+        let mut body = Some(frame.clone());
+
+        let action = ResponseStoreFilter::persist_from_streaming_state(&mut ctx, &mut body).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, Some(frame));
+        assert_ne!(ctx.get_metadata("responses.store_stream_budget_failed"), Some("true"));
+    }
 
     /// Build a minimal event record carrying `payload` for the encoder under test.
     fn record_with_payload(event_type: &str, payload: &[u8]) -> ResponseEventRecord {

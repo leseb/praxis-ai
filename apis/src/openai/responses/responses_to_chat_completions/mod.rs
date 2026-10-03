@@ -79,6 +79,17 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 const FINITE_TRANSLATION_OVERFLOW_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during buffered Chat translation";
 
+/// Request-side error before constructing the provider-visible Chat request.
+const OUTBOUND_TRANSLATION_OVERFLOW_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during outbound Chat translation";
+
+/// A translated request may briefly own converted messages, a Chat JSON tree,
+/// and the old and new capacities of its serialized wire buffer. Eight source
+/// copies plus fixed room for synthetic hosted-tool schemas cover these owners
+/// before the first converted message is allocated.
+const OUTBOUND_TRANSLATION_SOURCE_COPIES: usize = 8;
+const OUTBOUND_TRANSLATION_FIXED_BYTES: usize = 4_096;
+
 /// One compact `{"text":"x"}` part expands to a 64-byte Responses
 /// `output_text` item. Reserve that full schema for the translated tree and
 /// both old and new wire Vec capacities at a growth boundary. Every part is a
@@ -209,12 +220,18 @@ impl ResponsesToChatCompletionsFilter {
     /// Build and size-check the owned Chat Completions request body.
     fn translated_request_bytes(
         &self,
-        ctx: &HttpFilterContext<'_>,
+        ctx: &mut HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, SelectedUpstreamBodyOutcome>, FilterError> {
+        if !outbound_translation_source_fits(ctx) {
+            return Ok(Err(outbound_translation_budget_failure(ctx)));
+        }
         let translated = match translate_canonical_state(ctx, &self.config.reasoning) {
             Ok(value) => value,
             Err(outcome) => return Ok(Err(outcome)),
         };
+        if !outbound_translation_wire_fits(ctx, &translated) {
+            return Ok(Err(outbound_translation_budget_failure(ctx)));
+        }
         let serialized = serde_json::to_vec(&translated)
             .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
@@ -635,6 +652,57 @@ fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> FilterA
         "server_error",
         FINITE_TRANSLATION_OVERFLOW_MESSAGE,
     ))
+}
+
+/// Reject a provider-bound request while it can still become an HTTP error.
+fn outbound_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstreamBodyOutcome {
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        OUTBOUND_TRANSLATION_OVERFLOW_MESSAGE,
+    ))
+}
+
+/// Bound conversion from borrowed canonical state before allocating its
+/// independently owned Chat messages and JSON tree. All source measurements
+/// stream into a byte counter rather than building another payload copy.
+fn outbound_translation_source_fits(ctx: &HttpFilterContext<'_>) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let source_bytes = (|| {
+        super::state::retained_json_bytes(&state.request_body)?
+            .checked_add(super::state::retained_json_bytes(&state.messages)?)?
+            .checked_add(super::state::retained_json_bytes(state.request_tools())?)?
+            .checked_add(super::state::retained_json_bytes(state.request_tool_choice())?)
+    })();
+    source_bytes
+        .and_then(|bytes| bytes.checked_mul(OUTBOUND_TRANSLATION_SOURCE_COPIES))
+        .and_then(|bytes| bytes.checked_add(OUTBOUND_TRANSLATION_FIXED_BYTES))
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Check the exact translated JSON size before allocating its serialized Vec.
+/// The tree and old/new Vec capacities can coexist during serialization.
+fn outbound_translation_wire_fits(ctx: &HttpFilterContext<'_>, translated: &serde_json::Value) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    super::state::retained_json_bytes(translated)
+        .and_then(|bytes| bytes.checked_mul(3))
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
 #[expect(
