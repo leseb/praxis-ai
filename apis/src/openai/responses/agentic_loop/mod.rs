@@ -1470,7 +1470,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
         return;
     };
     state.current_round_output_start = Some(state.accumulated_output.len());
-    let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
+    let mut pending_file_search: Vec<(usize, usize, SynthesisKind)> = Vec::new();
     for (round_index, item) in output.iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         state.accumulated_output.push(item.clone());
@@ -1523,6 +1523,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // `FileSearchAssignment`; openai_file_search_callout drains those
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
+                let persisted_index = state.persisted_messages.len();
                 state.persisted_messages.push(item.clone());
                 if is_pending_file_search_call(item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
@@ -1530,7 +1531,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                     } else {
                         SynthesisKind::Native
                     };
-                    pending_file_search.push((absolute_index, synthesis));
+                    pending_file_search.push((absolute_index, persisted_index, synthesis));
                 }
             },
             _ => {},
@@ -1561,36 +1562,45 @@ fn mark_provider_history(state: &mut ResponsesState) {
 /// call is terminalized to `incomplete` in place and no assignment is recorded —
 /// leaving `has_dispatchable_calls` free to exit the loop. The dispatcher applies
 /// only its independent per-continuation server cap to the recorded assignments.
-fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usize, SynthesisKind)>) {
+fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usize, usize, SynthesisKind)>) {
     if pending.is_empty() {
         return;
     }
     let candidates = pending
-        .into_iter()
-        .map(|(output_index, synthesis)| FileSearchAssignment {
-            output_index,
-            synthesis,
+        .iter()
+        .map(|(output_index, _, synthesis)| FileSearchAssignment {
+            output_index: *output_index,
+            synthesis: *synthesis,
         })
         .collect::<Vec<_>>();
     let admissions = current_round_file_search_admissions(state, &candidates);
-    for (index, assignment) in candidates.into_iter().enumerate() {
+    for (index, (assignment, (_, persisted_index, _))) in candidates.into_iter().zip(pending).enumerate() {
         let admitted = admissions.get(index).copied().unwrap_or(false);
         if admitted {
             state.file_search_assignments.push(assignment);
         } else {
-            terminalize_file_search_item(state, assignment.output_index);
+            terminalize_file_search_item(state, assignment.output_index, persisted_index);
         }
     }
 }
 
-/// Mark the `file_search_call` at `index` in `accumulated_output` `incomplete`,
-/// dropping any partial results, when it cannot be dispatched.
-fn terminalize_file_search_item(state: &mut ResponsesState, index: usize) {
-    if let Some(item) = state.accumulated_output.get_mut(index)
-        && let Some(object) = item.as_object_mut()
+/// Mark both independently retained copies of a rejected file search incomplete.
+fn terminalize_file_search_item(state: &mut ResponsesState, output_index: usize, persisted_index: usize) {
+    let mut changed = false;
+    for item in [
+        state.accumulated_output.get_mut(output_index),
+        state.persisted_messages.get_mut(persisted_index),
+    ]
+    .into_iter()
+    .flatten()
     {
-        object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
-        object.remove("results");
+        if let Some(object) = item.as_object_mut() {
+            object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
+            object.remove("results");
+            changed = true;
+        }
+    }
+    if changed {
         state.mark_replay_stable_payload_changed();
     }
 }
@@ -1647,7 +1657,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
     // Move the round out (leaving a valid `[]`), so each item is routed to its
     // last consumer by move; only earlier consumers of a shared item clone.
     let round = std::mem::take(state.output_items_mut());
-    let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
+    let mut pending_file_search: Vec<(usize, usize, SynthesisKind)> = Vec::new();
     for (round_index, item) in round.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
@@ -1698,7 +1708,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
                     state.pending_local_tool_synthesis.push((absolute_index, synthesis));
                 }
                 if is_pending_file_search_call(&item) {
-                    pending_file_search.push((absolute_index, synthesis));
+                    pending_file_search.push((absolute_index, state.persisted_messages.len(), synthesis));
                 }
                 state.persisted_messages.push(item.clone());
                 state.accumulated_output.push(item);

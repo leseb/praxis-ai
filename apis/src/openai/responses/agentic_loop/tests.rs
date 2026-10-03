@@ -3674,6 +3674,57 @@ fn file_search_argument_normalization_is_reserved_before_allocation() {
     assert!(state.accumulated_output.is_empty());
 }
 
+#[test]
+fn over_budget_file_search_reconciles_persisted_history_in_both_collectors() {
+    let file = json!({
+        "type": "file_search_call",
+        "id": "fs_over_budget",
+        "status": "searching",
+        "results": [{"file_id": "file_partial"}]
+    });
+
+    for streaming in [false, true] {
+        let mut state = ResponsesState {
+            max_tool_calls: Some(0),
+            ..ResponsesState::default()
+        };
+        if streaming {
+            state.response_object = json!({"output": [file.clone()]});
+            super::collect_streaming_output_items(&mut state).unwrap();
+        } else {
+            let response = json!({"output": [file.clone()]});
+            super::collect_output_items(&response, &mut state, &[]);
+        }
+
+        assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+        assert!(state.accumulated_output[0].get("results").is_none());
+        assert_eq!(state.persisted_messages[0]["status"], "incomplete");
+        assert!(state.persisted_messages[0].get("results").is_none());
+        assert!(state.file_search_assignments.is_empty());
+    }
+}
+
+#[test]
+fn over_budget_file_search_with_reused_id_updates_only_rejected_history_item() {
+    let mut state = ResponsesState {
+        max_tool_calls: Some(1),
+        ..ResponsesState::default()
+    };
+    let response = json!({"output": [
+        {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["first"]},
+        {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["second"]}
+    ]});
+
+    super::collect_output_items(&response, &mut state, &[]);
+
+    assert_eq!(state.file_search_assignments.len(), 1);
+    assert_eq!(state.persisted_messages[0]["status"], "searching");
+    assert_eq!(state.persisted_messages[0]["results"], json!(["first"]));
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert_eq!(state.persisted_messages[1]["status"], "incomplete");
+    assert!(state.persisted_messages[1].get("results").is_none());
+}
+
 #[tokio::test]
 async fn dispatcher_failure_does_not_become_retained_budget_failure() {
     let req = make_request(Method::POST, "/v1/responses");
