@@ -817,8 +817,18 @@ fn parse_and_accumulate(
     // cleared. An invalid UTF-8 event field can expand each input byte to the
     // three-byte replacement character, so four times the chunk length bounds
     // the line plus its decoded field. Existing parser scratch is already
-    // included by `stream_payload_fits`.
-    let Some(parser_projection_bytes) = bytes.len().checked_mul(4) else {
+    // included by `stream_payload_fits`; fields or a data buffer carried from
+    // earlier chunks can acquire second owners on line completion.
+    let carried_copy_bytes = if shared_budget.is_some() {
+        state.frame_parser.previous_chunk_copy_bound(bytes)
+    } else {
+        Some(0)
+    };
+    let Some(parser_projection_bytes) = bytes
+        .len()
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(carried_copy_bytes?))
+    else {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
@@ -1704,9 +1714,12 @@ fn accumulate_chunk(
         shared_upper_bound: None,
     };
     for event in events {
-        // Earlier completion snapshots remain live until phase 2b. Admit this
-        // event's mutation peak before it clones another shared-state owner.
-        if completion_bytes > 0 && !pending_completion_event_fits(ctx, state, event, &mut admission) {
+        // Earlier completion snapshots remain live until phase 2b. A native
+        // done event also clones its output item without adding a snapshot,
+        // so admit each done mutation even while completion_bytes is zero.
+        if (completion_bytes > 0 || matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_)))
+            && !pending_completion_event_fits(ctx, state, event, &mut admission)
+        {
             release_client_tool_completions(ctx, completions, completion_bytes);
             return Ok(None);
         }

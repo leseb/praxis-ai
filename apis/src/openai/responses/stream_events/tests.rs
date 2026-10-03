@@ -2494,6 +2494,50 @@ async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
     );
 }
 
+#[test]
+fn co_batched_native_completions_reject_before_retaining_large_clones() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_accumulated_bytes: 67108864"));
+    let mut responses = ResponsesState::default();
+    responses.apply_retained_payload_limit(1_048_576);
+    ctx.extensions.insert(responses);
+
+    let mut coalesced = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "n".repeat(65_536), "arguments": "", "status": "in_progress"}
+        }),
+    )
+    .to_vec();
+    for _ in 0..40 {
+        coalesced.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+    }
+
+    let mut body = Some(Bytes::from(coalesced));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(body.is_none(), "co-batched completion amplification must fail closed");
+    assert!(
+        responses.retained_payload_failed,
+        "the aggregate budget must be the rejection source"
+    );
+    assert!(
+        responses.retained_payload_bytes_bounded(1_048_576).is_some(),
+        "no completion clone may put retained state beyond the admitted budget"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        allocations.bytes_max < 2 * 1_048_576,
+        "native done clones must be rejected before multi-megabyte amplification: {}",
+        allocations.bytes_max
+    );
+}
+
 #[tokio::test]
 async fn accumulation_charges_clone_when_added_output_index_mismatches() {
     // Finding 1 (#556 re-review): the clone charge must follow the accumulator's
@@ -2871,6 +2915,98 @@ async fn parser_projection_is_reserved_without_retaining_framework_chunk() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(!state.retained_payload_failed);
     assert_eq!(state.retained_payload_bytes().unwrap(), retained_before);
+}
+
+#[test]
+fn split_data_line_rejects_before_copying_prior_chunk_into_frame() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({
+        "model": "test-model", "input": "hello", "stream": true
+    }));
+    responses.apply_retained_payload_limit(65_536);
+    ctx.extensions.insert(responses);
+
+    let line = format!("data: {}", "x".repeat(57_000));
+    for segment in line.as_bytes().chunks(256) {
+        let mut body = Some(Bytes::copy_from_slice(segment));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "the unterminated line fits while it has a single parser owner"
+        );
+    }
+
+    let mut newline = Some(Bytes::from_static(b"\n"));
+    filter.on_response_body(&mut ctx, &mut newline, false).unwrap();
+    assert!(newline.is_none(), "the duplicated line must be suppressed");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .frame_parser
+            .retained_bytes(),
+        0,
+        "overflow cleanup must drop the pending line"
+    );
+}
+
+#[test]
+fn multiline_data_rejects_before_reallocating_prior_frame_buffer() {
+    let (filter, mut ctx) = make_armed_context();
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model", "input": "hello", "stream": true
+    })));
+
+    let mut first_line = Some(Bytes::from(format!("data: {}\n", "x".repeat(30_000))));
+    filter.on_response_body(&mut ctx, &mut first_line, false).unwrap();
+    let response = ctx.extensions.get::<ResponsesState>().unwrap();
+    let shared = response.retained_payload_bytes().unwrap() - response.retained_stream_parser_bytes;
+    let local = ctx
+        .get_filter_state::<StreamEventsState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let second_line = Bytes::from_static(b"data: x\n");
+    let limit = shared + local + second_line.len() * 4 + 30_000 - 1;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(limit);
+
+    let mut body = Some(second_line);
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        body.is_none(),
+        "reallocating the existing data buffer must be preflighted"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn completed_event_field_needs_no_second_copy_on_blank_line() {
+    let (filter, mut ctx) = make_armed_context();
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model", "input": "hello", "stream": true
+    })));
+    let mut field = Some(Bytes::from_static(b"event: example\n"));
+    filter.on_response_body(&mut ctx, &mut field, false).unwrap();
+
+    let response = ctx.extensions.get::<ResponsesState>().unwrap();
+    let shared = response.retained_payload_bytes().unwrap() - response.retained_stream_parser_bytes;
+    let local = ctx
+        .get_filter_state::<StreamEventsState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(shared + local + 4);
+
+    let mut blank = Some(Bytes::from_static(b"\n"));
+    filter.on_response_body(&mut ctx, &mut blank, false).unwrap();
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[tokio::test]
