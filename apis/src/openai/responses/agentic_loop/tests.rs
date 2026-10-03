@@ -2520,6 +2520,51 @@ fn hosted_tool_search_does_not_loop_when_max_tool_calls_is_exhausted() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn hosted_tool_search_cap_keeps_only_first_of_two_calls() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.max_tool_calls = Some(1);
+    state.deferred_mcp.push(pending_deferred_connector());
+    ctx.extensions.insert(state);
+    let response = json!({
+        "id": "resp_two_searches",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {"type": "tool_search_call", "id": "ts_first", "status": "completed"},
+            {"type": "tool_search_call", "id": "ts_second", "status": "completed"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "loop");
+    let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
+    assert_eq!(state.tool_search_calls.len(), 1);
+    assert_eq!(state.tool_search_calls[0]["id"], "ts_first");
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    let stored_calls: Vec<_> = state
+        .persisted_messages
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_call"))
+        .collect();
+    assert_eq!(stored_calls.len(), 2);
+    assert_eq!(stored_calls[0]["status"], "completed");
+    assert_eq!(stored_calls[1]["status"], "incomplete");
+    let mut public_body = None;
+    state.finalize_response_body(&mut public_body).unwrap();
+    let public: Value = serde_json::from_slice(public_body.as_ref().unwrap()).unwrap();
+    assert_eq!(public["output"][0]["status"], "completed");
+    assert_eq!(public["output"][1]["status"], "incomplete");
+}
+
 #[test]
 fn incomplete_tool_search_call_is_not_queued_for_deferred_discovery() {
     let filter = make_filter();

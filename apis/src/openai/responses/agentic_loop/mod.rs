@@ -126,6 +126,8 @@ mod config;
 )]
 mod tests;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
@@ -199,7 +201,7 @@ use super::{
     },
     state::{
         DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
-        current_round_file_search_admissions, tool_search_discovery_is_within_budget,
+        current_round_file_search_admissions, current_round_tool_call_admissions,
     },
     stream_events::{encode_local_completion, encode_local_error},
     usage::merge_usage,
@@ -1102,35 +1104,81 @@ fn evaluate_loop_decision(
 /// Rewrite queued hosted searches to `incomplete` when they cannot consume
 /// remaining `max_tool_calls` budget, and drop them from dispatch.
 fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
-    if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
+    if state.tool_search_calls.is_empty() {
         return;
     }
-    let queued_ids: Vec<String> = state
-        .tool_search_calls
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
-        .collect();
-    let mark_unidentified = queued_ids.is_empty();
-    let mark = |item: &mut Value| {
-        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
-            return;
-        }
-        let matches = match item.get("id").and_then(Value::as_str) {
-            Some(id) => queued_ids.iter().any(|queued| queued == id),
-            None => mark_unidentified,
+    let admissions = current_round_tool_call_admissions(state, &state.tool_search_calls);
+    let mut search_from = state.current_round_output_start.unwrap_or(0);
+    let mut admitted = Vec::with_capacity(state.tool_search_calls.len());
+    let mut denied = Vec::new();
+    // The call queue owns copies of the canonical output. Match them in model
+    // order so repeated provider IDs do not rewrite an admitted earlier call.
+    for (ordinal, call) in std::mem::take(&mut state.tool_search_calls).into_iter().enumerate() {
+        let output_index = state
+            .accumulated_output
+            .get(search_from..)
+            .and_then(|output| output.iter().position(|item| item == &call))
+            .and_then(|offset| search_from.checked_add(offset));
+        let Some(output_index) = output_index else {
+            continue;
         };
-        if matches && let Some(obj) = item.as_object_mut() {
-            obj.insert("status".to_owned(), json!("incomplete"));
+        search_from = output_index.saturating_add(1);
+        if admissions.get(ordinal) == Some(&true) {
+            admitted.push(call);
+        } else {
+            denied.push((output_index, call));
         }
-    };
-    for item in &mut state.accumulated_output {
-        mark(item);
     }
-    for item in &mut state.persisted_messages {
-        mark(item);
+    state.tool_search_calls = admitted;
+    if denied.is_empty() {
+        return;
+    }
+    for (output_index, _) in &denied {
+        if let Some(object) = state
+            .accumulated_output
+            .get_mut(*output_index)
+            .and_then(Value::as_object_mut)
+        {
+            object.insert("status".to_owned(), json!("incomplete"));
+        }
+    }
+    // A provider may reuse an ID across rounds. Update only the newest stored
+    // occurrence for each denied current-round call.
+    let mut pending = HashMap::<&str, usize>::new();
+    for (_, call) in &denied {
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            *pending.entry(id).or_default() += 1;
+        }
+    }
+    let mut remaining: usize = pending.values().sum();
+    for item in state.persisted_messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(count) = pending.get_mut(id)
+            && *count > 0
+        {
+            if let Some(object) = item.as_object_mut() {
+                object.insert("status".to_owned(), json!("incomplete"));
+            }
+            *count -= 1;
+            remaining -= 1;
+        }
+    }
+    for (_, call) in denied.iter().filter(|(_, call)| call.get("id").is_none()) {
+        if let Some(item) = state.persisted_messages.iter_mut().rfind(|item| **item == *call)
+            && let Some(object) = item.as_object_mut()
+        {
+            object.insert("status".to_owned(), json!("incomplete"));
+        }
     }
     state.mark_replay_stable_payload_changed();
-    state.tool_search_calls.clear();
 }
 
 /// Remove representation metadata after replacing a buffered response body.
