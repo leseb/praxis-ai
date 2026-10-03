@@ -126,6 +126,8 @@ mod config;
 )]
 mod tests;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
@@ -1075,32 +1077,60 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
         return;
     }
-    let queued_ids: Vec<String> = state
-        .selected_tool_search_calls()
+    let round_start = state.current_round_output_start.unwrap_or(0);
+    let selected: Vec<(usize, &str)> = state
+        .tool_search_calls
         .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+        .filter_map(|assignment| {
+            (assignment.output_index >= round_start)
+                .then(|| {
+                    assignment
+                        .resolve(&state.accumulated_output, "tool_search_call")
+                        .map(|_| (assignment.output_index, assignment.item_id.as_str()))
+                })
+                .flatten()
+        })
         .collect();
-    if queued_ids.is_empty() {
+    if selected.is_empty() {
         state.tool_search_calls.clear();
         return;
     }
-    let mark = |item: &mut Value| {
-        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
-            return;
-        }
-        let matches = item
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| queued_ids.iter().any(|queued| queued == id));
-        if matches && let Some(obj) = item.as_object_mut() {
+    for (output_index, _) in &selected {
+        if let Some(obj) = state
+            .accumulated_output
+            .get_mut(*output_index)
+            .and_then(Value::as_object_mut)
+        {
             obj.insert("status".to_owned(), json!("incomplete"));
         }
-    };
-    for item in &mut state.accumulated_output {
-        mark(item);
     }
-    for item in &mut state.persisted_messages {
-        mark(item);
+    // The persisted copy of each selected item is the latest matching
+    // `tool_search_call` in history. Walk backward so a reused provider ID in
+    // an earlier round cannot retroactively change that round's stored output.
+    let mut pending = HashMap::<&str, usize>::new();
+    for (_, item_id) in selected {
+        *pending.entry(item_id).or_default() += 1;
+    }
+    let mut remaining: usize = pending.values().sum();
+    for item in state.persisted_messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
+            continue;
+        }
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(count) = pending.get_mut(item_id)
+            && *count > 0
+        {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("status".to_owned(), json!("incomplete"));
+            }
+            *count -= 1;
+            remaining -= 1;
+        }
     }
     state.tool_search_calls.clear();
 }
