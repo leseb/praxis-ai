@@ -6981,7 +6981,7 @@ fn local_completion_charges_ready_file_search_clone_before_drain() {
     );
     ctx.extensions.insert(state);
 
-    let wire = String::from_utf8(super::encode_local_completion(&mut ctx).unwrap().to_vec()).unwrap();
+    let wire = String::from_utf8(encode_local_completion(&mut ctx).unwrap().to_vec()).unwrap();
     assert_eq!(wire.matches("event: error").count(), 1, "one bounded error: {wire}");
     assert!(
         !wire.contains("response.output_item.done"),
