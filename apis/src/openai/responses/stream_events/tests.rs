@@ -354,6 +354,44 @@ fn deferred_terminal_wire_overflow_keeps_sequence_for_error() {
 }
 
 #[test]
+fn deferred_terminal_reserves_metadata_while_serializing_wire() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        logical_stream_response_id: Some("resp_budget".to_owned()),
+        accumulated_output: vec![json!({"type": "message", "content": [{"text": "x".repeat(256 * 1024)}]})],
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": null,
+            "provider_metadata": "m".repeat(64 * 1024)
+        }),
+    };
+    state.apply_retained_payload_limit(600 * 1024);
+    let preflight = super::canonicalization_staging_bytes(&state, 0).unwrap()
+        + terminal.retained_payload_bytes().unwrap()
+        + parser_state.retained_payload_bytes().unwrap();
+    assert!(
+        state.can_replace_retained_payload(0, 0, preflight),
+        "canonicalization must fit so this exercises the later wire admission"
+    );
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(
+        output.is_empty(),
+        "over-budget terminal and metadata must stay off the wire"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
 fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -2447,6 +2485,28 @@ fn commit_projection_charges_argument_delta_and_terminal_usage_owners() {
     assert!(
         terminal_projection < response_bytes,
         "the response tree moves from the parsed event"
+    );
+}
+
+#[test]
+fn commit_projection_charges_bare_terminal_usage_clones() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.extensions.insert(ResponsesState::default());
+    let response = json!({
+        "type": "response.completed",
+        "id": "resp_bare_usage",
+        "output": [],
+        "usage": {"large_detail": "x".repeat(64 * 1024)}
+    });
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let usage_bytes = crate::openai::responses::state::retained_json_bytes(&response["usage"]).unwrap();
+    let event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(response);
+
+    let projection = super::projected_responses_state_clone_bytes(&ctx, &[event]).unwrap();
+    assert!(
+        projection >= response_bytes + usage_bytes * 2,
+        "the bare fallback clones the response and usage merging retains two more owners"
     );
 }
 

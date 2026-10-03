@@ -881,12 +881,10 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
             ResponsesEvent::ResponseCompleted(payload)
             | ResponsesEvent::ResponseIncomplete(payload)
             | ResponsesEvent::ResponseFailed(payload) => {
-                let response_bytes = retained_json_bytes(payload.get("response").unwrap_or(payload))?;
+                let response = payload.get("response").unwrap_or(payload);
+                let response_bytes = retained_json_bytes(response)?;
                 let previous_usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
-                let incoming_usage_bytes = payload
-                    .get("response")
-                    .and_then(|response| response.get("usage"))
-                    .map_or(Some(0), retained_json_bytes)?;
+                let incoming_usage_bytes = response.get("usage").map_or(Some(0), retained_json_bytes)?;
                 // The conformant terminal response moves from the parsed event
                 // into shared state. Usage merging can still grow the distinct
                 // accumulator and clone the merged usage into that response.
@@ -2953,7 +2951,12 @@ fn emit_deferred_terminal(
                 Some(bytes)
             }
         });
-    let staging = terminal_frame_bytes.and_then(|bytes| output.len().checked_add(bytes));
+    // The deferred metadata remains independently owned while the borrowed
+    // response is serialized into the wire buffer. The wire and metadata
+    // therefore coexist even though the response tree itself is only borrowed.
+    let staging = terminal_frame_bytes
+        .and_then(|bytes| output.len().checked_add(bytes))
+        .and_then(|bytes| terminal.retained_payload_bytes()?.checked_add(bytes));
     if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
         // The failed terminal never reached the client. Reuse its sequence
         // number for the single error event emitted by the finalizer.
