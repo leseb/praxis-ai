@@ -738,6 +738,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
                 // upstream without openai_responses_proxy in the chain. Record
                 // actual SSE body delivery for later request-side failures.
                 if ctx.extensions.get::<praxis_filter::IterationState>().is_some()
+                    && ctx.extensions.get::<praxis_filter::StreamBodySuppressed>().is_none()
                     && (end_of_stream || body.as_ref().is_some_and(|bytes| !bytes.is_empty()))
                 {
                     ctx.extensions.insert(ObservedResponsesSse);

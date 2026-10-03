@@ -5596,7 +5596,10 @@ def retained_tool_search_client(tmp_path, request):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["direct", "buffered_middle", "empty_stream", "buffered_sse", "translated"]
+    "scenario", [
+        "direct", "buffered_middle", "empty_stream", "buffered_sse",
+        "translated", "header_suppressed", "translated_header_suppressed",
+    ]
 )
 def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
     tmp_path, scenario
@@ -5623,7 +5626,7 @@ def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
         def do_POST(self):
             self.paths.append("POST " + self.path)
             self.rfile.read(int(self.headers["Content-Length"]))
-            if scenario == "translated":
+            if scenario.startswith("translated"):
                 payload = (
                     b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
                     b'"created":1,"model":"m","choices":[{"index":0,'
@@ -5708,7 +5711,7 @@ insecure_options:
   allow_private_endpoints: true
   allow_private_upstreams: true
 """
-    if scenario == "translated":
+    if scenario.startswith("translated"):
         config = config.replace(
             "              - filter: openai_responses_proxy\n",
             "              - filter: openai_stream_events\n"
@@ -5716,6 +5719,14 @@ insecure_options:
             1,
         )
         config = config.replace("max_retained_bytes: 4096", "max_retained_bytes: 65536")
+    if scenario.endswith("header_suppressed"):
+        first = config.index("          - name: first\n")
+        transition = config.index("            on_result:\n", first)
+        config = config[:transition] + config[transition:].replace(
+            "              - default: true\n                next: resolve",
+            "              - status: [200]\n                next: resolve",
+            1,
+        )
     if scenario in {"buffered_middle", "empty_stream"}:
         config = config.replace("max_iterations: 2", "max_iterations: 3", 1)
         config = config.replace("next: resolve", "next: middle", 1)
@@ -5777,7 +5788,7 @@ insecure_options:
                 },
                 timeout=20,
             )
-            if scenario == "buffered_sse":
+            if scenario in {"buffered_sse", "header_suppressed", "translated_header_suppressed"}:
                 assert response.status_code == 502, response.text
                 assert response.headers["content-type"].startswith("application/json")
                 assert response.json()["error"]["type"] == "server_error"
