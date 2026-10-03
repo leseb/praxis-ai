@@ -38,6 +38,6 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Temporary: until v0.5.2 is published on crates.io
+    # Temporary: pinned Praxis core until the suppression marker is published.
     "https://github.com/praxis-proxy/praxis",
 ]
