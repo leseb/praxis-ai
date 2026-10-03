@@ -856,6 +856,54 @@ fn deferred_terminal_reserves_client_tool_echo_before_canonicalization() {
 }
 
 #[test]
+fn deferred_terminal_reserves_namespaced_call_fanout_before_canonicalization() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let namespace = "n".repeat(8_192);
+    let mut state = ResponsesState {
+        accumulated_output: (0..128)
+            .map(|index| {
+                json!({
+                    "type": "function_call", "id": format!("fc_{index}"),
+                    "call_id": format!("call_{index}"), "name": "private",
+                    "arguments": "{}", "status": "completed"
+                })
+            })
+            .collect(),
+        response_object: json!({"id":"resp_budget", "object":"response", "status":"completed", "output":[]}),
+        client_tool_echo: Some(ClientToolEcho {
+            tools: vec![
+                json!({"type":"namespace", "name":namespace.as_str(), "tools":[{"type":"function", "name":"public", "parameters":{"type":"object"}}]}),
+            ],
+            tool_choice: json!("auto"),
+        }),
+        ..ResponsesState::default()
+    };
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some(namespace),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    state.apply_retained_payload_limit(400_000);
+    assert!(state.can_retain_payload(0));
+    assert!(!state.can_retain_payload(super::canonicalization_staging_bytes(&state, 0).unwrap()));
+    ctx.extensions.insert(state);
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type":"response.completed", "response":{"id":"resp_budget", "output":[]}}),
+    };
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert!(terminal.payload["response"]["output"].as_array().unwrap().is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
 fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();

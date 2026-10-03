@@ -1499,6 +1499,32 @@ fn canonical_logical_output_bytes(state: &ResponsesState) -> Option<usize> {
     }
 }
 
+/// Reserve names copied into each restored client-tool output item. A single
+/// namespace in the reverse map can expand into many public call items while
+/// the canonical response and returned terminal output both remain live.
+fn terminal_restored_name_staging_bytes(state: &ResponsesState, output: &[Value]) -> Option<usize> {
+    let mut names = 0_usize;
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let Some(lowered) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| state.client_tool_lowering.get(name))
+        else {
+            continue;
+        };
+        names = names
+            .checked_add(retained_json_bytes(&lowered.original_name)?)?
+            .checked_add(lowered.namespace.as_deref().map_or(Some(0), retained_json_bytes)?)?
+            .checked_add(128)?;
+    }
+    // One name can be temporarily owned by the retyped item as well as both
+    // completed output trees during restoration.
+    names.checked_mul(3)
+}
+
 /// Reserve the transient owners created before a logical terminal is emitted.
 ///
 /// `canonicalize_logical_response` keeps one output in the returned terminal
@@ -1530,10 +1556,12 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
             .checked_add(retained_json_bytes(&echo.tool_choice)?)?
             .checked_add(64)
     })?;
+    let restored_names_bytes = terminal_restored_name_staging_bytes(state, output)?;
     output_bytes
         .checked_mul(2)?
         .checked_add(annotation_bytes.checked_mul(3)?)?
         .checked_add(echoed_tools_bytes.checked_mul(2)?)?
+        .checked_add(restored_names_bytes)?
         .checked_add(existing_output_bytes)
 }
 
