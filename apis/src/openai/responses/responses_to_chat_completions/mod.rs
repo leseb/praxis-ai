@@ -530,6 +530,8 @@ fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut O
 
 /// Reserve the provider parse tree, translated resource, serialized wire body,
 /// and request fields echoed into the resource before creating any of them.
+/// The same bound protects finite provider-error normalization, which also
+/// parses the full provider body before building a replacement wire response.
 fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
@@ -557,9 +559,10 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
             .checked_add(echo.checked_mul(4)?)?
             .checked_add(normalized_tool_expansion)?
             .checked_add(response_id_bytes.checked_mul(12)?)?
-            // The fixed Responses resource fields exist even for a minimal
-            // provider object; reserve them in the tree and wire buffer.
-            .checked_add(1536)
+            // Even a minimal resource has about 1 KiB of fixed fields. Keep
+            // that schema live in the translated tree and both old/new wire
+            // Vec allocations at a growth boundary.
+            .checked_add(1024 * 3)
     })();
     staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
@@ -731,9 +734,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
             Some(_) => {
                 if end_of_stream {
-                    if ctx.get_metadata(RESPONSE_TRANSFORM_KEY) == Some(RESPONSE_TRANSFORM_SUCCESS)
-                        && !finite_translation_fits(ctx, body.as_deref().unwrap_or_default())
-                    {
+                    if !finite_translation_fits(ctx, body.as_deref().unwrap_or_default()) {
                         return Ok(finite_translation_budget_failure(ctx));
                     }
                     self.transform_finite_response(ctx, body)?;

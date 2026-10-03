@@ -2112,6 +2112,83 @@ async fn finite_success_reserves_long_request_echo_wire_growth() {
 }
 
 #[tokio::test]
+async fn finite_success_reserves_fixed_schema_at_wire_growth_boundary() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let response_id = "resp_12345678901234567890123456789012";
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", response_id);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "x".repeat(11), "stream": false, "store": false
+    }));
+    state.response_id = Some(response_id.to_owned());
+    state.apply_retained_payload_limit(4096);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]}).to_string(),
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "fixed schema and wire growth must be reserved: {action:?}"
+    );
+    assert_eq!(body, Some(original));
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_provider_error_rejects_over_budget_body_before_normalization() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": false, "store": false
+    }));
+    state.apply_retained_payload_limit(4096);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(json!({"error": {"message": "x".repeat(64 * 1024)}}).to_string());
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "provider error normalization must check the aggregate budget before parsing: {action:?}"
+    );
+    assert_eq!(body, Some(original));
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn malformed_success_shape_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
