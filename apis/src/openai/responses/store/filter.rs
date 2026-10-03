@@ -959,8 +959,9 @@ fn replay_payload_staging_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
         .checked_add(capture.events.len().checked_mul(64)?)
 }
 
-/// Reserve record, history, replay-row IDs, and backend serialization owners
-/// before building them.
+/// Reserve record, history, replay-row IDs, backend serialization, and the
+/// `PostgreSQL` input parameter buffer before building them.
+#[expect(clippy::too_many_lines, reason = "persistence owners share one aggregate admission")]
 pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, response_bytes: usize) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
@@ -971,9 +972,13 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
     let Some(history_bytes) = retained_json_values_bytes(&state.persisted_messages) else {
         return false;
     };
-    let Some(input_bytes) = retained_request_payload_bytes(ctx) else {
+    let Some(store_snapshot_bytes) = retained_request_payload_bytes(ctx) else {
         return false;
     };
+    let input_bind_bytes = ctx
+        .extensions
+        .get::<ResponseStoreRequestState>()
+        .map_or(0, |capture| capture.input_retained_bytes);
     let approval_bytes = state.pending_approvals.iter().try_fold(0_usize, |used, record| {
         used.checked_add(record.approval_id.len())?
             .checked_add(record.server_label.len())?
@@ -986,7 +991,11 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
     let additional = response_bytes
         .checked_mul(5)
         .and_then(|bytes| history_bytes.checked_mul(3)?.checked_add(bytes))
-        .and_then(|bytes| bytes.checked_add(input_bytes))
+        // The whole store snapshot is already charged in state. Serialization
+        // owns another copy, and PostgreSQL's query bind copies only the input
+        // from that snapshot, not its captured replay rows.
+        .and_then(|bytes| bytes.checked_add(store_snapshot_bytes))
+        .and_then(|bytes| bytes.checked_add(input_bind_bytes))
         .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(replay_id_bytes?))
         .and_then(|bytes| bytes.checked_add(replay_payload_bytes?));
@@ -2493,6 +2502,70 @@ mod encode_replay_event_tests {
             .get_mut::<ResponsesState>()
             .unwrap()
             .apply_retained_payload_limit(baseline + existing_staging + replay_staging - 1);
+        assert!(!persistence_construction_fits(&ctx, response_bytes));
+    }
+
+    /// `PostgreSQL` copies serialized input into its query argument buffer while
+    /// both the request snapshot and serialized input still own their bytes.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "checks both input bind and replay row boundaries")]
+    fn persistence_preflights_postgres_input_bind_copy() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let input = json!([{"role": "user", "content": "x".repeat(1_048_576)}]);
+        let input_bytes = super::retained_json_bytes(&input).unwrap();
+        let responses = ResponsesState {
+            response_object: json!({"id": "resp_pg_bind", "created_at": 0, "model": "m", "output": []}),
+            ..ResponsesState::default()
+        };
+        ctx.extensions.insert(responses);
+        capture_request_input(&mut ctx, input).unwrap();
+
+        let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        let response_bytes = super::retained_json_bytes(&state.response_object).unwrap();
+        let baseline = state.retained_payload_bytes().unwrap();
+        let construction = response_bytes * 5 + input_bytes * 2;
+        state.apply_retained_payload_limit(baseline + construction);
+        assert!(persistence_construction_fits(&ctx, response_bytes));
+
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(baseline + construction - 1);
+        assert!(
+            !persistence_construction_fits(&ctx, response_bytes),
+            "one byte below the PostgreSQL bind-copy peak must reject"
+        );
+
+        // Replay rows share the store snapshot charge, but do not enter the
+        // PostgreSQL input bind parameter. They must not be doubled here.
+        let event_type = "response.output_text.delta";
+        let replay_bytes = 65_536;
+        let capture = ctx.extensions.get_mut::<super::ResponseStoreRequestState>().unwrap();
+        capture.event_bytes += replay_bytes as u64;
+        capture.event_name_bytes += event_type.len();
+        capture.events.push(CapturedEvent {
+            sequence_number: 1,
+            event_type: event_type.to_owned(),
+            payload: vec![b'x'; replay_bytes],
+            terminal: false,
+        });
+        let snapshot_bytes = capture.retained_payload_bytes().unwrap();
+        let replay_staging = replay_bytes * 2 + (replay_bytes >> 8) + 64;
+        ctx.extensions.insert(ResponsesState {
+            response_object: json!({"id": "resp_pg_bind", "created_at": 0, "model": "m", "output": []}),
+            ..ResponsesState::default()
+        });
+        let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        state.set_retained_external_payload_bytes(snapshot_bytes);
+        let baseline = state.retained_payload_bytes().unwrap();
+        let construction = response_bytes * 5 + snapshot_bytes + input_bytes + replay_staging + "resp_pg_bind".len();
+        state.apply_retained_payload_limit(baseline + construction);
+        assert!(persistence_construction_fits(&ctx, response_bytes));
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(baseline + construction - 1);
         assert!(!persistence_construction_fits(&ctx, response_bytes));
     }
 
