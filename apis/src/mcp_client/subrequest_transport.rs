@@ -61,7 +61,11 @@ use crate::{StateOwner, callout_target::AddressPolicy};
 /// from the previous reqwest-layer `bounded_http` client; this is now the single
 /// home for the MCP response tiers, since the dial runs through the executor.
 /// `mod.rs` derives its cumulative `tools/list` budget from this value.
-pub(super) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Keep ordinary MCP handshakes usable even when the admitted tool result is
+/// small. The dispatcher separately reserves this floor for every new session.
+pub(crate) const MIN_TOOL_INITIALIZE_BYTES: usize = 1_024;
 
 /// JSON-RPC envelope allowance added on top of the configured `tools/call`
 /// result cap, covering the surrounding result object beyond the raw payload.
@@ -546,10 +550,12 @@ pub(crate) struct McpSubrequestClient {
     callout: McpCallout,
     /// Wire byte ceiling applied to a `tools/call` response on this client.
     ///
-    /// Control-plane exchanges (`initialize`, `tools/list`, ...) are always
-    /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`]; only `tools/call` responses use
-    /// this configured, JSON-expansion-adjusted ceiling (see [`Self::response_limit`]).
+    /// `tools/call` uses this configured, JSON-expansion-adjusted ceiling.
+    /// Tool-session `initialize` uses the separate admitted payload cap.
     tool_result_bytes: usize,
+    /// Initialization can be retained as rmcp peer information for the session
+    /// lifetime. Tool sessions bound it to their admitted result payload.
+    initialize_bytes: usize,
     /// Cumulative wire-byte ceiling for a server-initiated GET SSE stream.
     ///
     /// An intentionally coarse raw-wire `DoS` backstop, not decoded parity: for a
@@ -586,16 +592,17 @@ impl McpSubrequestClient {
             callout,
             step_timeout,
             MAX_CONTROL_RESPONSE_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
             owner,
         )
     }
 
     /// Build a client for
-    /// [`call_tool_with_forwarded_headers`](super::call_tool_with_forwarded_headers):
-    /// `initialize` uses the control ceiling and the `tools/call` response is
-    /// bounded to the configured `max_result_bytes` cap, expanded for worst-case
-    /// JSON string escaping.
+    /// [`call_tool_with_forwarded_headers_bounded_initialize`](super::call_tool_with_forwarded_headers_bounded_initialize):
+    /// With an aggregate budget, `initialize` uses the supplied decoded cap
+    /// (with a 1 KiB floor). Otherwise it keeps the 1 MiB control ceiling.
+    /// `tools/call` expands its result cap for worst-case JSON string escaping.
     ///
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
@@ -604,13 +611,16 @@ impl McpSubrequestClient {
         callout: McpCallout,
         step_timeout: Duration,
         max_result_bytes: usize,
+        initialize_limit: usize,
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
+        let initialize_bytes = initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES);
         Self::with_wire_cap(
             callout,
             step_timeout,
             wire,
+            initialize_bytes,
             wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
             owner,
         )
@@ -618,16 +628,22 @@ impl McpSubrequestClient {
 
     /// Shared constructor: move in the callout and pin the `tools/call` wire
     /// ceiling.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent result and initialize ceilings share one transport"
+    )]
     fn with_wire_cap(
         callout: McpCallout,
         step_timeout: Duration,
         tool_result_bytes: usize,
+        initialize_bytes: usize,
         stream_cumulative_cap: usize,
         owner: Option<StateOwner>,
     ) -> Self {
         Self {
             callout,
             tool_result_bytes,
+            initialize_bytes,
             step_timeout,
             stream_cumulative_cap,
             owner,
@@ -665,14 +681,18 @@ impl McpSubrequestClient {
 
     /// Select the wire byte ceiling for one outbound message.
     ///
-    /// `tools/call` responses use the configured tool-result ceiling; every other
-    /// exchange (`initialize`, `tools/list`, notifications, ...) is bounded to the
-    /// control ceiling so an untrusted server cannot exhaust proxy memory on the
-    /// control plane.
+    /// `tools/call` uses the configured result ceiling. Tool-session
+    /// `initialize` is separately bounded because rmcp retains its metadata;
+    /// other exchanges use the control ceiling.
     fn response_limit(&self, message: &ClientJsonRpcMessage) -> usize {
         match message {
             ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)) => {
                 self.tool_result_bytes
+            },
+            ClientJsonRpcMessage::Request(request)
+                if matches!(request.request, ClientRequest::InitializeRequest(_)) =>
+            {
+                self.initialize_bytes
             },
             _ => MAX_CONTROL_RESPONSE_BYTES,
         }
@@ -1240,7 +1260,13 @@ impl StreamableHttpClient for McpSubrequestClient {
             .await?;
         match maybe_body {
             // Blocker 5: praxis buffered anyway; classify the full buffered response.
-            None => classify_buffered_post_response(response, &message, session_was_attached),
+            None => classify_bounded_buffered_post_response(
+                response,
+                &message,
+                session_was_attached,
+                max_response_bytes,
+                &signal,
+            ),
             Some(streaming_body) => {
                 self.classify_streaming_post_response(
                     response,
@@ -1259,6 +1285,22 @@ impl StreamableHttpClient for McpSubrequestClient {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// The streaming executor's 2× backstop can return a buffered fallback larger
+/// than the per-message cap. Check the cap before rmcp parses the response.
+fn classify_bounded_buffered_post_response(
+    response: SubResponse,
+    message: &ClientJsonRpcMessage,
+    session_was_attached: bool,
+    cap: usize,
+    signal: &Arc<OnceLock<TransportSignal>>,
+) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
+    if response.body.len() > cap {
+        signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+        return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+    }
+    classify_buffered_post_response(response, message, session_was_attached)
+}
 
 /// Classify a fully buffered POST response into an rmcp post response.
 /// Verbatim the ladder previously inlined in `post_message`.
@@ -1364,7 +1406,7 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
 /// Collect a streaming body into a single `Bytes` buffer, failing closed.
 ///
 /// Accumulates chunks into one bounded [`bytes::BytesMut`] and enforces a local
-/// byte `cap`. On overflow (`buf.len() > cap`) the size signal is recorded into
+/// byte `cap`. Before an overflowing chunk is copied, the size signal is recorded into
 /// `signal` (first wins) so the typed 413 survives rmcp's opaque error mapping,
 /// the body is cancelled, and a typed [`McpTransportError::ResponseTooLarge`] is
 /// returned — never the truncated buffer.
@@ -1386,12 +1428,12 @@ async fn collect_body(
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > cap {
+                if buf.len().checked_add(chunk.len()).is_none_or(|bytes| bytes > cap) {
                     signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
                     body.cancel().await;
                     return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
                 }
+                buf.extend_from_slice(&chunk);
             },
             Ok(None) => {
                 body.cancel().await;
@@ -1874,10 +1916,11 @@ mod tests {
     }
 
     #[test]
-    fn response_limit_uses_tool_cap_only_for_tools_call() {
+    fn tool_session_initialize_uses_admitted_payload_cap() {
         let client = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
+            2048,
             2048,
             None,
         );
@@ -1886,6 +1929,20 @@ mod tests {
         )
         .expect("deserialize tools/call");
         assert_eq!(client.response_limit(&call), tool_result_wire_cap(2048));
+
+        let initialize: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        )
+        .expect("deserialize initialize");
+        assert_eq!(client.response_limit(&initialize), 2048);
+        let unbudgeted = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2048,
+            MAX_CONTROL_RESPONSE_BYTES,
+            None,
+        );
+        assert_eq!(unbudgeted.response_limit(&initialize), MAX_CONTROL_RESPONSE_BYTES);
 
         let list: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
@@ -2177,6 +2234,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
             max_result_bytes,
+            MAX_CONTROL_RESPONSE_BYTES,
             None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
@@ -2206,6 +2264,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             1024,
+            MAX_CONTROL_RESPONSE_BYTES,
             None,
         )
     }
@@ -2285,6 +2344,26 @@ mod tests {
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "collect_body must cancel after buffering"
         );
+    }
+
+    #[test]
+    fn buffered_initialize_fallback_rechecks_the_message_cap_before_parsing() {
+        let initialize: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        )
+        .unwrap();
+        let mut response = sub_response(200, Some("application/json"), b"");
+        response.body = Bytes::from(vec![b'x'; 3_072]);
+        let signal = test_signal();
+        let result = classify_bounded_buffered_post_response(response, &initialize, false, 2_048, &signal);
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+        ));
     }
 
     #[test]

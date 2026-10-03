@@ -35,6 +35,7 @@ use rmcp::{RoleClient, service::RunningService};
 use tokio::sync::oneshot;
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
+use crate::openai::responses::state::retained_json_bytes;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -112,6 +113,8 @@ pub(crate) struct PooledSession {
     signal_state: Arc<TransportSignalState>,
     /// Immutable result limit baked into this session's transport.
     payload_limit: usize,
+    /// Immutable initialize ceiling baked into this session's transport.
+    initialize_limit: usize,
     /// Instant when the session most recently entered the idle pool.
     last_used: Instant,
     /// Guard that disarms the idle cancellation task when taken or closed.
@@ -125,11 +128,13 @@ impl PooledSession {
         service: RunningService<RoleClient, ()>,
         signal_state: Arc<TransportSignalState>,
         payload_limit: usize,
+        initialize_limit: usize,
     ) -> Self {
         Self {
             service,
             signal_state,
             payload_limit,
+            initialize_limit,
             last_used: Instant::now(),
             idle_timer: None,
         }
@@ -296,9 +301,34 @@ impl McpSessionPool {
         }
     }
 
+    /// Payload retained by parked rmcp peer information and pool identities.
+    /// rmcp keeps initialize `instructions` and `_meta` in `peer_info`; read the
+    /// live value so a transparent reinitialization cannot leave a stale charge.
+    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
+        self.lock().iter().try_fold(0_usize, |used, (key, sessions)| {
+            let used = used.checked_add(key.target_fingerprint.len())?;
+            sessions.iter().try_fold(used, |used, session| {
+                let info = session.service.peer_info()?;
+                used.checked_add(retained_json_bytes(info.as_ref())?)
+            })
+        })
+    }
+
     /// Take one compatible session and return all unusable entries separately
     /// so the caller can close them outside the synchronous mutex boundary.
+    #[cfg(test)]
     pub(crate) fn checkout(&self, key: &McpPoolKey, payload_limit: usize) -> PoolCheckout {
+        self.checkout_with_initialize_limit(key, payload_limit, super::MAX_CONTROL_RESPONSE_BYTES)
+    }
+
+    /// Checkout additionally binds the immutable handshake limit, preventing a
+    /// session initialized without a budget from being reused under a smaller one.
+    pub(crate) fn checkout_with_initialize_limit(
+        &self,
+        key: &McpPoolKey,
+        payload_limit: usize,
+        initialize_limit: usize,
+    ) -> PoolCheckout {
         let mut map = self.lock();
         let Some(stack) = map.get_mut(key) else {
             return PoolCheckout {
@@ -315,6 +345,7 @@ impl McpSessionPool {
             if session.is_none()
                 && idle_timer_disarmed
                 && candidate.payload_limit == payload_limit
+                && candidate.initialize_limit == initialize_limit
                 && !candidate.is_closed()
                 && !candidate.is_expired_at(now)
             {
@@ -337,7 +368,7 @@ impl McpSessionPool {
         if let Some(existing) = map.get_mut(&key) {
             let mut retained = Vec::with_capacity(existing.len());
             for prior in std::mem::take(existing) {
-                if prior.payload_limit == session.payload_limit {
+                if prior.payload_limit == session.payload_limit && prior.initialize_limit == session.initialize_limit {
                     retained.push(prior);
                 } else {
                     rejected.push(prior);

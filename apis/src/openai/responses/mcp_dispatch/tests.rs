@@ -109,6 +109,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+        aggregate_budgeted: false,
         timeout,
         forwarded_header_names: &[],
         forwarded_headers: None,
@@ -613,7 +614,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    state.apply_retained_payload_limit(current + result_id_bytes + 4_000);
+    state.apply_retained_payload_limit(current + result_id_bytes + 20_000);
     let calls = state.selected_tool_calls();
 
     let arguments = retained_json_bytes(&state.selected_tool_calls()[0]["arguments"]).unwrap() * 3;
@@ -624,8 +625,35 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     let entry = retained_json_bytes(entry).unwrap();
     assert_eq!(
         aggregate_mcp_result_limit(&state, &calls, 8_192),
-        Some(((4_000 - arguments - entry) / 3, true))
+        Some((
+            (20_000 - arguments - entry - 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
+            true
+        ))
     );
+}
+
+#[test]
+fn aggregate_mcp_limit_reserves_initialize_and_parked_peer_info() {
+    let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    state.select_test_output("function_call", vec![call]);
+    let without_pool = state.retained_payload_bytes().unwrap();
+    let state_only = state
+        .retained_payload_bytes_bounded_without_external(usize::MAX)
+        .unwrap();
+    state.retained_mcp_session_bytes = 2_048;
+    let current = state.retained_payload_bytes().unwrap();
+    assert_eq!(current, without_pool + 2_048);
+    assert_eq!(
+        state.retained_payload_bytes_bounded_without_external(usize::MAX),
+        Some(state_only)
+    );
+    state.apply_retained_payload_limit(current + 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES - 1);
+    let calls = state.selected_tool_calls();
+    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
 }
 
 #[test]
