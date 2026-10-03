@@ -517,6 +517,10 @@ pub(crate) struct ResponsesState {
     /// captured SSE replay rows, and the store decoder's unfinished record).
     /// The loop owner refreshes this before initial admission.
     pub(crate) retained_external_payload_bytes: usize,
+    /// Parser payload published by `openai_stream_events` for other filters.
+    pub(crate) retained_stream_parser_bytes: usize,
+    /// Semantic and framing payload published by the Chat stream translator.
+    pub(crate) retained_chat_converter_bytes: usize,
 
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
@@ -1078,6 +1082,8 @@ impl Default for ResponsesState {
         Self {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
+            retained_stream_parser_bytes: 0,
+            retained_chat_converter_bytes: 0,
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -1214,12 +1220,12 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
     }
 
-    /// Request and history owners cannot change while one upstream stream is
-    /// being parsed. Measure them once per round; the stream meter measures all
-    /// other owners after each chunk.
+    /// Request and history owners remain stable between upstream chunks.
+    /// Measure them once per round; `stream_events` refreshes this baseline at
+    /// EOS after the agentic owner may append the finished round to history.
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1238,7 +1244,14 @@ impl ResponsesState {
     /// Count the owners which may change during a streaming response. The
     /// stream-local meter adds the cached request/history charge separately.
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
+    }
+
+    /// The translated upstream round cannot append prior output until its
+    /// converter has finished. The converter caches that large owner once;
+    /// this counts all other changing owners, including the stream parser.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1249,13 +1262,15 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
     #[expect(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
         reason = "exhaustive accounting for the request-scoped state bag"
     )]
     fn retained_payload_bytes_bounded_inner(
@@ -1263,10 +1278,19 @@ impl ResponsesState {
         max_bytes: usize,
         include_external: bool,
         skip_stream_stable: bool,
+        skip_accumulated_output: bool,
+        include_stream_parser: bool,
+        include_chat_converter: bool,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
             meter.raw(self.retained_external_payload_bytes)?;
+        }
+        if include_stream_parser {
+            meter.raw(self.retained_stream_parser_bytes)?;
+        }
+        if include_chat_converter {
+            meter.raw(self.retained_chat_converter_bytes)?;
         }
 
         if !skip_stream_stable {
@@ -1289,7 +1313,9 @@ impl ResponsesState {
         ] {
             meter.json(value)?;
         }
-        meter.json_values(&self.accumulated_output)?;
+        if !skip_accumulated_output {
+            meter.json_values(&self.accumulated_output)?;
+        }
         #[cfg(feature = "openai-mcp-tools")]
         meter.json_values(&self.approved_tool_calls)?;
         for assignment in self
