@@ -385,6 +385,7 @@ impl FileSearchCalloutFilter {
         for update in updates {
             update.commit(&mut state.accumulated_output);
         }
+        state.mark_replay_stable_payload_changed();
         state.citation_files.extend(new_citation_files);
         // Append only the private model-context bridges (function_call +
         // function_call_output pairs) to `messages`. The loop owner already routed
