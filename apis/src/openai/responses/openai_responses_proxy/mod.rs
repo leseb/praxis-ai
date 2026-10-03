@@ -49,7 +49,7 @@ use super::{
     body_limits::reject_rewritten_body_too_large,
     enforce_agentic_stream_guard,
     error::responses_error_rejection,
-    state::{ResponsesState, normalize_input_owned},
+    state::{ResponsesState, normalize_input_owned, retained_json_bytes},
 };
 use crate::json_body::SerializedJson;
 
@@ -169,18 +169,16 @@ impl ResponsesProxyFilter {
     fn serialize_selected_body(
         &self,
         body: &Bytes,
+        members: &[TopLevelMember],
         state: &ResponsesState,
         preserve_native_compaction: bool,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let members = scan_top_level_object(body).map_err(|error| -> FilterError {
-            format!("openai_responses_proxy: invalid selected request body: {error}").into()
-        })?;
         let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
             state.messages.get(state.provider_history_len..).unwrap_or_default()
         } else {
             &state.messages
         };
-        let live_input = selected_input_messages(body, &members)?;
+        let live_input = selected_input_messages(body, members)?;
         let state_backend_messages = messages_for_backend(
             state_messages,
             preserve_native_compaction,
@@ -395,6 +393,80 @@ fn selected_input_messages(
         |error| -> FilterError { format!("openai_responses_proxy: invalid selected input: {error}").into() },
     )?;
     Ok(Some(normalize_input_owned(value)))
+}
+
+/// Reserve the selected body's parsed input, message reconciliations, input
+/// replacement, and final wire buffer before any of those owners is built.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each independently live rewrite owner needs a bounded projection"
+)]
+fn selected_rewrite_reservation(body: &[u8], members: &[TopLevelMember], state: &ResponsesState) -> Option<usize> {
+    let input_bytes = members
+        .iter()
+        .rev()
+        .find(|member| member.name == TopLevelField::Input)
+        .map_or(Some(0), |member| {
+            let raw = body.get(member.value_start..member.value_end)?;
+            let parsed = super::agentic_loop::buffered_parsed_json_bytes_upper_bound(raw)?;
+            // A string input is normalized into a message object.
+            parsed.checked_add(usize::from(raw.first() == Some(&b'"')) * 64)
+        })?;
+    let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
+        state.messages.get(state.provider_history_len..).unwrap_or_default()
+    } else {
+        &state.messages
+    };
+    let message_bytes = retained_json_bytes(state_messages)?;
+    let (replacement_fields, repeated_field_wire) = if state.request_body_requires_rebuild() {
+        [
+            ("tools", TopLevelField::Tools),
+            ("tool_choice", TopLevelField::ToolChoice),
+        ]
+        .into_iter()
+        .try_fold((0_usize, 0_usize), |(fields, wire), (key, name)| {
+            let bytes = state.request_body.get(key).map_or(Some(0), retained_json_bytes)?;
+            let repeated = members
+                .iter()
+                .filter(|member| member.name == name)
+                .count()
+                .saturating_sub(1);
+            Some((
+                fields.checked_add(bytes)?,
+                wire.checked_add(bytes.checked_mul(repeated)?.checked_mul(2)?)?,
+            ))
+        })?
+    } else {
+        (0, 0)
+    };
+    let provider_ids = state
+        .provider_compaction_ids
+        .iter()
+        .try_fold(0_usize, |used, id| used.checked_add(id.len()))?;
+    let source_messages = input_bytes.checked_add(message_bytes)?;
+    // The serializer replaces every `input` member, including duplicate
+    // keys. A single replacement is in the base projection below; each
+    // further occurrence can grow the wire Vec by the expanded projection.
+    let repeated_inputs = members
+        .iter()
+        .filter(|member| member.name == TopLevelField::Input)
+        .count()
+        .saturating_sub(1);
+    let repeated_input_wire = source_messages
+        .checked_mul(6)?
+        .checked_add(64)?
+        .checked_mul(repeated_inputs)?
+        .checked_mul(2)?;
+    // Reconciliation and compaction may each own a message projection while
+    // the parsed input, input_replacement, and growing wire Vec remain live.
+    source_messages
+        .checked_mul(8)?
+        .checked_add(body.len().checked_mul(3)?)?
+        .checked_add(replacement_fields.checked_mul(4)?)?
+        .checked_add(repeated_input_wire)?
+        .checked_add(repeated_field_wire)?
+        .checked_add(provider_ids)?
+        .checked_add(512)
 }
 
 /// Append state-owned messages that are not part of the original input.
@@ -716,11 +788,28 @@ impl HttpFilter for ResponsesProxyFilter {
         let Some(current_body) = body.as_ref() else {
             return Ok(SelectedUpstreamBodyOutcome::Continue);
         };
-        let serialized = match self.serialize_selected_body(current_body, state, preserve_native_compaction)? {
-            Ok(bytes) => bytes,
-            Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
-            Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
-        };
+        let members = scan_top_level_object(current_body).map_err(|error| -> FilterError {
+            format!("openai_responses_proxy: invalid selected request body: {error}").into()
+        })?;
+        if state.retained_payload_limit().is_some()
+            && !selected_rewrite_reservation(current_body, &members, state)
+                .is_some_and(|bytes| state.can_retain_payload(bytes))
+        {
+            let action = super::budget_error::reject_retained_payload_budget(
+                ctx,
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during native request rewrite",
+            );
+            return match action {
+                FilterAction::Reject(rejection) => Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+                _ => Err("openai_responses_proxy: invalid retained-budget rejection".into()),
+            };
+        }
+        let serialized =
+            match self.serialize_selected_body(current_body, &members, state, preserve_native_compaction)? {
+                Ok(bytes) => bytes,
+                Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+                Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
+            };
 
         if let Some(limit) = effective_request_body_limit(ctx)
             && serialized.len() > limit
