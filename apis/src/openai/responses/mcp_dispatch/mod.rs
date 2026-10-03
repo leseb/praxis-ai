@@ -66,8 +66,8 @@ use tracing::{debug, warn};
 use self::{
     approval::{
         ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context, bind_owner_context,
-        build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
-        parse_approval_response, resolve_approval, target_fingerprint,
+        build_approved_tool_call, build_denial_message, connector_binding_growth_bytes, extract_approval_responses,
+        is_approval_response, parse_approval_response, resolve_approval, target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
@@ -320,15 +320,30 @@ impl McpDispatchFilter {
         ctx: &mut HttpFilterContext<'_>,
         headers: &http::HeaderMap,
         connector_identity: Option<&McpCalloutIdentity>,
-    ) {
+    ) -> bool {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
-            return;
+            return true;
         };
+        if state.retained_payload_limit().is_some() {
+            let growth = state.mcp_tool_map.values().try_fold(0_usize, |used, entry| {
+                used.checked_add(connector_binding_growth_bytes(
+                    entry,
+                    connector_identity.is_some(),
+                    connector_identity
+                        .and_then(McpCalloutIdentity::user_credential)
+                        .is_some(),
+                )?)
+            });
+            if !growth.is_some_and(|bytes| state.can_retain_payload(bytes)) {
+                return false;
+            }
+        }
         for entry in state.mcp_tool_map.values_mut() {
             bind_forwarded_header_context(entry, &self.forward_headers, headers);
             bind_owner_context(entry, connector_identity.map(McpCalloutIdentity::owner));
             bind_credential_context(entry, connector_identity.and_then(McpCalloutIdentity::user_credential));
         }
+        true
     }
 
     /// Append MCP execution results to private continuation and public output state.
@@ -391,7 +406,7 @@ impl McpDispatchFilter {
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while appending MCP results".to_owned(),
+                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while dispatching MCP tools".to_owned(),
             });
         }
         ctx.set_metadata("responses.skip_persist", "true");
@@ -1167,7 +1182,9 @@ impl McpDispatchFilter {
         } else {
             None
         };
-        self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
+        if !self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref()) {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
 
         // Fetch (or lazily create) the per-execution MCP session pool. It lives
         // in the request's threaded `RequestExtensions`, so this same pool is
@@ -1188,6 +1205,16 @@ impl McpDispatchFilter {
         // `function_call_output` so inference resumes without a tool call.
         if let Err(rejection) = self.resume_approvals(ctx).await {
             return Ok(FilterAction::Reject(rejection));
+        }
+
+        // Binding, parked sessions, and approval resume can each grow retained
+        // state even when this round has no MCP call to execute.
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| !state.can_retain_payload(0))
+        {
+            return Ok(Self::aggregate_budget_action(ctx));
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -1233,6 +1260,15 @@ impl McpDispatchFilter {
             .await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
+            }
+            // Deferred discovery inserts new map entries after the initial
+            // binding check. Its projected commit also needs a final admission.
+            if ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| !state.can_retain_payload(0))
+            {
+                return Ok(Self::aggregate_budget_action(ctx));
             }
         }
 

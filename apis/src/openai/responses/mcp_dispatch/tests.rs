@@ -31,8 +31,8 @@ use crate::{
             approval::{
                 ApprovalError, ApprovalResponseInput, ResolvedApproval, bind_credential_context,
                 bind_forwarded_header_context, bind_owner_context, build_approved_tool_call, build_denial_message,
-                extract_approval_responses, is_approval_response, owner_fingerprint, parse_approval_response,
-                resolve_approval, target_fingerprint,
+                connector_binding_growth_bytes, extract_approval_responses, is_approval_response, owner_fingerprint,
+                parse_approval_response, resolve_approval, target_fingerprint,
             },
             config::{McpDispatchConfig, build_config},
         },
@@ -1931,6 +1931,58 @@ async fn on_request_no_mcp_calls_returns_continue() {
     ctx.extensions.insert(ResponsesState::default());
     let result = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(result, FilterAction::Continue));
+}
+
+#[tokio::test]
+async fn connector_binding_over_budget_stops_before_upstream_without_tool_calls() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut tool_map = sample_tool_map();
+    tool_map.retain(|(server, _), _| server == "weather");
+    tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap()["connector_id"] = json!("weather");
+    let mut state = ResponsesState {
+        request_body: json!({"model": "gpt-4.1", "input": "x".repeat(4_096)}),
+        mcp_tool_map: tool_map,
+        ..ResponsesState::default()
+    };
+    let admitted = state.retained_payload_bytes().unwrap();
+    assert!(admitted >= 4_096);
+    state.apply_retained_payload_limit(admitted + 106);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.retained_payload_failed,
+        "the owner must reject before another inference request"
+    );
+    assert!(state.dispatch_failure.is_some());
+    assert!(
+        state.mcp_tool_map.is_empty(),
+        "over-budget tool definitions must be released"
+    );
+}
+
+#[test]
+fn connector_binding_projection_matches_actual_map_growth() {
+    let mut entry = json!({"connector_id": "weather", "server_url": "https://mcp.example"});
+    let before = retained_json_bytes(&entry).unwrap();
+    let growth = connector_binding_growth_bytes(&entry, false, false).unwrap();
+
+    bind_forwarded_header_context(&mut entry, &[], &http::HeaderMap::new());
+
+    assert_eq!(growth, retained_json_bytes(&entry).unwrap() - before);
+    assert_eq!(connector_binding_growth_bytes(&entry, false, false), Some(0));
+    assert_eq!(
+        connector_binding_growth_bytes(&json!({"server_url": "https://mcp.example"}), true, true),
+        Some(0)
+    );
 }
 
 #[tokio::test]
