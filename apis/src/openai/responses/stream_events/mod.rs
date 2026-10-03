@@ -1550,11 +1550,17 @@ fn commit_chunk_events(
             return Err(error);
         }
 
-        // The plan owns restored snapshots for the whole chunk. Admit their
-        // echoed tools and encoded output before the first payload clone.
-        if !projected_client_tool_restore_bytes(ctx, state, &events)
-            .and_then(|bytes| bytes.checked_add(staging_bytes))
-            .is_some_and(|bytes| stream_payload_fits(ctx, state, bytes))
+        // Native passthrough has no restoration plan. Its terminal response
+        // may already have moved from the event into shared state, so applying
+        // the earlier event staging here would charge that owner twice.
+        let has_restoration_plan = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|responses| !responses.client_tool_lowering.is_empty());
+        if has_restoration_plan
+            && !projected_client_tool_restore_bytes(ctx, state, &events)
+                .and_then(|bytes| bytes.checked_add(staging_bytes))
+                .is_some_and(|bytes| stream_payload_fits(ctx, state, bytes))
         {
             return Ok(None);
         }
