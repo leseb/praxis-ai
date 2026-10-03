@@ -918,7 +918,7 @@ fn parse_and_accumulate(
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     }
-    let Some(logical_output_upper_bound) = logical_output_upper_bound(ctx, &events) else {
+    let Some(logical_output_upper_bound) = logical_output_upper_bound(ctx, state.local_items_flushed, &events) else {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
@@ -1461,11 +1461,20 @@ fn ready_file_search_synthesis_staging_bytes(state: &ResponsesState) -> Option<u
 }
 
 /// Bound all output that `commit_chunk_events` can append for this chunk.
-fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
-    let mut bound = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .map_or(Some(0), local_terminal_output_upper_bound)?;
+fn logical_output_upper_bound(
+    ctx: &HttpFilterContext<'_>,
+    local_items_flushed: bool,
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    // The chunk commit cannot flush local items again after its first model
+    // content event. Terminal synthesis has a separate admission check.
+    let mut bound = if local_items_flushed {
+        0
+    } else {
+        ctx.extensions
+            .get::<ResponsesState>()
+            .map_or(Some(0), local_terminal_output_upper_bound)?
+    };
     for event in events {
         // Terminal payloads are held for finalization, not appended to this
         // chunk. Their wire bytes are reserved when the finalizer emits them.

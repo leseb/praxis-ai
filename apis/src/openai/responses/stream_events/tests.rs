@@ -940,6 +940,53 @@ fn streaming_budget_reuses_unchanged_current_output_charge() {
 }
 
 #[test]
+fn flushed_local_item_does_not_reproject_on_heartbeat_chunks() {
+    let (filter, mut ctx) = make_armed_context();
+    let item = json!({
+        "type": "mcp_call",
+        "id": "call_flushed",
+        "status": "completed",
+        "name": "tool",
+        "result": "x".repeat(1_048_576),
+    });
+    let mut responses = ResponsesState {
+        accumulated_output: vec![item],
+        locally_executed_output_items: ["call_flushed".to_owned()].into_iter().collect(),
+        ..ResponsesState::default()
+    };
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(64 * 1_048_576);
+    ctx.extensions.insert(responses);
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    parser.local_items_flushed = true;
+    assert!(
+        super::local_terminal_output_upper_bound(ctx.extensions.get::<ResponsesState>().unwrap()).unwrap() > 1_048_576
+    );
+    assert_eq!(super::logical_output_upper_bound(&ctx, true, &[]), Some(0));
+    ctx.insert_filter_state(parser);
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let mut body = Some(Bytes::from_static(b": heartbeat\n\n"));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "heartbeat admission must not serialize the completed local item: {:?}",
+        started.elapsed()
+    );
+
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(baseline + 512);
+    let mut heartbeat = Some(Bytes::from_static(b": heartbeat\n\n"));
+    filter.on_response_body(&mut ctx, &mut heartbeat, false).unwrap();
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(ctx.get_metadata("responses.stream_error_message").is_none());
+}
+
+#[test]
 fn unbounded_stream_skips_echo_projection_without_snapshots() {
     let (filter, mut ctx) = make_armed_context();
     let mut responses = ResponsesState::default();
@@ -3221,7 +3268,7 @@ async fn logical_output_is_admitted_before_allocation() {
     let mut parser = SseFrameParser::new(65_536);
     let frames = parser.parse_chunk(&chunk).unwrap();
     let event = crate::openai::sse::responses::ResponsesEvent::from_frame(&frames[0]).unwrap();
-    let output_upper_bound = super::logical_output_upper_bound(&ctx, &[event]).unwrap();
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, false, &[event]).unwrap();
     ctx.extensions
         .get_mut::<ResponsesState>()
         .unwrap()
@@ -3269,7 +3316,7 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
     let frame_bytes = super::retained_frame_payload_bytes(&frames).unwrap();
     let event_bytes = super::retained_event_payload_bytes(&events[0]).unwrap();
     let projected_state_bytes = super::projected_responses_state_clone_bytes(&ctx, &events);
-    let output_upper_bound = super::logical_output_upper_bound(&ctx, &events).unwrap();
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, false, &events).unwrap();
     let current = ctx
         .extensions
         .get::<ResponsesState>()
