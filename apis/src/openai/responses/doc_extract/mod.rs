@@ -63,8 +63,12 @@ use self::{
     extract::{ExtractError, ExtractionBudget, extract_input_file},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts_mut,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    body_limits::reject_rewritten_body_too_large,
+    bound_body_outcome,
+    content_parts::{content_parts, content_parts_mut},
+    error::responses_error_rejection,
+    openai_responses_proxy::serialized_outbound_body_len,
+    state::{ResponsesState, retained_json_bytes},
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 
@@ -186,6 +190,10 @@ impl HttpFilter for DocExtractFilter {
 ///
 /// Takes ownership of the parsed body so the extracted value can be
 /// moved into [`ResponsesState`] instead of deep-cloned.
+#[expect(
+    clippy::too_many_lines,
+    reason = "aggregate preflight applies to both input and history paths"
+)]
 fn extract_and_rewrite(
     filter: &DocExtractFilter,
     ctx: &mut HttpFilterContext<'_>,
@@ -195,14 +203,26 @@ fn extract_and_rewrite(
     let max_bytes = filter.config.max_rewritten_body_bytes;
     let mut budget = ExtractionBudget::new(&filter.config);
 
+    // One extracted string can exist in the parsed body, rewritten wire body,
+    // request state, and both history projections before the old owners drop.
+    // Bound the total decoded text before base64 decoding or JSON rewriting.
+    let aggregate_constrained = match constrain_aggregate_extraction(ctx, body, &parsed, &mut budget) {
+        Ok(constrained) => constrained,
+        Err(action) => return Ok(action),
+    };
+
     let count = match extract_current_input(&mut parsed, &mut budget) {
         Ok(count) => count,
+        Err(ExtractError::TooLarge { .. }) if aggregate_constrained => return Ok(reject_aggregate_extraction()),
         Err(e) => return Ok(reject_extract_error(&e)),
     };
 
     if count == 0 {
         trace!("no input_file parts to extract");
         if let Err(e) = extract_state_history(ctx, &mut budget) {
+            if matches!(e, ExtractError::TooLarge { .. }) && aggregate_constrained {
+                return Ok(reject_aggregate_extraction());
+            }
             return Ok(reject_extract_error(&e));
         }
         if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
@@ -216,6 +236,9 @@ fn extract_and_rewrite(
         return Ok(rejection);
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
+        if matches!(e, ExtractError::TooLarge { .. }) && aggregate_constrained {
+            return Ok(reject_aggregate_extraction());
+        }
         return Ok(reject_extract_error(&e));
     }
     if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
@@ -223,6 +246,85 @@ fn extract_and_rewrite(
     }
 
     Ok(FilterAction::Continue)
+}
+
+/// Cap the whole extraction, including escaped JSON and temporary owners,
+/// before the first base64 decode. A decoded byte can occupy six JSON bytes
+/// (`\u00XX`) in each of five current-input owners; mirrored history can also
+/// use an independent extraction allowance. A 48x reserve covers those owners,
+/// decoded buffers, and object/framing overhead. Existing
+/// state, the buffered request, parsed tree, rewritten wire body, and temporary
+/// current-input copies are charged separately.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checked preflight preserves every live extraction owner"
+)]
+fn constrain_aggregate_extraction(
+    ctx: &HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    parsed: &serde_json::Value,
+    budget: &mut ExtractionBudget,
+) -> Result<bool, FilterAction> {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Ok(false);
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return Ok(false);
+    };
+    let current_items = parsed
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| has_inline_file_data(items));
+    let history_end = state.messages.len().saturating_sub(state.input.len());
+    let persisted_history_end = state.persisted_messages.len().saturating_sub(state.input.len());
+    let history_items = state.messages.get(..history_end).is_some_and(has_inline_file_data)
+        || state
+            .persisted_messages
+            .get(..persisted_history_end)
+            .is_some_and(has_inline_file_data);
+    if !current_items && !history_items {
+        return Ok(false);
+    }
+
+    let parsed_bytes = retained_json_bytes(parsed).ok_or_else(reject_aggregate_extraction)?;
+    let live_body_copies = parsed_bytes.checked_mul(4).ok_or_else(reject_aggregate_extraction)?;
+    let headroom = state
+        .retained_payload_bytes_bounded(limit)
+        .and_then(|current| limit.checked_sub(current))
+        .and_then(|remaining| remaining.checked_sub(body.as_ref().map_or(0, Bytes::len)))
+        .and_then(|remaining| remaining.checked_sub(live_body_copies))
+        .and_then(|remaining| remaining.checked_sub(4_096))
+        .ok_or_else(reject_aggregate_extraction)?;
+    let text_limit = headroom / 48;
+    if text_limit == 0 {
+        return Err(reject_aggregate_extraction());
+    }
+    let constrained = text_limit < budget.max_content_bytes || text_limit < budget.max_total_text_bytes;
+    budget.max_content_bytes = budget.max_content_bytes.min(text_limit);
+    budget.max_total_text_bytes = budget.max_total_text_bytes.min(text_limit);
+    budget.remaining_total_text_bytes = budget.remaining_total_text_bytes.min(text_limit);
+    Ok(constrained)
+}
+
+/// Whether extraction can replace an inline file in these input/history items.
+fn has_inline_file_data(items: &[serde_json::Value]) -> bool {
+    items.iter().any(|item| {
+        content_parts(item).is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("input_file")
+                    && part.get("file_data").and_then(serde_json::Value::as_str).is_some()
+            })
+        })
+    })
+}
+
+/// Shared retained-budget failure before the request has committed a response.
+fn reject_aggregate_extraction() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during document extraction",
+    ))
 }
 
 /// Walk the current request input and extract text-safe `input_file` parts.
