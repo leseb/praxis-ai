@@ -729,6 +729,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "the excess marker must produce an error for the boundary assertion"
+    )]
     fn marker_limit_still_applies_without_offset_range_staging() {
         let files = HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]);
         let marker = "<|file-unknown|>";

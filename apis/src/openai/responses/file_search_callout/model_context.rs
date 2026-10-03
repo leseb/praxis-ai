@@ -153,6 +153,10 @@ impl ModelContextBuilder {
     }
 
     /// Append one result chunk when both formatting budgets permit it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "check both encoded size limits before appending a chunk"
+    )]
     fn append_chunk(&mut self, result: &SearchResult, content: &str, template: &str) -> bool {
         if self.exhausted || self.chunk_count >= MAX_FORMATTED_CHUNKS {
             return self.exhaust();
@@ -172,10 +176,9 @@ impl ModelContextBuilder {
         {
             return self.exhaust();
         }
-        let Some(annotation_json_bytes) = json_string_content_bytes(&self.annotation) else {
-            return self.exhaust();
-        };
-        let Some(next_json_bytes) = self.rendered_json_bytes.checked_add(annotation_json_bytes) else {
+        let Some(next_json_bytes) = json_string_content_bytes(&self.annotation)
+            .and_then(|annotation_json_bytes| self.rendered_json_bytes.checked_add(annotation_json_bytes))
+        else {
             return self.exhaust();
         };
         if next_json_bytes > self.max_rendered_json_bytes {
@@ -450,6 +453,10 @@ fn render_annotation_bounded(
 }
 
 /// Render one annotation into the reusable chunk buffer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reuse caller-owned storage with the bounded template fields"
+)]
 fn render_annotation_bounded_into(
     rendered: &mut String,
     result: &SearchResult,
@@ -524,6 +531,10 @@ mod tests {
 
     #[test]
     #[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare a full high-cardinality context with its fixed baseline"
+    )]
     fn large_citation_context_allocation_reuses_chunk_storage_and_moves_final_text() {
         // Reproducible high-cardinality input: 2048 citations, 256 ASCII
         // content bytes each, one file. The legacy fixture above models the
@@ -575,6 +586,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "check both sides of the exact escaped JSON boundary"
+    )]
     fn default_context_accepts_its_exact_json_boundary() {
         let result = SearchResult {
             attributes: None,
