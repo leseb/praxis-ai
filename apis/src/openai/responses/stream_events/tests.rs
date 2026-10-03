@@ -194,7 +194,11 @@ fn local_completion_encodes_canonical_logical_sse_terminal() {
     assert_eq!(payload["response"]["id"], "resp_logical");
     assert_eq!(
         payload["response"]["output"].as_array().map(Vec::as_slice),
-        Some(state.accumulated_output.as_slice())
+        state.response_object["output"].as_array().map(Vec::as_slice)
+    );
+    assert!(
+        state.accumulated_output.is_empty(),
+        "terminal output moved into response_object"
     );
     assert_eq!(payload["response"]["usage"], state.usage);
     assert_eq!(state.logical_stream_sequence, 5);
@@ -320,6 +324,36 @@ fn deferred_terminal_preflights_canonical_output_owners() {
 }
 
 #[test]
+fn deferred_terminal_wire_overflow_keeps_sequence_for_error() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        logical_stream_sequence: 4,
+        accumulated_output: vec![json!({"type": "message", "content": [{"text": "x".repeat(4_096)}]})],
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "sequence_number": 4}),
+    };
+    let preflight = super::canonicalization_staging_bytes(&state, 0).unwrap()
+        + terminal.retained_payload_bytes().unwrap()
+        + parser_state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + preflight + 128);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().logical_stream_sequence,
+        4
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
 fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -334,7 +368,7 @@ fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
         citation_files: [("file-known".to_owned(), "x".repeat(1_024))].into(),
         ..ResponsesState::default()
     };
-    let output_bytes = super::canonical_logical_output_bytes(&state).unwrap();
+    let output_bytes = crate::openai::responses::state::retained_json_values_bytes(&state.accumulated_output).unwrap();
     let expanded_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
     assert!(
         expanded_staging > output_bytes * 10,
@@ -755,7 +789,8 @@ fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
         ..ResponsesState::default()
     };
 
-    let (output, _usage) = canonicalize_logical_response(&mut state, false).expect("terminal restore");
+    canonicalize_logical_response(&mut state, false).expect("terminal restore");
+    let output = state.response_object["output"].as_array().unwrap();
 
     assert_eq!(output[0]["type"], "custom_tool_call", "lowered function_call retyped");
     assert_eq!(
@@ -2285,7 +2320,7 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
 }
 
 #[test]
-fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
+fn commit_projection_charges_argument_delta_and_terminal_usage_owners() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     let mut response_state = ResponsesState::default();
@@ -2319,12 +2354,20 @@ fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
         "usage": {"input_tokens": 1}
     });
     let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let old_usage_bytes =
+        crate::openai::responses::state::retained_json_bytes(&ctx.extensions.get::<ResponsesState>().unwrap().usage)
+            .unwrap();
+    let new_usage_bytes = crate::openai::responses::state::retained_json_bytes(&response["usage"]).unwrap();
     let terminal = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
         "type": "response.completed",
-        "response": response
+        "response": response.clone()
     }));
     let terminal_projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
-    assert!(terminal_projection >= response_bytes * 2);
+    assert_eq!(terminal_projection, (old_usage_bytes + new_usage_bytes) * 2);
+    assert!(
+        terminal_projection < response_bytes,
+        "the response tree moves from the parsed event"
+    );
 }
 
 /// Record execution provenance for every item currently in `accumulated_output`,
@@ -4807,6 +4850,103 @@ fn deferred_terminal_stores_moved_payload_without_deep_clone() {
         "deferred-terminal store must move the payload: clone={} move={}",
         clone_info.bytes_total,
         move_info.bytes_total
+    );
+}
+
+#[test]
+fn terminal_canonicalization_moves_large_output_without_a_payload_clone() {
+    let text = "x".repeat(256 * 1024);
+    let mut state = ResponsesState {
+        response_object: json!({"id": "resp_move", "output": []}),
+        accumulated_output: vec![json!({
+            "type": "message",
+            "id": "msg_move",
+            "content": [{"type": "output_text", "text": text}]
+        })],
+        ..ResponsesState::default()
+    };
+    let old_ptr = state.accumulated_output[0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    let clone_baseline = allocation_counter::measure(|| {
+        std::hint::black_box(state.accumulated_output.clone());
+    });
+    let moved = allocation_counter::measure(|| {
+        canonicalize_logical_response(&mut state, false).unwrap();
+    });
+    let new_ptr = state.response_object["output"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    assert_eq!(new_ptr, old_ptr, "canonical output keeps the original text allocation");
+    assert!(state.accumulated_output.is_empty());
+    assert!(clone_baseline.bytes_total >= 256 * 1024);
+    assert!(
+        moved.bytes_total < clone_baseline.bytes_total / 4,
+        "canonicalization allocated {} bytes versus {} for the old output clone",
+        moved.bytes_total,
+        clone_baseline.bytes_total
+    );
+}
+
+#[test]
+fn terminal_accumulation_moves_parsed_response_into_shared_state() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+        "type": "response.completed",
+        "sequence_number": 9,
+        "response": {
+            "id": "resp_move",
+            "output": [{"type": "message", "text": "x".repeat(256 * 1024)}]
+        }
+    }));
+    let original_text = event.payload()["response"]["output"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+
+    super::accumulator::accumulate_event(&mut ctx, &mut parser_state, &mut event);
+
+    let retained = &ctx.extensions.get::<ResponsesState>().unwrap().response_object;
+    assert_eq!(retained["output"][0]["text"].as_str().unwrap().as_ptr(), original_text);
+    assert!(event.payload().get("response").is_none());
+    assert_eq!(event.payload()["sequence_number"], 9);
+}
+
+#[test]
+fn borrowed_terminal_serializes_canonical_response_without_cloning_it() {
+    let response = json!({"id": "resp_borrow", "output": [{"text": "x".repeat(256 * 1024)}]});
+    let metadata = json!({"type": "response.completed", "sequence_number": 7});
+    let expected = json!({
+        "type": "response.completed",
+        "sequence_number": 7,
+        "response": response
+    });
+    let baseline = allocation_counter::measure(|| {
+        std::hint::black_box(response.clone());
+    });
+    let terminal = super::BorrowedTerminalPayload {
+        metadata: &metadata,
+        response: &response,
+    };
+    let mut wire = Vec::with_capacity(serde_json::to_vec(&expected).unwrap().len());
+    let borrowed = allocation_counter::measure(|| {
+        serde_json::to_writer(&mut wire, &terminal).unwrap();
+    });
+    assert_eq!(
+        wire,
+        serde_json::to_vec(&expected).unwrap(),
+        "terminal wire key order stays stable"
+    );
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&wire).unwrap(), expected);
+    assert!(baseline.bytes_total >= 256 * 1024);
+    assert!(
+        borrowed.bytes_total < baseline.bytes_total / 4,
+        "borrowed serialization allocated {} bytes versus {} for a response clone",
+        borrowed.bytes_total,
+        baseline.bytes_total
     );
 }
 
