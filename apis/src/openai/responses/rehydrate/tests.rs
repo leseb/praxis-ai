@@ -1417,6 +1417,55 @@ async fn an_explicit_null_conversation_is_treated_as_absent() {
 }
 
 #[tokio::test]
+async fn non_create_operations_rehydrate_small_history_with_agentic_budget() {
+    let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap())
+        .expect("valid budget policy");
+    let stored = json!([{"role": "user", "content": "Earlier turn"}]);
+
+    for path in ["/v1/responses/input_tokens", "/v1/responses/compact"] {
+        for use_conversation in [false, true] {
+            let store = if use_conversation {
+                MockStore::with_conversation("conv_prev", stored.clone())
+            } else {
+                MockStore::with_completed_response("resp_prev", json!("Earlier turn"), stored.clone())
+            };
+            let registry = setup_registry(store);
+            let req = crate::test_utils::make_request(http::Method::POST, path);
+            let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+            ctx.extensions.insert(registry);
+            ctx.extensions.insert(policy);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.set_metadata("responses.store_request_payload_bytes", "0");
+            assert!(ctx.extensions.get::<ResponsesState>().is_none());
+            let selector = if use_conversation {
+                json!({"conversation": "conv_prev"})
+            } else {
+                json!({"previous_response_id": "resp_prev"})
+            };
+            let mut request_body = json!({"model": "gpt-4.1", "input": "Count this"});
+            request_body
+                .as_object_mut()
+                .unwrap()
+                .extend(selector.as_object().unwrap().clone());
+            let mut body = Some(Bytes::from(request_body.to_string()));
+
+            let action = default_filter()
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .unwrap();
+            assert!(
+                matches!(action, FilterAction::Release),
+                "{path}, conversation={use_conversation}: {action:?}"
+            );
+            let state = ctx.extensions.get::<ResponsesState>().expect("history was rehydrated");
+            assert!(state.history_rehydrated);
+            assert_eq!(state.messages[0]["content"], "Earlier turn");
+            assert_eq!(state.retained_payload_limit(), Some(65_536));
+        }
+    }
+}
+
+#[tokio::test]
 async fn rehydrates_from_conversation_string_id() {
     let messages = json!([
         {"role": "user", "content": "turn one"},
@@ -3594,6 +3643,19 @@ impl ResponseStore for MockStore {
         Ok(self.records.get(id).filter(|r| &r.owner == tenant_id).cloned())
     }
 
+    async fn get_response_bounded(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let record = self.get_response(owner, id).await?;
+        if let Some(record) = &record {
+            bounded_mock_json(&[&record.response_object, &record.input, &record.messages], max_bytes)?;
+        }
+        Ok(record)
+    }
+
     async fn delete_response(&self, _tenant_id: &StateOwner, _id: &str) -> Result<bool, StoreError> {
         Ok(false)
     }
@@ -3691,6 +3753,32 @@ impl ResponseStore for MockStore {
                 messages: c.messages.clone(),
             }))
     }
+
+    async fn get_conversation_bounded(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let record = ResponseStore::get_conversation(self, owner, id).await?;
+        if let Some(record) = &record {
+            bounded_mock_json(&[&record.metadata, &record.messages], max_bytes)?;
+        }
+        Ok(record)
+    }
+}
+
+/// Model the store's bounded-column contract for policy tests. The production
+/// backends preflight before materializing these values; this mock already owns
+/// the records in memory.
+fn bounded_mock_json(values: &[&Value], max_bytes: usize) -> Result<(), StoreError> {
+    let used = values.iter().try_fold(0_usize, |used, value| {
+        used.checked_add(crate::openai::responses::state::retained_json_bytes(*value)?)
+    });
+    if used.is_none_or(|used| used > max_bytes) {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(())
 }
 
 fn setup_registry(store: MockStore) -> ResponseStoreRegistry {
