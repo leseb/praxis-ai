@@ -396,8 +396,8 @@ pub(crate) fn build_bare_outbound_pipeline(allow_private: bool) -> Result<Arc<Fi
 /// of these per request via [`from_context`](Self::from_context) and thread it
 /// down to
 /// [`list_tools_with_forwarded_headers`](super::list_tools_with_forwarded_headers)/
-/// [`call_tool_with_forwarded_headers`](super::call_tool_with_forwarded_headers), which build an
-/// [`McpSubrequestClient`] from it.
+/// [`call_tool_with_forwarded_headers_bounded_initialize`](super::call_tool_with_forwarded_headers_bounded_initialize),
+/// which build an [`McpSubrequestClient`] from it.
 ///
 /// It deliberately does *not* fabricate a fresh connector or a default runtime:
 /// the callout must share the server's connection pool and carry the originating
