@@ -1064,9 +1064,6 @@ fn projected_client_tool_restore_bytes(
     if responses.client_tool_lowering.is_empty() {
         return Some(0);
     }
-    let echo_bytes = responses.client_tool_echo.as_ref().map_or(Some(0), |echo| {
-        retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)
-    })?;
     let max_name_bytes = responses
         .client_tool_lowering
         .values()
@@ -1085,12 +1082,22 @@ fn projected_client_tool_restore_bytes(
             .checked_add(item.item_id.as_ref().map_or(0, String::len))
     })?;
     let mut projected = tracked.checked_mul(2)?;
+    let mut cached_echo_bytes = None;
     for event in events {
         if event.is_terminal() {
             continue;
         }
         let Some(snapshot) = event.payload().get("response") else {
             continue;
+        };
+        let echo_bytes = if let Some(bytes) = cached_echo_bytes {
+            bytes
+        } else {
+            let bytes = responses.client_tool_echo.as_ref().map_or(Some(0), |echo| {
+                retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)
+            })?;
+            cached_echo_bytes = Some(bytes);
+            bytes
         };
         let source_bytes = retained_json_bytes(snapshot)?;
         let item_count = snapshot.get("output").and_then(Value::as_array).map_or(0, Vec::len);
@@ -1689,8 +1696,8 @@ fn accumulate_chunk(
 ) -> Result<Option<ChargedClientToolCompletions>, SseParseError> {
     let mut completions = Vec::new();
     let mut completion_bytes = 0_usize;
-    // A chunk may contain hundreds of completed calls. Keep a conservative
-    // shared-state charge between adjacent done events instead of serializing
+    // A chunk may contain hundreds of completed calls and interleaved item
+    // events. Keep a conservative shared-state charge instead of serializing
     // the entire response tree again for every snapshot admission.
     let mut admission = CompletionAdmission {
         parsed_owner_bytes,
@@ -1702,9 +1709,6 @@ fn accumulate_chunk(
         if completion_bytes > 0 && !pending_completion_event_fits(ctx, state, event, &mut admission) {
             release_client_tool_completions(ctx, completions, completion_bytes);
             return Ok(None);
-        }
-        if !matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_)) {
-            admission.shared_upper_bound = None;
         }
         let retained_clone_bytes = accumulate_event(ctx, state, event);
         if matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_))
@@ -1718,6 +1722,11 @@ fn accumulate_chunk(
                 .checked_mul(2)
                 .and_then(|bytes| bytes.checked_add(retained_event_payload_bytes(event)?))
                 .and_then(|bytes| bytes.checked_add(64));
+            *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
+        } else if let Some(upper) = admission.shared_upper_bound.as_mut() {
+            // The preflight's clone projection also bounds the shared growth
+            // retained by an interleaved output, delta, or terminal event.
+            let growth = projected_responses_state_clone_bytes(ctx, std::slice::from_ref(event));
             *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
         }
         // `function_call_arguments.done` can clone a completed item whose
@@ -1762,8 +1771,8 @@ fn accumulate_chunk(
 
 /// Preflight an event while earlier completion snapshots are still retained.
 /// Repeated done events use their matching item and argument sizes; other
-/// events use the ordinary per-event clone projection before invalidating the
-/// running charge for their distinct mutations.
+/// events use the ordinary per-event clone projection to extend the running
+/// charge for their distinct mutations.
 fn pending_completion_event_fits(
     ctx: &HttpFilterContext<'_>,
     state: &StreamEventsState,
