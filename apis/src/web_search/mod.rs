@@ -96,12 +96,15 @@ pub(crate) fn format_search_results(results: &[SearchResult]) -> String {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "allocation fixture checks a fixed formatter baseline")]
 mod tests {
     use super::*;
 
     #[test]
     #[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare full-size formatter output and fixed allocation baseline"
+    )]
     fn large_web_result_format_allocation_uses_one_output_buffer() {
         let results = (0..64)
             .map(|index| SearchResult {

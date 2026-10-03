@@ -2764,6 +2764,11 @@ mod tests {
 
     #[test]
     #[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "build and compare the full high-cardinality legacy decode fixture"
+    )]
+    #[expect(clippy::expect_used, reason = "the deterministic fixture must decode successfully")]
     fn high_cardinality_decode_avoids_full_result_tree_allocation() {
         // Fixed legacy baseline: parse every provider result into an owned
         // Value tree before selecting the first 50 retained candidates.
@@ -2779,17 +2784,18 @@ mod tests {
         body.extend_from_slice(b"]}");
         let legacy = || {
             let mut document: Value = serde_json::from_slice(&body).expect("valid fixed fixture");
-            document["data"]
-                .as_array_mut()
+            document
+                .get_mut("data")
+                .and_then(Value::as_array_mut)
                 .expect("data array")
                 .drain(..50)
                 .map(|value| serde_json::from_value::<SearchResult>(value).expect("valid result"))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(decode(&body, 50).unwrap().len(), legacy().len());
+        assert_eq!(decode(&body, 50).expect("valid fixed fixture").len(), legacy().len());
 
         let optimized = allocation_counter::measure(|| {
-            std::hint::black_box(decode(&body, 50).unwrap());
+            std::hint::black_box(decode(&body, 50).expect("valid fixed fixture"));
         });
         let baseline = allocation_counter::measure(|| {
             std::hint::black_box(legacy());
