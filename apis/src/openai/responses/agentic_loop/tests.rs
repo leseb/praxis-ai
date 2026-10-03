@@ -3749,6 +3749,38 @@ fn streamed_tool_search_preflight_charges_every_retained_copy() {
 }
 
 #[test]
+fn compaction_collection_preflights_history_copies_and_provenance_id() {
+    let id = format!("cmp_{}", "x".repeat(4_096));
+    let response = json!({
+        "object": "response",
+        "output": [{"type": "compaction", "id": id, "encrypted_content": "opaque"}]
+    });
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let output_bytes = super::super::state::retained_json_bytes(&response["output"]).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let id_bytes = response["output"][0]["id"].as_str().unwrap().len();
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let buffered_peak = baseline + response_bytes + 2 * item_bytes + id_bytes;
+    let mut buffered = ResponsesState::default();
+    buffered.apply_retained_payload_limit(buffered_peak - 1);
+    assert!(super::extract_tool_calls_from_body(&body, &mut buffered).is_err());
+    assert!(buffered.accumulated_output.is_empty());
+    assert!(buffered.provider_compaction_ids.is_empty());
+
+    let mut streamed = ResponsesState {
+        response_object: response,
+        ..ResponsesState::default()
+    };
+    let streamed_retained = baseline - 4 + response_bytes - output_bytes + 2 + 3 * item_bytes + id_bytes;
+    streamed.apply_retained_payload_limit(streamed_retained - 1);
+    assert!(!super::streaming_collection_retention_fits(&streamed));
+    assert!(streamed.provider_compaction_ids.is_empty());
+    assert_eq!(streamed.response_object["output"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
     let response = json!({
         "id": "resp_exact",
