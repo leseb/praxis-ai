@@ -820,6 +820,17 @@ impl HttpFilter for McpToolResolveFilter {
         let Some(bytes) = body.as_ref().cloned() else {
             return Ok(FilterAction::Continue);
         };
+        // Rehydrate can leave earlier history near the aggregate ceiling.
+        // Charge the second JSON tree before parsing this already-buffered body;
+        // the Bytes handle above only increments an Arc refcount.
+        let parse_fits = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_none_or(|state| state.retained_payload_limit().is_none() || state.can_retain_payload(bytes.len()));
+        if !parse_fits {
+            let streaming = is_streaming(ctx);
+            return Ok(reject_retained_budget(ctx, streaming, &bytes));
+        }
         let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return Ok(FilterAction::Continue);
         };
@@ -831,15 +842,8 @@ impl HttpFilter for McpToolResolveFilter {
         // captures the size-bounded request options from it) is cheap.
         match Box::pin(self.resolve_mcp_tools(ctx, body, parsed)).await {
             Ok(action) => Ok(action),
-            Err(e) => {
-                if matches!(e, ResolveError::RetainedBudget) {
-                    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-                        state.discard_payload_for_budget_error();
-                    }
-                    ctx.set_metadata("responses.skip_persist", "true");
-                }
-                Ok(resolve_error_action(ctx, &e, streaming, &bytes))
-            },
+            Err(ResolveError::RetainedBudget) => Ok(reject_retained_budget(ctx, streaming, &bytes)),
+            Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
     }
 
@@ -851,6 +855,16 @@ impl HttpFilter for McpToolResolveFilter {
         let action = self.on_request_body(ctx, body, true).await?;
         bound_body_outcome(action)
     }
+}
+
+/// Mark an aggregate-budget failure terminal before constructing its response.
+/// No successful response may later be persisted for this request body.
+fn reject_retained_budget(ctx: &mut HttpFilterContext<'_>, streaming: bool, body: &[u8]) -> FilterAction {
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
+    resolve_error_action(ctx, &ResolveError::RetainedBudget, streaming, body)
 }
 
 // -----------------------------------------------------------------------------
