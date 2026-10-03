@@ -2687,6 +2687,48 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise the complete initialize SSE cap and signal path"
+    )]
+    async fn streaming_initialize_sse_obeys_admitted_control_cap() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            2_048,
+            None,
+        );
+        let initialize: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        )
+        .unwrap();
+        let cap = client.response_limit(&initialize);
+        let event = format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"instructions\":\"{}\"}}}}\n\n",
+            "x".repeat(3_072)
+        );
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+            [Bytes::from(event)],
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        let signal = test_signal();
+        let response = sub_response(200, Some("text/event-stream"), b"");
+        let out = client
+            .classify_streaming_post_response(response, body, false, cap, 16 * 1024 * 1024, Arc::clone(&signal))
+            .await
+            .unwrap();
+        let StreamableHttpPostResponse::Sse(mut stream, _) = out else {
+            panic!("expected an SSE post response");
+        };
+        assert!(matches!(futures::StreamExt::next(&mut stream).await, Some(Err(_))));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+        ));
+    }
+
+    #[tokio::test]
     async fn get_stream_405_is_no_sse_support() {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let body: Box<dyn StreamingResponseBody> = Box::new(

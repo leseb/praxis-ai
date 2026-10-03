@@ -1295,7 +1295,7 @@ impl McpDispatchFilter {
 /// is active; ordinary MCP calls do not need to serialize parked peer info.
 fn charge_pooled_mcp_sessions(ctx: &mut HttpFilterContext<'_>, pool: &mcp_client::McpSessionPool) -> bool {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
-        return false;
+        return true;
     };
     if state.retained_payload_limit().is_none() {
         return true;
