@@ -613,10 +613,10 @@ async fn aggregate_budget_rejects_file_before_content_callout() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let files_api_url = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let requests = std::thread::spawn(move || {
         let mut paths = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
+        while matches!(stop_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::park_timeout(Duration::from_millis(10));
                 continue;
@@ -659,13 +659,14 @@ async fn aggregate_budget_rejects_file_before_content_callout() {
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    drop(stop_tx);
+    let paths = requests.join().unwrap();
     match action {
         FilterAction::Reject(response) => assert_eq!(response.status, 502),
         other => panic!("over-budget file must fail closed: {other:?}"),
     }
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
-    let paths = requests.join().unwrap();
     assert_eq!(
         paths.len(),
         1,
