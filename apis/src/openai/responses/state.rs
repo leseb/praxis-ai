@@ -133,6 +133,7 @@ impl ResponsesState {
     }
 
     /// Borrow selected function calls, including approved calls on resume.
+    #[cfg(any(test, feature = "openai-mcp-tools"))]
     pub(crate) fn selected_tool_calls(&self) -> Vec<&serde_json::Value> {
         let calls: Vec<_> = self.selected_output(&self.tool_calls, "function_call").collect();
         #[cfg(feature = "openai-mcp-tools")]

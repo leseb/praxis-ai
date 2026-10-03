@@ -2920,8 +2920,12 @@ class TestOpenAIResponsesVLLM:
             },
             timeout=10,
         )
-        assert response.status_code == 200, response.text
-        assert len(forwarded) == 2, forwarded
+        # This shipped example has no input_tokens backend and deliberately
+        # returns its static unsupported-operation response after rehydration.
+        # A 413 here means the bounded history read failed before that route.
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["message"] == "unsupported managed Responses operation"
+        assert len(forwarded) == 1, forwarded
 
     def test_truncation_forwarded_to_backend_through_rehydration(
         self, witness_backend_client
