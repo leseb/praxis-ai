@@ -1135,6 +1135,62 @@ fn end_at_iteration_limit(
 // Body Parsing
 // -----------------------------------------------------------------------------
 
+/// Upper bound on compact JSON bytes after parsing a provider response.
+///
+/// `serde_json` can expand exponent-form numbers while serializing its parsed
+/// `Value` (for example, `1e15` becomes `1000000000000000.0`). Its current
+/// finite-float formatter has a 24-byte buffer. Scan number tokens outside
+/// strings without allocating so the parsed tree is admitted before creation.
+/// Integers below 20 bytes and decimal forms without an exponent already have
+/// a shortest round-trip spelling no longer than their input; `-0` is special.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass lexical bound must skip quoted number-like text"
+)]
+fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+    const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
+    let mut extra = 0_usize;
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(&byte) = body.get(index) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte != b'-' && !byte.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut has_exponent = false;
+        while let Some(&number_byte) = body.get(index) {
+            if !matches!(number_byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+                break;
+            }
+            has_exponent |= matches!(number_byte, b'e' | b'E');
+            index += 1;
+        }
+        let token = body.get(start..index)?;
+        if has_exponent || token.len() >= 20 || token == b"-0" {
+            extra = extra.checked_add(MAX_FORMATTED_NUMBER_BYTES.saturating_sub(token.len()))?;
+        }
+    }
+    body.len().checked_add(extra)
+}
+
 /// Extract completed function-call items from a non-streaming response body
 /// and populate `state.tool_calls` and `state.messages`.
 #[expect(
@@ -1144,11 +1200,15 @@ fn end_at_iteration_limit(
 fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     // The framework owns and separately bounds the raw response body. Only the
     // parsed response and the copies retained by agentic-loop state belong in
-    // this aggregate budget. The body length is an allocation-free upper bound
-    // for the parsed value's compact JSON payload, so reserve that projection
-    // before serde allocates it. The exact retained-owner accounting below runs
-    // after normalization and ID insertion without charging the framework body.
-    if !state.can_retain_payload(body.len()) {
+    // this aggregate budget. Numeric normalization can expand the compact JSON
+    // payload beyond the wire length, so reserve its checked upper bound before
+    // serde allocates. Exact owner accounting follows normalization and IDs.
+    let parsed_bound = if state.retained_payload_limit().is_some() {
+        buffered_parsed_json_bytes_upper_bound(body).ok_or_else(retained_payload_failure)?
+    } else {
+        body.len()
+    };
+    if !state.can_retain_payload(parsed_bound) {
         return Err(retained_payload_failure());
     }
     let response = serde_json::from_slice::<Value>(body)
@@ -1161,8 +1221,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
     };
     let normalization_staging = output_normalization_staging_bytes(&response, has_file_search_tool(state))
         .ok_or_else(retained_payload_failure)?;
-    if !body
-        .len()
+    if !parsed_bound
         .checked_add(normalization_staging)
         .is_some_and(|bytes| state.can_retain_payload(bytes))
     {

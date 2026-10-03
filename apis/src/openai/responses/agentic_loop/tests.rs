@@ -3516,6 +3516,57 @@ fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
 }
 
 #[test]
+fn buffered_numeric_projection_counts_normalization_only_outside_strings() {
+    let ordinary = br#"{"quoted":"1e15","escaped":"\\\"1e15","numbers":[1,2,3,1.0]}"#;
+    assert_eq!(
+        super::buffered_parsed_json_bytes_upper_bound(ordinary),
+        Some(ordinary.len())
+    );
+
+    let scientific = br#"{"object":"response","output":[],"numbers":[1e15,-0,18446744073709551616]}"#;
+    let parsed: Value = serde_json::from_slice(scientific).unwrap();
+    let exact = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let bound = super::buffered_parsed_json_bytes_upper_bound(scientific).unwrap();
+    assert!(
+        bound >= exact,
+        "numeric normalization must fit the pre-parse reservation"
+    );
+    assert!(
+        bound > scientific.len(),
+        "scientific notation expands in the parsed owner"
+    );
+}
+
+#[test]
+fn buffered_numeric_expansion_rejects_before_parsed_tree_allocation() {
+    let numbers = vec!["1e15"; 1_024].join(",");
+    let body = Bytes::from(format!(r#"{{"object":"response","output":[],"numbers":[{numbers}]}}"#));
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let parsed_bytes = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+    let limit = baseline + body.len() + 1;
+    assert!(parsed_bytes > body.len() + 1);
+
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(body.len()),
+        "the old raw-length guard would admit parsing"
+    );
+    let mut rejected = false;
+    let allocation = allocation_counter::measure(|| {
+        rejected = super::extract_tool_calls_from_body(&body, &mut state).is_err();
+    });
+    assert!(rejected);
+    assert!(
+        allocation.bytes_total < 1_024,
+        "numeric-heavy Value must be rejected before it is allocated: {allocation:?}"
+    );
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
 fn buffered_usage_projection_rejects_before_copying_large_usage() {
     let body = Bytes::from(
         serde_json::to_vec(&json!({

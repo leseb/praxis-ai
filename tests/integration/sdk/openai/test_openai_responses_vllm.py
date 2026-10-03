@@ -5312,29 +5312,38 @@ class TestClientToolCompatChatVLLM:
 
 
 class RetainedToolSearchBackendHandler(BaseHTTPRequestHandler):
-    """Return a hosted search item that fits once but exceeds three owners."""
+    """Return fixed hosted-search or numeric-heavy responses for budget checks."""
 
     requests: ClassVar[int] = 0
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(length)
+        request_body = self.rfile.read(length)
         type(self).requests += 1
-        payload = json.dumps(
-            {
-                "id": "resp_tool_search_budget",
-                "object": "response",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "tool_search_call",
-                        "id": "tsc_budget",
-                        "status": "completed",
-                        "results": [{"description": "x" * 5_000}],
-                    }
-                ],
-            }
-        ).encode()
+        if b"NUMERIC-PARSE-GUARD" in request_body:
+            numbers = b",".join([b"1e15"] * 1_024)
+            payload = (
+                b'{"id":"resp_numeric_budget","object":"response",'
+                b'"status":"completed","output":[],"numbers":['
+                + numbers
+                + b"]}"
+            )
+        else:
+            payload = json.dumps(
+                {
+                    "id": "resp_tool_search_budget",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "tool_search_call",
+                            "id": "tsc_budget",
+                            "status": "completed",
+                            "results": [{"description": "x" * 5_000}],
+                        }
+                    ],
+                }
+            ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -5463,6 +5472,21 @@ class TestAgenticLoopVLLM:
             retained_tool_search_client.responses.create(
                 model=VLLM_MODEL,
                 input="Find a tool.",
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 502
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedToolSearchBackendHandler.requests == 1
+
+    def test_numeric_normalization_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A short exponent-heavy wire response cannot bypass the parsed-owner bound."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input="NUMERIC-PARSE-GUARD",
                 store=False,
             )
 
