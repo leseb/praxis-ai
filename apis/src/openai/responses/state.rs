@@ -876,6 +876,14 @@ impl McpConnectorContextPolicy {
             authorization_slot: authorization_slot.map(str::to_owned),
         }
     }
+
+    /// Bytes owned by the configured slot names in request-scoped state.
+    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
+        self.credential_slot
+            .as_ref()
+            .map_or(0, String::len)
+            .checked_add(self.authorization_slot.as_ref().map_or(0, String::len))
+    }
 }
 
 impl fmt::Debug for DeferredMcpConnector {
