@@ -931,18 +931,22 @@ fn streamed_mcp_ownership_index_rejects_near_retained_limit() {
                 json!({"require_approval": "never"}),
             );
         }
+        let call = json!({
+            "type": "function_call",
+            "id": "fc_lookup",
+            "call_id": "call_lookup",
+            "name": "server__lookup",
+            "arguments": "{}",
+            "status": "completed"
+        });
+        // On the root branch the SSE parser records function calls before the
+        // agentic collector moves the final response output.
+        state.tool_calls.push(call.clone());
         state.response_object = json!({
             "id": "resp_index_budget",
             "object": "response",
             "status": "completed",
-            "output": [{
-                "type": "function_call",
-                "id": "fc_lookup",
-                "call_id": "call_lookup",
-                "name": "server__lookup",
-                "arguments": "{}",
-                "status": "completed"
-            }]
+            "output": [call]
         });
         state
     };
