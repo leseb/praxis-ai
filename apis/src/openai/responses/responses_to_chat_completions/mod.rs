@@ -78,6 +78,17 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 const FINITE_TRANSLATION_OVERFLOW_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during buffered Chat translation";
 
+/// One compact `{"text":"x"}` part expands to a 64-byte Responses
+/// `output_text` item. Reserve that full schema for the translated tree and
+/// both old and new wire Vec capacities at a growth boundary. Every part is a
+/// JSON object, so counting all structural objects is conservative.
+const FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES: usize = 64 * 3;
+
+/// `serde_json` can normalize `1e15` (four wire bytes) to
+/// `1000000000000000.0` (eighteen bytes). Reserve the expansion in the
+/// provider tree, translated tree, and output Vec with additional headroom.
+const FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES: usize = 64;
+
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
 /// The filter consumes the classification metadata and `ResponsesState`
@@ -531,13 +542,54 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
             .get_metadata("responses.response_id")
             .or(state.response_id.as_deref())
             .map_or(0, str::len);
+        let (objects, numbers) = json_structure_counts(body)?;
+        let object_expansion = objects.checked_mul(FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES)?;
+        let number_expansion = numbers.checked_mul(FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES)?;
         body.len()
             .checked_mul(6)?
+            .checked_add(object_expansion)?
+            .checked_add(number_expansion)?
             .checked_add(echo.checked_mul(3)?)?
             .checked_add(response_id_bytes.checked_mul(12)?)?
             .checked_add(512)
     })();
     staging.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Count structural objects and numeric tokens without allocating or mistaking
+/// their bytes inside JSON strings for payload structure. Invalid JSON still
+/// reaches provider-response validation unless its projection is over budget.
+fn json_structure_counts(body: &[u8]) -> Option<(usize, usize)> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_number = false;
+    let mut objects = 0_usize;
+    let mut numbers = 0_usize;
+    for &byte in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+            in_number = false;
+        } else if byte == b'{' {
+            objects = objects.checked_add(1)?;
+            in_number = false;
+        } else if byte == b'-' || byte.is_ascii_digit() {
+            if !in_number {
+                numbers = numbers.checked_add(1)?;
+            }
+            in_number = true;
+        } else if !in_number || !matches!(byte, b'.' | b'e' | b'E' | b'+') {
+            in_number = false;
+        }
+    }
+    Some((objects, numbers))
 }
 
 /// A finite response has not committed its translated wire body; reject it and
