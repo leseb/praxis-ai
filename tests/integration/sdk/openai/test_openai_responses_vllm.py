@@ -28,6 +28,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -287,6 +288,8 @@ def _write_full_flow_config(
     backend_endpoint: str | None = None,
     search_port: int | None = None,
     max_event_bytes: int | None = None,
+    compact_callout_port: int | None = None,
+    retained_limit: int | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     config = _load_example_config(
@@ -316,6 +319,27 @@ def _write_full_flow_config(
         )
         assert config.count(anchor) == 1
         config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
+    if compact_callout_port is not None:
+        anchor = "      - filter: iterative_request_router\n"
+        assert config.count(anchor) == 1
+        config = config.replace(
+            anchor,
+            "      - filter: openai_responses_compact\n"
+            "        allow_pre_security_callout: true\n"
+            f"        inference_url: http://127.0.0.1:{compact_callout_port}/v1/chat/completions\n"
+            "        allow_private_inference_url: true\n"
+            f"        default_model: {VLLM_MODEL}\n"
+            "        on_failure: open\n"
+            "        conditions:\n"
+            "          - unless:\n"
+            "              bound_upstream:\n"
+            "                application_provider: openai\n"
+            + anchor,
+        )
+    if retained_limit is not None:
+        anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
+        assert config.count(anchor) == 1
+        config = config.replace(anchor, anchor + f"                max_retained_bytes: {retained_limit}\n")
     if compression:
         config = _enable_response_store_compression(config)
 
@@ -1923,6 +1947,51 @@ def provider_compaction_client(tmp_path_factory, request):
                     f"\n=== Provider compaction Praxis logs ===\n{f.read()}",
                     file=sys.stderr,
                 )
+        os.unlink(config_path)
+
+
+@pytest.fixture()
+def usage_less_compact_client(tmp_path_factory, request, compaction_server):
+    """Native Responses continuation with no stored usage and an armed budget."""
+    NativeCompactionBackendHandler.requests = []
+    CompactionHandler.requests = []
+    backend_port = _free_port()
+    backend = HTTPServer(("127.0.0.1", backend_port), NativeCompactionBackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-usage-less-compact")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        compact_callout_port=compaction_server,
+        retained_limit=65_536,
+    )
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS), db_path
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        if request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== Usage-less compact Praxis logs ===\n{f.read()}", file=sys.stderr)
         os.unlink(config_path)
 
 
@@ -4031,6 +4100,37 @@ class TestResponsesCompactionVLLM:
         assert second.status == "completed"
         assert second.output_text
         assert len(CompactionHandler.requests) == request_count
+
+    def test_usage_less_rehydration_rejects_tokenizer_peak_before_callout(
+        self, usage_less_compact_client
+    ):
+        client, db_path = usage_less_compact_client
+        first = client.responses.create(
+            model=VLLM_MODEL,
+            input="abcdefghijklmnopqrstuvwxyz0123456789" * 90,
+            store=True,
+        )
+        assert first.usage is None, "backend intentionally omits usage"
+        backend_calls = len(NativeCompactionBackendHandler.requests)
+        callouts = len(CompactionHandler.requests)
+        with sqlite3.connect(db_path) as store:
+            persisted_before = store.execute("SELECT count(*) FROM openai_responses").fetchone()[0]
+        assert persisted_before == 1
+
+        with pytest.raises(APIStatusError) as exc_info:
+            client.responses.create(
+                model=VLLM_MODEL,
+                input="continue",
+                previous_response_id=first.id,
+                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+                store=True,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert len(NativeCompactionBackendHandler.requests) == backend_calls
+        assert len(CompactionHandler.requests) == callouts
+        with sqlite3.connect(db_path) as store:
+            assert store.execute("SELECT count(*) FROM openai_responses").fetchone()[0] == persisted_before
 
     @requires_real_inference
     def test_over_threshold_compacts_rehydrated_history(

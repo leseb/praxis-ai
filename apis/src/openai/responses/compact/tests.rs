@@ -896,6 +896,39 @@ async fn reactive_compaction_rejects_before_callout_without_transport_headroom()
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
+#[tokio::test]
+async fn reactive_compaction_rejects_usage_less_tokenizer_peak_before_callout() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({
+        "model": "m",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}],
+        "store": false
+    });
+    let mut state = ResponsesState::from_request_body(original.clone());
+    state.history_rehydrated = true;
+    state.messages = vec![json!({
+        "role": "user",
+        "content": "abcdefghijklmnopqrstuvwxyz0123456789".repeat(128)
+    })];
+    state.apply_retained_payload_limit(262_144);
+    assert!(state.previous_usage.is_none());
+    assert!(state.can_retain_payload(16_384), "old text-only reserve would pass");
+    assert!(!reactive_conversation_fits(&state));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
 #[test]
 fn reactive_compaction_preflight_borrows_model_before_admission() {
     let mut state = ResponsesState::from_request_body(json!({

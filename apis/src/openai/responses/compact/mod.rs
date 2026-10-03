@@ -49,8 +49,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -59,7 +59,7 @@ use tracing::{debug, warn};
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
     agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
-    bounded_json_size,
+    bound_body_outcome, bounded_json_size,
     budget_error::reject_retained_payload_budget,
     error::responses_error_rejection,
     is_explicit_compact_request,
@@ -81,6 +81,10 @@ const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
 /// Maximum Pingora H1 body read or default H2 flow-window chunk before the
 /// core buffered client applies its response-length check.
 const MAX_TRANSPORT_CHUNK_BYTES: usize = 65_536;
+/// Conservative live-owner reserve for the pinned tiktoken fallback. Its
+/// large-piece BPE path holds 32-byte states, a growable merge heap, token
+/// vectors, and regex workspace alongside both formatted conversation strings.
+const TOKENIZER_STAGING_MULTIPLIER: usize = 160;
 
 /// Error reported when reactive summarization would exceed the loop budget.
 const COMPACTION_BUDGET_MESSAGE: &str =
@@ -545,6 +549,10 @@ impl HttpFilter for CompactFilter {
         BodyAccess::ReadOnly
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
@@ -602,6 +610,19 @@ impl HttpFilter for CompactFilter {
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        // An explicit compact response is terminal and belongs to the
+        // pre-read lifecycle. The bound phase only handles rehydrated turns.
+        if is_explicit_compact_request(ctx) {
+            return Ok(BoundUpstreamBodyOutcome::Continue);
+        }
+        bound_body_outcome(self.on_request_body(ctx, body, true).await?)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -634,7 +655,13 @@ fn reactive_conversation_fits(state: &ResponsesState) -> bool {
             return text.checked_mul(2);
         }
         let request_body = bounded_json_size(&state.request_body, limit).ok().flatten()?;
-        text.checked_mul(3)?.checked_add(request_body.checked_mul(2)?)
+        // With no stored usage, tiktoken materializes its token Vec and BPE
+        // workspace while the conversation, overhead, and full text are live.
+        // Request JSON bounds the decoded instructions and serialized tools;
+        // 64 bytes cover their labels and the join separators.
+        text.checked_add(request_body)?
+            .checked_add(64)?
+            .checked_mul(TOKENIZER_STAGING_MULTIPLIER)
     })();
     staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
