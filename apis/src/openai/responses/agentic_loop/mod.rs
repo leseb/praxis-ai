@@ -1135,7 +1135,7 @@ fn end_at_iteration_limit(
 // Body Parsing
 // -----------------------------------------------------------------------------
 
-/// Upper bound on compact JSON bytes after parsing a provider response.
+/// Upper bound on compact JSON bytes after parsing a request or response.
 ///
 /// `serde_json` can expand exponent-form numbers while serializing its parsed
 /// `Value` (for example, `1e15` becomes `1000000000000000.0`). Its current
@@ -1147,7 +1147,7 @@ fn end_at_iteration_limit(
     clippy::too_many_lines,
     reason = "single-pass lexical bound must skip quoted number-like text"
 )]
-fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+pub(super) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
     const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
     let mut extra = 0_usize;
     let mut index = 0;

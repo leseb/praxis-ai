@@ -87,8 +87,11 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
+    body_limits::reject_rewritten_body_too_large,
+    bound_body_outcome,
+    openai_responses_proxy::serialized_outbound_body_len,
+    state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -381,6 +384,10 @@ impl HttpFilter for FileResolveFilter {
             return Ok(FilterAction::Release);
         };
 
+        let Some(parsed_bound) = file_parse_admitted_bytes(ctx, raw) else {
+            return Ok(reject_retained_resolution_budget(ctx));
+        };
+
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
             Err(e) => {
@@ -389,7 +396,7 @@ impl HttpFilter for FileResolveFilter {
             },
         };
 
-        resolve_and_rewrite(self, ctx, body, parsed).await
+        resolve_and_rewrite(self, ctx, body, parsed, parsed_bound).await
     }
 
     async fn on_bound_upstream_request_body(
@@ -442,6 +449,7 @@ async fn resolve_and_rewrite(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     mut parsed: serde_json::Value,
+    parsed_bound: usize,
 ) -> Result<FilterAction, FilterError> {
     let max_bytes = filter.config.max_rewritten_body_bytes;
     let needs_files_api = body_has_file_id_reference(&parsed)
@@ -461,18 +469,24 @@ async fn resolve_and_rewrite(
     let mut budget = filter
         .client
         .resolution_budget(identity.and_then(|identity| build_outbound_execution(filter, ctx, identity)));
+    if let Some(headroom) = aggregate_resolution_headroom(ctx, parsed_bound) {
+        budget.apply_aggregate_headroom(headroom);
+    }
     // Body pre-read mutations have not reached `ctx.request` yet. Materialize
     // their effective view once so every Files API call observes trusted
     // removals and projections while `ctx` is subsequently mutated.
     let request_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)).into_owned();
     let count = match resolve_current_input(filter, &request_headers, &mut parsed, &mut budget).await {
         Ok(count) => count,
-        Err(e) => return Ok(reject_resolve_error(&e)),
+        Err(e) => return Ok(reject_resolution_failure(ctx, &e)),
     };
     if count == 0 {
         trace!("no file_id references found");
         if let Err(e) = update_state(filter, ctx, &request_headers, None, &mut budget).await {
-            return Ok(reject_resolve_error(&e));
+            return Ok(reject_resolution_failure(ctx, &e));
+        }
+        if !file_state_fits_budget(ctx) {
+            return Ok(reject_retained_resolution_budget(ctx));
         }
         if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
             return Ok(rejection);
@@ -485,13 +499,100 @@ async fn resolve_and_rewrite(
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, &request_headers, Some(parsed), &mut budget).await {
-        return Ok(reject_resolve_error(&e));
+        return Ok(reject_resolution_failure(ctx, &e));
+    }
+    if !file_state_fits_budget(ctx) {
+        return Ok(reject_retained_resolution_budget(ctx));
     }
     if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
         return Ok(rejection);
     }
 
     Ok(FilterAction::Continue)
+}
+
+/// The parsed body is another owner until resolution and state synchronization finish.
+fn file_parse_admitted_bytes(ctx: &mut HttpFilterContext<'_>, raw: &[u8]) -> Option<usize> {
+    let policy_limit = ctx
+        .extensions
+        .get::<AgenticBudgetPolicy>()
+        .map(|policy| policy.max_retained_bytes());
+    if let (Some(limit), Some(state)) = (policy_limit, ctx.extensions.get_mut::<ResponsesState>()) {
+        state.apply_retained_payload_limit(limit);
+    }
+    let active_budget = policy_limit.is_some()
+        || ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_limit().is_some());
+    let parsed_bound = if active_budget {
+        buffered_parsed_json_bytes_upper_bound(raw)?
+    } else {
+        raw.len()
+    };
+    if let Some(state) = ctx.extensions.get::<ResponsesState>() {
+        return state.can_retain_payload(parsed_bound).then_some(parsed_bound);
+    }
+    policy_limit
+        .is_none_or(|limit| {
+            parsed_bound
+                .checked_mul(super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)
+                .is_some_and(|bytes| bytes <= limit)
+        })
+        .then_some(parsed_bound)
+}
+
+/// Leave room for the parsed body, encoded wire body, resolution cache, and
+/// independently owned request/history mirrors before a Files API read.
+fn aggregate_resolution_headroom(ctx: &HttpFilterContext<'_>, parsed_bound: usize) -> Option<usize> {
+    let limit = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+        .or_else(|| {
+            ctx.extensions
+                .get::<AgenticBudgetPolicy>()
+                .map(|policy| policy.max_retained_bytes())
+        })?;
+    let baseline = match ctx.extensions.get::<ResponsesState>() {
+        Some(state) => state.retained_payload_bytes_bounded(limit).unwrap_or(limit),
+        None => 0,
+    };
+    // Parsing and state synchronization may briefly retain the original body,
+    // its parsed form, and both current-input mirrors before replacement.
+    let parse_reserve = parsed_bound.checked_mul(4).unwrap_or(limit);
+    Some(limit.checked_sub(baseline)?.saturating_sub(parse_reserve))
+}
+
+/// Verify a state synchronization did not exceed its active aggregate budget.
+fn file_state_fits_budget(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .is_none_or(|state| state.can_retain_payload(0))
+}
+
+/// Clear payload and disable successful persistence on aggregate exhaustion.
+fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    FilterAction::Reject(super::error::responses_error_rejection(
+        502,
+        "server_error",
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during file resolution",
+    ))
+}
+
+/// Map aggregate failures through request cleanup before returning a rejection.
+fn reject_resolution_failure(ctx: &mut HttpFilterContext<'_>, error: &ResolveError) -> FilterAction {
+    if matches!(error, ResolveError::RetainedBudget) {
+        reject_retained_resolution_budget(ctx)
+    } else {
+        reject_resolve_error(error)
+    }
 }
 
 /// Snapshot the downstream request context and build the outbound
@@ -780,6 +881,11 @@ fn resolve_error_response(err: &ResolveError) -> (u16, String) {
         ResolveError::InvalidFileId { file_id, detail } => invalid_id_error_response(file_id, detail),
         ResolveError::TooManyReferences { limit } => too_many_error_response(*limit),
         ResolveError::TooLarge { reference, limit } => too_large_error_response(reference, *limit),
+        ResolveError::RetainedBudget => (
+            502,
+            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during file resolution"
+                .to_owned(),
+        ),
         ResolveError::FileUrlBlocked { label } => file_url_blocked_response(label),
         ResolveError::FileUrlFailed { label, detail } => file_url_failed_response(label, detail),
     }
