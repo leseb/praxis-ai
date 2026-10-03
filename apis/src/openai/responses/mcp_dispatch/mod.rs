@@ -8,7 +8,7 @@
 //! response classification, approval partitioning, and terminal policy. This
 //! dispatcher resumes client approval responses, lists deferred connectors
 //! after a hosted `tool_search_call`, and executes prepared MCP calls via
-//! [`mcp_client::call_tool_with_forwarded_headers`]. A streaming deferred `tools/list` failure is
+//! [`mcp_client::call_tool_with_forwarded_headers_bounded_initialize`]. A streaming deferred `tools/list` failure is
 //! stashed during the body pre-read and emitted from `on_request` as the
 //! canonical `response.mcp_list_tools.failed` / `response.failed` lifecycle.
 //!
@@ -77,7 +77,7 @@ use super::{
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
+        MAX_FUNCTION_NAME_LEN, McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
@@ -657,24 +657,39 @@ fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]
 
 /// Retain each newly approved call's minimum result and dispatch staging owners.
 fn approved_result_reservation_bytes(state: &ResponsesState, decisions: &[ResolvedApproval]) -> Option<usize> {
-    decisions
-        .iter()
-        .filter(|decision| decision.approve)
-        .try_fold(0_usize, |used, decision| {
-            // resolve_approval already proved this pair uniquely owns the
-            // encoded target. Borrow it here rather than allocating an index
-            // of every tool name just to preflight one approved result.
-            let entry = state.mcp_tool_map.iter().find_map(|((server, tool), entry)| {
-                (server == &decision.server_label && tool == &decision.tool_name).then_some(entry)
+    let result_reservation =
+        decisions
+            .iter()
+            .filter(|decision| decision.approve)
+            .try_fold(0_usize, |used, decision| {
+                // resolve_approval already proved this pair uniquely owns the
+                // encoded target. Borrow it here rather than allocating an index
+                // of every tool name just to preflight one approved result.
+                let entry = state.mcp_tool_map.iter().find_map(|((server, tool), entry)| {
+                    (server == &decision.server_label && tool == &decision.tool_name).then_some(entry)
+                })?;
+                let staging = decision
+                    .approval_id
+                    .len()
+                    .checked_add(retained_json_bytes(&decision.arguments)?.checked_mul(3)?)?
+                    .checked_add(retained_json_bytes(entry)?)?;
+                // Match aggregate_mcp_result_limit after the approval is claimed:
+                // four result owners plus the four-copy initialize floor per call.
+                // Otherwise a tight budget can spend the approval before dispatch
+                // discovers there is no admissible MCP result allowance.
+                let minimum = MIN_RETAINED_RESULT_BYTES
+                    .checked_mul(4)?
+                    .checked_add(mcp_client::MIN_TOOL_INITIALIZE_BYTES.checked_mul(4)?)?;
+                used.checked_add(staging)?.checked_add(minimum)
             })?;
-            let staging = decision
-                .approval_id
-                .len()
-                .checked_add(retained_json_bytes(&decision.arguments)?.checked_mul(3)?)?
-                .checked_add(retained_json_bytes(entry)?)?;
-            let minimum = MIN_RETAINED_RESULT_BYTES.checked_mul(3)?;
-            used.checked_add(staging)?.checked_add(minimum)
-        })
+    // Approval continuation builds one dispatch index after the durable claim.
+    // Reserve it here too, or index admission could spend an approval before
+    // noticing a tight budget. Denials create no dispatch index.
+    if decisions.iter().any(|decision| decision.approve) {
+        result_reservation.checked_add(mcp_tool_index_charge(state)?)
+    } else {
+        Some(result_reservation)
+    }
 }
 
 /// Raw payload cloned while parsing client approval controls.
@@ -1232,13 +1247,24 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let has_connector_calls = selected_calls.iter().any(|call| {
-            let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
-                return false;
-            };
+        let has_connector_calls = if selected_calls.is_empty() {
+            false
+        } else {
+            // The encoded names are independently owned while this index is
+            // live. Admit them before allocating, and build only one index for
+            // this phase even if the model selected several calls.
+            if admitted_mcp_tool_index_charge(state).is_none() {
+                return Ok(Self::aggregate_budget_action(ctx));
+            }
             let index = McpToolIndex::new(&state.mcp_tool_map);
-            matches!(index.get(name), Some(McpToolMatch::Unique { entry, .. }) if is_connector_tool_entry(entry))
-        });
+            selected_calls.iter().any(|call| {
+                call.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| {
+                        matches!(index.get(name), Some(McpToolMatch::Unique { entry, .. }) if is_connector_tool_entry(entry))
+                    })
+            })
+        };
         let needs_connector_context = needs_discovery || has_connector_calls;
         debug_assert!(
             !needs_connector_context || has_connector_state,
@@ -1289,15 +1315,22 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
 
+        let Some(index_charge) = admitted_mcp_tool_index_charge(state) else {
+            return Ok(Self::aggregate_budget_action(ctx));
+        };
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
         let mcp_calls = extract_mcp_tool_calls(&selected_calls, &tool_index);
         if mcp_calls.is_empty() {
             return Ok(FilterAction::Continue);
         }
 
-        let Some((result_limit, aggregate_constrained)) =
-            aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes)
-        else {
+        let Some((result_limit, aggregate_constrained)) = aggregate_mcp_result_limit(
+            state,
+            &mcp_calls,
+            &tool_index,
+            index_charge,
+            self.max_total_result_bytes,
+        ) else {
             return Ok(Self::aggregate_budget_action(ctx));
         };
 
@@ -1318,6 +1351,9 @@ impl McpDispatchFilter {
             Err(_limit) if aggregate_constrained => return Ok(Self::aggregate_budget_action(ctx)),
             Err(_limit) => return Ok(Self::result_limit_action(ctx)),
         };
+        // The execution index has no role after callout completion. Release it
+        // before append_results builds its index against the updated output.
+        drop(tool_index);
         // rmcp retains initialization peer information (including instructions
         // and _meta) in every parked session. Publish its current charge before
         // admitting the result batch or the next agentic round.
@@ -1327,7 +1363,7 @@ impl McpDispatchFilter {
         if !ctx
             .extensions
             .get::<ResponsesState>()
-            .is_some_and(|state| mcp_result_commit_fits(state, &results))
+            .is_some_and(|state| mcp_result_commit_fits(state, &results, index_charge))
         {
             return Ok(Self::aggregate_budget_action(ctx));
         }
@@ -1425,6 +1461,10 @@ pub(crate) fn prepare_response_round(
     if selected_calls.is_empty() || state.mcp_tool_map.is_empty() {
         return Ok(());
     }
+    let Some(index_charge) = admitted_mcp_tool_index_charge(state) else {
+        state.discard_payload_for_budget_error();
+        return Err(mcp_budget_failure());
+    };
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let mcp_call_count = count_mcp_tool_calls(&selected_calls, &tool_index);
     if mcp_call_count > max_calls_per_round {
@@ -1442,7 +1482,8 @@ pub(crate) fn prepare_response_round(
         .iter()
         .try_fold(0_usize, |used, call| used.checked_add(retained_json_bytes(*call)?))
         .and_then(|bytes| bytes.checked_mul(8))
-        .and_then(|bytes| mcp_calls.len().checked_mul(4_096)?.checked_add(bytes));
+        .and_then(|bytes| mcp_calls.len().checked_mul(4_096)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(index_charge));
     if !classification_staging.is_some_and(|bytes| state.can_retain_payload(bytes)) {
         state.discard_payload_for_budget_error();
         return Err(mcp_budget_failure());
@@ -1490,19 +1531,21 @@ pub(crate) fn prepare_response_round(
             .checked_add(call.arguments.len())?
             .checked_add(call.target_fingerprint.len())
     });
-    let admission = pending_bytes.and_then(|bytes| bytes.checked_mul(4));
+    let admission = pending_bytes
+        .and_then(|bytes| bytes.checked_mul(4))
+        .and_then(|bytes| bytes.checked_add(index_charge));
     if !admission.is_some_and(|bytes| state.can_retain_payload(bytes)) {
         state.discard_payload_for_budget_error();
         return Err(mcp_budget_failure());
     }
-    record_and_emit_approvals(state, pending);
-    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let output = &state.accumulated_output;
     state.tool_calls.retain(|assignment| {
         !assignment
             .resolve(output, "function_call")
             .is_some_and(|call| is_mcp_tool_call(call, &tool_index))
     });
+    drop(tool_index);
+    record_and_emit_approvals(state, pending);
     if executable.is_empty() {
         state.mcp_approval_state = McpApprovalState::ApprovalPendingThenReturn;
     } else {
@@ -1802,6 +1845,31 @@ impl McpCallResult {
     }
 }
 
+/// Admit the encoded-name owner and peak temporary encoder strings before an
+/// index is allocated. The actual encoded names are at most 64 ASCII bytes
+/// each, while `encode_function_name` briefly holds both full raw and sanitized
+/// names for one entry at a time.
+fn admitted_mcp_tool_index_charge(state: &ResponsesState) -> Option<usize> {
+    let charge = mcp_tool_index_charge(state)?;
+    state.can_retain_payload(charge).then_some(charge)
+}
+
+/// Return the index owner and encoder peak without allocating either value.
+fn mcp_tool_index_charge(state: &ResponsesState) -> Option<usize> {
+    if state.retained_payload_limit().is_none() {
+        return Some(0);
+    }
+    let (names, largest_raw) =
+        state
+            .mcp_tool_map
+            .keys()
+            .try_fold((0_usize, 0_usize), |(names, largest_raw), (server, tool)| {
+                let raw = server.len().checked_add(2)?.checked_add(tool.len())?;
+                Some((names.checked_add(raw.min(MAX_FUNCTION_NAME_LEN))?, largest_raw.max(raw)))
+            })?;
+    names.checked_add(largest_raw.checked_mul(2)?)
+}
+
 /// Reserve raw callout bodies and parsed result staging alongside the three
 /// final result owners before making an external MCP call.
 #[expect(
@@ -1811,6 +1879,8 @@ impl McpCallResult {
 fn aggregate_mcp_result_limit(
     state: &ResponsesState,
     mcp_calls: &[&serde_json::Value],
+    tool_index: &McpToolIndex<'_>,
+    index_charge: usize,
     configured_limit: usize,
 ) -> Option<(usize, bool)> {
     let Some(limit) = state.retained_payload_limit() else {
@@ -1820,7 +1890,6 @@ fn aggregate_mcp_result_limit(
     // Argument normalization and transport serialization can coexist with the
     // original calls. Parallel calls also retain their tool definitions and
     // result IDs, so reserve those owners before any external work.
-    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let staging = mcp_calls.iter().try_fold(0_usize, |used, call| {
         let id_bytes = call
             .get("call_id")
@@ -1853,6 +1922,7 @@ fn aggregate_mcp_result_limit(
         .checked_mul(4)?;
     let available = limit
         .checked_sub(current)?
+        .checked_sub(index_charge)?
         .checked_sub(staging)?
         .checked_sub(initialize_floor)?;
     let admitted = configured_limit.min(available / 4);
@@ -1862,12 +1932,13 @@ fn aggregate_mcp_result_limit(
 
 /// The result vector remains live while messages are cloned into two distinct
 /// histories and public output is moved into the accumulator.
-fn mcp_result_commit_fits(state: &ResponsesState, results: &[McpCallResult]) -> bool {
+fn mcp_result_commit_fits(state: &ResponsesState, results: &[McpCallResult], index_charge: usize) -> bool {
     let added = results
         .iter()
         .try_fold(0_usize, |used, result| used.checked_add(result.retained_bytes()?));
     added
         .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(index_charge))
         .is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 

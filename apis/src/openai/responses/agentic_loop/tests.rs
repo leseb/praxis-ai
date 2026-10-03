@@ -3762,7 +3762,7 @@ fn compaction_collection_preflights_history_copies_and_provenance_id() {
     let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
 
     let body = Bytes::from(serde_json::to_vec(&response).unwrap());
-    let buffered_peak = baseline + response_bytes + 3 * item_bytes + id_bytes;
+    let buffered_peak = baseline + response_bytes + 2 * item_bytes + id_bytes;
     let mut buffered = ResponsesState::default();
     buffered.apply_retained_payload_limit(buffered_peak - 1);
     assert!(super::extract_tool_calls_from_body(&body, &mut buffered).is_err());
