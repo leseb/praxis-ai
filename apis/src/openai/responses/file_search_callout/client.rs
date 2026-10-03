@@ -28,7 +28,7 @@ use crate::{
     callout_policy::OnFailure,
     callout_target::AddressPolicy,
     http_hop::{connection_nominates_header, is_hop_by_hop},
-    openai::api_client::resource_url,
+    openai::{api_client::resource_url, responses::state::retained_json_bytes},
     subrequest::SubRequestClient,
 };
 
@@ -50,6 +50,10 @@ pub(super) const MAX_QUERY_BYTES: usize = 65_536;
 
 /// Maximum serialized search request body: 1 MiB.
 pub(super) const MAX_SEARCH_REQUEST_BYTES: usize = 1_048_576;
+
+/// The writer can hold its old and growing buffers together before the final
+/// request body is moved to the filtered subrequest.
+const REQUEST_BODY_PEAK_MULTIPLIER: usize = 3;
 
 /// Maximum vector store identifier size accepted for one URL segment.
 pub(super) const MAX_VECTOR_STORE_ID_BYTES: usize = 512;
@@ -164,6 +168,36 @@ impl<'a> VectorStoreSearchRequest<'a> {
             search_mode: translated.search_mode,
         })
     }
+}
+
+/// Bound the largest concurrent group of owned outbound request bodies before
+/// the serializer or filtered subrequest can allocate any of them. The search
+/// scheduler runs at most `MAX_CONCURRENT_SEARCHES` specs at once, so the eight
+/// largest bodies cover every possible group without cloning their payloads.
+/// Each body also reserves the writer's possible old and new `Vec` buffers
+/// during growth; the final buffer is moved into the subrequest.
+pub(super) fn outbound_request_peak_bytes(specs: &[SearchSpec<'_>]) -> Option<usize> {
+    let mut largest = [0_usize; MAX_CONCURRENT_SEARCHES];
+    for spec in specs {
+        if spec.query.len() > MAX_QUERY_BYTES {
+            continue;
+        }
+        let Ok(request) =
+            VectorStoreSearchRequest::new(spec.filters, spec.max_num_results, spec.query, spec.ranking_options)
+        else {
+            continue;
+        };
+        let bytes = retained_json_bytes(&request)?.min(MAX_SEARCH_REQUEST_BYTES);
+        if bytes > largest[0] {
+            largest[0] = bytes;
+            largest.sort_unstable();
+        }
+    }
+    largest.into_iter().try_fold(0_usize, |total, bytes| {
+        bytes
+            .checked_mul(REQUEST_BODY_PEAK_MULTIPLIER)
+            .and_then(|peak| total.checked_add(peak))
+    })
 }
 
 /// Ranking options for the vector store search endpoint.
@@ -438,7 +472,7 @@ impl SearchBatch {
     pub(super) fn staging_bytes(&self) -> Option<usize> {
         let result_bytes = self.results_by_call.iter().try_fold(0_usize, |total, results| {
             results.iter().try_fold(total, |total, result| {
-                crate::openai::responses::state::retained_json_bytes(result).and_then(|bytes| total.checked_add(bytes))
+                retained_json_bytes(result).and_then(|bytes| total.checked_add(bytes))
             })
         });
         let failure_bytes = self.failures.iter().try_fold(0_usize, |total, failure| {
@@ -677,6 +711,12 @@ impl FileSearchClient {
             );
 
             next_spec = next_spec.saturating_add(chunk_len);
+            // A request-wide limit is terminal even when ordinary per-store
+            // failures are configured to be open. Do not schedule a later
+            // chunk after its response exceeded the retained budget.
+            if batch.retained_payload_overflow() {
+                break;
+            }
             if execution_started.elapsed() >= execution_timeout {
                 append_unprocessed_deadline_failures(&mut batch.failures, specs, next_spec);
                 deadline_recorded = true;
