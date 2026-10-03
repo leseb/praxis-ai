@@ -1962,6 +1962,96 @@ async fn finite_success_reserves_numeric_normalization_before_translation() {
 }
 
 #[tokio::test]
+async fn finite_success_reserves_duplicated_call_id_and_wire_capacity() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_call_id");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": false, "store": false,
+        "tools": [{"type": "function", "name": "f"}]
+    }));
+    state.apply_retained_payload_limit(650_000);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({
+            "id": "chatcmpl_call", "object": "chat.completion", "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [{
+                "id": "i".repeat(100_000), "type": "function",
+                "function": {"name": "f", "arguments": "{}"}
+            }]}, "finish_reason": "tool_calls"}]
+        })
+        .to_string(),
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "duplicated call IDs and wire capacity must be reserved: {action:?}"
+    );
+    assert_eq!(body, Some(original));
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_success_reserves_fixed_resource_fields_near_limit() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_fixed");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": false, "store": false
+    }));
+    state.accumulated_output.push(json!({
+        "id": "msg_prior", "type": "message", "status": "completed", "role": "assistant",
+        "content": [{"type": "output_text", "text": "x".repeat(1850)}]
+    }));
+    state.apply_retained_payload_limit(4096);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]}).to_string(),
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "fixed Responses resource fields must be reserved: {action:?}"
+    );
+    assert_eq!(body, Some(original));
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn malformed_success_shape_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
