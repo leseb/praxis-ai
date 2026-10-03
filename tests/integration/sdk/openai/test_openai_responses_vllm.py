@@ -2898,6 +2898,35 @@ class TestOpenAIResponsesVLLM:
             for item in replayed.get("input", [])
         ), replayed
 
+    def test_input_tokens_history_read_with_agentic_policy(
+        self, provider_compaction_client
+    ):
+        """A count operation reads stored history without create-state."""
+        client, forwarded = provider_compaction_client
+        first = client.responses.create(
+            model=VLLM_MODEL,
+            input="Store history for the token-count operation.",
+            store=True,
+        )
+        assert first.status == "completed"
+
+        response = httpx.post(
+            f"{str(client.base_url).rstrip('/')}/responses/input_tokens",
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
+            json={
+                "model": VLLM_MODEL,
+                "input": "Count this continuation.",
+                "previous_response_id": first.id,
+            },
+            timeout=10,
+        )
+        # This shipped example has no input_tokens backend and deliberately
+        # returns its static unsupported-operation response after rehydration.
+        # A 413 here means the bounded history read failed before that route.
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["message"] == "unsupported managed Responses operation"
+        assert len(forwarded) == 1, forwarded
+
     def test_truncation_forwarded_to_backend_through_rehydration(
         self, witness_backend_client
     ):
