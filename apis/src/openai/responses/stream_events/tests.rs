@@ -5918,6 +5918,14 @@ async fn output_item_done_replaces_by_id() {
 #[test]
 fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
     let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState {
+        accumulated_output: vec![json!({"text": "prior".repeat(200_000)})],
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(16 * 1_048_576);
+    ctx.extensions.insert(responses);
+    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert!(super::shared_retained_budget(&ctx, stream).unwrap().1.is_some());
     let added = json!({
         "output_index": 0,
         "item": {"type": "message", "id": "item_A", "content": [{"type": "output_text", "text": "aaaa"}]}
@@ -5925,19 +5933,22 @@ fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
     let mut body = Some(make_sse_chunk("response.output_item.added", &added));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
-    let before = responses.replay_stable_payload_revision;
+    let stable_revision = responses.replay_stable_payload_revision;
+    let before = responses.current_output_revision;
     let before_bytes = crate::openai::responses::state::retained_json_bytes(&responses.response_object).unwrap();
+    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let prior_cache = stream.shared_prior_output_bytes.get().unwrap().unwrap();
+    assert!(prior_cache.matches(responses));
 
-    let mut body = Some(make_sse_chunk(
-        "response.output_text.delta",
-        &json!({"output_index": 0, "content_index": 0, "delta": "x"}),
-    ));
-    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    for _ in 0..200 {
+        let mut body = Some(make_sse_chunk(
+            "response.output_text.delta",
+            &json!({"output_index": 0, "content_index": 0, "delta": "x"}),
+        ));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    }
     assert_eq!(
-        ctx.extensions
-            .get::<ResponsesState>()
-            .unwrap()
-            .replay_stable_payload_revision,
+        ctx.extensions.get::<ResponsesState>().unwrap().current_output_revision,
         before
     );
 
@@ -5950,10 +5961,23 @@ fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(responses.output_items().len(), 1);
     assert_eq!(
-        responses.replay_stable_payload_revision,
+        responses.current_output_revision,
         before.and_then(|revision| revision.checked_add(1))
     );
     assert!(crate::openai::responses::state::retained_json_bytes(&responses.response_object).unwrap() > before_bytes);
+    assert_eq!(responses.replay_stable_payload_revision, stable_revision);
+    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        stream
+            .shared_prior_output_bytes
+            .get()
+            .unwrap()
+            .unwrap()
+            .matches(responses)
+    );
+    for _ in 0..200 {
+        assert!(super::shared_retained_budget(&ctx, stream).unwrap().1.is_some());
+    }
 }
 
 #[tokio::test]

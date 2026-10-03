@@ -371,6 +371,7 @@ impl McpDispatchFilter {
         }
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
         state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+        state.mark_current_output_changed();
     }
 
     /// Fail closed when no shared sub-request client is available to dial the
@@ -393,6 +394,7 @@ impl McpDispatchFilter {
     fn result_limit_action(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.tool_calls.clear();
+            state.mark_current_output_changed();
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
@@ -1082,6 +1084,7 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
             "resuming approved MCP tool call"
         );
         state.tool_calls.push(build_approved_tool_call(decision));
+        state.mark_current_output_changed();
     } else {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
@@ -1582,6 +1585,7 @@ pub(crate) fn prepare_response_round(
         state.tool_calls.extend(executable);
         state.mcp_approval_state = McpApprovalState::ExecuteUngatedThenReturn;
     }
+    state.mark_current_output_changed();
     Ok(())
 }
 

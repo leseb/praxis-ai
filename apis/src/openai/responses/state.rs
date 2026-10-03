@@ -352,10 +352,14 @@ pub(crate) struct ResponsesState {
     #[cfg(feature = "openai-mcp-tools")]
     pub(crate) retained_mcp_session_bytes: usize,
 
-    /// Revision of request, history, output, and resolved MCP definitions
+    /// Revision of request, history, prior output, and resolved MCP definitions
     /// cached by streaming admission. In-place changes do not alter lengths.
     /// `None` means the counter overflowed and replay must fail closed.
     pub(crate) replay_stable_payload_revision: Option<u64>,
+    /// Revision of the current response, local completion template, and
+    /// completed tool calls. Kept separate so current-round item events do not
+    /// invalidate the stream parser's once-measured prior output.
+    pub(crate) current_output_revision: Option<u64>,
 
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
@@ -929,6 +933,7 @@ impl Default for ResponsesState {
             #[cfg(feature = "openai-mcp-tools")]
             retained_mcp_session_bytes: 0,
             replay_stable_payload_revision: Some(0),
+            current_output_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -1346,6 +1351,7 @@ impl ResponsesState {
     pub(crate) fn fail_retained_payload_budget(&mut self) {
         self.retained_payload_failed = true;
         self.tool_calls.clear();
+        self.mark_current_output_changed();
         self.tool_search_calls.clear();
         self.web_search_calls.clear();
         self.file_search_assignments.clear();
@@ -1389,6 +1395,7 @@ impl ResponsesState {
         self.request_body = serde_json::json!({ "stream": streaming });
         self.response_object = serde_json::Value::Null;
         self.local_completion_response_template = serde_json::Value::Null;
+        self.mark_current_output_changed();
         self.tool_choice = serde_json::Value::Null;
         self.tools.clear();
         self.usage = serde_json::Value::Null;
@@ -1472,6 +1479,14 @@ impl ResponsesState {
     pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
         self.replay_stable_payload_revision = self
             .replay_stable_payload_revision
+            .and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Invalidate store and rehydrate current-output measurements without
+    /// invalidating the stream parser's completed prior-output cache.
+    pub(crate) fn mark_current_output_changed(&mut self) {
+        self.current_output_revision = self
+            .current_output_revision
             .and_then(|revision| revision.checked_add(1));
     }
 
@@ -1576,6 +1591,7 @@ impl ResponsesState {
         if !self.response_object.is_object() {
             return Ok(());
         }
+        self.mark_current_output_changed();
         let final_output = if self.accumulated_output.is_empty() {
             self.response_object
                 .get("output")
@@ -1839,7 +1855,7 @@ fn current_round_tool_call_admissions_by<'a>(
 /// When the current round's output is not yet replayable, remaining prior-round
 /// budget is the admission signal.
 #[cfg_attr(
-    not(feature = "openai-mcp-tools"),
+    all(not(feature = "openai-mcp-tools"), not(test)),
     expect(dead_code, reason = "MCP resolver is the production caller")
 )]
 pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
@@ -1950,6 +1966,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "store")]
     fn current_output_bytes(state: &ResponsesState) -> usize {
         retained_json_bytes(&state.response_object).unwrap()
             + retained_json_bytes(&state.local_completion_response_template).unwrap()
@@ -2024,6 +2041,7 @@ mod tests {
         let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
         assert!(stable > before_capture + 1_048_576);
         let full = state.retained_payload_bytes().unwrap();
+        #[cfg(feature = "store")]
         let current_output = current_output_bytes(&state);
 
         let started = std::time::Instant::now();
@@ -2059,6 +2077,7 @@ mod tests {
 
         let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
         assert_eq!(stable, baseline_stable + map_bytes);
+        #[cfg(feature = "store")]
         let current_output = current_output_bytes(&state);
         for changing in [
             state.stream_changing_payload_bytes_bounded_for_parser(1_024),

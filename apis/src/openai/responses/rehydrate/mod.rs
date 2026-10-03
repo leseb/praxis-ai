@@ -556,6 +556,8 @@ struct RestoreStableBudget {
     iteration: u32,
     /// Revision for in-place request/history mutations between stream chunks.
     revision: u64,
+    /// Revision for in-place current response mutations between fragments.
+    current_output_revision: u64,
     /// Lengths of every stable collection, including history appended during a round.
     collection_lengths: [usize; 7],
     /// Serialized bytes retained by request/history and completed prior output.
@@ -566,10 +568,17 @@ struct RestoreStableBudget {
 
 impl RestoreStableBudget {
     /// Capture the current stable collection shape and its measured charge.
-    fn new(state: &ResponsesState, revision: u64, bytes: usize, current_output_bytes: usize) -> Self {
+    fn new(
+        state: &ResponsesState,
+        revision: u64,
+        current_output_revision: u64,
+        bytes: usize,
+        current_output_bytes: usize,
+    ) -> Self {
         Self {
             iteration: state.iteration,
             revision,
+            current_output_revision,
             collection_lengths: Self::collection_lengths(state),
             bytes,
             current_output_bytes,
@@ -580,6 +589,7 @@ impl RestoreStableBudget {
     /// remain in the per-fragment admission check.
     fn measure(state: &ResponsesState, limit: usize) -> Option<Self> {
         let revision = state.replay_stable_payload_revision?;
+        let current_output_revision = state.current_output_revision?;
         let stable = state.stream_stable_payload_bytes_bounded(limit)?;
         let mut prior_meter = PayloadMeter::new(limit.checked_sub(stable)?);
         prior_meter.json_values(&state.accumulated_output)?;
@@ -588,13 +598,20 @@ impl RestoreStableBudget {
         current_meter.json(&state.response_object)?;
         current_meter.json(&state.local_completion_response_template)?;
         current_meter.json_values(&state.tool_calls)?;
-        Some(Self::new(state, revision, stable, current_meter.used()))
+        Some(Self::new(
+            state,
+            revision,
+            current_output_revision,
+            stable,
+            current_meter.used(),
+        ))
     }
 
     /// Detect a new round or any append to a stable request/history collection.
     fn matches(self, state: &ResponsesState) -> bool {
         self.iteration == state.iteration
             && state.replay_stable_payload_revision == Some(self.revision)
+            && state.current_output_revision == Some(self.current_output_revision)
             && self.collection_lengths == Self::collection_lengths(state)
     }
 

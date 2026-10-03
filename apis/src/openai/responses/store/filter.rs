@@ -726,6 +726,8 @@ struct StoreStableCache {
     iteration: u32,
     /// In-place mutation revision of the cached owners.
     revision: u64,
+    /// In-place mutation revision of the current response owners.
+    current_output_revision: u64,
     /// Lengths of every cached collection. Dispatch may append after synthesis
     /// has already advanced the iteration.
     collection_lengths: [usize; 7],
@@ -741,6 +743,7 @@ impl StoreStableCache {
         Some(Self {
             iteration: state.iteration,
             revision: state.replay_stable_payload_revision?,
+            current_output_revision: state.current_output_revision?,
             collection_lengths: Self::collection_lengths(state),
             bytes,
             current_output_bytes,
@@ -751,6 +754,7 @@ impl StoreStableCache {
     fn matches(&self, state: &ResponsesState) -> bool {
         self.iteration == state.iteration
             && Some(self.revision) == state.replay_stable_payload_revision
+            && Some(self.current_output_revision) == state.current_output_revision
             && self.collection_lengths == Self::collection_lengths(state)
     }
 
@@ -3006,7 +3010,7 @@ mod encode_replay_event_tests {
             .unwrap();
         let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
         responses.response_object["output"][0]["text"] = json!("\u{0001}".repeat(4_096));
-        responses.mark_replay_stable_payload_changed();
+        responses.mark_current_output_changed();
         assert_eq!(responses.output_items().len(), 1);
         assert!(!old_cache.matches(responses));
         assert!(!filter.capture_stream_events(&mut ctx, &frame, false));

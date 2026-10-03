@@ -1924,9 +1924,9 @@ fn build_list_tools_failure_response(
     // `pending` (not `ctx`) and the `model` metadata borrow of `ctx` both ended
     // with the final `discovery_response` call above, so the snapshot is moved
     // into state here without a clone.
-    ctx.extensions
-        .get_or_insert_with(ResponsesState::default)
-        .response_object = response;
+    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
+    state.response_object = response;
+    state.mark_current_output_changed();
 
     // Emit as a header-phase `TerminalResponse`, not a `Reject`. A terminal
     // response preserves downstream keepalive (this is a successful 200 transport

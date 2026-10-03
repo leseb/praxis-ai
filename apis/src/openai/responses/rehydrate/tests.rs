@@ -2374,6 +2374,14 @@ fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
         !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
         "an exhausted revision must fail closed"
     );
+    state.replay_stable_payload_revision = Some(1);
+    state.current_output_revision = Some(u64::MAX);
+    state.mark_current_output_changed();
+    assert_eq!(state.current_output_revision, None);
+    assert!(
+        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        "an exhausted current-output revision must also fail closed"
+    );
 }
 
 #[test]
@@ -2408,7 +2416,7 @@ fn streaming_restore_remeasures_same_length_completed_output_rewrite() {
     let cached = stable_budget.unwrap();
 
     state.response_object["output"][0]["text"] = json!("\u{0001}".repeat(4_096));
-    state.mark_replay_stable_payload_changed();
+    state.mark_current_output_changed();
     assert_eq!(state.output_items().len(), 1);
     assert!(!cached.matches(&state));
     assert!(!streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
