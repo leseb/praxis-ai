@@ -71,20 +71,37 @@ pub(crate) enum SynthesisKind {
 ///
 /// The owner is the sole parser: it appends the canonical `file_search_call`
 /// output item to [`ResponsesState::accumulated_output`] and records its
-/// absolute index here plus the synthesis origin (private-normalized vs native).
+/// absolute index and item ID here plus the synthesis origin
+/// (private-normalized vs native).
 /// The dispatcher drains these at request-body EOS and mutates the indexed item
 /// in place — setting `completed`/`incomplete`, adding public results, and
 /// bridging model context — so the complete output item is never cloned into a
 /// second owner (avoids the payload duplication the "keep `Vec<Value>`" interface
 /// would incur; the recommended "store output indices" boundary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileSearchAssignment {
     /// Absolute index into [`ResponsesState::accumulated_output`] of the
     /// `file_search_call` item the dispatcher must execute and reconcile.
     pub output_index: usize,
+    /// Public item ID, assigned before the parse owner records selections.
+    pub item_id: String,
     /// Whether the item was normalized from a private `function_call` this round
     /// (`Private`, opening suppressed) or streamed natively (`Native`).
     pub synthesis: SynthesisKind,
+}
+
+impl FileSearchAssignment {
+    /// Resolve only the original current-round file-search placeholder.
+    pub(crate) fn resolve<'a>(&self, state: &'a ResponsesState) -> Option<&'a serde_json::Value> {
+        let round_start = state.current_round_output_start.unwrap_or(0);
+        if self.output_index < round_start {
+            return None;
+        }
+        let item = state.accumulated_output.get(self.output_index)?;
+        (item.get("type").and_then(serde_json::Value::as_str) == Some("file_search_call")
+            && item.get("id").and_then(serde_json::Value::as_str) == Some(self.item_id.as_str()))
+        .then_some(item)
+    }
 }
 
 /// A round-local dispatch selection into the canonical public output.
@@ -125,6 +142,25 @@ impl ResponsesState {
 
     pub(crate) fn selected_web_search_calls(&self) -> Vec<&serde_json::Value> {
         self.selected_output(&self.web_search_calls, "web_search_call")
+            .collect()
+    }
+
+    /// Preserve the absolute output index for each valid web-search selection.
+    /// The dispatcher uses it to replace only the selected placeholder, even
+    /// when an earlier selection in the same round has become stale.
+    pub(crate) fn selected_web_search_outputs(&self) -> Vec<(usize, &serde_json::Value)> {
+        let round_start = self.current_round_output_start.unwrap_or(0);
+        self.web_search_calls
+            .iter()
+            .filter_map(|assignment| {
+                (assignment.output_index >= round_start)
+                    .then(|| {
+                        assignment
+                            .resolve(&self.accumulated_output, "web_search_call")
+                            .map(|item| (assignment.output_index, item))
+                    })
+                    .flatten()
+            })
             .collect()
     }
 
@@ -1243,6 +1279,9 @@ impl ResponsesState {
             .chain(&self.tool_search_calls)
             .chain(&self.web_search_calls)
         {
+            meter.raw(assignment.item_id.len())?;
+        }
+        for assignment in &self.file_search_assignments {
             meter.raw(assignment.item_id.len())?;
         }
         for value in [
@@ -2413,6 +2452,7 @@ mod tests {
         let web = json!({"type":"web_search_call", "id":"ws_second", "status":"in_progress"});
         let assignment = FileSearchAssignment {
             output_index: 0,
+            item_id: "fs_first".to_owned(),
             synthesis: SynthesisKind::Native,
         };
         let state = ResponsesState {
@@ -2693,10 +2733,12 @@ mod tests {
         let mut state = ResponsesState::default();
         state.file_search_assignments.push(FileSearchAssignment {
             output_index: 2,
+            item_id: "fs_2".to_owned(),
             synthesis: SynthesisKind::Private,
         });
         state.file_search_assignments.push(FileSearchAssignment {
             output_index: 5,
+            item_id: "fs_5".to_owned(),
             synthesis: SynthesisKind::Native,
         });
         let drained = state.drain_file_search_assignments();
@@ -2705,10 +2747,12 @@ mod tests {
             vec![
                 FileSearchAssignment {
                     output_index: 2,
+                    item_id: "fs_2".to_owned(),
                     synthesis: SynthesisKind::Private,
                 },
                 FileSearchAssignment {
                     output_index: 5,
+                    item_id: "fs_5".to_owned(),
                     synthesis: SynthesisKind::Native,
                 },
             ]

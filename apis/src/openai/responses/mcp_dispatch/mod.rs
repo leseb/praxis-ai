@@ -15,9 +15,10 @@
 //! # Pipeline dependencies
 //!
 //! - **`mcp_tool_resolve`** must run before this filter so that [`ResponsesState::mcp_tool_map`] is populated.
-//! - **`openai_stream_events`** (or equivalent accumulator) must populate [`ResponsesState::tool_calls`] from the
-//!   upstream response. Currently only `function_call` events are accumulated; native `mcp_call` events require either
-//!   `mcp_tool_resolve` rewriting MCP tools into function tools or the accumulator adding `mcp_call` support.
+//! - **`openai_stream_events`** (or equivalent accumulator) must collect the upstream response, then
+//!   `openai_agentic_loop` records [`ResponsesState::tool_calls`] as selections into canonical output. Currently only
+//!   `function_call` events are selected; native `mcp_call` events require either `mcp_tool_resolve` rewriting MCP
+//!   tools into function tools or the accumulator adding `mcp_call` support.
 //! - **`openai_agentic_loop`** must run after this filter in request order, so response order is `openai_agentic_loop`
 //!   then `openai_mcp_dispatch`.
 //! - The IRR transition must match `openai_agentic_loop.action = "loop"` and target the same inference step.
