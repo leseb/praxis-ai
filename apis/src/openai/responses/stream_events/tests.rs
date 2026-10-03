@@ -354,6 +354,37 @@ fn deferred_terminal_wire_overflow_keeps_sequence_for_error() {
 }
 
 #[test]
+fn deferred_terminal_reserves_metadata_while_serializing_wire() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        logical_stream_response_id: Some("resp_budget".to_owned()),
+        accumulated_output: vec![json!({"type": "message", "content": [{"text": "x".repeat(256 * 1024)}]})],
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": null,
+            "provider_metadata": "m".repeat(64 * 1024)
+        }),
+    };
+    state.apply_retained_payload_limit(600 * 1024);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(
+        output.is_empty(),
+        "over-budget terminal and metadata must stay off the wire"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
 fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
