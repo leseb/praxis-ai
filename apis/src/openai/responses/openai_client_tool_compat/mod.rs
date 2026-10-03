@@ -159,7 +159,7 @@ use self::config::{ClientToolCompatConfig, build_config};
 use super::{
     agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
     body_limits::reject_rewritten_body_too_large,
-    budget_error::reject_retained_payload_response_budget,
+    budget_error::{reject_retained_payload_budget, reject_retained_payload_response_budget},
     error::responses_error_rejection,
     state::{
         ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call,
@@ -230,6 +230,8 @@ const RESTORATION_RESPONSE_RESERVATION: usize = 32;
 /// Stable error text for aggregate rejection and persistence cleanup.
 const RESTORATION_BUDGET_ERROR: &str =
     "client tool response restoration exceeded openai_agentic_loop.max_retained_bytes";
+/// Stable error text for request-lowering aggregate rejection and cleanup.
+const LOWERING_BUDGET_ERROR: &str = "client tool request lowering exceeded openai_agentic_loop.max_retained_bytes";
 
 /// Distinguish aggregate exhaustion from an ordinary invalid provider output
 /// so the response hook can clear state and disable successful persistence.
@@ -638,6 +640,10 @@ impl HttpFilter for ClientToolCompatFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request budget admission and lowering must share one ownership boundary"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -649,10 +655,30 @@ impl HttpFilter for ClientToolCompatFilter {
         }
         let streaming = request_is_streaming(ctx);
         let stream_restoration_armed = ctx.get_metadata("responses.client_tool_stream_restoration").is_some();
+        let listener_limit = ctx
+            .extensions
+            .get::<AgenticBudgetPolicy>()
+            .copied()
+            .map(AgenticBudgetPolicy::max_retained_bytes);
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        if let Err(action) = self.lower_request(state, streaming, stream_restoration_armed) {
+        if let Some(limit) = listener_limit {
+            state.apply_retained_payload_limit(limit);
+        }
+        if state.retained_payload_limit().is_some()
+            && !request_lowering_reservation(state).is_some_and(|bytes| state.can_retain_payload(bytes))
+        {
+            return Ok(reject_retained_payload_budget(ctx, LOWERING_BUDGET_ERROR));
+        }
+        let lowering = self.lower_request(state, streaming, stream_restoration_armed);
+        // Check the committed owners as well as the conservative staging bound.
+        // The latter protects allocation before lowering; this check protects
+        // future lowering variants that retain a new kind of owner.
+        if !state.can_retain_payload(0) {
+            return Ok(reject_retained_payload_budget(ctx, LOWERING_BUDGET_ERROR));
+        }
+        if let Err(action) = lowering {
             return Ok(action);
         }
         // The `state` borrow above ends here. Re-read the echo flag before mutating
@@ -707,6 +733,71 @@ impl HttpFilter for ClientToolCompatFilter {
 // -----------------------------------------------------------------------------
 // Request lowering
 // -----------------------------------------------------------------------------
+
+/// Reserve the independently owned copies that rich-tool lowering may create
+/// before discovery, descriptions, reverse-map entries, or the echo are built.
+/// The source tool and typed-history JSON are already charged to `state`; their
+/// compact sizes provide an allocation-free upper bound for every cloned field.
+/// Stringification can escape one byte into six and the custom/namespace paths
+/// can hold the original, conflict representation, lowered declaration, echo,
+/// reverse entry, and outbound serialization at once. Fixed allowance covers
+/// the generated function schema and small map keys per item. Namespace headers
+/// additionally fan out into every member's lowered description.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the checked source reservation covers tools and typed history together"
+)]
+fn request_lowering_reservation(state: &ResponsesState) -> Option<usize> {
+    const SOURCE_COPIES: usize = 32;
+    const ITEM_OVERHEAD: usize = 2_048;
+    let mut reserve = 0_usize;
+    let tools = state.client_tool_echo.as_ref().map_or_else(
+        || state.request_body.get("tools").and_then(Value::as_array),
+        |echo| Some(&echo.tools),
+    );
+    let has_rich = tools.is_some_and(|tools| tools.iter().any(is_rich_client_tool));
+    let has_discovery = state
+        .messages
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_output"));
+    if (has_rich || has_discovery)
+        && let Some(tools) = tools
+    {
+        for tool in tools {
+            reserve = reserve
+                .checked_add(retained_json_bytes(tool)?.checked_mul(SOURCE_COPIES)?)?
+                .checked_add(ITEM_OVERHEAD)?;
+            if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+                let members = tool.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
+                let header = retained_json_bytes(tool.get("name").unwrap_or(&Value::Null))?
+                    .checked_add(retained_json_bytes(tool.get("description").unwrap_or(&Value::Null))?)?;
+                reserve = reserve.checked_add(header.checked_mul(members)?.checked_mul(SOURCE_COPIES)?)?;
+            }
+        }
+        if let Some(choice) = state.request_body.get("tool_choice") {
+            reserve = reserve.checked_add(retained_json_bytes(choice)?.checked_mul(SOURCE_COPIES)?)?;
+        }
+    }
+    for item in &state.messages {
+        if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some(
+                "custom_tool_call"
+                    | "custom_tool_call_output"
+                    | "shell_call"
+                    | "shell_call_output"
+                    | "tool_search_call"
+                    | "tool_search_output"
+                    | "function_call"
+            )
+        ) {
+            reserve = reserve
+                .checked_add(retained_json_bytes(item)?.checked_mul(SOURCE_COPIES)?)?
+                .checked_add(ITEM_OVERHEAD)?;
+        }
+    }
+    Some(reserve)
+}
 
 /// Restore an owned `tools` array back into the request body verbatim.
 fn restore_tools(state: &mut ResponsesState, tools: Vec<Value>) {

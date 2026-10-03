@@ -1180,6 +1180,76 @@ fn buffered_restoration_without_state_has_no_owned_echo_to_restore() {
     assert_eq!(body.as_ref().unwrap().as_ref(), raw.as_bytes());
 }
 
+#[tokio::test]
+async fn request_lowering_rejects_before_expanding_tool_state_past_aggregate_budget() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let tools: Vec<Value> = (0..10)
+        .map(|index| json!({"type": "custom", "name": format!("tool_{index}")}))
+        .collect();
+    let parsed = json!({"model": "m", "input": "hi", "tools": tools, "store": false});
+    let raw = serde_json::to_vec(&parsed).expect("request serializes");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let mut tight = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    tight
+        .extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+    assert!(
+        super::super::initial_budget_rejection(&tight, &raw).is_none(),
+        "the supported pipeline admits the raw request before lowering"
+    );
+    super::super::insert_budgeted_responses_state(&mut tight, parsed.clone(), "resp_test")
+        .expect("initial parsed state fits");
+    let mut body = Some(Bytes::from(raw.clone()));
+    let agentic = super::super::AgenticLoopFilter::from_config(&config).unwrap();
+    assert!(matches!(
+        agentic.on_request_body(&mut tight, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let baseline = tight.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        baseline.can_retain_payload(0),
+        "state fits before compatibility lowering"
+    );
+
+    let rejection = filter().on_request_body(&mut tight, &mut body, true).await.unwrap();
+    assert_eq!(
+        reject_parts(&rejection).0,
+        413,
+        "initial request fails before the upstream call"
+    );
+    assert_eq!(tight.get_metadata("responses.skip_persist"), Some("true"));
+    let discarded = tight.extensions.get::<ResponsesState>().unwrap();
+    assert!(discarded.retained_payload_failed, "successful persistence is disabled");
+    assert!(
+        discarded.retained_payload_bytes().unwrap() <= 4096,
+        "large lowered owners are never committed over the aggregate cap"
+    );
+
+    let loose_config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 1048576").unwrap();
+    let mut loose = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    loose
+        .extensions
+        .insert(AgenticBudgetPolicy::from_config(&loose_config).expect("valid policy"));
+    super::super::insert_budgeted_responses_state(&mut loose, parsed, "resp_test").expect("initial parsed state fits");
+    let mut loose_body = Some(Bytes::from(raw));
+    assert!(matches!(
+        filter()
+            .on_request_body(&mut loose, &mut loose_body, true)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        loose
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .client_tool_echo
+            .is_some(),
+        "adequate headroom still permits client-tool lowering"
+    );
+}
+
 #[test]
 fn restores_custom_tool_call_and_echoes_tools() {
     let state = state_with_custom_lowered();
