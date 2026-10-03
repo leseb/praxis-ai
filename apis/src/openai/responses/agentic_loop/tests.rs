@@ -262,6 +262,27 @@ fn streamed_round_assignments_keep_one_output_owner_across_rounds() {
     );
 }
 
+#[test]
+fn stale_tool_search_selection_cannot_rewrite_prior_output_or_history() {
+    let prior = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "prior"});
+    let current = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "current"});
+    let mut state = ResponsesState {
+        accumulated_output: vec![prior.clone(), current.clone()],
+        persisted_messages: vec![prior.clone(), current],
+        max_tool_calls: Some(0),
+        ..ResponsesState::default()
+    };
+    state.select_test_output("tool_search_call", vec![state.accumulated_output[1].clone()]);
+    state.accumulated_output[1] = json!({"type": "function_call", "id": "ts_duplicate"});
+
+    super::mark_over_budget_tool_searches_incomplete(&mut state);
+
+    assert!(state.tool_search_calls.is_empty());
+    assert_eq!(state.accumulated_output[0], prior);
+    assert_eq!(state.persisted_messages[0]["status"], "completed");
+    assert_eq!(state.persisted_messages[1]["status"], "completed");
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
