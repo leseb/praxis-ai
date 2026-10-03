@@ -214,7 +214,7 @@ fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut
         .or(accumulated)
         .unwrap_or_default();
 
-    finalize_function_call(ctx, &key, payload, &arguments);
+    finalize_function_call(ctx, &key, payload, arguments);
 }
 
 /// Reject a completed function call whose `arguments` already exceed the cap.
@@ -243,7 +243,7 @@ fn reject_oversized_done(filter_state: &mut StreamEventsState, key: &str, payloa
 /// The completed item stays in the stream's output array. No dispatch copy is
 /// created: the loop records its index after moving the array to the canonical
 /// accumulated output at the round boundary.
-fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &Value, arguments: &str) {
+fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &Value, arguments: String) {
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     let Some(item) = find_output_item_mut(state.output_items_mut(), payload) else {
         warn!(
@@ -315,13 +315,13 @@ fn find_output_item_mut<'a>(output_items: &'a mut [Value], payload: &Value) -> O
 }
 
 /// Apply finalized arguments to an existing function-call item.
-fn complete_function_call_item(item: &mut Value, arguments: &str) -> bool {
+fn complete_function_call_item(item: &mut Value, arguments: String) -> bool {
     let Some(obj) = item.as_object_mut() else { return false };
     if obj.get("type").and_then(Value::as_str) != Some("function_call") {
         return false;
     }
 
-    obj.insert("arguments".to_owned(), Value::String(arguments.to_owned()));
+    obj.insert("arguments".to_owned(), Value::String(arguments));
     if !matches!(
         obj.get("status").and_then(Value::as_str),
         Some("completed" | "incomplete")
