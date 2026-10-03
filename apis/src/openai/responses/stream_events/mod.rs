@@ -871,10 +871,6 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
 /// This is intentionally an upper bound: replacement writes may release the
 /// previous state owner during commit, but charging the projected owner keeps
 /// the preflight transactional at the allocation peak.
-#[expect(
-    clippy::too_many_lines,
-    reason = "exhaustive per-event transactional projection accounting"
-)]
 fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>();
     events.iter().try_fold(0_usize, |used, event| {
@@ -1353,6 +1349,9 @@ fn commit_chunk_events(
     result.map(Some)
 }
 
+/// Completion snapshots and the aggregate charge held until restoration ends.
+type ChargedClientToolCompletions = (Vec<client_tools::ClientToolCompletion>, usize);
+
 /// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`
 /// and capture lowered client-tool completion artifacts for phase 2b (#1159).
 ///
@@ -1363,7 +1362,7 @@ fn accumulate_chunk(
     ctx: &mut HttpFilterContext<'_>,
     events: &[ResponsesEvent],
     staging_bytes: usize,
-) -> Result<Option<(Vec<client_tools::ClientToolCompletion>, usize)>, SseParseError> {
+) -> Result<Option<ChargedClientToolCompletions>, SseParseError> {
     let mut completions: Vec<client_tools::ClientToolCompletion> = Vec::new();
     let mut completion_bytes = 0_usize;
     for event in events {
@@ -1375,10 +1374,7 @@ fn accumulate_chunk(
             Ok(Some(bytes)) => {
                 let Some(total) = completion_bytes.checked_add(bytes) else {
                     release_client_tool_completions(ctx, completions, completion_bytes);
-                    ctx.extensions
-                        .get_mut::<ResponsesState>()
-                        .expect("completion snapshots require ResponsesState")
-                        .release_external_payload_bytes(bytes);
+                    release_client_tool_charge(ctx, bytes);
                     return Ok(None);
                 };
                 completion_bytes = total;
@@ -1396,12 +1392,18 @@ fn accumulate_chunk(
     Ok(Some((completions, completion_bytes)))
 }
 
+/// Drop completion snapshots before releasing their shared budget charge.
 fn release_client_tool_completions(
     ctx: &mut HttpFilterContext<'_>,
     completions: Vec<client_tools::ClientToolCompletion>,
     bytes: usize,
 ) {
     drop(completions);
+    release_client_tool_charge(ctx, bytes);
+}
+
+/// Release one filter-local completion snapshot's shared charge.
+fn release_client_tool_charge(ctx: &mut HttpFilterContext<'_>, bytes: usize) {
     if let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() {
         responses.release_external_payload_bytes(bytes);
     }
@@ -1415,6 +1417,10 @@ fn release_client_tool_completions(
 /// completed item lives in [`ResponsesState::output_items`] after [`accumulate_event`]
 /// merged its arguments. The plan pass needs a distinct snapshot to synthesize
 /// the restored lifecycle while the state is borrowed mutably elsewhere.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflight and charge both budgets before copying a lowered completion"
+)]
 fn capture_client_tool_completion(
     state: &StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -1453,10 +1459,9 @@ fn capture_client_tool_completion(
     // The item can be much larger than this completion frame. Charge the copy
     // to both ceilings before it is allocated, and keep the aggregate charge
     // while the restoration plan owns it.
-    let responses = ctx
-        .extensions
-        .get_mut::<ResponsesState>()
-        .expect("lowered item requires ResponsesState");
+    let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() else {
+        return Ok(None);
+    };
     responses.stream_accumulated_bytes = responses.stream_accumulated_bytes.checked_add(snapshot_bytes).ok_or(
         SseParseError::AccumulationLimitExceeded {
             dimension: "accumulated_bytes",
@@ -1473,29 +1478,30 @@ fn capture_client_tool_completion(
     {
         return Ok(None);
     }
-    if !ctx
-        .extensions
-        .get_mut::<ResponsesState>()
-        .expect("lowered item requires ResponsesState")
-        .retain_external_payload_bytes(snapshot_bytes)
-    {
+    let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() else {
+        return Ok(None);
+    };
+    if !responses.retain_external_payload_bytes(snapshot_bytes) {
         return Ok(None);
     }
-    let key = tool_call_key(payload).expect("projected key must identify the completion");
+    let Some(key) = tool_call_key(payload) else {
+        release_client_tool_charge(ctx, snapshot_bytes);
+        return Ok(None);
+    };
+    let Some(item) = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|responses| find_output_item(responses.output_items(), payload))
+    else {
+        release_client_tool_charge(ctx, snapshot_bytes);
+        return Ok(None);
+    };
     // Necessary clone (AGENTS.md boundary): the restoration plan retains a
     // completed lowered call while subsequent events can mutate shared output.
     // It cannot hold a borrow of `ResponsesState` across that plan (#1159).
     completions.push(client_tools::ClientToolCompletion {
         key,
-        item: find_output_item(
-            ctx.extensions
-                .get::<ResponsesState>()
-                .expect("lowered item requires ResponsesState")
-                .output_items(),
-            payload,
-        )
-        .expect("selected lowered item is stable during snapshot reservation")
-        .clone(),
+        item: item.clone(),
     });
     Ok(Some(snapshot_bytes))
 }

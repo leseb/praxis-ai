@@ -3499,8 +3499,8 @@ fn make_state_with_mcp_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
     state.response_object = json!({
         "object": "response",
         "status": "completed",
-        "output": tool_calls,
     });
+    state.response_object["output"] = Value::Array(tool_calls);
     state.mcp_tool_map.insert(
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),

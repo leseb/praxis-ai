@@ -503,16 +503,13 @@ impl FileSearchCalloutFilter {
     /// decides whether another inference round occurs and never commits a terminal
     /// response.
     async fn dispatch(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let (assignments, assignment_bytes) = match ctx.extensions.get_mut::<ResponsesState>() {
-            Some(state) => match take_charged_file_search_assignments(state) {
-                Some(owned) => owned,
-                None => {
-                    state.discard_payload_for_budget_error();
-                    state.dispatch_failure = Some(file_search_budget_failure());
-                    return Ok(FilterAction::Continue);
-                },
-            },
-            None => return Ok(FilterAction::Continue),
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+        let Some((assignments, assignment_bytes)) = take_charged_file_search_assignments(state) else {
+            state.discard_payload_for_budget_error();
+            state.dispatch_failure = Some(file_search_budget_failure());
+            return Ok(FilterAction::Continue);
         };
         if assignments.is_empty() {
             return Ok(FilterAction::Continue);
@@ -555,14 +552,14 @@ impl FileSearchCalloutFilter {
             }
             return Ok(FilterAction::Continue);
         }
-        if !file_search_plan_projection_fits(state, &assignments) {
+        if !file_search_plan_projection_fits(state, assignments) {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
                 state.dispatch_failure = Some(file_search_budget_failure());
             }
             return Ok(FilterAction::Continue);
         }
-        let plan = build_search_plan(state, &assignments);
+        let plan = build_search_plan(state, assignments);
         let Some(plan_bytes) = plan.retained_payload_bytes() else {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
@@ -608,14 +605,7 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        let apply_result = Self::apply_batch(
-            state,
-            &assignments,
-            &plan,
-            &batch,
-            framework_bytes,
-            self.max_state_bytes,
-        );
+        let apply_result = Self::apply_batch(state, assignments, &plan, &batch, framework_bytes, self.max_state_bytes);
         drop(batch);
         if let Err(failure) = apply_result {
             state.dispatch_failure = Some(failure);
