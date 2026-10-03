@@ -39,7 +39,7 @@ use self::{
 };
 use super::{
     body_limits::rewritten_body_too_large_rejection,
-    enforce_agentic_stream_guard,
+    bounded_json_size, enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
     stream_events::RETAINED_PAYLOAD_OVERFLOW_MESSAGE,
@@ -72,6 +72,11 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 
 /// Marker for a streaming Chat Completions SSE response.
 const RESPONSE_TRANSFORM_STREAM: &str = "stream";
+
+/// Response-side error when a finite Chat response cannot be translated within
+/// the request-wide retained-payload budget.
+const FINITE_TRANSLATION_OVERFLOW_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during buffered Chat translation";
 
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
@@ -507,6 +512,50 @@ fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut O
     super::fs_end_stream_with_error_ctx(ctx, "server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
 }
 
+/// Reserve the provider parse tree, translated resource, serialized wire body,
+/// and request fields echoed into the resource before creating any of them.
+fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return true;
+    };
+    let choice = state.original_tool_choice.as_ref().unwrap_or(&state.tool_choice);
+    let staging = (|| {
+        let request_echo = bounded_json_size(&state.request_body, limit).ok().flatten()?;
+        let tools_echo = bounded_json_size(&state.tools, limit).ok().flatten()?;
+        let choice_echo = bounded_json_size(choice, limit).ok().flatten()?;
+        let echo = request_echo.checked_add(tools_echo)?.checked_add(choice_echo)?;
+        let response_id_bytes = ctx
+            .get_metadata("responses.response_id")
+            .or(state.response_id.as_deref())
+            .map_or(0, str::len);
+        body.len()
+            .checked_mul(6)?
+            .checked_add(echo.checked_mul(3)?)?
+            .checked_add(response_id_bytes.checked_mul(12)?)?
+            .checked_add(512)
+    })();
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// A finite response has not committed its translated wire body; reject it and
+/// prevent the outer response store from recording a successful completion.
+fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        FINITE_TRANSLATION_OVERFLOW_MESSAGE,
+    ))
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "selected adapter also completes deferred local dispatch"
@@ -605,6 +654,11 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
             Some(_) => {
                 if end_of_stream {
+                    if ctx.get_metadata(RESPONSE_TRANSFORM_KEY) == Some(RESPONSE_TRANSFORM_SUCCESS)
+                        && !finite_translation_fits(ctx, body.as_deref().unwrap_or_default())
+                    {
+                        return Ok(finite_translation_budget_failure(ctx));
+                    }
                     self.transform_finite_response(ctx, body)?;
                 }
                 Ok(FilterAction::Continue)
