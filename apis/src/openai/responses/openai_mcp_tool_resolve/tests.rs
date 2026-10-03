@@ -5878,6 +5878,54 @@ async fn eager_cache_resolution_rejects_tight_budget_before_commit() {
     assert!(state.accumulated_output.is_empty());
 }
 
+#[test]
+fn near_limit_rehydrated_history_rejects_before_second_body_parse() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut body_json = mcp_body("http://8.8.8.8/mcp");
+    body_json["metadata"] = serde_json::json!({"note": "x".repeat(300_000)});
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut state = ResponsesState::from_request_body(body_json);
+    state
+        .messages
+        .push(serde_json::json!({"content": "y".repeat(4_000_000)}));
+    let retained = state.retained_payload_bytes().unwrap();
+    let limit = retained + original.len() / 2;
+    assert!(
+        original.len() <= limit / 8,
+        "raw create body passes the initial budget gate"
+    );
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(original.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut action = None;
+
+    let allocation = allocation_counter::measure(|| {
+        action = Some(
+            runtime
+                .block_on(filter.on_request_body(&mut ctx, &mut body, true))
+                .unwrap(),
+        );
+    });
+
+    assert!(matches!(&action, Some(FilterAction::Reject(rejection)) if rejection.status == 502));
+    assert!(
+        allocation.bytes_max < u64::try_from(original.len()).unwrap() / 4,
+        "budget rejection must precede the second JSON tree: {allocation:?}"
+    );
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.messages.is_empty());
+}
+
 #[tokio::test]
 async fn eager_fresh_resolution_preflights_budget_before_tools_list() {
     let (url, cancel, calls) = start_counted_single_tool_mcp_server().await;
