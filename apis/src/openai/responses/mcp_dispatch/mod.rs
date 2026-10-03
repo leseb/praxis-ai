@@ -343,6 +343,12 @@ impl McpDispatchFilter {
             bind_owner_context(entry, connector_identity.map(McpCalloutIdentity::owner));
             bind_credential_context(entry, connector_identity.and_then(McpCalloutIdentity::user_credential));
         }
+        if !state.mcp_tool_map.is_empty() {
+            // The resolved map belongs to the cached streaming baseline. Header,
+            // owner, or credential binding may rewrite entries without changing
+            // the map's length, so invalidate store and rehydrate snapshots.
+            state.mark_replay_stable_payload_changed();
+        }
         true
     }
 

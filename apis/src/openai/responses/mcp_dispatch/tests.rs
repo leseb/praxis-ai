@@ -1986,6 +1986,32 @@ fn connector_binding_projection_matches_actual_map_growth() {
 }
 
 #[tokio::test]
+async fn connector_binding_invalidates_cached_mcp_definition_charge() {
+    let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
+    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&request);
+    let mut tool_map = sample_tool_map();
+    tool_map.retain(|(server, _), _| server == "weather");
+    tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap()["connector_id"] = json!("weather");
+    let state = ResponsesState {
+        mcp_tool_map: tool_map,
+        ..ResponsesState::default()
+    };
+    let before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.replay_stable_payload_revision, Some(1));
+    assert!(state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap() > before);
+}
+
+#[tokio::test]
 async fn configured_deferred_connector_missing_assertion_records_security_failure_before_dispatch() {
     let filter = make_scoped_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
