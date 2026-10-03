@@ -70,6 +70,39 @@ fn lowered_snapshot_echo_fails_before_planning_many_owned_copies() {
 }
 
 #[test]
+fn native_terminal_does_not_pay_restoration_staging_after_move() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
+    responses.apply_retained_payload_limit(12_000);
+    ctx.extensions.insert(responses);
+    let metadata: serde_json::Map<String, serde_json::Value> =
+        (0..8).map(|i| (format!("key{i}"), json!("x".repeat(512)))).collect();
+    let terminal = make_sse_chunk(
+        "response.completed",
+        &json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_budget",
+                "object": "response",
+                "status": "completed",
+                "output": [],
+                "metadata": metadata,
+            }
+        }),
+    );
+    for slice in terminal.chunks(256) {
+        let mut body = Some(Bytes::copy_from_slice(slice));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+    }
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let body = std::str::from_utf8(eos.as_ref().unwrap()).unwrap();
+    assert!(body.contains("event: response.completed"), "{body}");
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+}
+
+#[test]
 fn done_after_terminal_at_max_events_is_allowed() {
     let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
     let completed =
