@@ -373,6 +373,13 @@ fn deferred_terminal_reserves_metadata_while_serializing_wire() {
         }),
     };
     state.apply_retained_payload_limit(600 * 1024);
+    let preflight = super::canonicalization_staging_bytes(&state, 0).unwrap()
+        + terminal.retained_payload_bytes().unwrap()
+        + parser_state.retained_payload_bytes().unwrap();
+    assert!(
+        state.can_replace_retained_payload(0, 0, preflight),
+        "canonicalization must fit so this exercises the later wire admission"
+    );
     ctx.extensions.insert(state);
     let mut output = Vec::new();
 
