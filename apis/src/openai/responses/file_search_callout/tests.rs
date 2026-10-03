@@ -428,6 +428,46 @@ fn aggregate_limit_clears_file_search_dispatch_without_committing_batch() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "finds a budget where public results fit but the private bridge does not"
+)]
+fn public_result_without_model_bridge_invalidates_store_replay_cache() {
+    for headroom in (1_024..16_000).step_by(32) {
+        let mut state = one_pending_state(&["vs-a"]);
+        state.include.push("file_search_call.results".to_owned());
+        let initial = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(initial + headroom);
+        let assignments = state.drain_file_search_assignments();
+        let plan = build_search_plan(&state, &assignments);
+        let mut batch = SearchBatch::new(plan.calls.len());
+        batch.results_by_call[0].push(SearchResult {
+            attributes: None,
+            content: vec![ContentChunk {
+                _chunk_type: ContentChunkType::Text,
+                text: "result".repeat(128),
+            }],
+            file_id: "file-a".to_owned(),
+            filename: "a.txt".to_owned(),
+            score: 0.9,
+        });
+        let output_len = state.accumulated_output.len();
+        let revision = state.replay_stable_payload_revision;
+
+        if FileSearchCalloutFilter::apply_batch(&mut state, &assignments, &plan, &batch, 0, usize::MAX).is_err()
+            || !state.messages.is_empty()
+        {
+            continue;
+        }
+        assert_eq!(state.accumulated_output.len(), output_len);
+        assert!(!state.accumulated_output[0]["results"].as_array().unwrap().is_empty());
+        assert_ne!(state.replay_stable_payload_revision, revision);
+        return;
+    }
+    panic!("expected a public-result admission without a private model bridge");
+}
+
+#[test]
 fn aggregate_limit_rejects_before_file_search_formatting() {
     let mut state = one_pending_state(&[]);
     let assignments = state.drain_file_search_assignments();
