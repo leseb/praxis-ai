@@ -1804,6 +1804,10 @@ fn current_round_tool_call_admissions_by<'a>(
 /// `max_tool_calls` is exhausted. An omitted limit leaves discovery allowed.
 /// When the current round's output is not yet replayable, remaining prior-round
 /// budget is the admission signal.
+#[cfg_attr(
+    not(feature = "openai-mcp-tools"),
+    expect(dead_code, reason = "MCP resolver is the production caller")
+)]
 pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
     let Some(max) = state.max_tool_calls else {
         return true;
