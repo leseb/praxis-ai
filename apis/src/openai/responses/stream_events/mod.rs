@@ -1522,9 +1522,18 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
         &state.citation_files,
     )
     .ok()?;
+    // Client-tool restoration copies the echoed declarations into the
+    // canonical response and the deferred terminal before the final wire
+    // preflight. Admit those owners before either response is mutated.
+    let echoed_tools_bytes = state.client_tool_echo.as_ref().map_or(Some(0), |echo| {
+        retained_json_bytes(&echo.tools)?
+            .checked_add(retained_json_bytes(&echo.tool_choice)?)?
+            .checked_add(64)
+    })?;
     output_bytes
         .checked_mul(2)?
         .checked_add(annotation_bytes.checked_mul(3)?)?
+        .checked_add(echoed_tools_bytes.checked_mul(2)?)?
         .checked_add(existing_output_bytes)
 }
 
@@ -3649,8 +3658,20 @@ fn emit_deferred_terminal(
     if let Some(response) = terminal.payload.get_mut("response") {
         restore_snapshot_tools(response, state.client_tool_echo.as_ref());
     }
-    let terminal_bytes = retained_json_bytes(&terminal.payload);
-    let staging = terminal_bytes.and_then(|bytes| output.len().checked_add(bytes));
+    // The held JSON terminal remains live while its independently owned SSE
+    // serialization is appended. Reserve both owners, including normalization
+    // and the optional [DONE] frame, before writing to the output buffer.
+    let staging = normalized_sse_event_upper_bound(ctx, &terminal.event_type, &terminal.payload)
+        // Normalization can grow the held JSON owner as well as the wire copy.
+        .and_then(|event_bytes| event_bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(output.len()))
+        .and_then(|bytes| {
+            bytes.checked_add(if parser_state.deferred_done {
+                b"data: [DONE]\n\n".len()
+            } else {
+                0
+            })
+        });
     if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
         output.clear();
         record_retained_payload_overflow(ctx, parser_state);
