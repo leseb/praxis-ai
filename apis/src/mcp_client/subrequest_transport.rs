@@ -1296,6 +1296,22 @@ fn classify_bounded_buffered_post_response(
     signal: &Arc<OnceLock<TransportSignal>>,
 ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
     if response.body.len() > cap {
+        let status = StatusCode::from_u16(response.status)
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+        // These outcomes do not parse the body. In particular, a reused
+        // session's 404 must reach rmcp as SessionExpired so it can reinitialize.
+        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT)
+            || (status == StatusCode::NOT_FOUND && session_was_attached)
+            || (matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                && www_authenticate(&response.headers).is_some())
+        {
+            return classify_buffered_post_response(response, message, session_was_attached);
+        }
+        if !status.is_success() {
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {status}").into(),
+            ));
+        }
         signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
         return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
     }
@@ -2364,6 +2380,20 @@ mod tests {
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
         ));
+    }
+
+    #[test]
+    fn oversized_buffered_session_expiry_still_triggers_reinitialization() {
+        let call: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .unwrap();
+        let mut response = sub_response(404, Some("application/json"), b"");
+        response.body = Bytes::from(vec![b'x'; 3_072]);
+        let signal = test_signal();
+        let result = classify_bounded_buffered_post_response(response, &call, true, 2_048, &signal);
+        assert!(matches!(result, Err(StreamableHttpError::SessionExpired)));
+        assert!(signal.get().is_none(), "404 is a session signal, not a size error");
     }
 
     #[test]
