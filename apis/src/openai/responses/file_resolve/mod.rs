@@ -74,7 +74,7 @@ use bytes::Bytes;
 use praxis_core::config::ChainRef;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -92,6 +92,7 @@ use super::{
     bound_body_outcome,
     openai_responses_proxy::serialized_outbound_body_len,
     state::ResponsesState,
+    stream_events::{encode_local_error, encode_retained_payload_error},
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -571,8 +572,25 @@ fn file_state_fits_budget(ctx: &HttpFilterContext<'_>) -> bool {
         .is_none_or(|state| state.can_retain_payload(0))
 }
 
+/// A prior IRR step's SSE response has already fixed the downstream wire format.
+fn irr_stream_was_committed(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<IterationState>().is_some_and(|iteration| {
+        iteration.iteration() > 0
+            && iteration.previous_response.as_ref().is_some_and(|response| {
+                response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.as_bytes().get(..b"text/event-stream".len()))
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/event-stream"))
+            })
+    })
+}
+
 /// Clear payload and disable successful persistence on aggregate exhaustion.
 fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    const MESSAGE: &str =
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during file resolution";
+    let committed_stream = irr_stream_was_committed(ctx);
     let initial = ctx
         .extensions
         .get::<ResponsesState>()
@@ -583,16 +601,25 @@ fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterA
     }
     #[cfg(feature = "store")]
     super::store::discard_retained_request_payload(ctx);
+    if committed_stream {
+        // IRR appends a later step's rejection body to the first streamed
+        // response. Once that response is SSE, a JSON rejection would be raw
+        // bytes in the event stream rather than a terminal error event.
+        let body =
+            encode_local_error(ctx, "server_error", MESSAGE).unwrap_or_else(|| encode_retained_payload_error(ctx));
+        return FilterAction::Reject(
+            Rejection::status(200)
+                .with_header("content-type", "text/event-stream")
+                .with_body(body)
+                .preserving_keepalive(),
+        );
+    }
     let (status, code) = if initial {
         (413, "invalid_request_error")
     } else {
         (502, "server_error")
     };
-    FilterAction::Reject(super::error::responses_error_rejection(
-        status,
-        code,
-        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during file resolution",
-    ))
+    FilterAction::Reject(super::error::responses_error_rejection(status, code, MESSAGE))
 }
 
 /// Map aggregate failures through request cleanup before returning a rejection.

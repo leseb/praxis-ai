@@ -5484,6 +5484,154 @@ def retained_tool_search_client(tmp_path, request):
         os.unlink(config_path)
 
 
+def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(tmp_path):
+    """A later IRR file failure must finish the SSE stream, not append raw JSON."""
+
+    class StubHandler(BaseHTTPRequestHandler):
+        paths: ClassVar[list[str]] = []
+
+        def do_GET(self):
+            self.paths.append(self.path)
+            if self.path != "/v1/files/file-budget":
+                self.send_error(500, "unexpected content fetch")
+                return
+            payload = json.dumps(
+                {"filename": "a.txt", "content_type": "text/plain", "bytes": 49152}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            self.paths.append("POST " + self.path)
+            self.rfile.read(int(self.headers["Content-Length"]))
+            payload = (
+                b'event: response.created\ndata: {"type":"response.created",'
+                b'"response":{"id":"resp_file_budget","object":"response",'
+                b'"status":"in_progress","output":[]}}\n\n'
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    stub = ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+    thread = threading.Thread(target=stub.serve_forever, daemon=True)
+    thread.start()
+    proxy_port = _free_port()
+    config = f"""
+listeners:
+  - name: file-budget-stream
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [file-budget-stream]
+filter_chains:
+  - name: file-budget-stream
+    filters:
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: first
+        max_iterations: 2
+        steps:
+          - name: first
+            filters:
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{stub.server_port}"]
+            on_result:
+              - default: true
+                next: resolve
+          - name: resolve
+            filters:
+              - filter: openai_responses_format
+              - filter: openai_file_resolve
+                files_api_url: "http://127.0.0.1:{stub.server_port}"
+                allow_pre_security_callout: true
+              - filter: openai_stream_events
+              - filter: openai_agentic_loop
+                max_infer_iters: 1
+                max_retained_bytes: 4096
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{stub.server_port}"]
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true
+"""
+    config_path = _persist_config(config)
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, str(log_path))
+            response = httpx.post(
+                f"http://127.0.0.1:{proxy_port}/v1/responses",
+                json={
+                    "model": "m",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_file", "file_id": "file-budget"}],
+                        }
+                    ],
+                    "store": False,
+                    "stream": True,
+                },
+                timeout=20,
+            )
+            assert response.status_code == 200, response.text
+            assert response.headers["content-type"].startswith("text/event-stream")
+            frames = [frame for frame in response.text.split("\n\n") if frame]
+            assert [frame.split("\n", 1)[0] for frame in frames] == [
+                "event: response.created",
+                "event: error",
+            ], response.text
+            error = json.loads(frames[1].split("data: ", 1)[1])
+            assert error["type"] == "error"
+            assert error["code"] == "server_error"
+            assert "agentic retained payload exceeded" in error["message"]
+            assert "{\"error\":" not in response.text
+            assert StubHandler.paths.count("POST /v1/responses") == 1
+            assert StubHandler.paths.count("/v1/files/file-budget") == 1
+            assert "/v1/files/file-budget/content" not in StubHandler.paths
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stub.shutdown()
+            stub.server_close()
+            os.unlink(config_path)
+            if proc.returncode not in (0, -2):
+                print(_read_log_tail(str(log_path)), file=sys.stderr)
+
+
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 

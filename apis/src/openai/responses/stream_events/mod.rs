@@ -2742,7 +2742,7 @@ fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>, output_capacit
 
 /// Drop retained payload and construct the bounded terminal error used after a
 /// local-output admission failure.
-fn encode_retained_payload_error(ctx: &mut HttpFilterContext<'_>) -> Bytes {
+pub(crate) fn encode_retained_payload_error(ctx: &mut HttpFilterContext<'_>) -> Bytes {
     let state = ctx.extensions.get_mut::<ResponsesState>();
     let sequence_number = state.map_or(0, |state| {
         state.discard_payload_for_budget_error();
