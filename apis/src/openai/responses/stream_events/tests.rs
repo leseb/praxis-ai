@@ -4966,6 +4966,31 @@ fn bare_terminal_payload_keeps_its_original_wire_shape() {
 }
 
 #[test]
+fn bare_upstream_terminal_remains_bare_after_deferred_emission() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut terminal = Some(make_sse_chunk(
+        "response.completed",
+        &json!({"id": "resp_bare", "status": "completed", "output": []}),
+    ));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(
+        terminal.is_none(),
+        "terminal remains deferred until stream finalization"
+    );
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let wire = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    let data = wire.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert!(
+        payload.get("response").is_none(),
+        "bare upstream payload must stay bare: {wire}"
+    );
+    assert_eq!(payload["id"], "resp_bare");
+}
+
+#[test]
 fn parse_error_sets_metadata() {
     let (filter, mut ctx) = make_armed_context();
     ctx.insert_filter_state(StreamEventsState {
