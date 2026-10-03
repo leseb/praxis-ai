@@ -1054,7 +1054,7 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true, true)
     }
 
     /// Request and history owners remain stable between upstream chunks.
@@ -1078,11 +1078,26 @@ impl ResponsesState {
         Some(meter.used())
     }
 
+    /// The canonical client-tool echo is captured once before the first
+    /// upstream response chunk and remains fixed for the parser's lifetime.
+    /// Include it in the parser's cached baseline, leaving the other filters'
+    /// stable/changing split unchanged.
+    pub(crate) fn stream_stable_payload_bytes_bounded_for_parser(&self, max_bytes: usize) -> Option<usize> {
+        let base = self.stream_stable_payload_bytes_bounded(max_bytes)?;
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.raw(base)?;
+        if let Some(echo) = &self.client_tool_echo {
+            meter.json_values(&echo.tools)?;
+            meter.json(&echo.tool_choice)?;
+        }
+        Some(meter.used())
+    }
+
     /// Rehydration runs after the stream parser and can see new canonical output
     /// between chunks; count both while reusing only stable request/history bytes.
     #[cfg(feature = "store")]
     pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true, true)
     }
 
     /// The response store caches request/history and prior output while
@@ -1090,20 +1105,20 @@ impl ResponsesState {
     /// including the parser charge published by `openai_stream_events`.
     #[cfg(feature = "store")]
     pub(crate) fn store_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true, true)
     }
 
     /// The translated upstream round cannot append prior output until its
     /// converter has finished. The converter caches that large owner once;
     /// this counts all other changing owners, including the stream parser.
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true, true)
     }
 
-    /// Stream events separately charges its parser state and cached prior
-    /// output, so neither owner belongs in the shared changing charge.
+    /// Stream events separately charges its parser state, cached prior output,
+    /// and capture-once client-tool echo; none belongs in the changing charge.
     pub(crate) fn stream_changing_payload_bytes_bounded_for_parser(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, false, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, false, true, false)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1114,7 +1129,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false, true)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1133,6 +1148,7 @@ impl ResponsesState {
         skip_accumulated_output: bool,
         include_stream_parser: bool,
         include_chat_converter: bool,
+        include_client_tool_echo: bool,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
@@ -1198,7 +1214,7 @@ impl ResponsesState {
                 meter.raw(namespace.len())?;
             }
         }
-        if let Some(echo) = &self.client_tool_echo {
+        if include_client_tool_echo && let Some(echo) = &self.client_tool_echo {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
         }

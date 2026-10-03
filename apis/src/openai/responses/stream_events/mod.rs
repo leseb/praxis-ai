@@ -898,7 +898,7 @@ fn parse_and_accumulate(
     // The existing two-phase commit enforces the stream's own item and byte caps
     // before it records any client-visible lifecycle milestones.
     let staging = CommitChunkStaging {
-        pre_commit_bytes: commit_staging_bytes.unwrap_or(usize::MAX),
+        parsed_owner_bytes: construction_bytes.unwrap_or(usize::MAX),
         frame_payload_bytes,
         logical_output_upper_bound,
     };
@@ -1143,7 +1143,7 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
     let limit = responses.retained_payload_limit()?;
     let stable = *stream.shared_stable_bytes.get_or_init(|| {
         responses
-            .stream_stable_payload_bytes_bounded(limit)
+            .stream_stable_payload_bytes_bounded_for_parser(limit)
             .unwrap_or(usize::MAX)
     });
     // A resumed round can carry megabytes of completed prior output. It does
@@ -1544,8 +1544,9 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 
 /// Transient owners needed at each phase of one chunk commit.
 struct CommitChunkStaging {
-    /// Checked before accumulation, then reused while admitting snapshots.
-    pre_commit_bytes: usize,
+    /// Parsed frames and events remain live after accumulation. The pre-commit
+    /// clone projection is omitted once those clones enter shared state.
+    parsed_owner_bytes: usize,
     /// Completed frame data remains live during restoration planning.
     frame_payload_bytes: Option<usize>,
     /// Maximum logical wire output built from this chunk.
@@ -1590,7 +1591,8 @@ fn commit_chunk_events(
     staging: &CommitChunkStaging,
 ) -> Result<Option<Vec<u8>>, SseParseError> {
     // Phase 2a accumulates shared output and captures charged completion snapshots.
-    let Some((completions, completion_bytes)) = accumulate_chunk(state, ctx, &events, staging.pre_commit_bytes)? else {
+    let Some((completions, completion_bytes)) = accumulate_chunk(state, ctx, &events, staging.parsed_owner_bytes)?
+    else {
         return Ok(None);
     };
 
@@ -1675,7 +1677,7 @@ fn accumulate_chunk(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: &[ResponsesEvent],
-    staging_bytes: usize,
+    parsed_owner_bytes: usize,
 ) -> Result<Option<ChargedClientToolCompletions>, SseParseError> {
     let mut completions = Vec::new();
     let mut completion_bytes = 0_usize;
@@ -1699,7 +1701,7 @@ fn accumulate_chunk(
                 return Err(error);
             }
         }
-        match capture_client_tool_completion(state, ctx, &mut completions, event, staging_bytes) {
+        match capture_client_tool_completion(state, ctx, &mut completions, event, parsed_owner_bytes) {
             Ok(Some(bytes)) => {
                 let Some(total) = completion_bytes.checked_add(bytes) else {
                     release_client_tool_completions(ctx, completions, completion_bytes);
@@ -1732,7 +1734,7 @@ fn capture_client_tool_completion(
     ctx: &mut HttpFilterContext<'_>,
     completions: &mut Vec<client_tools::ClientToolCompletion>,
     event: &ResponsesEvent,
-    staging_bytes: usize,
+    parsed_owner_bytes: usize,
 ) -> Result<Option<usize>, SseParseError> {
     let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
         return Ok(Some(0));
@@ -1775,7 +1777,7 @@ fn capture_client_tool_completion(
     if let Some(error) = accumulation_bytes_exceeded(state, responses.stream_accumulated_bytes) {
         return Err(error);
     }
-    if !staging_bytes
+    if !parsed_owner_bytes
         .checked_add(snapshot_bytes)
         .is_some_and(|bytes| stream_payload_fits(ctx, state, bytes))
     {
