@@ -166,19 +166,23 @@ impl ResponsesProxyFilter {
         clippy::too_many_lines,
         reason = "streaming splice keeps the large body out of serde_json::Value"
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "move the admitted parsed input into serialization without cloning it"
+    )]
     fn serialize_selected_body(
         &self,
         body: &Bytes,
         members: &[TopLevelMember],
         state: &ResponsesState,
         preserve_native_compaction: bool,
+        live_input: Option<Vec<serde_json::Value>>,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
             state.messages.get(state.provider_history_len..).unwrap_or_default()
         } else {
             &state.messages
         };
-        let live_input = selected_input_messages(body, members)?;
         let state_backend_messages = messages_for_backend(
             state_messages,
             preserve_native_compaction,
@@ -467,6 +471,48 @@ fn selected_rewrite_reservation(body: &[u8], members: &[TopLevelMember], state: 
         .checked_add(repeated_field_wire)?
         .checked_add(provider_ids)?
         .checked_add(512)
+}
+
+/// A local compaction summary can expand when decoded bytes require JSON
+/// escapes. Reserve each translated owner after the input parser is admitted.
+fn selected_compaction_expansion(
+    state: &ResponsesState,
+    live_input: Option<&[serde_json::Value]>,
+    preserve_native_compaction: bool,
+) -> Option<usize> {
+    let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
+        state.messages.get(state.provider_history_len..).unwrap_or_default()
+    } else {
+        &state.messages
+    };
+    state_messages
+        .iter()
+        .chain(live_input.into_iter().flatten())
+        .filter(|message| {
+            message.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                && !is_provider_compaction(message, preserve_native_compaction, &state.provider_compaction_ids)
+        })
+        .try_fold(0_usize, |used, message| {
+            let encoded_len = message
+                .get("encrypted_content")
+                .and_then(serde_json::Value::as_str)
+                .map_or(0, str::len);
+            used.checked_add(encoded_len.checked_mul(6)?.checked_add(64)?)
+        })?
+        .checked_mul(4)
+}
+
+/// Reject before committing the selected outbound body and discard the
+/// request's retained state using the shared commitment-aware error path.
+fn reject_selected_rewrite_budget(ctx: &mut HttpFilterContext<'_>) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+    let action = super::budget_error::reject_retained_payload_budget(
+        ctx,
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during native request rewrite",
+    );
+    match action {
+        FilterAction::Reject(rejection) => Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+        _ => Err("openai_responses_proxy: invalid retained-budget rejection".into()),
+    }
 }
 
 /// Append state-owned messages that are not part of the original input.
@@ -791,25 +837,42 @@ impl HttpFilter for ResponsesProxyFilter {
         let members = scan_top_level_object(current_body).map_err(|error| -> FilterError {
             format!("openai_responses_proxy: invalid selected request body: {error}").into()
         })?;
-        if state.retained_payload_limit().is_some()
-            && !selected_rewrite_reservation(current_body, &members, state)
-                .is_some_and(|bytes| state.can_retain_payload(bytes))
-        {
-            let action = super::budget_error::reject_retained_payload_budget(
-                ctx,
-                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during native request rewrite",
-            );
-            return match action {
-                FilterAction::Reject(rejection) => Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
-                _ => Err("openai_responses_proxy: invalid retained-budget rejection".into()),
+        let reservation = if state.retained_payload_limit().is_some() {
+            let Some(bytes) = selected_rewrite_reservation(current_body, &members, state)
+                .filter(|bytes| state.can_retain_payload(*bytes))
+            else {
+                return reject_selected_rewrite_budget(ctx);
             };
+            Some(bytes)
+        } else {
+            None
+        };
+        let live_input = selected_input_messages(current_body, &members)?;
+        if let Some(bytes) = reservation {
+            let Some(expansion) =
+                selected_compaction_expansion(state, live_input.as_deref(), preserve_native_compaction)
+            else {
+                return reject_selected_rewrite_budget(ctx);
+            };
+            if expansion > 0
+                && !bytes
+                    .checked_add(expansion)
+                    .is_some_and(|total| state.can_retain_payload(total))
+            {
+                return reject_selected_rewrite_budget(ctx);
+            }
         }
-        let serialized =
-            match self.serialize_selected_body(current_body, &members, state, preserve_native_compaction)? {
-                Ok(bytes) => bytes,
-                Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
-                Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
-            };
+        let serialized = match self.serialize_selected_body(
+            current_body,
+            &members,
+            state,
+            preserve_native_compaction,
+            live_input,
+        )? {
+            Ok(bytes) => bytes,
+            Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+            Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
+        };
 
         if let Some(limit) = effective_request_body_limit(ctx)
             && serialized.len() > limit
@@ -972,6 +1035,24 @@ fn serialize_outbound_body(
 
 /// Project compaction items into the selected backend's input format.
 ///
+/// Keep opaque provider compaction items unchanged for a native backend.
+fn is_provider_compaction(
+    message: &serde_json::Value,
+    preserve_native_compaction: bool,
+    provider_compaction_ids: &HashSet<String>,
+) -> bool {
+    preserve_native_compaction
+        && message.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+        && message
+            .get(crate::openai::responses::state::LOCAL_COMPACTION_MARKER)
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        && match message.get("id").and_then(serde_json::Value::as_str) {
+            Some(id) => provider_compaction_ids.contains(id),
+            None => true,
+        }
+}
+
 /// Returns `Cow::Borrowed` when no compaction items are present, avoiding
 /// allocation. Native mode borrows only provider-originated compaction items;
 /// locally generated Praxis summaries are still translated to assistant
@@ -984,16 +1065,9 @@ fn messages_for_backend<'a>(
     let mut translated: Option<Vec<serde_json::Value>> = None;
 
     for (i, m) in messages.iter().enumerate() {
-        let is_provider_compaction = preserve_native_compaction
-            && m.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-            && m.get(crate::openai::responses::state::LOCAL_COMPACTION_MARKER)
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-            && match m.get("id").and_then(serde_json::Value::as_str) {
-                Some(id) => provider_compaction_ids.contains(id),
-                None => true,
-            };
-        if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction") && !is_provider_compaction {
+        if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            && !is_provider_compaction(m, preserve_native_compaction, provider_compaction_ids)
+        {
             let vec = translated.get_or_insert_with(|| messages.get(..i).unwrap_or(&[]).to_vec());
             vec.push(compaction_to_assistant_message(m));
         } else if let Some(vec) = &mut translated {

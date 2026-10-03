@@ -852,7 +852,13 @@ async fn native_selected_rebuild_reserves_each_duplicate_input_replacement() {
     let unbounded = (super::ResponsesProxyFilter {
         config: super::ResponsesProxyConfig::default(),
     })
-    .serialize_selected_body(&original, &members, &state, true)
+    .serialize_selected_body(
+        &original,
+        &members,
+        &state,
+        true,
+        super::selected_input_messages(&original, &members).unwrap(),
+    )
     .unwrap()
     .unwrap();
     assert_eq!(
@@ -865,6 +871,50 @@ async fn native_selected_rebuild_reserves_each_duplicate_input_replacement() {
     assert!(unbounded.len() > 150_000);
     let retained = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(retained + 150_000);
+    ctx.extensions.insert(state);
+    let mut body = Some(original.clone());
+
+    let action = make_filter()
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_ref(), Some(&original));
+}
+
+#[tokio::test]
+async fn native_selected_rebuild_reserves_local_compaction_translation() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context_without_subrequest_client(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(vec![1_u8; 16_384]);
+    state.messages.push(json!({
+        "type": "compaction",
+        "id": "local",
+        "encrypted_content": encoded,
+        "_praxis_local_compaction": true,
+    }));
+    state.mark_request_body_for_rebuild();
+    let original = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let members = super::scan_top_level_object(&original).unwrap();
+    let expanded = (super::ResponsesProxyFilter {
+        config: super::ResponsesProxyConfig::default(),
+    })
+    .serialize_selected_body(
+        &original,
+        &members,
+        &state,
+        true,
+        super::selected_input_messages(&original, &members).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(expanded.len() > 98_000);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 190_000);
     ctx.extensions.insert(state);
     let mut body = Some(original.clone());
 
