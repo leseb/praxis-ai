@@ -1002,6 +1002,14 @@ fn push_search_turn(
             state.dispatch_failure = Some(web_search_budget_failure());
             return;
         }
+        let Some(slot) = state.accumulated_output.get_mut(ids.output_index) else {
+            state.dispatch_failure = Some(DispatchFailure {
+                status: 502,
+                code: "server_error",
+                message: "web-search output selection became stale before result commit".to_owned(),
+            });
+            return;
+        };
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
@@ -1011,7 +1019,7 @@ fn push_search_turn(
         if let Some(id) = output_item.get("id").and_then(Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
         }
-        state.accumulated_output[ids.output_index] = output_item;
+        *slot = output_item;
     }
 }
 
