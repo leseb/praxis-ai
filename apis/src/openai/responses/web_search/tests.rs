@@ -2169,7 +2169,7 @@ async fn query_cap_bounds_the_whole_batch_and_keeps_partial_results() {
         );
         let bridge = find_queries_bridge_output(messages, &starved).expect("starved bridge present");
         assert_eq!(
-            bridge["output"], TOOL_LIMIT_OUTPUT,
+            bridge["output"], NOT_PERFORMED_OUTPUT,
             "an undispatched call must not fabricate results"
         );
     }
