@@ -5443,6 +5443,14 @@ def retained_tool_search_client(tmp_path, request):
         "      - filter: openai_mcp_tool_resolve\n",
         1,
     )
+    if getattr(request, "param", None) == "doc_extract":
+        config = config.replace(
+            "      - filter: openai_mcp_tool_resolve\n",
+            "      - filter: openai_doc_extract\n"
+            "        allow_pre_security_callout: true\n\n"
+            "      - filter: openai_mcp_tool_resolve\n",
+            1,
+        )
     config = config.replace(
         "  allow_private_endpoints: true # example proxies to local backends",
         "  allow_private_endpoints: true # example proxies to local backends\n"
@@ -5732,6 +5740,34 @@ class TestAgenticLoopVLLM:
         assert "agentic retained payload exceeded" in exc_info.value.response.text
         assert RetainedFileMetadataHandler.metadata_requests == 1
         assert RetainedFileMetadataHandler.content_requests == 0
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    @pytest.mark.parametrize("retained_tool_search_client", ["doc_extract"], indirect=True)
+    def test_document_extraction_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """Escaped extracted text cannot multiply beyond the shared budget."""
+        file_data = "data:text/plain;base64," + base64.b64encode(b"\x01" * 256).decode()
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "filename": "controls.txt",
+                                "file_data": file_data,
+                            }
+                        ],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "during document extraction" in exc_info.value.response.text
         assert RetainedToolSearchBackendHandler.requests == 0
 
     def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
