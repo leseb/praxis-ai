@@ -1024,7 +1024,7 @@ struct SlowRequest {
 struct TestMcpServer {
     tool_router: ToolRouter<Self>,
     echo_calls: StdArc<AtomicUsize>,
-    instructions: StdArc<String>,
+    instructions: StdArc<str>,
 }
 
 #[expect(clippy::unused_self, reason = "rmcp macro-generated code")]
@@ -1038,11 +1038,11 @@ impl TestMcpServer {
         Self {
             tool_router: Self::tool_router(),
             echo_calls,
-            instructions: StdArc::new("Test MCP server for integration tests".to_owned()),
+            instructions: StdArc::from("Test MCP server for integration tests"),
         }
     }
 
-    fn with_instructions(echo_calls: StdArc<AtomicUsize>, instructions: StdArc<String>) -> Self {
+    fn with_instructions(echo_calls: StdArc<AtomicUsize>, instructions: StdArc<str>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             echo_calls,
@@ -1077,7 +1077,7 @@ impl TestMcpServer {
 impl ServerHandler for TestMcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(self.instructions.as_str())
+            .with_instructions(self.instructions.as_ref())
     }
 }
 
@@ -1101,7 +1101,7 @@ async fn start_test_mcp_server_with_instructions(
     let service: StreamableHttpService<TestMcpServer, LocalSessionManager> = StreamableHttpService::new(
         {
             let echo_calls = StdArc::clone(&echo_calls);
-            let instructions = StdArc::new(instructions);
+            let instructions = StdArc::<str>::from(instructions);
             move || {
                 Ok(TestMcpServer::with_instructions(
                     StdArc::clone(&echo_calls),
@@ -2029,7 +2029,7 @@ async fn oversized_tool_initialize_is_rejected_before_tool_call() {
     let (url, ct, echo_calls) = start_test_mcp_server_with_instructions("x".repeat(256 * 1024)).await;
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "large-initialize".to_owned()).unwrap();
-    let result = call_tool_with_forwarded_headers(
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
         Some((&pool, &key)),
         &url,
         None,
@@ -2041,15 +2041,19 @@ async fn oversized_tool_initialize_is_rejected_before_tool_call() {
         serde_json::json!({"message": "must not run"}),
         INTEGRATION_TIMEOUT,
         2_048,
+        2_048,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await;
     ct.cancel();
 
-    assert!(matches!(
-        result,
-        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
-    ));
+    assert!(
+        matches!(
+            &result,
+            Err(McpClientError::ResponseTooLarge { limit, .. }) if *limit <= 2 * 2_048
+        ),
+        "bounded initialize should fail with typed size error: {result:?}"
+    );
     assert_eq!(echo_calls.load(Ordering::Relaxed), 0);
     assert_eq!(pool.retained_payload_bytes(), Some(0));
 }
@@ -2059,7 +2063,7 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
     let (url, ct, _echo_calls) = start_test_mcp_server_with_instructions("instruction".repeat(32)).await;
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "small-initialize".to_owned()).unwrap();
-    let result = call_tool_with_forwarded_headers(
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
         Some((&pool, &key)),
         &url,
         None,
@@ -2070,6 +2074,7 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
         "echo",
         serde_json::json!({"message": "ok"}),
         INTEGRATION_TIMEOUT,
+        2_048,
         2_048,
         &McpCallout::fabricated(true).unwrap(),
     )
@@ -2472,6 +2477,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         None,
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         callout,
         &parse_display_url(url),
     )

@@ -109,6 +109,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+        aggregate_budgeted: false,
         timeout,
         forwarded_header_names: &[],
         forwarded_headers: None,
@@ -619,7 +620,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     assert_eq!(
         aggregate_mcp_result_limit(&state, &calls, 8_192),
         Some((
-            (20_000 - arguments - entry - 4 * mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
+            (20_000 - arguments - entry - 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
             true
         ))
     );
@@ -633,12 +634,20 @@ fn aggregate_mcp_limit_reserves_initialize_and_parked_peer_info() {
         ..ResponsesState::default()
     };
     state.tool_calls = vec![call];
+    let without_pool = state.retained_payload_bytes().unwrap();
+    let state_only = state
+        .retained_payload_bytes_bounded_without_external(usize::MAX)
+        .unwrap();
     state.retained_mcp_session_bytes = 2_048;
     let current = state.retained_payload_bytes().unwrap();
-    state.apply_retained_payload_limit(current + 4 * mcp_client::MIN_TOOL_INITIALIZE_BYTES - 1);
+    assert_eq!(current, without_pool + 2_048);
+    assert_eq!(
+        state.retained_payload_bytes_bounded_without_external(usize::MAX),
+        Some(state_only)
+    );
+    state.apply_retained_payload_limit(current + 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES - 1);
     let calls = call_refs(&state.tool_calls);
     assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
-    assert!(state.retained_payload_bytes().unwrap() >= 2_048);
 }
 
 #[test]

@@ -291,6 +291,7 @@ impl McpDispatchFilter {
             max_parallel_calls: self.max_parallel_calls,
             max_result_bytes: per_result_limit,
             max_total_result_bytes: execution_batch_limit,
+            aggregate_budgeted: state.retained_payload_limit().is_some(),
             timeout: self.timeout,
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
@@ -1177,11 +1178,8 @@ impl McpDispatchFilter {
             .extensions
             .get_or_insert_with(mcp_client::McpSessionPool::new)
             .clone();
-        let Some(pooled_bytes) = session_pool.retained_payload_bytes() else {
+        if !charge_pooled_mcp_sessions(ctx, &session_pool) {
             return Ok(Self::aggregate_budget_action(ctx));
-        };
-        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-            state.retained_mcp_session_bytes = pooled_bytes;
         }
 
         // Resume approvals from the previous turn before executing any calls.
@@ -1277,11 +1275,8 @@ impl McpDispatchFilter {
         // rmcp retains initialization peer information (including instructions
         // and _meta) in every parked session. Publish its current charge before
         // admitting the result batch or the next agentic round.
-        let Some(pooled_bytes) = session_pool.retained_payload_bytes() else {
+        if !charge_pooled_mcp_sessions(ctx, &session_pool) {
             return Ok(Self::aggregate_budget_action(ctx));
-        };
-        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-            state.retained_mcp_session_bytes = pooled_bytes;
         }
         if !ctx
             .extensions
@@ -1294,6 +1289,22 @@ impl McpDispatchFilter {
 
         Ok(FilterAction::Continue)
     }
+}
+
+/// Publish the request pool's retained metadata only when aggregate admission
+/// is active; ordinary MCP calls do not need to serialize parked peer info.
+fn charge_pooled_mcp_sessions(ctx: &mut HttpFilterContext<'_>, pool: &mcp_client::McpSessionPool) -> bool {
+    let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+        return false;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let Some(bytes) = pool.retained_payload_bytes() else {
+        return false;
+    };
+    state.retained_mcp_session_bytes = bytes;
+    true
 }
 
 /// Load deferred connector tools when a hosted `tool_search_call` is pending.
@@ -1739,6 +1750,10 @@ impl McpCallResult {
 
 /// Reserve raw callout bodies and parsed result staging alongside the three
 /// final result owners before making an external MCP call.
+#[expect(
+    clippy::too_many_lines,
+    reason = "result and handshake reservations share one MCP admission calculation"
+)]
 fn aggregate_mcp_result_limit(
     state: &ResponsesState,
     mcp_calls: &[&serde_json::Value],
@@ -1860,6 +1875,8 @@ struct McpExecutionOptions<'a> {
     max_result_bytes: usize,
     /// Maximum serialized bytes retained by one result batch.
     max_total_result_bytes: usize,
+    /// Bound rmcp's retained initialize peer info only under agentic budget.
+    aggregate_budgeted: bool,
     /// Timeout applied independently to each MCP call.
     timeout: Duration,
     /// Names reserved for trusted forwarding, including when values are absent.
@@ -2162,7 +2179,12 @@ async fn execute_single_call(
     // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
     // key and therefore remain fail-closed and unpooled.
     let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
-    let result = mcp_client::call_tool_with_forwarded_headers(
+    let initialize_limit = if options.aggregate_budgeted {
+        payload_limit
+    } else {
+        mcp_client::MAX_CONTROL_RESPONSE_BYTES
+    };
+    let result = mcp_client::call_tool_with_forwarded_headers_bounded_initialize(
         session_key.as_ref().map(|key| (options.session_pool, key)),
         server_url,
         headers,
@@ -2174,6 +2196,7 @@ async fn execute_single_call(
         arguments,
         options.timeout,
         payload_limit,
+        initialize_limit,
         callout,
     )
     .await;
