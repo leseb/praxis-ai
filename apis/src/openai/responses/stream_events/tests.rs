@@ -335,7 +335,7 @@ fn deferred_terminal_wire_overflow_keeps_sequence_for_error() {
     };
     let mut terminal = super::DeferredTerminalEvent {
         event_type: "response.completed".to_owned(),
-        payload: json!({"type": "response.completed", "sequence_number": 4}),
+        payload: json!({"type": "response.completed", "sequence_number": 4, "response": null}),
     };
     let preflight = super::canonicalization_staging_bytes(&state, 0).unwrap()
         + terminal.retained_payload_bytes().unwrap()
@@ -4911,14 +4911,14 @@ fn terminal_accumulation_moves_parsed_response_into_shared_state() {
 
     let retained = &ctx.extensions.get::<ResponsesState>().unwrap().response_object;
     assert_eq!(retained["output"][0]["text"].as_str().unwrap().as_ptr(), original_text);
-    assert!(event.payload().get("response").is_none());
+    assert!(event.payload()["response"].is_null());
     assert_eq!(event.payload()["sequence_number"], 9);
 }
 
 #[test]
 fn borrowed_terminal_serializes_canonical_response_without_cloning_it() {
     let response = json!({"id": "resp_borrow", "output": [{"text": "x".repeat(256 * 1024)}]});
-    let metadata = json!({"type": "response.completed", "sequence_number": 7});
+    let metadata = json!({"type": "response.completed", "sequence_number": 7, "response": null});
     let expected = json!({
         "type": "response.completed",
         "sequence_number": 7,
@@ -4947,6 +4947,21 @@ fn borrowed_terminal_serializes_canonical_response_without_cloning_it() {
         "borrowed serialization allocated {} bytes versus {} for a response clone",
         borrowed.bytes_total,
         baseline.bytes_total
+    );
+}
+
+#[test]
+fn bare_terminal_payload_keeps_its_original_wire_shape() {
+    let response = json!({"id": "resp_bare", "output": []});
+    let metadata = json!({"type": "response.completed", "id": "resp_bare", "output": []});
+    let borrowed = super::BorrowedTerminalPayload {
+        metadata: &metadata,
+        response: &response,
+    };
+    assert_eq!(
+        serde_json::to_vec(&borrowed).unwrap(),
+        serde_json::to_vec(&metadata).unwrap(),
+        "bare upstream terminal has no response wrapper to replace"
     );
 }
 

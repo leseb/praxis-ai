@@ -64,8 +64,8 @@ const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
 struct DeferredTerminalEvent {
     /// Canonical event type.
     event_type: String,
-    /// Parsed envelope fields. The response tree is owned by `ResponsesState`
-    /// after terminal accumulation, so the live stream holds only metadata.
+    /// Parsed envelope fields. A `response: null` marker replaces the moved
+    /// tree, so the live stream holds only metadata on conformant terminals.
     payload: Value,
 }
 
@@ -1575,16 +1575,10 @@ fn append_logical_event(
 
     if event.is_terminal() {
         let event_type = event.event_type().to_owned();
-        let mut payload = event.into_payload();
-        if ctx
-            .extensions
-            .get::<ResponsesState>()
-            .is_some_and(|response| response.response_object.is_object())
-            && let Some(envelope) = payload.as_object_mut()
-        {
-            envelope.remove("response");
-        }
-        state.deferred_terminal = Some(DeferredTerminalEvent { event_type, payload });
+        state.deferred_terminal = Some(DeferredTerminalEvent {
+            event_type,
+            payload: event.into_payload(),
+        });
         return;
     }
     if state.iteration > 0 && is_response_lifecycle_creation(&event) {
@@ -3061,31 +3055,18 @@ impl Serialize for BorrowedTerminalPayload<'_> {
     where
         S: serde::Serializer,
     {
-        let metadata = self.metadata.as_object();
-        let len = metadata.map_or(1, |object| usize::from(!object.contains_key("response")) + object.len());
-        let mut map = serializer.serialize_map(Some(len))?;
-        let mut response_written = false;
-        if let Some(metadata) = metadata {
-            for (key, value) in metadata {
-                // `serde_json::Value` normally serializes sorted map keys. Put
-                // the borrowed response in the same position so existing SSE
-                // recordings retain their exact wire bytes.
-                if !response_written && key.as_str() > "response" {
-                    map.serialize_entry("response", self.response)?;
-                    response_written = true;
-                }
-                if key == "response" {
-                    if !response_written {
-                        map.serialize_entry("response", self.response)?;
-                        response_written = true;
-                    }
-                } else {
-                    map.serialize_entry(key, value)?;
-                }
+        let Some(metadata) = self.metadata.as_object() else {
+            return self.metadata.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(metadata.len()))?;
+        for (key, value) in metadata {
+            if key == "response" {
+                // Keep the existing map position, including JSON key order,
+                // while borrowing the canonical response from shared state.
+                map.serialize_entry(key, self.response)?;
+            } else {
+                map.serialize_entry(key, value)?;
             }
-        }
-        if !response_written {
-            map.serialize_entry("response", self.response)?;
         }
         map.end()
     }
