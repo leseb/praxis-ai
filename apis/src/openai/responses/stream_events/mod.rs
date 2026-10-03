@@ -33,7 +33,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
     StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
 };
-use serde::{Serialize, ser::SerializeMap};
+use serde::{Serialize, ser::SerializeMap as _};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -899,6 +899,7 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
 /// This is intentionally an upper bound: replacement writes may release the
 /// previous state owner during commit, but charging the projected owner keeps
 /// the preflight transactional at the allocation peak.
+#[expect(clippy::too_many_lines, reason = "event variants require distinct clone projections")]
 fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>();
     events.iter().try_fold(0_usize, |used, event| {
@@ -1112,6 +1113,10 @@ fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEv
 /// Canonicalization moves the accumulated output into `response_object` and
 /// borrows it for the wire. Reserve metadata, usage, citation, and client-tool
 /// restoration copies before mutating the canonical response.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one terminal projection covers several independent owners"
+)]
 fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes: usize) -> Option<usize> {
     let output = if state.accumulated_output.is_empty() {
         state.output_items()
@@ -3137,6 +3142,10 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 ///
 /// Either way the id is only ever restored, never fabricated: a non-rehydrated
 /// turn keeps the real value the backend echoed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "canonical terminal construction follows ordered state transitions"
+)]
 fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
@@ -3228,7 +3237,9 @@ fn restore_terminal_client_tools(state: &mut ResponsesState) -> Result<(), SsePa
 /// owned by `ResponsesState` for persistence. The deferred metadata never owns
 /// another full response tree.
 struct BorrowedTerminalPayload<'a> {
+    /// Deferred lifecycle metadata and event type.
     metadata: &'a Value,
+    /// Canonical response owned by request state.
     response: &'a Value,
 }
 
