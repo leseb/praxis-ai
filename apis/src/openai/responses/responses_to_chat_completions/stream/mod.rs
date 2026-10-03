@@ -41,7 +41,7 @@ use self::{
     framing::{Framing, FramingError},
 };
 use crate::openai::{
-    responses::state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
+    responses::state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
     translation::chat_completions::{
         ResponseContext, chat_response_to_response_resource, context_has_web_search,
         function_call_output_item_from_parts, in_progress_response_resource, message_output_item, output_text_item,
@@ -383,6 +383,76 @@ pub(super) struct StreamConverter {
     /// Request, history, and prior-round output are immutable until the
     /// translated upstream round has completed.
     shared_stable_bytes: Option<usize>,
+    /// Current response/template/call charge, reused while their owner
+    /// revisions and request round are unchanged.
+    current_output_charge: Option<CurrentOutputCharge>,
+    /// Number of full output measurements, used to prove cache reuse.
+    #[cfg(test)]
+    current_output_measurements: usize,
+}
+
+/// Revisioned measurement of the current Responses output owners.
+#[derive(Clone, Copy)]
+struct CurrentOutputCharge {
+    /// Revision of current response/template/call owners.
+    current_revision: u64,
+    /// Revision of request, history, and prior output owners.
+    stable_revision: u64,
+    /// Iterative request-router round.
+    iteration: u32,
+    /// Response value shape at measurement time.
+    response_is_object: bool,
+    /// Number of current response output items.
+    output_len: usize,
+    /// Fallback template value shape at measurement time.
+    template_is_object: bool,
+    /// Number of fallback template output items.
+    template_output_len: usize,
+    /// Number of completed call copies.
+    tool_calls_len: usize,
+    /// Exact compact JSON charge of all three owners.
+    bytes: usize,
+}
+
+impl CurrentOutputCharge {
+    /// A cheap shape check supplements the mutation revisions.
+    fn matches(self, state: &ResponsesState) -> bool {
+        Some(self.current_revision) == state.current_output_revision
+            && Some(self.stable_revision) == state.replay_stable_payload_revision
+            && self.iteration == state.iteration
+            && self.response_is_object == state.response_object.is_object()
+            && self.output_len == state.output_items().len()
+            && self.template_is_object == state.local_completion_response_template.is_object()
+            && self.template_output_len == Self::template_output_len(state)
+            && self.tool_calls_len == state.tool_calls.len()
+    }
+
+    /// Create a cache entry only while both mutation counters are usable.
+    fn from_state(state: &ResponsesState, bytes: usize) -> Option<Self> {
+        let (current_revision, stable_revision) = state
+            .current_output_revision
+            .zip(state.replay_stable_payload_revision)?;
+        Some(Self {
+            current_revision,
+            stable_revision,
+            iteration: state.iteration,
+            response_is_object: state.response_object.is_object(),
+            output_len: state.output_items().len(),
+            template_is_object: state.local_completion_response_template.is_object(),
+            template_output_len: Self::template_output_len(state),
+            tool_calls_len: state.tool_calls.len(),
+            bytes,
+        })
+    }
+
+    /// Read the template's small top-level shape without serializing it.
+    fn template_output_len(state: &ResponsesState) -> usize {
+        state
+            .local_completion_response_template
+            .get("output")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    }
 }
 
 impl StreamConverter {
@@ -481,6 +551,32 @@ impl StreamConverter {
         self.shared_stable_bytes
     }
 
+    /// Measure the current output only when it changes. Parser, external, and
+    /// converter owners remain live in the callback's separate state meter.
+    pub(super) fn current_output_bytes(&mut self, state: &ResponsesState, limit: usize) -> Option<usize> {
+        if let Some(cached) = self.current_output_charge
+            && cached.matches(state)
+        {
+            return (cached.bytes <= limit).then_some(cached.bytes);
+        }
+        #[cfg(test)]
+        {
+            self.current_output_measurements += 1;
+        }
+        let mut meter = PayloadMeter::new(limit);
+        meter.json(&state.response_object)?;
+        meter.json(&state.local_completion_response_template)?;
+        meter.json_values(&state.tool_calls)?;
+        let bytes = meter.used();
+        self.current_output_charge = CurrentOutputCharge::from_state(state, bytes);
+        Some(bytes)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn current_output_measurements(&self) -> usize {
+        self.current_output_measurements
+    }
+
     /// Set the maximum wire staging this callback can safely allocate.
     pub(super) fn set_callback_output_limit(&mut self, bytes: usize) {
         self.emit.callback_output_limit = bytes;
@@ -492,6 +588,10 @@ impl StreamConverter {
     }
 
     /// Create a converter for a streaming response.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request-local converter state is initialized together"
+    )]
     pub(super) fn new(response_id: String, created_at: u64, limits: StreamLimits) -> Self {
         Self {
             framing: Framing::new(limits.max_sse_buffer_bytes),
@@ -520,6 +620,9 @@ impl StreamConverter {
             frames_processed: 0,
             echo_projection: None,
             shared_stable_bytes: None,
+            current_output_charge: None,
+            #[cfg(test)]
+            current_output_measurements: 0,
         }
     }
 

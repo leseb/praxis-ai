@@ -32,6 +32,88 @@ fn wide_stream_limits() -> super::stream::StreamLimits {
 }
 
 #[test]
+fn repeated_stream_budget_checks_do_not_reserialize_unchanged_current_output() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "stream": true, "input": "hi"}));
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    let mut converter = super::stream::StreamConverter::new("resp_output_cache".to_owned(), 1, wide_stream_limits());
+    converter.set_echo_projection(&state.request_body, &state.tools, None);
+    context.extensions.insert(state);
+
+    for _ in 0..100 {
+        assert!(super::converter_construction_fits(&context, &mut converter, 100));
+    }
+    assert_eq!(
+        converter.current_output_measurements(),
+        1,
+        "unchanged output is measured once"
+    );
+    let before_output = super::converter_budget_remaining(
+        context.extensions.get::<ResponsesState>().unwrap(),
+        &mut converter,
+        0,
+        0,
+    )
+    .unwrap();
+    let state = context.extensions.get_mut::<ResponsesState>().unwrap();
+    state.response_object = json!({"output": [{"type": "message", "content": [{"text": "x".repeat(1024 * 1024)}]}]});
+    state.mark_current_output_changed();
+    for _ in 0..100 {
+        assert!(super::converter_construction_fits(&context, &mut converter, 100));
+    }
+    assert_eq!(
+        converter.current_output_measurements(),
+        2,
+        "the changed output is measured once more"
+    );
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    let after_output = super::converter_budget_remaining(state, &mut converter, 0, 0).unwrap();
+    assert_eq!(
+        before_output - after_output,
+        super::super::state::retained_json_bytes(&state.response_object).unwrap() - 4,
+        "the revised output must reduce available budget by its exact charge"
+    );
+
+    // Parser and sibling-filter owners can change without touching current
+    // output. They must still be charged by every callback admission.
+    let remaining = super::converter_budget_remaining(
+        context.extensions.get::<ResponsesState>().unwrap(),
+        &mut converter,
+        0,
+        0,
+    )
+    .unwrap();
+    let state = context.extensions.get_mut::<ResponsesState>().unwrap();
+    state.retained_stream_parser_bytes = remaining + 1;
+    assert!(
+        super::converter_budget_remaining(state, &mut converter, 0, 0).is_none(),
+        "a growing stream parser still exhausts the aggregate budget"
+    );
+    state.retained_stream_parser_bytes = 0;
+    state.retained_external_payload_bytes = remaining + 1;
+    assert!(
+        super::converter_budget_remaining(state, &mut converter, 0, 0).is_none(),
+        "a growing sibling-filter owner still exhausts the aggregate budget"
+    );
+    assert_eq!(
+        converter.current_output_measurements(),
+        2,
+        "changing other owners never reserializes output"
+    );
+
+    state.retained_external_payload_bytes = 0;
+    state.current_output_revision = None;
+    assert!(super::converter_budget_remaining(state, &mut converter, 0, 0).is_some());
+    assert!(super::converter_budget_remaining(state, &mut converter, 0, 0).is_some());
+    assert_eq!(
+        converter.current_output_measurements(),
+        4,
+        "an exhausted revision cannot reuse the cache"
+    );
+}
+
+#[test]
 fn first_stream_callback_reserves_both_request_echo_lifecycle_frames() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);

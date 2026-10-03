@@ -1098,11 +1098,15 @@ impl ResponsesState {
         Some(meter.used())
     }
 
-    /// The translated upstream round cannot append prior output until its
-    /// converter has finished. The converter caches that large owner once;
-    /// this counts all other changing owners, including the stream parser.
-    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true, None)
+    /// The Chat stream converter caches the current response/template/call
+    /// charge by revision, but this meter still rechecks parser and sibling
+    /// filter owners on every callback.
+    pub(crate) fn chat_stream_changing_payload_bytes_bounded_with_current_output(
+        &self,
+        max_bytes: usize,
+        current_output_bytes: usize,
+    ) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true, Some(current_output_bytes))
     }
 
     /// Stream events separately charges its parser state and cached prior
@@ -1966,7 +1970,6 @@ mod tests {
 
     use super::*;
 
-    #[cfg(feature = "store")]
     fn current_output_bytes(state: &ResponsesState) -> usize {
         retained_json_bytes(&state.response_object).unwrap()
             + retained_json_bytes(&state.local_completion_response_template).unwrap()
@@ -2041,14 +2044,13 @@ mod tests {
         let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
         assert!(stable > before_capture + 1_048_576);
         let full = state.retained_payload_bytes().unwrap();
-        #[cfg(feature = "store")]
         let current_output = current_output_bytes(&state);
 
         let started = std::time::Instant::now();
         for _ in 0..200 {
             let changing = [
                 state.stream_changing_payload_bytes_bounded_for_parser(1_024),
-                state.stream_changing_payload_bytes_bounded_with_cached_output(1_024),
+                state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
                 #[cfg(feature = "store")]
                 state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
             ];
@@ -2077,11 +2079,10 @@ mod tests {
 
         let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
         assert_eq!(stable, baseline_stable + map_bytes);
-        #[cfg(feature = "store")]
         let current_output = current_output_bytes(&state);
         for changing in [
             state.stream_changing_payload_bytes_bounded_for_parser(1_024),
-            state.stream_changing_payload_bytes_bounded_with_cached_output(1_024),
+            state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
             #[cfg(feature = "store")]
             state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
         ] {
