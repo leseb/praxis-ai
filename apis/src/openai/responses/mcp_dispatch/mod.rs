@@ -2029,15 +2029,14 @@ fn fit_result_or_limit_error(
 
 /// Distinguish a request-wide size failure from a configured per-tool limit.
 /// The latter stays a bounded tool error so an executed call is not retried.
-fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
-    if !matches!(
-        options.aggregate_result_policy,
-        McpAggregateResultPolicy::PerCallConstrained
-    ) {
-        return false;
-    }
-    let admitted_payload = result_payload_limit(options.max_result_bytes);
-    let configured_payload = result_payload_limit(options.configured_max_result_bytes);
+fn lowered_exchange_ceiling(limit: usize, admitted: usize, configured: usize) -> bool {
+    (limit == admitted && admitted < configured)
+        || (limit == mcp_client::streaming_executor_backstop(admitted)
+            && mcp_client::streaming_executor_backstop(admitted) < mcp_client::streaming_executor_backstop(configured))
+}
+
+/// Match the transport's POST, GET cumulative, and streaming executor ceilings.
+fn aggregate_transport_ceiling_lowered(limit: usize, admitted_payload: usize, configured_payload: usize) -> bool {
     let admitted_initialize = admitted_payload.clamp(
         mcp_client::MIN_TOOL_INITIALIZE_BYTES,
         mcp_client::MAX_CONTROL_RESPONSE_BYTES,
@@ -2048,11 +2047,28 @@ fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutio
     );
     let admitted_tool_wire = mcp_client::tool_result_wire_cap(admitted_payload);
     let configured_tool_wire = mcp_client::tool_result_wire_cap(configured_payload);
+    let admitted_get_cumulative = mcp_client::tool_stream_cumulative_cap(admitted_tool_wire);
+    let configured_get_cumulative = mcp_client::tool_stream_cumulative_cap(configured_tool_wire);
+    lowered_exchange_ceiling(limit, admitted_initialize, configured_initialize)
+        || lowered_exchange_ceiling(limit, admitted_tool_wire, configured_tool_wire)
+        || lowered_exchange_ceiling(limit, admitted_get_cumulative, configured_get_cumulative)
+}
+
+/// Distinguish a request-wide size failure from a configured per-tool limit.
+/// The latter stays a bounded tool error so an executed call is not retried.
+fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
+    if !matches!(
+        options.aggregate_result_policy,
+        McpAggregateResultPolicy::PerCallConstrained
+    ) {
+        return false;
+    }
+    let admitted_payload = result_payload_limit(options.max_result_bytes);
+    let configured_payload = result_payload_limit(options.configured_max_result_bytes);
     let exceeded_aggregate_cap = match result.size_limit_exceeded {
         Some(McpSizeLimitFailure::Decoded(actual)) => actual <= configured_payload,
         Some(McpSizeLimitFailure::Transport(limit)) => {
-            (limit == admitted_initialize && admitted_initialize < configured_initialize)
-                || (limit == admitted_tool_wire && admitted_tool_wire < configured_tool_wire)
+            aggregate_transport_ceiling_lowered(limit, admitted_payload, configured_payload)
         },
         None => false,
     };

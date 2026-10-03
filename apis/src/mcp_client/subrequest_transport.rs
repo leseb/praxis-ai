@@ -101,8 +101,14 @@ pub(crate) fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
 /// size and yields HTTP 413, while the ceiling stays finite (not `usize::MAX`) so
 /// the `None`-body buffered fallback and the success-`application/json` drain
 /// (`collect_body`/`drain_body`) remain memory-bounded — at 2x the cap.
-fn streaming_executor_backstop(binding_cap: usize) -> usize {
+pub(crate) fn streaming_executor_backstop(binding_cap: usize) -> usize {
     binding_cap.saturating_mul(2)
+}
+
+/// Bound a tool session's GET stream while allowing one control response in
+/// addition to its tool-result wire allowance.
+pub(crate) fn tool_stream_cumulative_cap(tool_wire_cap: usize) -> usize {
+    tool_wire_cap.saturating_add(MAX_CONTROL_RESPONSE_BYTES)
 }
 
 /// The `mcp-session-id` header carrying the Streamable-HTTP session token.
@@ -621,7 +627,7 @@ impl McpSubrequestClient {
             step_timeout,
             wire,
             initialize_bytes,
-            wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            tool_stream_cumulative_cap(wire),
             owner,
         )
     }
@@ -2028,6 +2034,60 @@ mod tests {
             ),
             "an oversized initialized ACK must hit the admitted handshake cap"
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real HTTP body proves the executor backstop signal"
+    )]
+    async fn oversized_tool_response_reports_streaming_executor_backstop() {
+        use std::io::{Read as _, Write as _};
+
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(true).unwrap(),
+            Duration::from_secs(5),
+            4_096,
+            1_024,
+            None,
+        );
+        let message: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .unwrap();
+        let backstop = streaming_executor_backstop(client.response_limit(&message));
+        let signal = client.signal_handle();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let body = vec![b'x'; backstop + 1];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).unwrap();
+            drop(socket.write_all(&body));
+        });
+        let result = client
+            .post_message_with_max_sse_event_size(
+                Arc::from(format!("http://{address}/mcp")),
+                message,
+                None,
+                None,
+                HashMap::new(),
+                16 * 1024 * 1024,
+            )
+            .await;
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit }) if *limit == backstop));
     }
 
     #[test]
