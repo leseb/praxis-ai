@@ -23,7 +23,10 @@ mod local_tools;
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
     hash::{Hash as _, Hasher as _},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -155,6 +158,12 @@ pub(super) struct StreamEventsState {
     /// Prior-round output is immutable during an inference stream. Cache its
     /// charge separately from current-round output and parser state.
     shared_prior_output_bytes: OnceLock<Option<PriorOutputCache>>,
+    /// Exact charge for the current response, fallback terminal template, and
+    /// completed call copies. Output/terminal/done events change these owners
+    /// during a live stream; later argument deltas leave them intact.
+    /// Zero means unmeasured; the serialized `response_object` is always at
+    /// least `null` (four bytes), so every valid measurement is nonzero.
+    shared_current_output_bytes: AtomicUsize,
 }
 
 /// A prior-output measurement and the state shape it describes.
@@ -180,6 +189,14 @@ impl PriorOutputCache {
 }
 
 impl StreamEventsState {
+    /// The owner can append history or rewrite the terminal between EOS
+    /// callbacks; recalculate every shared charge after that boundary.
+    fn clear_shared_budget_caches(&mut self) {
+        self.shared_stable_bytes = OnceLock::new();
+        self.shared_prior_output_bytes = OnceLock::new();
+        self.shared_current_output_bytes.store(0, Ordering::Relaxed);
+    }
+
     /// Raw parser, argument, deferred-terminal, and local suppression payload
     /// retained outside [`ResponsesState`].
     fn retained_payload_bytes(&self) -> Option<usize> {
@@ -321,6 +338,7 @@ impl OpenaiStreamEventsFilter {
             stream_failed: false,
             shared_stable_bytes: OnceLock::new(),
             shared_prior_output_bytes: OnceLock::new(),
+            shared_current_output_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -551,6 +569,9 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.local_completion_response_template = Value::Null;
         }
+        if let Some(stream) = ctx.get_filter_state::<StreamEventsState>() {
+            stream.shared_current_output_bytes.store(0, Ordering::Relaxed);
+        }
 
         if !is_success_sse_response(ctx) {
             debug!("disarming stream_events: response is not 2xx text/event-stream");
@@ -683,8 +704,7 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_
         // The agentic-loop callback can append streamed output to history
         // immediately before this EOS callback. Re-measure that changed
         // baseline before admitting even the final provider chunk.
-        state.shared_stable_bytes = OnceLock::new();
-        state.shared_prior_output_bytes = OnceLock::new();
+        state.clear_shared_budget_caches();
     }
 
     // Aggregate overflow is terminal for the logical stream. Suppress every
@@ -1185,10 +1205,24 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
         },
         (_, None) => None,
     };
+    let cached_current_output_bytes = stream.shared_current_output_bytes.load(Ordering::Relaxed);
+    let current_output_bytes = (cached_current_output_bytes != 0)
+        .then_some(cached_current_output_bytes)
+        .or_else(|| {
+            let mut meter = PayloadMeter::new(limit);
+            meter.json(&responses.response_object)?;
+            meter.json(&responses.local_completion_response_template)?;
+            meter.json_values(&responses.tool_calls)?;
+            let bytes = meter.used();
+            stream.shared_current_output_bytes.store(bytes, Ordering::Relaxed);
+            Some(bytes)
+        });
     let current = limit
         .checked_sub(stable)
         .and_then(|remaining| remaining.checked_sub(prior_bytes?))
-        .and_then(|remaining| responses.stream_changing_payload_bytes_bounded_for_parser(remaining))
+        .and_then(|remaining| {
+            responses.stream_changing_payload_bytes_bounded_with_current_output(remaining, current_output_bytes?)
+        })
         .and_then(|changing| stable.checked_add(prior_bytes?)?.checked_add(changing));
     Some((limit, current))
 }
@@ -1724,6 +1758,17 @@ fn accumulate_chunk(
             return Ok(None);
         }
         let retained_clone_bytes = accumulate_event(ctx, state, event);
+        if matches!(
+            event,
+            ResponsesEvent::ResponseCompleted(_)
+                | ResponsesEvent::ResponseIncomplete(_)
+                | ResponsesEvent::ResponseFailed(_)
+                | ResponsesEvent::OutputItemAdded(_)
+                | ResponsesEvent::OutputItemDone(_)
+                | ResponsesEvent::FunctionCallArgumentsDone(_)
+        ) {
+            state.shared_current_output_bytes.store(0, Ordering::Relaxed);
+        }
         if matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_))
             && let Some(upper) = admission.shared_upper_bound.as_mut()
         {
@@ -3034,6 +3079,9 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let parser_deferred_done = ctx
         .get_filter_state::<StreamEventsState>()
         .is_some_and(|state| state.deferred_done);
+    if let Some(stream) = ctx.get_filter_state::<StreamEventsState>() {
+        stream.shared_current_output_bytes.store(0, Ordering::Relaxed);
+    }
     let state = ctx.extensions.get::<ResponsesState>()?;
     let Some(local_output_upper_bound) = local_terminal_output_upper_bound(state) else {
         return Some(encode_retained_payload_error(ctx));
@@ -3265,8 +3313,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // chunk; starting from an empty buffer here would drop those earlier events.
     // Agentic collection can append history immediately before this EOS callback.
     // Refresh the shared baseline before admitting synthesis construction.
-    parser_state.shared_stable_bytes = OnceLock::new();
-    parser_state.shared_prior_output_bytes = OnceLock::new();
+    parser_state.clear_shared_budget_caches();
     let mut output = match body.take() {
         None => Vec::new(),
         Some(bytes) => {
@@ -3333,8 +3380,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // The agentic-loop callback runs before this finalizer and can append the
     // just-finished round to messages/persisted_messages. Their per-stream
     // baseline from the first chunk is therefore stale at EOS.
-    parser_state.shared_stable_bytes = OnceLock::new();
-    parser_state.shared_prior_output_bytes = OnceLock::new();
+    parser_state.clear_shared_budget_caches();
     if !stream_payload_fits(ctx, &parser_state, output.len()) {
         output.clear();
         record_retained_payload_overflow(ctx, &mut parser_state);
@@ -3458,6 +3504,7 @@ fn emit_deferred_terminal(
         return Err(SseParseError::StreamPoisoned);
     }
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
+    parser_state.shared_current_output_bytes.store(0, Ordering::Relaxed);
     if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
         response.insert("output".to_owned(), Value::Array(accumulated_output));
         if !usage.is_null() {

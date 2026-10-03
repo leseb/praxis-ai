@@ -735,7 +735,7 @@ fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
 
 #[test]
 fn streaming_budget_cache_counts_stable_owners_once_per_round() {
-    let (_filter, mut ctx) = make_armed_context();
+    let (filter, mut ctx) = make_armed_context();
     let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState {
         request_body: json!({"input": "p".repeat(32_768)}),
@@ -755,7 +755,13 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .retained_payload_bytes()
             .unwrap()
     );
-    ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object = json!({"output": [{"text": "new"}]});
+    ctx.insert_filter_state(stream);
+    let mut body = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"text": "new"}}),
+    ));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
     assert_eq!(
         next,
@@ -803,6 +809,39 @@ fn streaming_budget_caches_client_tool_echo_captured_after_arm() {
             .is_some()
     );
     assert!(!responses.retained_payload_failed);
+}
+
+#[test]
+fn streaming_budget_reuses_unchanged_current_output_charge() {
+    let (_filter, mut ctx) = make_armed_context();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let call = json!({
+        "type": "function_call",
+        "id": "fc_completed",
+        "name": "lookup",
+        "arguments": "x".repeat(512 * 1024),
+        "status": "completed",
+    });
+    let mut responses = ResponsesState {
+        response_object: json!({"output": [call.clone()]}),
+        tool_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let expected = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(expected + 1);
+    ctx.extensions.insert(responses);
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(expected));
+    }
+    assert!(super::stream_payload_fits(&ctx, &stream, 1));
+    assert!(!super::stream_payload_fits(&ctx, &stream, 2));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "unchanged completed output must not be reserialized on every SSE admission: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -5707,6 +5746,7 @@ fn parse_error_sets_metadata() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         shared_prior_output_bytes: std::sync::OnceLock::new(),
+        shared_current_output_bytes: std::sync::atomic::AtomicUsize::new(0),
     });
 
     let large_chunk =
@@ -5762,6 +5802,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         shared_prior_output_bytes: std::sync::OnceLock::new(),
+        shared_current_output_bytes: std::sync::atomic::AtomicUsize::new(0),
     });
 
     validate_stream_end(&mut ctx);

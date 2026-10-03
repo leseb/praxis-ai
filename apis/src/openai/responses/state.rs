@@ -1059,7 +1059,7 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true, None)
     }
 
     /// Request, history, resolved MCP definitions, and the capture-once
@@ -1097,7 +1097,7 @@ impl ResponsesState {
     /// between chunks; count both while reusing only stable request/history bytes.
     #[cfg(feature = "store")]
     pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true, None)
     }
 
     /// The response store caches request/history and prior output while
@@ -1105,20 +1105,32 @@ impl ResponsesState {
     /// including the parser charge published by `openai_stream_events`.
     #[cfg(feature = "store")]
     pub(crate) fn store_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true, None)
     }
 
     /// The translated upstream round cannot append prior output until its
     /// converter has finished. The converter caches that large owner once;
     /// this counts all other changing owners, including the stream parser.
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true, None)
     }
 
     /// Stream events separately charges its parser state and cached prior
     /// output; the capture-once echo belongs to the common stable charge.
+    #[cfg(test)]
     pub(crate) fn stream_changing_payload_bytes_bounded_for_parser(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, false, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, false, true, None)
+    }
+
+    /// Stream events separately caches the exact current response, fallback
+    /// terminal template, and completed tool-call charge while those owners
+    /// stay unchanged across SSE chunks.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_current_output(
+        &self,
+        max_bytes: usize,
+        current_output_bytes: usize,
+    ) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, false, true, Some(current_output_bytes))
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1129,7 +1141,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false, None)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1148,6 +1160,7 @@ impl ResponsesState {
         skip_accumulated_output: bool,
         include_stream_parser: bool,
         include_chat_converter: bool,
+        cached_current_output_bytes: Option<usize>,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
@@ -1189,18 +1202,20 @@ impl ResponsesState {
                 meter.json(value)?;
             }
         }
-        for value in [
-            &self.response_object,
-            &self.local_completion_response_template,
-            &self.tool_choice,
-            &self.usage,
-        ] {
+        if let Some(bytes) = cached_current_output_bytes {
+            meter.raw(bytes)?;
+        } else {
+            meter.json(&self.response_object)?;
+            meter.json(&self.local_completion_response_template)?;
+            meter.json_values(&self.tool_calls)?;
+        }
+        for value in [&self.tool_choice, &self.usage] {
             meter.json(value)?;
         }
         if !skip_accumulated_output {
             meter.json_values(&self.accumulated_output)?;
         }
-        for values in [&self.tool_calls, &self.tool_search_calls, &self.web_search_calls] {
+        for values in [&self.tool_search_calls, &self.web_search_calls] {
             meter.json_values(values)?;
         }
         for value in [
