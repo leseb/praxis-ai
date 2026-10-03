@@ -47,7 +47,8 @@ use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPON
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
-        McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+        MIN_TOOL_INITIALIZE_BYTES, McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline,
+        transport_signal_error, validate_mcp_target,
     },
 };
 use crate::StateOwner;
@@ -522,9 +523,9 @@ async fn open_tool_session(
 
 /// Issue one `tools/call` on an already-initialized session without closing it.
 ///
-/// `initialize` uses the control ceiling; the `tools/call` result is bounded to
-/// the configured `max_result_bytes` cap (expanded for worst-case JSON string
-/// escaping) before deserialization, applied inside the session's transport.
+/// `initialize` uses the admitted payload cap with a 1 KiB floor; the
+/// `tools/call` result is bounded to the configured `max_result_bytes` cap
+/// (expanded for worst-case JSON string escaping) before deserialization.
 async fn invoke_tool(
     session: &PooledSession,
     signal: &Arc<OnceLock<subrequest_transport::TransportSignal>>,

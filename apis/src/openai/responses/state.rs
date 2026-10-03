@@ -348,6 +348,9 @@ pub(crate) struct ResponsesState {
     pub(crate) retained_rehydrate_stream_bytes: usize,
     /// Semantic and framing payload published by the Chat stream translator.
     pub(crate) retained_chat_converter_bytes: usize,
+    /// Initialized MCP peer metadata retained in the request-scoped session pool.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub(crate) retained_mcp_session_bytes: usize,
 
     /// Revision of request/history/output owners cached by response-store
     /// replay admission. In-place changes do not alter collection lengths.
@@ -923,6 +926,8 @@ impl Default for ResponsesState {
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
+            #[cfg(feature = "openai-mcp-tools")]
+            retained_mcp_session_bytes: 0,
             replay_stable_payload_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
@@ -1149,6 +1154,8 @@ impl ResponsesState {
         if include_chat_converter {
             meter.raw(self.retained_chat_converter_bytes)?;
         }
+        #[cfg(feature = "openai-mcp-tools")]
+        meter.raw(self.retained_mcp_session_bytes)?;
 
         if !skip_stream_stable {
             meter.json(&self.request_body)?;
@@ -1347,6 +1354,10 @@ impl ResponsesState {
         self.mcp_tool_map.clear();
         self.client_tool_lowering.clear();
         self.client_tool_echo = None;
+        #[cfg(feature = "openai-mcp-tools")]
+        {
+            self.retained_mcp_session_bytes = 0;
+        }
         self.messages.clear();
         self.persisted_messages.clear();
         #[cfg(feature = "store")]

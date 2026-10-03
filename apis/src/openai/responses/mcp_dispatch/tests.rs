@@ -607,7 +607,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    state.apply_retained_payload_limit(current + result_id_bytes + 4_000);
+    state.apply_retained_payload_limit(current + result_id_bytes + 20_000);
     let calls = call_refs(&state.tool_calls);
 
     let arguments = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap() * 3;
@@ -618,8 +618,27 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     let entry = retained_json_bytes(entry).unwrap();
     assert_eq!(
         aggregate_mcp_result_limit(&state, &calls, 8_192),
-        Some(((4_000 - arguments - entry) / 3, true))
+        Some((
+            (20_000 - arguments - entry - 4 * mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
+            true
+        ))
     );
+}
+
+#[test]
+fn aggregate_mcp_limit_reserves_initialize_and_parked_peer_info() {
+    let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    state.tool_calls = vec![call];
+    state.retained_mcp_session_bytes = 2_048;
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + 4 * mcp_client::MIN_TOOL_INITIALIZE_BYTES - 1);
+    let calls = call_refs(&state.tool_calls);
+    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+    assert!(state.retained_payload_bytes().unwrap() >= 2_048);
 }
 
 #[test]

@@ -382,6 +382,9 @@ impl McpDispatchFilter {
 
     /// Stop the request after an aggregate MCP result admission failure.
     fn aggregate_budget_action(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+        if let Some(pool) = ctx.extensions.get::<mcp_client::McpSessionPool>() {
+            pool.drain_in_background();
+        }
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.discard_payload_for_budget_error();
             state.dispatch_failure = Some(DispatchFailure {
@@ -1174,6 +1177,12 @@ impl McpDispatchFilter {
             .extensions
             .get_or_insert_with(mcp_client::McpSessionPool::new)
             .clone();
+        let Some(pooled_bytes) = session_pool.retained_payload_bytes() else {
+            return Ok(Self::aggregate_budget_action(ctx));
+        };
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.retained_mcp_session_bytes = pooled_bytes;
+        }
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -1265,6 +1274,15 @@ impl McpDispatchFilter {
             Err(_limit) if aggregate_constrained => return Ok(Self::aggregate_budget_action(ctx)),
             Err(_limit) => return Ok(Self::result_limit_action(ctx)),
         };
+        // rmcp retains initialization peer information (including instructions
+        // and _meta) in every parked session. Publish its current charge before
+        // admitting the result batch or the next agentic round.
+        let Some(pooled_bytes) = session_pool.retained_payload_bytes() else {
+            return Ok(Self::aggregate_budget_action(ctx));
+        };
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.retained_mcp_session_bytes = pooled_bytes;
+        }
         if !ctx
             .extensions
             .get::<ResponsesState>()
@@ -1754,8 +1772,21 @@ fn aggregate_mcp_result_limit(
             .checked_add(arguments)?
             .checked_add(tool_bytes)
     })?;
-    let available = limit.checked_sub(current)?.checked_sub(staging)?;
-    let admitted = configured_limit.min(available / 3);
+    // Initialization can leave peer information in the pool after the result
+    // is committed. The transport caps each initialize response to at most the
+    // decoded tool payload allowance (one quarter of its retained-result
+    // allowance), with a 1 KiB compatibility floor. Four simultaneous forms
+    // cover buffered wire, decoded response, rmcp peer info, and conversion
+    // staging; reserve that floor plus one extra result allowance per call.
+    let initialize_floor = mcp_calls
+        .len()
+        .checked_mul(mcp_client::MIN_TOOL_INITIALIZE_BYTES)?
+        .checked_mul(4)?;
+    let available = limit
+        .checked_sub(current)?
+        .checked_sub(staging)?
+        .checked_sub(initialize_floor)?;
+    let admitted = configured_limit.min(available / 4);
     let minimum = mcp_calls.len().checked_mul(MIN_RETAINED_RESULT_BYTES)?;
     (admitted >= minimum).then_some((admitted, admitted < configured_limit))
 }

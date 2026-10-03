@@ -1024,6 +1024,7 @@ struct SlowRequest {
 struct TestMcpServer {
     tool_router: ToolRouter<Self>,
     echo_calls: StdArc<AtomicUsize>,
+    instructions: StdArc<String>,
 }
 
 #[expect(clippy::unused_self, reason = "rmcp macro-generated code")]
@@ -1037,6 +1038,15 @@ impl TestMcpServer {
         Self {
             tool_router: Self::tool_router(),
             echo_calls,
+            instructions: StdArc::new("Test MCP server for integration tests".to_owned()),
+        }
+    }
+
+    fn with_instructions(echo_calls: StdArc<AtomicUsize>, instructions: StdArc<String>) -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+            echo_calls,
+            instructions,
         }
     }
 
@@ -1067,20 +1077,41 @@ impl TestMcpServer {
 impl ServerHandler for TestMcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Test MCP server for integration tests")
+            .with_instructions(self.instructions.as_str())
     }
 }
 
 async fn start_test_mcp_server() -> (String, tokio_util::sync::CancellationToken) {
+    let (url, ct, _calls) =
+        start_test_mcp_server_with_instructions("Test MCP server for integration tests".to_owned()).await;
+    (url, ct)
+}
+
+async fn start_test_mcp_server_with_instructions(
+    instructions: String,
+) -> (String, tokio_util::sync::CancellationToken, StdArc<AtomicUsize>) {
     let ct = tokio_util::sync::CancellationToken::new();
+    let echo_calls = StdArc::new(AtomicUsize::new(0));
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_sse_keep_alive(None)
         .with_cancellation_token(ct.child_token());
 
-    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
-        StreamableHttpService::new(|| Ok(TestMcpServer::new()), Arc::default(), config);
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> = StreamableHttpService::new(
+        {
+            let echo_calls = StdArc::clone(&echo_calls);
+            let instructions = StdArc::new(instructions);
+            move || {
+                Ok(TestMcpServer::with_instructions(
+                    StdArc::clone(&echo_calls),
+                    StdArc::clone(&instructions),
+                ))
+            }
+        },
+        Arc::default(),
+        config,
+    );
 
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1095,7 +1126,7 @@ async fn start_test_mcp_server() -> (String, tokio_util::sync::CancellationToken
         );
     });
 
-    (format!("http://{addr}/mcp"), ct)
+    (format!("http://{addr}/mcp"), ct, echo_calls)
 }
 
 #[derive(Debug, Clone)]
@@ -1990,6 +2021,65 @@ async fn call_tool_timeout() {
 // =========================================================================
 // Session pooling / reuse (#1019)
 // =========================================================================
+
+/// A tool session must reject a large initialize body before rmcp can retain
+/// its instructions or issue the side-effecting `tools/call`.
+#[tokio::test]
+async fn oversized_tool_initialize_is_rejected_before_tool_call() {
+    let (url, ct, echo_calls) = start_test_mcp_server_with_instructions("x".repeat(256 * 1024)).await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "large-initialize".to_owned()).unwrap();
+    let result = call_tool_with_forwarded_headers(
+        Some((&pool, &key)),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "must not run"}),
+        INTEGRATION_TIMEOUT,
+        2_048,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    ct.cancel();
+
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
+    assert_eq!(echo_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(pool.retained_payload_bytes(), Some(0));
+}
+
+#[tokio::test]
+async fn pooled_tool_initialize_peer_info_is_counted() {
+    let (url, ct, _echo_calls) = start_test_mcp_server_with_instructions("instruction".repeat(32)).await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "small-initialize".to_owned()).unwrap();
+    let result = call_tool_with_forwarded_headers(
+        Some((&pool, &key)),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "ok"}),
+        INTEGRATION_TIMEOUT,
+        2_048,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    assert!(result.is_ok(), "small initialize should permit a tool call: {result:?}");
+    let retained = pool.retained_payload_bytes().unwrap();
+    assert!(retained >= 32 * "instruction".len() + "small-initialize".len());
+    pool.drain().await;
+    ct.cancel();
+}
 
 /// Two `tools/call`s for the same identity across consecutive rounds share one
 /// initialized session: exactly one `initialize` handshake, two `tools/call`s.

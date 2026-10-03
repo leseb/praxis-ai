@@ -35,6 +35,7 @@ use rmcp::{RoleClient, service::RunningService};
 use tokio::sync::oneshot;
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
+use crate::openai::responses::state::retained_json_bytes;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -294,6 +295,19 @@ impl McpSessionPool {
                 sessions: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Payload retained by parked rmcp peer information and pool identities.
+    /// rmcp keeps initialize `instructions` and `_meta` in `peer_info`; read the
+    /// live value so a transparent reinitialization cannot leave a stale charge.
+    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
+        self.lock().iter().try_fold(0_usize, |used, (key, sessions)| {
+            let used = used.checked_add(key.target_fingerprint.len())?;
+            sessions.iter().try_fold(used, |used, session| {
+                let info = session.service.peer_info()?;
+                used.checked_add(retained_json_bytes(info.as_ref())?)
+            })
+        })
     }
 
     /// Take one compatible session and return all unusable entries separately
