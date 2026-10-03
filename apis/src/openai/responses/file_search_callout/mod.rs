@@ -1654,7 +1654,10 @@ fn rewrite_function_call_as_file_search(object: &mut serde_json::Map<String, Val
         .map(extract_file_search_queries)
         .unwrap_or_default();
 
-    let call_id = object.get("call_id").and_then(Value::as_str).map(ToOwned::to_owned);
+    let call_id = object.remove("call_id").and_then(|value| match value {
+        Value::String(call_id) => Some(call_id),
+        _ => None,
+    });
 
     object.insert("type".to_owned(), Value::String("file_search_call".to_owned()));
     object.insert("status".to_owned(), Value::String("searching".to_owned()));
@@ -1671,7 +1674,6 @@ fn rewrite_function_call_as_file_search(object: &mut serde_json::Map<String, Val
 
     object.remove("name");
     object.remove("arguments");
-    object.remove("call_id");
 }
 
 /// Build the standard Responses bridge carrying private model context.
