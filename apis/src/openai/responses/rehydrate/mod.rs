@@ -775,7 +775,7 @@ fn restore_previous_response_id(prev_id: String, body: &mut Option<Bytes>) {
 /// dropped, nothing errored) and the restore disarms. At `end_of_stream` any
 /// unterminated trailing bytes are likewise flushed raw so no bytes are ever withheld
 /// from the client.
-#[cfg(test)]
+#[cfg(all(test, feature = "store-sqlite"))]
 fn restore_previous_response_id_stream_chunk(
     armed: &mut RestorePreviousResponseIdStream,
     body: &mut Option<Bytes>,
@@ -1120,11 +1120,13 @@ fn accumulate_frame(
         && state.retained_payload_limit().is_some()
     {
         let id_growth = prev_id.len().checked_mul(6).and_then(|bytes| bytes.checked_add(64));
-        // The running output may grow while its old backing allocation and
-        // the newly rebuilt frame are both still live.
+        // Once a rewrite creates `out`, later plain frames can extend it
+        // without another rewrite check. Reserve the whole scanned buffer:
+        // one carried `pending` owner plus old and new Vec capacities during
+        // a later growth, even when that growth happens on a plain frame.
         let peak = buf
             .len()
-            .checked_mul(2)
+            .checked_mul(4)
             .and_then(|bytes| {
                 out.as_ref()
                     .map_or(Some(bytes), |out| out.len().checked_mul(4)?.checked_add(bytes))
