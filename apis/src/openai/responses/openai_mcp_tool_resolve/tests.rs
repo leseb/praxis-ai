@@ -4267,6 +4267,60 @@ async fn deferred_discovery_budget_rejects_before_any_tools_list_call() {
 }
 
 #[tokio::test]
+async fn escaped_deferred_label_is_reserved_before_tools_list() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mut connector = deferred_connector(&server_url, None, None);
+    connector.server_label = "\0".repeat(1024);
+    assert_eq!(
+        deferred_entry_json_bytes(&connector),
+        retained_json_bytes(&deferred_entry_view(&connector)),
+        "entry projection must include JSON escaping"
+    );
+    let empty_prepared = PreparedDeferredListing {
+        entry: deferred_entry_view(&connector),
+        filtered: Vec::new(),
+        functions: Vec::new(),
+        listing_item: mcp_list_tools_item(connector.server_label.clone(), Vec::new()),
+        server_label: connector.server_label.clone(),
+    };
+    assert!(
+        deferred_listing_staging_bytes(&connector).unwrap() >= prepared_deferred_bytes(&[empty_prepared]).unwrap(),
+        "preflight must cover even an empty listing's retained owners"
+    );
+    let mut state = ResponsesState {
+        deferred_mcp: vec![connector],
+        ..ResponsesState::default()
+    };
+    select_deferred_discovery_search(&mut state);
+    let baseline = state.retained_payload_bytes().unwrap();
+    let old_staging = deferred_connector_bytes(&state.deferred_mcp[0]).unwrap() * 2;
+    let old_admission_limit =
+        baseline + mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION + old_staging;
+    assert!(deferred_listing_batch_fits(
+        baseline,
+        0,
+        old_staging,
+        1,
+        old_admission_limit
+    ));
+    state.apply_retained_payload_limit(old_admission_limit);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(state.deferred_mcp.len(), 1);
+    assert!(state.mcp_tool_map.is_empty());
+    assert_eq!(state.accumulated_output[0]["type"], "tool_search_call");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "escaped label copies must be admitted before any tools/list side effect"
+    );
+}
+
+#[tokio::test]
 async fn deferred_discovery_stops_before_the_next_call_when_prepared_results_fill_budget() {
     let (first_url, cancel_first) = start_single_tool_mcp_server().await;
     let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -2562,9 +2562,8 @@ async fn prepare_deferred_listings(
         let mut end = start;
         let mut entry_staging = 0_usize;
         while let Some(connector) = pending.get(end) {
-            let Some(next_entry_staging) = deferred_connector_bytes(connector)
-                .and_then(|bytes| bytes.checked_mul(2))
-                .and_then(|bytes| entry_staging.checked_add(bytes))
+            let Some(next_entry_staging) =
+                deferred_listing_staging_bytes(connector).and_then(|bytes| entry_staging.checked_add(bytes))
             else {
                 return Err(ResolveError::RetainedBudget);
             };
@@ -2616,6 +2615,44 @@ fn deferred_connector_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
     .into_iter()
     .flatten()
     .try_fold(raw, |used, value| used.checked_add(retained_json_bytes(value)?))
+}
+
+/// Compact size of the entry reconstructed before deferred `tools/list`.
+fn deferred_entry_json_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
+    let mut bytes = br#"{"connector_id":,"server_label":,"server_url":}"#
+        .len()
+        .checked_add(retained_json_bytes(&connector.connector_id)?)?
+        .checked_add(retained_json_bytes(&connector.server_label)?)?
+        .checked_add(retained_json_bytes(&connector.server_url)?)?;
+    if let Some(auth) = &connector.authorization {
+        bytes = bytes
+            .checked_add(br#","authorization":"#.len())?
+            .checked_add(retained_json_bytes(auth)?)?;
+    }
+    for (key, value) in [
+        (br#","allowed_tools":"#.len(), connector.allowed_tools.as_ref()),
+        (br#","headers":"#.len(), connector.headers.as_ref()),
+        (br#","require_approval":"#.len(), connector.require_approval.as_ref()),
+    ] {
+        if let Some(value) = value {
+            bytes = bytes.checked_add(key)?.checked_add(retained_json_bytes(value)?)?;
+        }
+    }
+    Some(bytes)
+}
+
+/// Reserve escaped label copies before dialing, including an empty public listing.
+/// `tools/list` bytes are reserved separately by `deferred_listing_batch_fits`.
+fn deferred_listing_staging_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
+    let entry = deferred_entry_json_bytes(connector)?;
+    let listing = br#"{"id":"mcpl_0000000000000000","type":"mcp_list_tools","server_label":,"tools":[]}"#
+        .len()
+        .checked_add(retained_json_bytes(&connector.server_label)?)?;
+    entry
+        .checked_mul(2)?
+        .checked_add(listing)?
+        .checked_add(connector.server_label.len())?
+        .checked_add(4) // Two empty serialized arrays.
 }
 
 /// Retained bytes in the pending deferred connector descriptors.
