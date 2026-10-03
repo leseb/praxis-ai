@@ -54,6 +54,38 @@ fn call_refs(calls: &[serde_json::Value]) -> Vec<&serde_json::Value> {
     calls.iter().collect()
 }
 
+#[tokio::test]
+async fn approval_remains_claimable_when_minimum_dispatch_cannot_fit() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+    let mut state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_1", true, None)],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(4_096);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"m"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed, "dispatch must be refused by the budget");
+    assert!(state.accumulated_output.is_empty(), "no tool call should execute");
+    assert!(matches!(action, FilterAction::Continue));
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let consumed = store
+        .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_1"], 9999)
+        .await
+        .unwrap();
+    assert_eq!(consumed, None, "unexecuted approval must remain retryable");
+}
+
 const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
 const TEST_MAX_TOTAL_RESULT_BYTES: usize = 8_388_608;
 

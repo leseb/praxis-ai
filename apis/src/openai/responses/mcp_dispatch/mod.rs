@@ -617,7 +617,7 @@ impl McpDispatchFilter {
             && !ctx
                 .extensions
                 .get::<ResponsesState>()
-                .is_some_and(|state| approval_decisions_fit(state, &resolved))
+                .is_some_and(|state| approval_decisions_fit(state, &resolved, self.max_total_result_bytes))
         {
             record_approval_budget_failure(ctx);
             return Ok(());
@@ -645,7 +645,11 @@ impl McpDispatchFilter {
 }
 
 /// Preflight the independently owned values created by approval resumptions.
-fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]) -> bool {
+fn approval_decisions_fit(
+    state: &ResponsesState,
+    decisions: &[ResolvedApproval],
+    max_total_result_bytes: usize,
+) -> bool {
     let removed = state
         .messages
         .iter()
@@ -660,9 +664,86 @@ fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]
         let owners = if decision.approve { 1 } else { 2 };
         used.checked_add(bytes?.checked_mul(owners)?)
     });
+    let dispatch = if state.retained_payload_limit().is_some() {
+        minimum_approval_dispatch_reserve(state, decisions, max_total_result_bytes)
+    } else {
+        Some(0)
+    };
     removed
         .zip(added)
-        .is_some_and(|(removed, added)| state.can_replace_retained_payload(removed, added, 0))
+        .zip(dispatch)
+        .is_some_and(|((removed, added), dispatch)| {
+            added
+                .checked_add(dispatch)
+                .is_some_and(|added| state.can_replace_retained_payload(removed, added, 0))
+        })
+}
+
+/// Reserve the minimum initialize and result capacity that dispatch requires
+/// after approved calls are injected. This check runs before the durable
+/// approval claim so an unexecuted call remains retryable after exhaustion.
+#[expect(
+    clippy::too_many_lines,
+    reason = "counts existing and approved calls before the durable claim"
+)]
+fn minimum_approval_dispatch_reserve(
+    state: &ResponsesState,
+    decisions: &[ResolvedApproval],
+    max_total_result_bytes: usize,
+) -> Option<usize> {
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let mut calls = 0_usize;
+    let mut staging = 0_usize;
+    for call in extract_mcp_tool_calls(&state.tool_calls, &tool_index) {
+        calls = calls.checked_add(1)?;
+        let arguments = retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?;
+        staging = staging.checked_add(mcp_call_dispatch_staging(
+            call.get("call_id")
+                .or_else(|| call.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            arguments,
+            call.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
+            &tool_index,
+        )?)?;
+    }
+    for decision in decisions.iter().filter(|decision| decision.approve) {
+        calls = calls.checked_add(1)?;
+        staging = staging.checked_add(mcp_call_dispatch_staging(
+            &decision.approval_id,
+            retained_json_bytes(&decision.arguments)?,
+            &decision.encoded_name,
+            &tool_index,
+        )?)?;
+    }
+    let minimum = calls.checked_mul(MIN_RETAINED_RESULT_BYTES)?;
+    if minimum > max_total_result_bytes {
+        return None;
+    }
+    staging
+        .checked_add(
+            calls
+                .checked_mul(mcp_client::MIN_TOOL_INITIALIZE_BYTES)?
+                .checked_mul(4)?,
+        )?
+        .checked_add(minimum.checked_mul(4)?)
+}
+
+/// Count independently owned callout arguments, correlation ID, and target
+/// definition that can coexist with retained state before a result arrives.
+fn mcp_call_dispatch_staging(
+    id: &str,
+    arguments_json_bytes: usize,
+    name: &str,
+    tool_index: &McpToolIndex<'_>,
+) -> Option<usize> {
+    let tool_bytes = match tool_index.get(name) {
+        Some(McpToolMatch::Unique { entry, .. }) => retained_json_bytes(entry)?,
+        _ => 0,
+    };
+    id.len()
+        .checked_add(arguments_json_bytes.checked_mul(3)?)?
+        .checked_add(tool_bytes)
 }
 
 /// Raw payload cloned while parsing client approval controls.
@@ -1792,10 +1873,6 @@ impl McpCallResult {
 
 /// Reserve raw callout bodies and parsed result staging alongside the three
 /// final result owners before making an external MCP call.
-#[expect(
-    clippy::too_many_lines,
-    reason = "result and handshake reservations share one MCP admission calculation"
-)]
 fn aggregate_mcp_result_limit(
     state: &ResponsesState,
     mcp_calls: &[&serde_json::Value],
@@ -1810,24 +1887,15 @@ fn aggregate_mcp_result_limit(
     // result IDs, so reserve those owners before any external work.
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let staging = mcp_calls.iter().try_fold(0_usize, |used, call| {
-        let id_bytes = call
-            .get("call_id")
-            .or_else(|| call.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .len();
-        let arguments =
-            retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?.checked_mul(3)?;
-        let tool_bytes =
-            call.get("name")
+        used.checked_add(mcp_call_dispatch_staging(
+            call.get("call_id")
+                .or_else(|| call.get("id"))
                 .and_then(serde_json::Value::as_str)
-                .and_then(|name| match tool_index.get(name) {
-                    Some(McpToolMatch::Unique { entry, .. }) => retained_json_bytes(entry),
-                    _ => Some(0),
-                })?;
-        used.checked_add(id_bytes)?
-            .checked_add(arguments)?
-            .checked_add(tool_bytes)
+                .unwrap_or("unknown"),
+            retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?,
+            call.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
+            &tool_index,
+        )?)
     })?;
     // Initialization can leave peer information in the pool after the result
     // is committed. The transport caps each initialize response to at most the
