@@ -78,6 +78,9 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
+/// Maximum Pingora H1 body read or default H2 flow-window chunk before the
+/// core buffered client applies its response-length check.
+const MAX_TRANSPORT_CHUNK_BYTES: usize = 65_536;
 
 /// Error reported when reactive summarization would exceed the loop budget.
 const COMPACTION_BUDGET_MESSAGE: &str =
@@ -102,11 +105,11 @@ pub use crate::openai::translation::chat_completions::DEFAULT_SUMMARY_PREFIX;
 
 /// Parsed compaction parameters from the request's `context_management`.
 #[derive(Debug, Eq, PartialEq)]
-struct CompactionParams {
+struct CompactionParams<'a> {
     /// Token threshold above which compaction triggers.
     compact_threshold: u64,
     /// Optional model override for the summarization call.
-    compaction_model: Option<String>,
+    compaction_model: Option<&'a str>,
 }
 
 /// Result of a successful summarization callout.
@@ -263,10 +266,10 @@ impl CompactFilter {
     async fn execute_compaction(
         &self,
         state: &ResponsesState,
-        params: &CompactionParams,
+        params: &CompactionParams<'_>,
         conversation_text: &str,
     ) -> Result<Option<String>, ReactiveCompactionError> {
-        let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
+        let model = params.compaction_model.unwrap_or(&self.config.default_model);
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let system_bytes = instructions
             .map_or(Some(SUMMARIZATION_SYSTEM_PROMPT.len()), |inst| {
@@ -310,9 +313,17 @@ impl CompactFilter {
                 .and_then(|bytes| bytes.checked_sub(system.len()))
                 .and_then(|bytes| bytes.checked_sub(request_bytes.checked_mul(2)?))
                 .ok_or(ReactiveCompactionError::RetainedBudget)?;
-            // The core buffered client can hold its Vec, its old capacity
-            // during growth, and the just-read transport chunk at once.
-            let aggregate_read_limit = available / 3;
+            // The core buffered client can hold its Vec and old capacity
+            // during growth. Pingora may first read a full 64 KiB chunk into
+            // its own buffer and copy that chunk before enforcing the requested
+            // response limit. Reserve both transport owners before dispatch.
+            let transport_staging = MAX_TRANSPORT_CHUNK_BYTES
+                .checked_mul(2)
+                .ok_or(ReactiveCompactionError::RetainedBudget)?;
+            let aggregate_read_limit = available
+                .checked_sub(transport_staging)
+                .ok_or(ReactiveCompactionError::RetainedBudget)?
+                / 3;
             if aggregate_read_limit == 0 {
                 return Err(ReactiveCompactionError::RetainedBudget);
             }
@@ -335,7 +346,7 @@ impl CompactFilter {
         .await;
         if state.retained_payload_limit().is_some() {
             match &result {
-                Ok(resp) => {
+                Ok(resp) if (200..300).contains(&(resp.status as usize)) => {
                     let parsed = buffered_parsed_json_bytes_upper_bound(&resp.body)
                         .ok_or(ReactiveCompactionError::RetainedBudget)?;
                     let staging = parsed
@@ -349,7 +360,9 @@ impl CompactFilter {
                         return Err(ReactiveCompactionError::RetainedBudget);
                     }
                 },
-                Err(subrequest::SubRequestError::ResponseTooLarge { .. }) if aggregate_controls_response => {
+                Err(subrequest::SubRequestError::ResponseTooLarge { limit, .. })
+                    if aggregate_controls_response && *limit == response_limit =>
+                {
                     return Err(ReactiveCompactionError::RetainedBudget);
                 },
                 _ => {},
@@ -681,10 +694,10 @@ fn is_compactable(state: Option<&ResponsesState>) -> bool {
 /// The check is reactive: the token count reflects the *previous*
 /// turn's usage, not the current one. If the previous turn exceeded
 /// the threshold, we compact before sending this turn.
-fn should_compact(
-    state: &ResponsesState,
+fn should_compact<'a>(
+    state: &'a ResponsesState,
     tiktoken_encoding: &str,
-) -> Result<Option<(CompactionParams, String)>, String> {
+) -> Result<Option<(CompactionParams<'a>, String)>, String> {
     let Some(params) = extract_compaction_config(&state.context_management)? else {
         return Ok(None);
     };
@@ -715,7 +728,7 @@ fn should_compact(
 }
 
 /// Log and return whether `token_count` exceeds the compaction threshold.
-fn exceeds_threshold(token_count: u64, params: &CompactionParams) -> bool {
+fn exceeds_threshold(token_count: u64, params: &CompactionParams<'_>) -> bool {
     if token_count <= params.compact_threshold {
         debug!(
             token_count,
@@ -1032,7 +1045,7 @@ fn reject_compact(status: u16, code: &str, message: &str) -> FilterAction {
 /// - `Ok(Some(params))` if a valid compaction entry is present.
 /// - `Err(msg)` if `context_management` is present but not an array, or a compaction entry has an invalid
 ///   `compact_threshold` or `compaction_model`.
-fn extract_compaction_config(context_management: &Option<Value>) -> Result<Option<CompactionParams>, String> {
+fn extract_compaction_config(context_management: &Option<Value>) -> Result<Option<CompactionParams<'_>>, String> {
     // Absent or explicit null: OpenAI treats both as "no context management".
     let Some(value) = context_management.as_ref().filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -1049,7 +1062,7 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Result<Optio
 }
 
 /// Parse a single `{"type": "compaction", ...}` entry into [`CompactionParams`].
-fn parse_compaction_entry(entry: &Value) -> Result<CompactionParams, String> {
+fn parse_compaction_entry(entry: &Value) -> Result<CompactionParams<'_>, String> {
     let err_msg = "compact_threshold must be an integer of at least 1000";
     let raw_threshold = entry.get("compact_threshold").ok_or_else(|| err_msg.to_owned())?;
     let compact_threshold = raw_threshold.as_u64().ok_or_else(|| err_msg.to_owned())?;
@@ -1059,8 +1072,7 @@ fn parse_compaction_entry(entry: &Value) -> Result<CompactionParams, String> {
     let compaction_model = match entry.get("compaction_model") {
         Some(m) => Some(
             m.as_str()
-                .ok_or_else(|| "compaction_model must be a string".to_owned())?
-                .to_owned(),
+                .ok_or_else(|| "compaction_model must be a string".to_owned())?,
         ),
         None => None,
     };
