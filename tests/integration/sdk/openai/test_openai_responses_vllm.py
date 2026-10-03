@@ -2898,6 +2898,31 @@ class TestOpenAIResponsesVLLM:
             for item in replayed.get("input", [])
         ), replayed
 
+    def test_input_tokens_history_read_with_agentic_policy(
+        self, provider_compaction_client
+    ):
+        """A count operation reads stored history without create-state."""
+        client, forwarded = provider_compaction_client
+        first = client.responses.create(
+            model=VLLM_MODEL,
+            input="Store history for the token-count operation.",
+            store=True,
+        )
+        assert first.status == "completed"
+
+        response = httpx.post(
+            f"{str(client.base_url).rstrip('/')}/responses/input_tokens",
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
+            json={
+                "model": VLLM_MODEL,
+                "input": "Count this continuation.",
+                "previous_response_id": first.id,
+            },
+            timeout=10,
+        )
+        assert response.status_code == 200, response.text
+        assert len(forwarded) == 2, forwarded
+
     def test_truncation_forwarded_to_backend_through_rehydration(
         self, witness_backend_client
     ):
