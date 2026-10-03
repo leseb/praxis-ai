@@ -3875,6 +3875,7 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
         tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
         ..ResponsesState::default()
     };
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
 
     discover_deferred_connectors(&mut state).await.unwrap();
     ct.cancel();
@@ -4187,6 +4188,74 @@ async fn discover_deferred_connectors_skips_tools_list_when_budget_exhausted() {
     assert!(
         state.mcp_tool_map.is_empty(),
         "exhausted budget must not rewrite deferred MCP tools"
+    );
+}
+
+#[tokio::test]
+async fn deferred_discovery_budget_rejects_before_any_tools_list_call() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mut state = ResponsesState {
+        deferred_mcp: vec![deferred_connector(&server_url, None, None)],
+        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(
+        state.deferred_mcp.len(),
+        1,
+        "a rejected discovery must leave its connector pending"
+    );
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "no tools/list request may reach the MCP server after budget preflight fails"
+    );
+}
+
+#[tokio::test]
+async fn deferred_discovery_stops_before_the_next_call_when_prepared_results_fill_budget() {
+    let (first_url, cancel_first) = start_single_tool_mcp_server().await;
+    let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_url = format!("http://{}/mcp", second_listener.local_addr().unwrap());
+    let first = deferred_connector(&first_url, None, None);
+    let first_entry_bytes = deferred_connector_bytes(&first).unwrap();
+    let mut second = deferred_connector(&second_url, None, None);
+    second.connector_id = "c2".to_owned();
+    second.server_label = "other".to_owned();
+    let mut state = ResponsesState {
+        deferred_mcp: vec![first, second],
+        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(
+        baseline + mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION + first_entry_bytes * 2,
+    );
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+    cancel_first.cancel();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(
+        state.deferred_mcp.len(),
+        2,
+        "neither connector is committed on overflow"
+    );
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second_listener.accept())
+            .await
+            .is_err(),
+        "the second server must not be contacted after the first listing fills the budget"
     );
 }
 
