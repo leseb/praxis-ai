@@ -4218,9 +4218,12 @@ async fn deferred_discovery_budget_rejects_before_any_tools_list_call() {
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let mut state = ResponsesState {
         deferred_mcp: vec![deferred_connector(&server_url, None, None)],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
         ..ResponsesState::default()
     };
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+    );
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
 
     let error = discover_deferred_connectors(&mut state).await.unwrap_err();
@@ -4253,9 +4256,12 @@ async fn deferred_discovery_stops_before_the_next_call_when_prepared_results_fil
     second.server_label = "other".to_owned();
     let mut state = ResponsesState {
         deferred_mcp: vec![first, second],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
         ..ResponsesState::default()
     };
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+    );
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(
         baseline + mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION + first_entry_bytes * 2,
