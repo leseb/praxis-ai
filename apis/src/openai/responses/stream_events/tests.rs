@@ -71,8 +71,32 @@ fn lowered_snapshot_echo_fails_before_planning_many_owned_copies() {
 
 #[test]
 fn native_terminal_does_not_pay_restoration_staging_after_move() {
+    assert_terminal_does_not_pay_moved_staging(false);
+}
+
+#[test]
+fn lowered_terminal_does_not_pay_restoration_staging_after_move() {
+    assert_terminal_does_not_pay_moved_staging(true);
+}
+
+/// A terminal payload moves into shared state before the restoration plan.
+fn assert_terminal_does_not_pay_moved_staging(lowered: bool) {
     let (filter, mut ctx) = make_armed_context();
     let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
+    if lowered {
+        responses.client_tool_lowering.insert(
+            "private".to_owned(),
+            LoweredClientTool {
+                original_name: "public".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
+        responses.client_tool_echo = Some(ClientToolEcho {
+            tools: vec![json!({"type": "custom", "name": "public"})],
+            tool_choice: json!("auto"),
+        });
+    }
     responses.apply_retained_payload_limit(12_000);
     ctx.extensions.insert(responses);
     let metadata: serde_json::Map<String, serde_json::Value> =
@@ -93,7 +117,11 @@ fn native_terminal_does_not_pay_restoration_staging_after_move() {
     for slice in terminal.chunks(256) {
         let mut body = Some(Bytes::copy_from_slice(slice));
         filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-        assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+        assert!(
+            ctx.get_metadata("responses.stream_error_code").is_none(),
+            "{:?}",
+            ctx.get_metadata("responses.stream_error_message")
+        );
     }
     let mut eos = None;
     filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
