@@ -86,7 +86,7 @@ use crate::{
 
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
-const MAX_FUNCTION_NAME_LEN: usize = 64;
+pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
 
 /// Raw control page, decoded listing, converted JSON, function tools, public
 /// listing, and one owner for transformation overlap.

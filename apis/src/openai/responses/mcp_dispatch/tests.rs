@@ -14,13 +14,14 @@ use secrecy::SecretString;
 use serde_json::json;
 
 use super::{
-    McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
-    approval_resume_peak_fits, approved_result_reservation_bytes, approved_tool_call_projection_bytes,
-    build_error_result, build_success_result, content_blocks_to_output, denial_message_projection_bytes,
-    discover_pending_connectors, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
-    extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
-    mcp_call_ids_are_unique_and_new, mcp_result_commit_fits, normalize_arguments, parse_call_arguments,
-    partition_calls_by_approval, prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
+    MAX_FUNCTION_NAME_LEN, McpDispatchFilter, McpExecutionOptions, admitted_mcp_tool_index_charge,
+    admitted_result_limits, aggregate_mcp_result_limit, approval_decisions_fit, approval_resume_peak_fits,
+    approved_result_reservation_bytes, approved_tool_call_projection_bytes, build_error_result, build_success_result,
+    content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls,
+    execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
+    is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits,
+    mcp_tool_index_charge, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
+    prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -591,9 +592,9 @@ fn append_results_rejects_when_incoming_result_staging_exceeds_budget() {
     };
     let current = state.retained_payload_bytes().unwrap();
     let staging = result.retained_bytes().unwrap() * 2;
-    state.apply_retained_payload_limit(current + staging - 1);
-
-    assert!(!mcp_result_commit_fits(&state, &[result]));
+    state.apply_retained_payload_limit(current + staging);
+    assert!(mcp_result_commit_fits(&state, std::slice::from_ref(&result), 0));
+    assert!(!mcp_result_commit_fits(&state, std::slice::from_ref(&result), 1));
     assert_eq!(state.selected_tool_calls()[0]["call_id"], call["call_id"]);
 }
 
@@ -619,14 +620,15 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
 
     let arguments = retained_json_bytes(&state.selected_tool_calls()[0]["arguments"]).unwrap() * 3;
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let index_charge = admitted_mcp_tool_index_charge(&state).unwrap();
     let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
         panic!("weather tool must resolve")
     };
     let entry = retained_json_bytes(entry).unwrap();
     assert_eq!(
-        aggregate_mcp_result_limit(&state, &calls, 8_192),
+        aggregate_mcp_result_limit(&state, &calls, &tool_index, index_charge, 8_192),
         Some((
-            (20_000 - arguments - entry - 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
+            (20_000 - index_charge - arguments - entry - 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
             true
         ))
     );
@@ -653,7 +655,8 @@ fn aggregate_mcp_limit_reserves_initialize_and_parked_peer_info() {
     );
     state.apply_retained_payload_limit(current + 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES - 1);
     let calls = state.selected_tool_calls();
-    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    assert_eq!(aggregate_mcp_result_limit(&state, &calls, &tool_index, 0, 8_192), None);
 }
 
 #[test]
@@ -674,15 +677,72 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
     };
     let current = state.retained_payload_bytes().unwrap();
     let argument_staging = retained_json_bytes(&state.selected_tool_calls()[0]["arguments"]).unwrap() * 3;
-    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-    let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
-        panic!("weather tool must resolve")
+    let entry_staging = {
+        let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+        let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
+            panic!("weather tool must resolve")
+        };
+        retained_json_bytes(entry).unwrap()
     };
-    let entry_staging = retained_json_bytes(entry).unwrap();
     state.apply_retained_payload_limit(current + "call_1".len() + argument_staging + entry_staging - 1);
     let calls = state.selected_tool_calls();
 
-    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    assert_eq!(aggregate_mcp_result_limit(&state, &calls, &tool_index, 0, 8_192), None);
+}
+
+#[test]
+fn tool_index_is_rejected_before_encoding_tight_budget_names() {
+    let mut state = ResponsesState::default();
+    for index in 0..128 {
+        state.mcp_tool_map.insert(
+            ("weather".to_owned(), format!("tool_{index:03}_{}", "x".repeat(46))),
+            weather_entry(),
+        );
+    }
+    let current = state.retained_payload_bytes().unwrap();
+    let raw_name_bytes = "weather".len() + 2 + "tool_000_".len() + 46;
+    let index_charge = 128 * raw_name_bytes.min(MAX_FUNCTION_NAME_LEN) + 2 * raw_name_bytes;
+    state.apply_retained_payload_limit(current + index_charge - 1);
+
+    let allocations = allocation_counter::measure(|| {
+        assert_eq!(admitted_mcp_tool_index_charge(&state), None);
+    });
+    assert_eq!(
+        allocations.bytes_total, 0,
+        "index admission must not encode names first"
+    );
+}
+
+#[test]
+fn approved_call_reserves_index_before_approval_is_consumed() {
+    let mut state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        messages: vec![approval_response("call_index_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(usize::MAX);
+    let decision = ResolvedApproval {
+        approval_id: "call_index_budget".to_owned(),
+        approve: true,
+        reason: None,
+        server_label: "weather".to_owned(),
+        tool_name: "get_weather".to_owned(),
+        encoded_name: "weather__get_weather".to_owned(),
+        arguments: "{}".to_owned(),
+    };
+    let removed = retained_json_bytes(&state.messages[0]).unwrap();
+    let added = approved_tool_call_projection_bytes(&decision.approval_id, &decision.encoded_name, &decision.arguments)
+        .unwrap();
+    let index_charge = mcp_tool_index_charge(&state).unwrap();
+    assert!(index_charge > 0);
+    let without_index =
+        approved_result_reservation_bytes(&state, std::slice::from_ref(&decision)).unwrap() - index_charge;
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current - removed + added + without_index);
+
+    assert!(state.can_replace_retained_payload(removed, added, without_index));
+    assert!(!approval_decisions_fit(&state, &[decision]));
 }
 
 #[test]
@@ -3372,9 +3432,10 @@ async fn approval_result_reservation_failure_keeps_claim_retryable() {
     let mut ctx = make_owned_filter_context(&req);
     register_store(&mut ctx, Arc::clone(&store));
     let mut state = make_state();
-    // Enough for the small pending record and approved invocation, but below
-    // the result reservation required before an MCP call can execute.
-    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 2_048);
+    // Enough for the pending record, approved invocation, and the old result
+    // minimum, but below the combined result and initialize reservation.
+    // A rejection at this boundary must leave the approval retryable.
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 6_000);
     ctx.extensions.insert(state);
     let pending = pending_record(
         "call_result_budget",
