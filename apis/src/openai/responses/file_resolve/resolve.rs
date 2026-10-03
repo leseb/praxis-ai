@@ -392,7 +392,7 @@ impl ResolutionBudget {
         let outbound = self.outbound.as_ref();
         let aggregate_remaining_bytes = self.aggregate_remaining_bytes;
         let aggregate_binding =
-            aggregate_remaining_bytes.is_some_and(|remaining| remaining < self.remaining_resolved_bytes);
+            aggregate_remaining_bytes.is_some_and(|remaining| remaining <= self.remaining_resolved_bytes);
         let resolution = tokio::time::timeout_at(self.deadline, async {
             match source {
                 ReferenceSource::FileId(file_id) => {
