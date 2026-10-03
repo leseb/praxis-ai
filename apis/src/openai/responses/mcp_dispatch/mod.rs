@@ -626,6 +626,9 @@ impl McpDispatchFilter {
 }
 
 /// Preflight the independently owned values created by approval resumptions.
+/// Approved calls must also retain their minimum result reservation before the
+/// pending approval is consumed: dispatch cannot admit that reservation later
+/// without turning a retryable budget error into an already-used approval.
 fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]) -> bool {
     let removed = state
         .messages
@@ -641,9 +644,31 @@ fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]
         let owners = if decision.approve { 1 } else { 2 };
         used.checked_add(bytes?.checked_mul(owners)?)
     });
+    let result_reservation = approved_result_reservation_bytes(state, decisions);
     removed
         .zip(added)
-        .is_some_and(|(removed, added)| state.can_replace_retained_payload(removed, added, 0))
+        .zip(result_reservation)
+        .is_some_and(|((removed, added), reservation)| state.can_replace_retained_payload(removed, added, reservation))
+}
+
+/// Retain each newly approved call's minimum result and dispatch staging owners.
+fn approved_result_reservation_bytes(state: &ResponsesState, decisions: &[ResolvedApproval]) -> Option<usize> {
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    decisions
+        .iter()
+        .filter(|decision| decision.approve)
+        .try_fold(0_usize, |used, decision| {
+            let McpToolMatch::Unique { entry, .. } = tool_index.get(&decision.encoded_name)? else {
+                return None;
+            };
+            let staging = decision
+                .approval_id
+                .len()
+                .checked_add(retained_json_bytes(&decision.arguments)?.checked_mul(3)?)?
+                .checked_add(retained_json_bytes(entry)?)?;
+            let minimum = MIN_RETAINED_RESULT_BYTES.checked_mul(3)?;
+            used.checked_add(staging)?.checked_add(minimum)
+        })
 }
 
 /// Raw payload cloned while parsing client approval controls.
@@ -1300,6 +1325,7 @@ impl McpDispatchFilter {
 /// Load deferred connector tools when a hosted `tool_search_call` is pending.
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "deferred discovery needs request state, trusted headers, executor, and scoped identity"
 )]
 async fn discover_pending_connectors(
