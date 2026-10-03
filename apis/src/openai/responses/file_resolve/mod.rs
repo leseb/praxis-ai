@@ -573,15 +573,24 @@ fn file_state_fits_budget(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Clear payload and disable successful persistence on aggregate exhaustion.
 fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    let initial = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_none_or(|state| state.iteration == 0);
     ctx.set_metadata("responses.skip_persist", "true");
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.discard_payload_for_budget_error();
     }
     #[cfg(feature = "store")]
     super::store::discard_retained_request_payload(ctx);
+    let (status, code) = if initial {
+        (413, "invalid_request_error")
+    } else {
+        (502, "server_error")
+    };
     FilterAction::Reject(super::error::responses_error_rejection(
-        502,
-        "server_error",
+        status,
+        code,
         "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during file resolution",
     ))
 }

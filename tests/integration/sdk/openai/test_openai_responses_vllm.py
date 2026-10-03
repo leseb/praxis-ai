@@ -5354,13 +5354,44 @@ class RetainedToolSearchBackendHandler(BaseHTTPRequestHandler):
         pass
 
 
+class RetainedFileMetadataHandler(BaseHTTPRequestHandler):
+    """Report an oversized file without serving its content."""
+
+    metadata_requests: ClassVar[int] = 0
+    content_requests: ClassVar[int] = 0
+
+    def do_GET(self):
+        if self.path.endswith("/content"):
+            type(self).content_requests += 1
+            self.send_response(500)
+            self.end_headers()
+            return
+        type(self).metadata_requests += 1
+        payload = json.dumps(
+            {"id": "file-budget", "filename": "budget.txt", "content_type": "text/plain", "bytes": 49_152}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 @pytest.fixture()
 def retained_tool_search_client(tmp_path, request):
     """OpenAI SDK client backed by a fixed, oversized hosted search result."""
     RetainedToolSearchBackendHandler.requests = 0
+    RetainedFileMetadataHandler.metadata_requests = 0
+    RetainedFileMetadataHandler.content_requests = 0
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), RetainedToolSearchBackendHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    files_port = _free_port()
+    files_server = HTTPServer(("127.0.0.1", files_port), RetainedFileMetadataHandler)
+    threading.Thread(target=files_server.serve_forever, daemon=True).start()
 
     proxy_port = _free_port()
     with open("examples/configs/openai/responses/agentic-loop-overflow-fixture.yaml") as f:
@@ -5404,6 +5435,20 @@ def retained_tool_search_client(tmp_path, request):
     if store_filters not in config:
         raise RuntimeError("retained overflow fixture's store filters changed")
     config = config.replace(store_filters, "", 1)
+    config = config.replace(
+        "      - filter: openai_mcp_tool_resolve\n",
+        "      - filter: openai_file_resolve\n"
+        f'        files_api_url: "http://127.0.0.1:{files_port}"\n'
+        "        allow_pre_security_callout: true\n\n"
+        "      - filter: openai_mcp_tool_resolve\n",
+        1,
+    )
+    config = config.replace(
+        "  allow_private_endpoints: true # example proxies to local backends",
+        "  allow_private_endpoints: true # example proxies to local backends\n"
+        "  allow_private_upstreams: true # stubbed Files API callouts",
+        1,
+    )
     config_path = _persist_config(config)
     log_path = str(tmp_path / "praxis.log")
     log_file = open(log_path, "w")
@@ -5432,6 +5477,8 @@ def retained_tool_search_client(tmp_path, request):
         log_file.close()
         server.shutdown()
         server.server_close()
+        files_server.shutdown()
+        files_server.server_close()
         if not started or request.session.testsfailed > 0:
             print(f"\n=== Retained tool search Praxis logs ===\n{_read_log_tail(log_path)}", file=sys.stderr)
         os.unlink(config_path)
@@ -5493,6 +5540,28 @@ class TestAgenticLoopVLLM:
         assert exc_info.value.status_code == 502
         assert "agentic retained payload exceeded" in exc_info.value.response.text
         assert RetainedToolSearchBackendHandler.requests == 1
+
+    def test_initial_file_resolution_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A declared oversized file is rejected before content or inference."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file-budget"}],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedFileMetadataHandler.metadata_requests == 1
+        assert RetainedFileMetadataHandler.content_requests == 0
+        assert RetainedToolSearchBackendHandler.requests == 0
 
     def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
         """The example's explicit 64 MiB aggregate budget admits an ordinary response."""
