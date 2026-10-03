@@ -30,6 +30,46 @@ use crate::{
 };
 
 #[test]
+fn lowered_snapshot_echo_fails_before_planning_many_owned_copies() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter());
+    let mut state = ResponsesState::default();
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "public", "description": "x".repeat(16_000)})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(65_536);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let frame = make_sse_chunk(
+        "response.in_progress",
+        &json!({"response": {"id": "resp_probe", "output": []}}),
+    );
+    let mut body = Some(Bytes::from(frame.repeat(20)));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none(), "the whole co-batched chunk must be suppressed");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        allocations.bytes_max < 65_536 * 2,
+        "restoration must reject before retaining many echo copies: {}",
+        allocations.bytes_max
+    );
+}
+
+#[test]
 fn done_after_terminal_at_max_events_is_allowed() {
     let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
     let completed =
@@ -525,6 +565,45 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .unwrap()
     );
     assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+}
+
+#[test]
+fn streaming_budget_cache_refreshes_prior_output_after_revision_change() {
+    let (_filter, mut ctx) = make_armed_context();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState {
+        accumulated_output: vec![json!({"text": "a".repeat(128 * 1024)})],
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(1_000_000);
+    ctx.extensions.insert(responses);
+
+    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let cache = stream.shared_prior_output_bytes.get().unwrap().unwrap();
+    assert!(cache.bytes > 128 * 1024);
+    assert_eq!(
+        initial,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(initial));
+
+    let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    responses.accumulated_output[0]["text"] = json!("b".repeat(256 * 1024));
+    responses.mark_replay_stable_payload_changed();
+    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    assert_eq!(
+        next,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert_eq!(next - initial, 128 * 1024);
 }
 
 #[test]
@@ -5290,6 +5369,7 @@ fn parse_error_sets_metadata() {
         client_tool_items: Vec::new(),
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        shared_prior_output_bytes: std::sync::OnceLock::new(),
     });
 
     let large_chunk =
@@ -5344,6 +5424,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         }],
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        shared_prior_output_bytes: std::sync::OnceLock::new(),
     });
 
     validate_stream_end(&mut ctx);
