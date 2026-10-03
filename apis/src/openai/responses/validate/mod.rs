@@ -231,9 +231,18 @@ fn insert_responses_state(
 ) -> Result<(), FilterAction> {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
+    #[cfg(feature = "store")]
+    {
+        state.set_retained_external_payload_bytes(
+            super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX),
+        );
+        state.store_persist_armed = super::store::request_persistence_armed(ctx);
+    }
     if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
         state.apply_retained_payload_limit(policy.max_retained_bytes());
         if !state.can_retain_payload(0) {
+            #[cfg(feature = "store")]
+            super::store::discard_retained_request_payload(ctx);
             return Err(FilterAction::Reject(responses_error_rejection(
                 413,
                 "invalid_request_error",
@@ -242,6 +251,8 @@ fn insert_responses_state(
         }
     }
     ctx.extensions.insert(state);
+    #[cfg(feature = "store")]
+    super::store::mark_retained_request_payload_charged(ctx);
     Ok(())
 }
 
