@@ -1238,6 +1238,9 @@ impl ResponsesState {
         ] {
             meter.json_values(values)?;
         }
+        for id in &self.provider_compaction_ids {
+            meter.raw(id.len())?;
+        }
         Some(meter.used())
     }
 
@@ -1303,6 +1306,9 @@ impl ResponsesState {
                 &self.tools,
             ] {
                 meter.json_values(values)?;
+            }
+            for id in &self.provider_compaction_ids {
+                meter.raw(id.len())?;
             }
         }
         for value in [
@@ -1518,6 +1524,7 @@ impl ResponsesState {
         self.emitted_output_items.clear();
         self.locally_executed_output_items.clear();
         self.provider_streamed_terminal_ids.clear();
+        self.provider_compaction_ids.clear();
         self.dispatch_failure = None;
     }
 
@@ -1560,12 +1567,18 @@ impl ResponsesState {
     pub(crate) fn provider_compaction_ids_from_messages(messages: &[serde_json::Value]) -> HashSet<String> {
         messages
             .iter()
-            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
-            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
-            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
-            .filter(|id| !id.starts_with("compact_"))
+            .filter_map(Self::provider_compaction_id_from_message)
             .map(ToOwned::to_owned)
             .collect()
+    }
+
+    /// Borrow a provider compaction ID before a collector copies it into state.
+    pub(crate) fn provider_compaction_id_from_message(item: &serde_json::Value) -> Option<&str> {
+        (item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+            .then_some(item)
+            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
+            .and_then(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.starts_with("compact_"))
     }
 
     /// Record the first security-context failure; later calls are ignored (first wins).
@@ -2128,6 +2141,28 @@ mod tests {
             bytes * 4,
             "each of the four owned JSON copies contributes its bytes"
         );
+    }
+
+    #[test]
+    fn retained_payload_counts_and_releases_provider_compaction_ids() {
+        let id = "c".repeat(8_192);
+        let mut state = ResponsesState::from_request_body(json!({
+            "input": [{"type": "compaction", "id": &id, "encrypted_content": "opaque"}]
+        }));
+        let with_id = state.retained_payload_bytes().unwrap();
+        let stable_with_id = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        state.provider_compaction_ids.clear();
+        assert_eq!(with_id - state.retained_payload_bytes().unwrap(), id.len());
+        assert_eq!(
+            stable_with_id - state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap(),
+            id.len()
+        );
+
+        state.provider_compaction_ids.insert(id);
+        state.apply_retained_payload_limit(with_id - 1);
+        assert!(!state.can_retain_payload(0));
+        state.discard_payload_for_budget_error();
+        assert!(state.provider_compaction_ids.is_empty());
     }
 
     #[cfg(feature = "store")]
