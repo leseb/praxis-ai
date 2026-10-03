@@ -737,7 +737,7 @@ impl HttpFilter for ClientToolCompatFilter {
 /// Reserve the independently owned copies that rich-tool lowering may create
 /// before discovery, descriptions, reverse-map entries, or the echo are built.
 /// The source tool and typed-history JSON are already charged to `state`; their
-/// compact sizes provide an allocation-free upper bound for every cloned field.
+/// compact sizes provide an upper bound without cloning those payloads.
 /// Stringification can escape one byte into six and the custom/namespace paths
 /// can hold the original, conflict representation, lowered declaration, echo,
 /// reverse entry, and outbound serialization at once. Fixed allowance covers
@@ -751,15 +751,31 @@ fn request_lowering_reservation(state: &ResponsesState) -> Option<usize> {
     const SOURCE_COPIES: usize = 32;
     const ITEM_OVERHEAD: usize = 2_048;
     let mut reserve = 0_usize;
+    let client_call_ids: HashSet<&str> = state
+        .messages
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("shell_call" | "tool_search_call")
+            ) && is_client_executed_tool_call(item)
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str).filter(|id| !id.is_empty()))
+        .collect();
     let tools = state.client_tool_echo.as_ref().map_or_else(
         || state.request_body.get("tools").and_then(Value::as_array),
         |echo| Some(&echo.tools),
     );
-    let has_rich = tools.is_some_and(|tools| tools.iter().any(is_rich_client_tool));
-    let has_discovery = state
-        .messages
-        .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_output"));
+    let has_rich = request_has_rich_client_tool(state);
+    let has_discovery = state.messages.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+            && item
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
+            && output_may_hoist_tools(item)
+            && history_output_has_client_call(&client_call_ids, item)
+    });
     if (has_rich || has_discovery)
         && let Some(tools) = tools
     {
@@ -767,36 +783,94 @@ fn request_lowering_reservation(state: &ResponsesState) -> Option<usize> {
             reserve = reserve
                 .checked_add(retained_json_bytes(tool)?.checked_mul(SOURCE_COPIES)?)?
                 .checked_add(ITEM_OVERHEAD)?;
-            if tool.get("type").and_then(Value::as_str) == Some("namespace") {
-                let members = tool.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
-                let header = retained_json_bytes(tool.get("name").unwrap_or(&Value::Null))?
-                    .checked_add(retained_json_bytes(tool.get("description").unwrap_or(&Value::Null))?)?;
-                reserve = reserve.checked_add(header.checked_mul(members)?.checked_mul(SOURCE_COPIES)?)?;
-            }
+            reserve = reserve.checked_add(namespace_fanout_reservation(tool)?)?;
         }
         if let Some(choice) = state.request_body.get("tool_choice") {
             reserve = reserve.checked_add(retained_json_bytes(choice)?.checked_mul(SOURCE_COPIES)?)?;
         }
     }
     for item in &state.messages {
-        if matches!(
-            item.get("type").and_then(Value::as_str),
-            Some(
-                "custom_tool_call"
-                    | "custom_tool_call_output"
-                    | "shell_call"
-                    | "shell_call_output"
-                    | "tool_search_call"
-                    | "tool_search_output"
-                    | "function_call"
-            )
-        ) {
-            reserve = reserve
-                .checked_add(retained_json_bytes(item)?.checked_mul(SOURCE_COPIES)?)?
-                .checked_add(ITEM_OVERHEAD)?;
-        }
+        reserve = reserve.checked_add(history_lowering_reservation(&client_call_ids, item)?)?;
     }
     Some(reserve)
+}
+
+/// A namespace's name and description are copied into each lowered member,
+/// including members discovered inside a tool-search output. The source JSON
+/// contains this header only once, so its ordinary source-copy factor alone
+/// cannot bound the fanout.
+fn namespace_fanout_reservation(tool: &Value) -> Option<usize> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return Some(0);
+    }
+    let members = tool.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
+    let header = retained_json_bytes(tool.get("name").unwrap_or(&Value::Null))?
+        .checked_add(retained_json_bytes(tool.get("description").unwrap_or(&Value::Null))?)?;
+    header.checked_mul(members)?.checked_mul(32)
+}
+
+/// Charge only history items that this adapter actually rewrites. A native
+/// `function_call` may carry megabytes of arguments and is passed through
+/// unchanged; charging it as a new owner would reject a valid request.
+fn history_lowering_reservation(client_call_ids: &HashSet<&str>, item: &Value) -> Option<usize> {
+    const SOURCE_COPIES: usize = 32;
+    const ITEM_OVERHEAD: usize = 2_048;
+    let item_type = item.get("type").and_then(Value::as_str);
+    let copies = match item_type {
+        Some("custom_tool_call") => retained_json_bytes(item)?.checked_mul(SOURCE_COPIES)?,
+        Some("custom_tool_call_output") => 0,
+        Some("shell_call" | "tool_search_call") if is_client_executed_tool_call(item) => {
+            retained_json_bytes(item)?.checked_mul(SOURCE_COPIES)?
+        },
+        Some("shell_call_output" | "tool_search_output") if history_output_has_client_call(client_call_ids, item) => {
+            let source = retained_json_bytes(item)?.checked_mul(SOURCE_COPIES)?;
+            if item_type == Some("tool_search_output") {
+                source.checked_add(discovered_namespace_reservation(item)?)?
+            } else {
+                source
+            }
+        },
+        Some("function_call") if item.get("namespace").and_then(Value::as_str).is_some() => {
+            let namespace = item.get("namespace")?;
+            let name = item.get("name").unwrap_or(&Value::Null);
+            retained_json_bytes(namespace)?
+                .checked_add(retained_json_bytes(name)?)?
+                .checked_mul(SOURCE_COPIES)?
+        },
+        _ => return Some(0),
+    };
+    copies.checked_add(ITEM_OVERHEAD)
+}
+
+/// Charge repeated namespace headers only when discovery actually hoists them.
+fn discovered_namespace_reservation(output: &Value) -> Option<usize> {
+    if !output_may_hoist_tools(output) {
+        return Some(0);
+    }
+    output
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .try_fold(0_usize, |used, tool| {
+            used.checked_add(namespace_fanout_reservation(tool)?)
+        })
+}
+
+/// Only terminal search outputs hoist their namespace definitions. The output
+/// itself is still stringified for history on a nonterminal search, but its
+/// namespace header is not copied into callable function descriptions.
+fn output_may_hoist_tools(item: &Value) -> bool {
+    item.get("status")
+        .is_none_or(|status| status.is_null() || status.as_str() == Some("completed"))
+}
+
+/// Correlate an output using borrowed IDs, without cloning call-id payloads.
+fn history_output_has_client_call(client_call_ids: &HashSet<&str>, output: &Value) -> bool {
+    output
+        .get("call_id")
+        .and_then(Value::as_str)
+        .is_some_and(|call_id| client_call_ids.contains(call_id))
 }
 
 /// Restore an owned `tools` array back into the request body verbatim.
