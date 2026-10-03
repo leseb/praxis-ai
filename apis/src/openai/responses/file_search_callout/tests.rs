@@ -724,6 +724,31 @@ async fn stale_file_search_assignment_cannot_dispatch_or_rewrite_another_item() 
     );
 }
 
+#[test]
+fn drained_file_search_assignment_keeps_its_id_in_the_request_budget() {
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({
+            "type": "file_search_call",
+            "id": "x".repeat(16_384),
+            "status": "searching",
+            "queries": ["query"],
+        })],
+    );
+    let before = state.retained_payload_bytes().unwrap();
+    let (assignments, charged_bytes) = take_charged_file_search_assignments(&mut state).unwrap();
+    assert_eq!(charged_bytes, 16_384);
+    assert_eq!(state.retained_payload_bytes().unwrap(), before);
+
+    state.apply_retained_payload_limit(before + 128);
+    assert!(state.can_retain_payload(128));
+    assert!(!state.can_retain_payload(129));
+
+    drop(assignments);
+    state.release_external_payload_bytes(charged_bytes);
+    assert_eq!(state.retained_payload_bytes().unwrap(), before - charged_bytes);
+}
+
 #[tokio::test]
 async fn mixed_valid_and_empty_calls_are_both_terminalized() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.8, "A"));

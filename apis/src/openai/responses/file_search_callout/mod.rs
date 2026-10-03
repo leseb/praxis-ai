@@ -502,15 +502,36 @@ impl FileSearchCalloutFilter {
     /// extending citations). It records a [`DispatchFailure`] on failure but never
     /// decides whether another inference round occurs and never commits a terminal
     /// response.
-    #[expect(clippy::too_many_lines, reason = "sequential drain, plan, execute, and reconcile")]
     async fn dispatch(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let assignments = match ctx.extensions.get_mut::<ResponsesState>() {
-            Some(state) => state.drain_file_search_assignments(),
+        let (assignments, assignment_bytes) = match ctx.extensions.get_mut::<ResponsesState>() {
+            Some(state) => match take_charged_file_search_assignments(state) {
+                Some(owned) => owned,
+                None => {
+                    state.discard_payload_for_budget_error();
+                    state.dispatch_failure = Some(file_search_budget_failure());
+                    return Ok(FilterAction::Continue);
+                },
+            },
             None => return Ok(FilterAction::Continue),
         };
         if assignments.is_empty() {
             return Ok(FilterAction::Continue);
         }
+        let result = self.dispatch_assignments(ctx, &assignments).await;
+        drop(assignments);
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.release_external_payload_bytes(assignment_bytes);
+        }
+        result
+    }
+
+    /// Execute assignments while their ID payload remains charged to the request.
+    #[expect(clippy::too_many_lines, reason = "sequential plan, execute, and reconcile")]
+    async fn dispatch_assignments(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        assignments: &[FileSearchAssignment],
+    ) -> Result<FilterAction, FilterError> {
         let identity = match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
             Ok(identity) => identity,
             Err(CalloutContextMissing::Credential { slot }) => {
@@ -602,6 +623,18 @@ impl FileSearchCalloutFilter {
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Move compact file-search selections to the dispatcher without losing their
+/// request-wide payload charge while the local vector owns their IDs.
+fn take_charged_file_search_assignments(state: &mut ResponsesState) -> Option<(Vec<FileSearchAssignment>, usize)> {
+    let assignments = state.drain_file_search_assignments();
+    let bytes = assignments
+        .iter()
+        .try_fold(0_usize, |used, assignment| used.checked_add(assignment.item_id.len()))?;
+    state
+        .retain_external_payload_bytes(bytes)
+        .then_some((assignments, bytes))
 }
 
 /// Record a write-once security-context terminal before vector-store dispatch.
