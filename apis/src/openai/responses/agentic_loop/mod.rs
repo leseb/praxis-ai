@@ -209,7 +209,7 @@ use super::{
 use super::{
     mcp_classify::{McpDisposition, classify_mcp},
     mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    openai_mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
+    openai_mcp_tool_resolve::{MAX_FUNCTION_NAME_LEN, McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
 
@@ -441,6 +441,11 @@ impl HttpFilter for AgenticLoopFilter {
             return finish_incomplete_round(ctx, state, body);
         }
 
+        // Ownership classification builds a reverse MCP name index. Reserve
+        // its owned keys and encoder scratch before either classification pass.
+        if !mcp_tool_index_fits(&state) {
+            return finish_response_failure(ctx, state, &retained_payload_failure(), true);
+        }
         if has_mixed_function_call_ownership(&state) {
             return reject_mixed_ownership_round(ctx, state);
         }
@@ -450,7 +455,7 @@ impl HttpFilter for AgenticLoopFilter {
             return finish_response_failure(ctx, state, &failure, retained_budget_failure);
         }
 
-        if !state.can_retain_payload(0) {
+        if !state.can_retain_payload(0) || !mcp_tool_index_fits(&state) {
             if request_is_streaming(&state) {
                 state.discard_payload_for_budget_error();
             }
@@ -984,6 +989,37 @@ fn request_is_streaming(state: &ResponsesState) -> bool {
 /// terminate as `done` rather than loop uselessly to the `max_infer_iters` cap.
 fn has_dispatchable_calls(state: &ResponsesState) -> bool {
     !state.web_search_calls.is_empty() || !state.file_search_assignments.is_empty() || has_dispatchable_mcp_work(state)
+}
+
+/// Both agentic ownership predicates build a temporary reverse MCP name index.
+/// Admission must be rechecked after dispatcher preparation can grow the state.
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_tool_index_fits(state: &ResponsesState) -> bool {
+    (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty())
+        || mcp_tool_index_charge(state).is_some_and(|charge| state.can_retain_payload(charge))
+}
+
+/// Account for the index's owned encoded names and its largest in-flight raw
+/// and sanitized encoder strings without allocating them first.
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_tool_index_charge(state: &ResponsesState) -> Option<usize> {
+    if state.retained_payload_limit().is_none() {
+        return Some(0);
+    }
+    let (names, largest_raw) =
+        state
+            .mcp_tool_map
+            .keys()
+            .try_fold((0_usize, 0_usize), |(names, largest_raw), (server, tool)| {
+                let raw = server.len().checked_add(2)?.checked_add(tool.len())?;
+                Some((names.checked_add(raw.min(MAX_FUNCTION_NAME_LEN))?, largest_raw.max(raw)))
+            })?;
+    names.checked_add(largest_raw.checked_mul(2)?)
+}
+
+#[cfg(not(feature = "openai-mcp-tools"))]
+const fn mcp_tool_index_fits(_state: &ResponsesState) -> bool {
+    true
 }
 
 /// Whether deferred MCP discovery is pending or a recorded call resolves to a

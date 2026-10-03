@@ -909,6 +909,71 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
     assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
 }
 
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn streamed_mcp_ownership_index_rejects_near_retained_limit() {
+    let make_state = || {
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": "test",
+            "stream": true
+        }));
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "lookup".to_owned()),
+            json!({"server_label": "server", "require_approval": "never"}),
+        );
+        for index in 0..128 {
+            state.mcp_tool_map.insert(
+                (
+                    format!("other_server_{index}"),
+                    "long_tool_name_for_index_budget".to_owned(),
+                ),
+                json!({"require_approval": "never"}),
+            );
+        }
+        state.response_object = json!({
+            "id": "resp_index_budget",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_lookup",
+                "call_id": "call_lookup",
+                "name": "server__lookup",
+                "arguments": "{}",
+                "status": "completed"
+            }]
+        });
+        state
+    };
+
+    // Measure the state after the streaming collector moves the output. The
+    // reverse index is a separate allocation even though the state still fits.
+    let mut projected = make_state();
+    super::collect_streaming_output_items(&mut projected).unwrap();
+    projected.apply_retained_payload_limit(usize::MAX);
+    let retained = projected.retained_payload_bytes().unwrap();
+    let index_charge = super::mcp_tool_index_charge(&projected).unwrap();
+    let limit = retained + index_charge - 1;
+    assert!(index_charge > 4_096);
+    assert!(limit > retained);
+
+    let mut state = make_state();
+    state.apply_retained_payload_limit(limit);
+    assert!(state.can_retain_payload(0), "the request itself fits before indexing");
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "done");
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
 #[test]
 fn streaming_iteration_limit_ends_with_sse_error() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 1").unwrap();
