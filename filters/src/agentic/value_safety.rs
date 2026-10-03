@@ -20,11 +20,10 @@ mod tests {
     #[test]
     fn control_classification_matches_header_value() {
         for byte in 0_u8..=127 {
-            let raw = [byte];
-            let value = std::str::from_utf8(&raw).expect("ASCII byte");
+            let value = char::from(byte).to_string();
             assert_eq!(
-                !contains_control_chars(value),
-                http::HeaderValue::from_str(value).is_ok(),
+                !contains_control_chars(&value),
+                http::HeaderValue::from_str(&value).is_ok(),
                 "byte 0x{byte:02x} must match HTTP header safety"
             );
         }
