@@ -681,6 +681,7 @@ async fn on_request_body_provider_failure_produces_failed_item_and_truthful_inpu
         vec![serde_json::json!({
             "type": "web_search_call",
             "id": "ws_fail_1",
+            "status": "completed",
             "action": {"type": "search", "query": "rust language"}
         })],
     );
@@ -805,11 +806,13 @@ async fn on_request_body_mixed_batch_preserves_completed_and_failed() {
             serde_json::json!({
                 "type": "web_search_call",
                 "id": "ws_ok",
+                "status": "completed",
                 "action": {"type": "search", "query": "rust language"}
             }),
             serde_json::json!({
                 "type": "web_search_call",
                 "id": "ws_fail",
+                "status": "completed",
                 "action": {"type": "search", "query": "rust crates"}
             }),
         ],
@@ -1585,31 +1588,31 @@ async fn on_request_body_honors_client_max_tool_calls() {
     assert_eq!(state.accumulated_output[0]["status"], "completed");
     assert_eq!(state.accumulated_output[1]["id"], "ws_b");
     assert_eq!(
-        state.accumulated_output[1]["status"], "incomplete",
-        "the over-budget call is surfaced as incomplete, not executed"
+        state.accumulated_output[1]["status"], "failed",
+        "the ordered admission pass rejects the over-budget call"
     );
     assert_eq!(
         state.accumulated_output[1]["action"]["query"], "second",
-        "the declined query is preserved in the incomplete item"
+        "the declined query is preserved in the failed item"
     );
 
-    // The model-facing bridge (state.messages) and the durable rehydration
-    // history (persisted_messages) must tell the model the truth about the
-    // over-budget call: it was not performed, not a completed empty search.
+    assert!(state.deferred_tool_limit_completion);
+    // The model-facing bridge and durable history report the tool-call limit
+    // without presenting the rejected call as a completed empty search.
     let bridge = find_bridge_output(&state.messages, "second").expect("ws_b bridge present");
     assert_eq!(
-        bridge["output"], "Web search not performed.",
-        "the over-budget bridge must not fabricate a no-results outcome"
+        bridge["output"], TOOL_LIMIT_OUTPUT,
+        "the over-budget bridge must report the ordered admission rejection"
     );
     let persisted = find_bridge_output(&state.persisted_messages, "second").expect("ws_b persisted");
     assert_eq!(
-        persisted["output"], "Web search not performed.",
-        "durable history must not persist a false completed outcome"
+        persisted["output"], TOOL_LIMIT_OUTPUT,
+        "durable history must report the ordered admission rejection"
     );
     // The dispatched call remains a truthful bridge carrying real results.
     let dispatched = find_bridge_output(&state.messages, "first").expect("ws_a bridge present");
     assert_ne!(
-        dispatched["output"], "Web search not performed.",
+        dispatched["output"], TOOL_LIMIT_OUTPUT,
         "the dispatched call must carry a real search outcome"
     );
     assert!(
@@ -2166,7 +2169,7 @@ async fn query_cap_bounds_the_whole_batch_and_keeps_partial_results() {
         );
         let bridge = find_queries_bridge_output(messages, &starved).expect("starved bridge present");
         assert_eq!(
-            bridge["output"], "Web search not performed.",
+            bridge["output"], TOOL_LIMIT_OUTPUT,
             "an undispatched call must not fabricate results"
         );
     }
