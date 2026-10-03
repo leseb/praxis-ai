@@ -5850,6 +5850,138 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     );
 }
 
+#[tokio::test]
+async fn eager_cache_resolution_rejects_tight_budget_before_commit() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let body_json = mcp_body(server_url);
+    let mut listing = cached_weather_listing(server_url);
+    listing["tools"][0]["description"] = serde_json::json!("x".repeat(4_096));
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![listing];
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + 1_024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[tokio::test]
+async fn eager_fresh_resolution_preflights_budget_before_tools_list() {
+    let (url, cancel, calls) = start_counted_single_tool_mcp_server().await;
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let body_json = mcp_body(&url);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.apply_retained_payload_limit(8_192);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+
+    let admitted_req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut admitted_ctx = crate::test_utils::make_filter_context(&admitted_req);
+    admitted_ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut admitted = ResponsesState::from_request_body(body_json);
+    admitted.apply_retained_payload_limit(64 * 1024 * 1024);
+    admitted_ctx.extensions.insert(admitted);
+    let mut admitted_body = Some(Bytes::from(original));
+    let admitted_action = filter
+        .on_request_body(&mut admitted_ctx, &mut admitted_body, true)
+        .await
+        .unwrap();
+    cancel.cancel();
+
+    assert!(matches!(admitted_action, FilterAction::Continue));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(
+        admitted_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .can_retain_payload(0)
+    );
+}
+
+#[tokio::test]
+async fn eager_resolution_batches_two_fresh_servers_under_default_budget() {
+    let (first_url, first_cancel, first_calls) = start_counted_single_tool_mcp_server().await;
+    let (second_url, second_cancel, second_calls) = start_counted_single_tool_mcp_server().await;
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let mut body_json = mcp_body(&first_url);
+    body_json["tools"].as_array_mut().unwrap().push(serde_json::json!({
+        "type": "mcp", "server_label": "calendar", "server_url": second_url,
+        "allowed_tools": ["get_weather"]
+    }));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    first_cancel.cancel();
+    second_cancel.cancel();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(first_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(second_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(0));
+}
+
+#[tokio::test]
+async fn eager_resolution_does_not_call_later_server_after_budget_exhaustion() {
+    let (second_url, second_cancel, second_calls) = start_counted_single_tool_mcp_server().await;
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let first_url = "http://8.8.8.8/mcp";
+    let mut body_json = mcp_body(first_url);
+    body_json["tools"].as_array_mut().unwrap().push(serde_json::json!({
+        "type": "mcp", "server_label": "calendar", "server_url": second_url,
+        "allowed_tools": ["get_weather"]
+    }));
+    let mut cached = cached_weather_listing(first_url);
+    cached["tools"][0]["description"] = serde_json::json!("x".repeat(1_500_000));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![cached];
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    second_cancel.cancel();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(second_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
 /// `commit_discovery_items` appends one item per server in request order.
 #[test]
 fn commit_discovery_items_preserves_request_order() {

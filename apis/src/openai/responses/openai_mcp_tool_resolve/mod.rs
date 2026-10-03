@@ -92,6 +92,11 @@ pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// listing, and one owner for transformation overlap.
 const DEFERRED_LISTING_OWNER_RESERVATION: usize = 6;
 
+/// Eager resolution retains the decoded task result, per-entry filtered and
+/// converted tools, dispatch map, rewritten body, public listing, private
+/// cache listing, and serialization overlap alongside the raw control body.
+const EAGER_LISTING_OWNER_RESERVATION: usize = 12;
+
 // -----------------------------------------------------------------------------
 // McpToolResolveFilter
 // -----------------------------------------------------------------------------
@@ -346,6 +351,18 @@ impl McpToolResolveFilter {
         }
 
         resolve_connector_ids(&self.connectors, &mut mcp_entries.values)?;
+        let local_staging = match ctx.extensions.get::<ResponsesState>() {
+            Some(state) if state.retained_payload_limit().is_some() => retained_json_bytes(&parsed)
+                .and_then(|bytes| bytes.checked_add(retained_json_bytes(&mcp_entries.values)?.checked_mul(2)?))
+                .filter(|bytes| state.can_retain_payload(*bytes)),
+            _ => Some(0),
+        };
+        let Some(local_staging) = local_staging else {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+            }
+            return Err(ResolveError::RetainedBudget);
+        };
         let has_configured_connector = mcp_entries
             .values
             .iter()
@@ -373,8 +390,21 @@ impl McpToolResolveFilter {
             self.max_tools,
             self.max_rewritten_body_bytes,
         );
+        let local_staging = if local_staging == 0 {
+            0
+        } else {
+            local_staging
+                .checked_add(pending_deferred_bytes(&deferred_mcp).ok_or(ResolveError::RetainedBudget)?)
+                .ok_or(ResolveError::RetainedBudget)?
+        };
         let resolution = self
-            .resolve_request_entries(ctx, &mcp_entries.values, &callout, connector_identity.as_ref())
+            .resolve_request_entries(
+                ctx,
+                &mcp_entries.values,
+                &callout,
+                connector_identity.as_ref(),
+                local_staging,
+            )
             .await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
@@ -402,6 +432,7 @@ impl McpToolResolveFilter {
     /// Rewrite the request body and store resolved plus deferred MCP state.
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "rewrite needs the parsed body and both resolved maps"
     )]
     fn commit_resolved_tools(
@@ -426,19 +457,45 @@ impl McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
-        serialized.commit(body, self.name(), "tools");
+        let commit_fits = ctx.extensions.get::<ResponsesState>().is_none_or(|state| {
+            eager_commit_fits(
+                state,
+                &parsed,
+                &tool_map,
+                &deferred_mcp,
+                &listings,
+                &connector_context_policy,
+                serialized.len(),
+            )
+        });
+        if !commit_fits {
+            return Err(ResolveError::RetainedBudget);
+        }
         write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy);
         commit_discovery_items(ctx, listings);
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| !state.can_retain_payload(0))
+        {
+            return Err(ResolveError::RetainedBudget);
+        }
+        serialized.commit(body, self.name(), "tools");
         Ok(FilterAction::Continue)
     }
 
     /// Resolve request entries using the effective trusted-header view.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "resolution needs the request-local budget staging"
+    )]
     async fn resolve_request_entries(
         &self,
         ctx: &HttpFilterContext<'_>,
         entries: &[serde_json::Value],
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        local_staging: usize,
     ) -> Result<Resolution, ResolveError> {
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
         let owner_fingerprint = ctx
@@ -454,6 +511,8 @@ impl McpToolResolveFilter {
             &forwarded_headers,
             callout,
             connector_identity,
+            ctx.extensions.get::<ResponsesState>(),
+            local_staging,
         )
         .await
     }
@@ -473,13 +532,15 @@ impl McpToolResolveFilter {
     /// Resolve all MCP entries, building both the global dispatch
     /// map and pre-built function tools for body rewriting.
     ///
-    /// Server resolutions run concurrently via
-    /// [`futures::future::try_join_all`]. Non-credentialed entries
+    /// Server resolutions run concurrently in batches admitted by the
+    /// aggregate payload budget via [`futures::future::try_join_all`].
+    /// Non-credentialed entries
     /// sharing the same `(server_label, server_url)` are
     /// deduplicated to a single resolution task; credentialed
     /// entries always resolve independently.
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "concurrent resolution threads cache, trusted headers, executor, and scoped identity"
     )]
     async fn resolve_all_entries(
@@ -490,30 +551,143 @@ impl McpToolResolveFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        state: Option<&ResponsesState>,
+        local_staging: usize,
     ) -> Result<Resolution, ResolveError> {
         let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries)?;
+        let consumers = task_consumer_counts(&entry_to_task, task_entries.len());
+        let budgeted_state = state.filter(|state| state.retained_payload_limit().is_some());
+        let mut task_results = Vec::with_capacity(task_entries.len());
+        let mut prepared_charge = 0_usize;
 
-        let futures: Vec<_> = task_entries
-            .iter()
-            .zip(&task_allowed_names)
-            .map(|(entry, allowed)| async {
-                let result = self
-                    .resolve_entry(
+        while task_results.len() < task_entries.len() {
+            let start = task_results.len();
+            let mut end = start;
+            let mut batch_charge = 0_usize;
+            while end < task_entries.len() {
+                let ((entry, allowed_names), consumers) = task_entries
+                    .get(end)
+                    .zip(task_allowed_names.get(end))
+                    .zip(consumers.get(end))
+                    .ok_or(ResolveError::RetainedBudget)?;
+                let charge = if let Some(state) = budgeted_state {
+                    self.eager_task_reservation(
                         entry,
-                        previous_tools,
+                        allowed_names.as_deref(),
+                        &state.previous_tools,
                         owner_fingerprint,
-                        allowed.as_deref(),
-                        forwarded_headers,
-                        callout,
-                        connector_identity,
-                    )
-                    .await;
-                redact_connector_client_error(result, entry)
-            })
-            .collect();
-        let task_results = futures::future::try_join_all(futures).await?;
+                        *consumers,
+                    )?
+                } else {
+                    0
+                };
+                let Some(next_charge) = batch_charge.checked_add(charge) else {
+                    return Err(ResolveError::RetainedBudget);
+                };
+                let Some(staging) = local_staging
+                    .checked_add(prepared_charge)
+                    .and_then(|bytes| bytes.checked_add(next_charge))
+                else {
+                    return Err(ResolveError::RetainedBudget);
+                };
+                if budgeted_state.is_some_and(|state| !state.can_retain_payload(staging)) {
+                    break;
+                }
+                batch_charge = next_charge;
+                end += 1;
+            }
+            if end == start {
+                return Err(ResolveError::RetainedBudget);
+            }
+
+            let entries_batch = task_entries.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+            let allowed_batch = task_allowed_names.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+            let futures: Vec<_> = entries_batch
+                .iter()
+                .zip(allowed_batch)
+                .map(|(entry, allowed)| async {
+                    let result = self
+                        .resolve_entry(
+                            entry,
+                            previous_tools,
+                            owner_fingerprint,
+                            allowed.as_deref(),
+                            forwarded_headers,
+                            callout,
+                            connector_identity,
+                        )
+                        .await;
+                    redact_connector_client_error(result, entry)
+                })
+                .collect();
+            let batch_results = futures::future::try_join_all(futures).await?;
+            if budgeted_state.is_some() {
+                for (offset, result) in batch_results.iter().enumerate() {
+                    if let Some(tools) = result {
+                        let task_idx = start + offset;
+                        let entry = task_entries.get(task_idx).ok_or(ResolveError::RetainedBudget)?;
+                        let consumers = *consumers.get(task_idx).ok_or(ResolveError::RetainedBudget)?;
+                        let charge = eager_listing_charge(
+                            server_label(entry),
+                            retained_json_bytes(tools).ok_or(ResolveError::RetainedBudget)?,
+                            tools.len(),
+                            consumers,
+                        )?;
+                        prepared_charge = prepared_charge
+                            .checked_add(charge)
+                            .ok_or(ResolveError::RetainedBudget)?;
+                    }
+                }
+                let staging = local_staging
+                    .checked_add(prepared_charge)
+                    .ok_or(ResolveError::RetainedBudget)?;
+                if budgeted_state.is_some_and(|state| !state.can_retain_payload(staging)) {
+                    return Err(ResolveError::RetainedBudget);
+                }
+            }
+            task_results.extend(batch_results);
+        }
 
         collect_resolutions(entries, &entry_to_task, task_results)
+    }
+
+    /// Charge an eager task before it clones a cache entry or dials a server.
+    /// A fresh task may consume the complete independent MCP listing cap.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cache identity and one task's owner count are separate inputs"
+    )]
+    fn eager_task_reservation(
+        &self,
+        entry: &serde_json::Value,
+        allowed_names: Option<&[String]>,
+        previous_tools: &[serde_json::Value],
+        owner_fingerprint: Option<&str>,
+        consumers: usize,
+    ) -> Result<usize, ResolveError> {
+        let server_url = resolvable_server_url(entry).ok_or(ResolveError::RetainedBudget)?;
+        let cached = can_reuse_cached_listing(entry, entry.get("connector_id").is_some())
+            .then(|| {
+                find_cached_listing_borrowed(
+                    Some(previous_tools),
+                    server_label(entry),
+                    server_url,
+                    owner_fingerprint,
+                    allowed_names,
+                )
+            })
+            .flatten();
+        let listed_bytes = cached.map_or_else(|| Some(mcp_client::MAX_LISTING_RESPONSE_BYTES), retained_json_bytes);
+        let tool_count = cached.map_or_else(
+            || self.max_tools.min(mcp_client::MAX_LISTING_RESPONSE_BYTES),
+            <[serde_json::Value]>::len,
+        );
+        eager_listing_charge(
+            server_label(entry),
+            listed_bytes.ok_or(ResolveError::RetainedBudget)?,
+            tool_count,
+            consumers,
+        )
     }
 
     /// Resolve tools for a single MCP entry independently.
@@ -657,7 +831,15 @@ impl HttpFilter for McpToolResolveFilter {
         // captures the size-bounded request options from it) is cheap.
         match Box::pin(self.resolve_mcp_tools(ctx, body, parsed)).await {
             Ok(action) => Ok(action),
-            Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
+            Err(e) => {
+                if matches!(e, ResolveError::RetainedBudget) {
+                    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                        state.discard_payload_for_budget_error();
+                    }
+                    ctx.set_metadata("responses.skip_persist", "true");
+                }
+                Ok(resolve_error_action(ctx, &e, streaming, &bytes))
+            },
         }
     }
 
@@ -854,6 +1036,77 @@ fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize)
         });
     }
     Ok(())
+}
+
+/// Admit the eager rewrite while the old request state, rewritten JSON, wire
+/// bytes, dispatch map, and discovery listings are all independently owned.
+/// The final state check after commit is a guard against a future output-shape
+/// change outgrowing this projection; the request body is committed last.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every independent commit owner is projected explicitly"
+)]
+fn eager_commit_fits(
+    state: &ResponsesState,
+    parsed: &serde_json::Value,
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+    deferred_mcp: &[DeferredMcpConnector],
+    listings: &[McpListing],
+    connector_context_policy: &McpConnectorContextPolicy,
+    serialized_bytes: usize,
+) -> bool {
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let projected = retained_json_bytes(parsed)
+        .and_then(|bytes| bytes.checked_add(serialized_bytes))
+        // write_state clones these two fields from the rewritten request.
+        .and_then(|bytes| bytes.checked_add(optional_json_bytes(parsed.get("tools"))?))
+        .and_then(|bytes| bytes.checked_add(optional_json_bytes(parsed.get("tool_choice"))?))
+        .and_then(|bytes| {
+            tool_map.iter().try_fold(bytes, |used, ((server, tool), entry)| {
+                used.checked_add(server.len())?
+                    .checked_add(tool.len())?
+                    .checked_add(retained_json_bytes(entry)?)
+            })
+        })
+        .and_then(|bytes| {
+            deferred_mcp.iter().try_fold(bytes, |used, connector| {
+                used.checked_add(deferred_connector_bytes(connector)?)
+            })
+        })
+        .and_then(|bytes| {
+            listings.iter().try_fold(bytes, |used, listing| {
+                let owner = retained_json_bytes(&listing.tools)?
+                    .checked_add(listing.server_label.len())?
+                    .checked_add(listing.server_url.as_ref().map_or(0, String::len))?
+                    .checked_add(64)?;
+                used.checked_add(owner.checked_mul(4)?)
+            })
+        })
+        .and_then(|bytes| bytes.checked_add(connector_context_policy.retained_payload_bytes()?));
+    projected.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Measured retained size of an optional request field.
+fn optional_json_bytes(value: Option<&serde_json::Value>) -> Option<usize> {
+    value.map_or(Some(0), retained_json_bytes)
+}
+
+/// Conservative peak for a decoded eager listing and each entry consuming it.
+/// The function name is capped, but the label remains in private and public
+/// listing owners once per tool. All arithmetic fails closed.
+fn eager_listing_charge(
+    label: &str,
+    listed_bytes: usize,
+    tool_count: usize,
+    consumers: usize,
+) -> Result<usize, ResolveError> {
+    listed_bytes
+        .checked_mul(EAGER_LISTING_OWNER_RESERVATION)
+        .and_then(|bytes| bytes.checked_add(label.len().checked_mul(tool_count)?.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_mul(consumers))
+        .ok_or(ResolveError::RetainedBudget)
 }
 
 /// Collect per-entry resolutions from task results.
@@ -3279,6 +3532,25 @@ fn find_cached_listing(
     owner_fingerprint: Option<&str>,
     allowed_tools: Option<&[String]>,
 ) -> Option<Vec<serde_json::Value>> {
+    find_cached_listing_borrowed(
+        previous_tools.map(Vec::as_slice),
+        label,
+        server_url,
+        owner_fingerprint,
+        allowed_tools,
+    )
+    .map(<[serde_json::Value]>::to_vec)
+}
+
+/// Inspect a cache candidate without cloning its tool definitions. Aggregate
+/// admission uses this before the eager resolver may materialize the listing.
+fn find_cached_listing_borrowed<'a>(
+    previous_tools: Option<&'a [serde_json::Value]>,
+    label: &str,
+    server_url: &str,
+    owner_fingerprint: Option<&str>,
+    allowed_tools: Option<&[String]>,
+) -> Option<&'a [serde_json::Value]> {
     let previous = previous_tools?;
     let allowed = allowed_tools?;
 
@@ -3301,7 +3573,7 @@ fn find_cached_listing(
         return None;
     }
 
-    Some(cached_tools.clone())
+    Some(cached_tools)
 }
 
 /// Filter tools by name list and/or read-only annotation.
