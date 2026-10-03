@@ -5915,6 +5915,47 @@ async fn output_item_done_replaces_by_id() {
     assert_eq!(state.output_items()[0]["content"][0]["text"], "replaced");
 }
 
+#[test]
+fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
+    let (filter, mut ctx) = make_armed_context();
+    let added = json!({
+        "output_index": 0,
+        "item": {"type": "message", "id": "item_A", "content": [{"type": "output_text", "text": "aaaa"}]}
+    });
+    let mut body = Some(make_sse_chunk("response.output_item.added", &added));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    let before = responses.replay_stable_payload_revision;
+    let before_bytes = crate::openai::responses::state::retained_json_bytes(&responses.response_object).unwrap();
+
+    let mut body = Some(make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"output_index": 0, "content_index": 0, "delta": "x"}),
+    ));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .replay_stable_payload_revision,
+        before
+    );
+
+    let done = json!({
+        "output_index": 0,
+        "item": {"type": "message", "id": "item_A", "content": [{"type": "output_text", "text": "\u{0001}\u{0001}\u{0001}\u{0001}"}]}
+    });
+    let mut body = Some(make_sse_chunk("response.output_item.done", &done));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(responses.output_items().len(), 1);
+    assert_eq!(
+        responses.replay_stable_payload_revision,
+        before.and_then(|revision| revision.checked_add(1))
+    );
+    assert!(crate::openai::responses::state::retained_json_bytes(&responses.response_object).unwrap() > before_bytes);
+}
+
 #[tokio::test]
 async fn upsert_tool_call_dedup() {
     let (filter, mut ctx) = make_armed_context();

@@ -358,6 +358,7 @@ impl OpenaiStreamEventsFilter {
             } else {
                 state.response_object = Value::Null;
             }
+            state.mark_replay_stable_payload_changed();
             (state.iteration, output_index_offset)
         });
         // Re-arming drops the preceding round's parser owner. Publish the new
@@ -568,6 +569,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         // could leave stale success metadata live after an upstream error.
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.local_completion_response_template = Value::Null;
+            state.mark_replay_stable_payload_changed();
         }
         if let Some(stream) = ctx.get_filter_state::<StreamEventsState>() {
             stream.shared_current_output_bytes.store(0, Ordering::Relaxed);
@@ -1768,6 +1770,9 @@ fn accumulate_chunk(
                 | ResponsesEvent::FunctionCallArgumentsDone(_)
         ) {
             state.shared_current_output_bytes.store(0, Ordering::Relaxed);
+            if let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() {
+                responses.mark_replay_stable_payload_changed();
+            }
         }
         if matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_))
             && let Some(upper) = admission.shared_upper_bound.as_mut()
@@ -3105,6 +3110,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     if !state.response_object.is_object() {
         state.response_object = std::mem::take(&mut state.local_completion_response_template);
     }
+    state.mark_replay_stable_payload_changed();
     if !canonicalization_staging_bytes(state, output.len())
         .is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging))
     {
@@ -3122,6 +3128,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
         // `encode_local_error` (which would re-drain those events).
         return Some(encode_local_restore_error(ctx, output, &e));
     }
+    state.mark_replay_stable_payload_changed();
     if !state.response_object.is_object() {
         return None;
     }
@@ -3505,6 +3512,7 @@ fn emit_deferred_terminal(
     }
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
     parser_state.shared_current_output_bytes.store(0, Ordering::Relaxed);
+    state.mark_replay_stable_payload_changed();
     if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
         response.insert("output".to_owned(), Value::Array(accumulated_output));
         if !usage.is_null() {

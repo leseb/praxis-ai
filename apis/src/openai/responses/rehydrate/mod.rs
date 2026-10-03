@@ -54,7 +54,7 @@ use super::{
     append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
-    state::{ResponsesState, strip_local_compaction_marker},
+    state::{PayloadMeter, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
@@ -544,12 +544,12 @@ struct RestorePreviousResponseIdStream {
     /// The `previous_response_id` the caller supplied, echoed into every
     /// response-lifecycle frame.
     previous_response_id: String,
-    /// Cached request/history charge; changing response owners are metered on
-    /// every fragment and the cache key detects same-iteration history growth.
+    /// Cached request/history and completed-output charges. Live parser and
+    /// rewrite owners remain in the per-fragment meter.
     stable_budget: Option<RestoreStableBudget>,
 }
 
-/// Stable request/history charge and an O(1) invalidation key for streamed restore.
+/// Stable request/history/output charges and an O(1) invalidation key for streamed restore.
 #[derive(Clone, Copy)]
 struct RestoreStableBudget {
     /// Logical agentic round when the stable owners were measured.
@@ -557,20 +557,38 @@ struct RestoreStableBudget {
     /// Revision for in-place request/history mutations between stream chunks.
     revision: u64,
     /// Lengths of every stable collection, including history appended during a round.
-    collection_lengths: [usize; 6],
-    /// Serialized bytes retained by the request and history owners.
+    collection_lengths: [usize; 7],
+    /// Serialized bytes retained by request/history and completed prior output.
     bytes: usize,
+    /// Serialized response, local completion template, and tool-call owners.
+    current_output_bytes: usize,
 }
 
 impl RestoreStableBudget {
     /// Capture the current stable collection shape and its measured charge.
-    fn new(state: &ResponsesState, revision: u64, bytes: usize) -> Self {
+    fn new(state: &ResponsesState, revision: u64, bytes: usize, current_output_bytes: usize) -> Self {
         Self {
             iteration: state.iteration,
             revision,
             collection_lengths: Self::collection_lengths(state),
             bytes,
+            current_output_bytes,
         }
+    }
+
+    /// Measure all completed owners once; the live parser and restore staging
+    /// remain in the per-fragment admission check.
+    fn measure(state: &ResponsesState, limit: usize) -> Option<Self> {
+        let revision = state.replay_stable_payload_revision?;
+        let stable = state.stream_stable_payload_bytes_bounded(limit)?;
+        let mut prior_meter = PayloadMeter::new(limit.checked_sub(stable)?);
+        prior_meter.json_values(&state.accumulated_output)?;
+        let stable = stable.checked_add(prior_meter.used())?;
+        let mut current_meter = PayloadMeter::new(limit.checked_sub(stable)?);
+        current_meter.json(&state.response_object)?;
+        current_meter.json(&state.local_completion_response_template)?;
+        current_meter.json_values(&state.tool_calls)?;
+        Some(Self::new(state, revision, stable, current_meter.used()))
     }
 
     /// Detect a new round or any append to a stable request/history collection.
@@ -581,7 +599,7 @@ impl RestoreStableBudget {
     }
 
     /// Read the sizes of the collections charged by the stable meter.
-    fn collection_lengths(state: &ResponsesState) -> [usize; 6] {
+    fn collection_lengths(state: &ResponsesState) -> [usize; 7] {
         [
             state.input.len(),
             state.messages.len(),
@@ -589,6 +607,7 @@ impl RestoreStableBudget {
             state.previous_tools.len(),
             state.tools.len(),
             state.provider_compaction_ids.len(),
+            state.accumulated_output.len(),
         ]
     }
 }
@@ -815,26 +834,20 @@ fn streaming_restore_fits(
     let Some(limit) = state.retained_payload_limit() else {
         return true;
     };
-    let Some(revision) = state.replay_stable_payload_revision else {
-        return false;
-    };
     if stable_budget.is_none_or(|cache| !cache.matches(state)) {
-        let Some(stable) = state.stream_stable_payload_bytes_bounded(limit) else {
-            return false;
-        };
-        *stable_budget = Some(RestoreStableBudget::new(state, revision, stable));
+        *stable_budget = RestoreStableBudget::measure(state, limit);
     }
-    let Some(stable) = stable_budget.as_ref().map(|cache| cache.bytes) else {
+    let Some(cache) = stable_budget.as_ref() else {
         return false;
     };
-    let Some(remaining) = limit.checked_sub(stable) else {
+    let Some(remaining) = limit.checked_sub(cache.bytes) else {
         return false;
     };
     let Some(measurement_limit) = remaining.checked_add(removed_bytes) else {
         return false;
     };
     state
-        .rehydrate_stream_changing_payload_bytes_bounded(measurement_limit)
+        .store_stream_changing_payload_bytes_bounded_with_current_output(measurement_limit, cache.current_output_bytes)
         .and_then(|current| current.checked_sub(removed_bytes))
         .and_then(|current| current.checked_add(staging_bytes))
         .is_some_and(|peak| peak <= remaining)
