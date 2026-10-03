@@ -37,11 +37,9 @@ use serde::Deserialize;
 use tracing::{debug, trace};
 
 use super::{
-    agentic_loop::AgenticBudgetPolicy,
     bound_body_outcome,
     error::{responses_error_rejection, responses_error_rejection_with_code},
-    extract_conversation_id,
-    state::ResponsesState,
+    extract_conversation_id, insert_budgeted_responses_state,
 };
 
 /// Configuration for `openai_responses_validate`.
@@ -150,7 +148,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         enrich_context(ctx, &response_id, &conversation_id);
         #[cfg(feature = "openai-conversations")]
         crate::openai::conversations::capture_validated_append_owner(ctx);
-        if let Err(action) = insert_responses_state(ctx, parsed, &response_id) {
+        if let Err(action) = insert_budgeted_responses_state(ctx, parsed, &response_id) {
             return Ok(action);
         }
 
@@ -223,38 +221,6 @@ fn early_validation_action(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> 
     })
 }
 
-/// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(
-    ctx: &mut HttpFilterContext<'_>,
-    parsed: serde_json::Value,
-    response_id: &str,
-) -> Result<(), FilterAction> {
-    let mut state = ResponsesState::from_request_body(parsed);
-    state.response_id = Some(response_id.to_owned());
-    #[cfg(feature = "store")]
-    {
-        state.set_retained_external_payload_bytes(
-            super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX),
-        );
-        state.store_persist_armed = super::store::request_persistence_armed(ctx);
-    }
-    if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
-        state.apply_retained_payload_limit(policy.max_retained_bytes());
-        if !state.can_retain_payload(0) {
-            #[cfg(feature = "store")]
-            super::store::discard_retained_request_payload(ctx);
-            return Err(FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-            )));
-        }
-    }
-    ctx.extensions.insert(state);
-    #[cfg(feature = "store")]
-    super::store::mark_retained_request_payload_charged(ctx);
-    Ok(())
-}
 
 /// Parse the request body as JSON.
 fn parse_request_body(body: &Option<Bytes>) -> Result<serde_json::Value, FilterAction> {
@@ -365,6 +331,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::openai::responses::state::ResponsesState;
 
     #[test]
     fn from_config_succeeds() {
