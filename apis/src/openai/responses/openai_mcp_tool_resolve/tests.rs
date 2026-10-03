@@ -5952,6 +5952,57 @@ async fn aggregate_budget_rejects_fresh_mcp_listing_before_callout() {
 }
 
 #[tokio::test]
+async fn listener_budget_rejects_no_state_mcp_discovery_before_callout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let filter =
+        McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("timeout_ms: 100").unwrap()).unwrap();
+    let body_json = mcp_body(&server_url);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 8192").unwrap()).unwrap());
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "tools/list must not start without listener-budget room for its bounded response"
+    );
+}
+
+#[tokio::test]
+async fn listener_budget_applies_to_no_state_mcp_discovery_commit() {
+    let (server_url, cancel) = start_single_tool_mcp_server().await;
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 67108864").unwrap()).unwrap(),
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+    let mut body = Some(Bytes::from(serde_json::to_vec(&mcp_body(&server_url)).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    cancel.cancel();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().expect("resolver created state");
+    assert_eq!(state.retained_payload_limit(), Some(67_108_864));
+    assert!(state.can_retain_payload(0));
+    assert!(!state.mcp_tool_map.is_empty());
+}
+
+#[tokio::test]
 async fn aggregate_budget_rejects_deferred_mcp_listing_before_callout() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
