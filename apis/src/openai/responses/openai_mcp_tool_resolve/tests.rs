@@ -4178,6 +4178,13 @@ fn has_pending_deferred_discovery_respects_exhausted_max_tool_calls() {
         !has_pending_deferred_discovery(&state),
         "an earlier current-round built-in call consumes the shared cap first"
     );
+
+    state.max_tool_calls = None;
+    state.accumulated_output[1] = serde_json::json!({"type": "function_call", "id": "tsc_1"});
+    assert!(
+        !has_pending_deferred_discovery(&state),
+        "a stale tool-search index cannot authorize tools/list even without a call limit"
+    );
 }
 
 #[tokio::test]
