@@ -16,11 +16,11 @@ use serde_json::json;
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
     approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result, build_success_result,
-    content_blocks_to_output, denial_message_projection_bytes, execute_mcp_calls, execute_single_call,
-    extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry,
-    is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits, normalize_arguments,
-    parse_call_arguments, partition_calls_by_approval, prepare_response_round, process_call_result, resolve_tool_entry,
-    result_payload_limit,
+    content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls,
+    execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
+    is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits,
+    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
+    process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -2094,10 +2094,10 @@ async fn deferred_budget_failure_skips_successful_response_persistence() {
         }],
         ..ResponsesState::default()
     };
-    state.select_test_output(
-        "tool_search_call",
-        vec![json!({"type": "tool_search_call", "id": "tsc_budget"})],
-    );
+    let search = json!({"type": "tool_search_call", "id": "tsc_budget"});
+    state.tool_search_calls = vec![search.clone()];
+    state.accumulated_output = vec![search.clone()];
+    state.response_object = json!({"output": [search]});
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
     ctx.extensions.insert(state);
     let callout = crate::mcp_client::McpCallout::fabricated(true).unwrap();
@@ -2226,10 +2226,10 @@ fn bodyless_deferred_failure_does_not_copy_full_retained_request_for_echo() {
         server_url,
         timeout: std::time::Duration::from_secs(1),
     }];
-    state.select_test_output(
-        "tool_search_call",
-        vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})],
-    );
+    let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
+    state.tool_search_calls = vec![search.clone()];
+    state.accumulated_output = vec![search.clone()];
+    state.response_object = json!({"output": [search]});
     let retained = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(retained + 25 * 1024 * 1024);
     ctx.extensions.insert(state);
