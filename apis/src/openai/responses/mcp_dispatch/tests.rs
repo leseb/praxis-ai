@@ -15,12 +15,12 @@ use serde_json::json;
 
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
-    approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result, build_success_result,
-    content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls,
-    execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
-    is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits,
-    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
-    process_call_result, resolve_tool_entry, result_payload_limit,
+    approval_resume_peak_fits, approved_result_reservation_bytes, approved_tool_call_projection_bytes,
+    build_error_result, build_success_result, content_blocks_to_output, denial_message_projection_bytes,
+    discover_pending_connectors, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
+    extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
+    mcp_call_ids_are_unique_and_new, mcp_result_commit_fits, normalize_arguments, parse_call_arguments,
+    partition_calls_by_approval, prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -3418,6 +3418,32 @@ async fn approval_result_reservation_failure_keeps_claim_retryable() {
     );
     assert_eq!(rejection.status, 400);
     assert!(reject_message(&rejection).contains("already been used"));
+}
+
+#[test]
+fn denial_result_preflight_does_not_index_the_tool_map() {
+    let mut state = ResponsesState::default();
+    for index in 0..128 {
+        state.mcp_tool_map.insert(
+            ("weather".to_owned(), format!("tool_{index:03}_{}", "x".repeat(46))),
+            weather_entry(),
+        );
+    }
+    let denial = ResolvedApproval {
+        approval_id: "call_denied".to_owned(),
+        approve: false,
+        reason: None,
+        server_label: "weather".to_owned(),
+        tool_name: "get_weather".to_owned(),
+        encoded_name: "weather__get_weather".to_owned(),
+        arguments: "{}".to_owned(),
+    };
+
+    let allocations = allocation_counter::measure(|| {
+        assert_eq!(approved_result_reservation_bytes(&state, &[denial]), Some(0));
+    });
+
+    assert_eq!(allocations.bytes_total, 0, "a denial needs no encoded-name index");
 }
 
 #[tokio::test]
