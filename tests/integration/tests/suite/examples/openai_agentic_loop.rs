@@ -170,6 +170,68 @@ fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
 }
 
 #[test]
+fn aggregate_mcp_transport_overflow_stops_remaining_calls_and_persistence() {
+    let first_response = serde_json::json!({
+        "id": "resp_mcp_transport_budget",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call", "id": "fc_large", "call_id": "call_large",
+                "name": "weather__get_weather", "arguments": "{}", "status": "completed"
+            },
+            {
+                "type": "function_call", "id": "fc_later", "call_id": "call_later",
+                "name": "weather__get_weather", "arguments": "{}", "status": "completed"
+            }
+        ]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_unexpected_mcp_continuation",
+        "object": "response",
+        "status": "completed",
+        "output": []
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, second_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        sse_tool_results: true,
+        oversized_sse_bytes: Some(262_144),
+        ..McpMockConfig::default()
+    });
+    let db = TempSqlite::new("agentic_mcp_transport_budget");
+    let config = load_retained_budget_config_with_limit(free_port(), model.port(), db.url(), 1_048_576);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Check the weather twice.",
+        "parallel_tool_calls": false,
+        "store": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "{raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(mcp.method_count("tools/call"), 1, "later call must not execute");
+    assert_eq!(model.requests().len(), 1, "overflow must not resume inference");
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_mcp_transport_budget", None);
+    assert_eq!(status, 404, "overflow must not persist a successful response");
+}
+
+#[test]
 fn committed_stream_retained_overflow_emits_one_error_and_is_not_stored() {
     let response = vec![
         sse_event(
@@ -7772,11 +7834,23 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
 }
 
 fn load_retained_budget_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    load_retained_budget_config_with_limit(proxy_port, model_port, db_url, 4_096)
+}
+
+fn load_retained_budget_config_with_limit(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replace("max_retained_bytes: 67108864", "max_retained_bytes: 4096");
+    let yaml = yaml.replace(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+    );
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse retained-budget agentic config")
 }

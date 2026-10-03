@@ -55,7 +55,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt as _, future::join_all};
+use futures::{FutureExt as _, future::try_join_all};
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
@@ -266,7 +266,8 @@ impl McpDispatchFilter {
     /// call here executes.
     #[expect(
         clippy::too_many_arguments,
-        reason = "callout threads the per-request MCP subrequest executor through the dispatch batch"
+        clippy::too_many_lines,
+        reason = "callout threads the per-request MCP subrequest executor and aggregate policy through the batch"
     )]
     async fn execute_pending_calls(
         &self,
@@ -278,6 +279,7 @@ impl McpDispatchFilter {
         connector_identity: Option<&McpCalloutIdentity>,
         session_pool: &mcp_client::McpSessionPool,
         max_total_result_bytes: usize,
+        aggregate_constrained: bool,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -286,12 +288,21 @@ impl McpDispatchFilter {
         );
         let (per_result_limit, execution_batch_limit) =
             admitted_result_limits(mcp_calls.len(), 0, self.max_result_bytes, max_total_result_bytes)?;
+        let (configured_per_result_limit, _) =
+            admitted_result_limits(mcp_calls.len(), 0, self.max_result_bytes, self.max_total_result_bytes)?;
+        let aggregate_result_policy = if state.retained_payload_limit().is_none() {
+            McpAggregateResultPolicy::Unbudgeted
+        } else if aggregate_constrained && per_result_limit < configured_per_result_limit {
+            McpAggregateResultPolicy::PerCallConstrained
+        } else {
+            McpAggregateResultPolicy::Budgeted
+        };
         let options = McpExecutionOptions {
             parallel: state.parallel_tool_calls,
             max_parallel_calls: self.max_parallel_calls,
             max_result_bytes: per_result_limit,
             max_total_result_bytes: execution_batch_limit,
-            aggregate_budgeted: state.retained_payload_limit().is_some(),
+            aggregate_result_policy,
             timeout: self.timeout,
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
@@ -1391,6 +1402,7 @@ impl McpDispatchFilter {
                 connector_identity.as_ref(),
                 &session_pool,
                 result_limit,
+                aggregate_constrained,
             )
             .await
         {
@@ -1863,6 +1875,8 @@ struct McpCallResult {
     message: serde_json::Value,
     /// Output item for `output_items`.
     output_item: serde_json::Value,
+    /// A transport or content size ceiling was hit before this error was built.
+    size_limit_exceeded: bool,
 }
 
 impl McpCallResult {
@@ -1978,6 +1992,29 @@ fn fit_result_or_limit_error(
     fallback
 }
 
+/// Distinguish a request-wide size failure from a configured per-tool limit.
+/// The latter stays a bounded tool error so an executed call is not retried.
+fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
+    matches!(
+        options.aggregate_result_policy,
+        McpAggregateResultPolicy::PerCallConstrained
+    ) && (result.size_limit_exceeded
+        || result
+            .retained_bytes()
+            .is_none_or(|bytes| bytes > options.max_result_bytes))
+}
+
+/// How the request-wide retained budget affects one MCP call's wire ceiling.
+#[derive(Clone, Copy)]
+enum McpAggregateResultPolicy {
+    /// No retained-payload policy is active.
+    Unbudgeted,
+    /// The policy applies but this call keeps its configured result ceiling.
+    Budgeted,
+    /// The policy lowered this call's configured result ceiling.
+    PerCallConstrained,
+}
+
 /// Controls execution of one homogeneous MCP call batch.
 #[derive(Clone, Copy)]
 struct McpExecutionOptions<'a> {
@@ -1989,8 +2026,8 @@ struct McpExecutionOptions<'a> {
     max_result_bytes: usize,
     /// Maximum serialized bytes retained by one result batch.
     max_total_result_bytes: usize,
-    /// Bound rmcp's retained initialize peer info only under agentic budget.
-    aggregate_budgeted: bool,
+    /// Whether the aggregate policy applies and lowered this call's ceiling.
+    aggregate_result_policy: McpAggregateResultPolicy,
     /// Timeout applied independently to each MCP call.
     timeout: Duration,
     /// Names reserved for trusted forwarding, including when values are absent.
@@ -2032,9 +2069,9 @@ async fn execute_mcp_calls(
         ..options
     };
     if options.parallel {
-        Ok(execute_parallel(mcp_calls, tool_index, bounded_options, callout).await)
+        execute_parallel(mcp_calls, tool_index, bounded_options, callout).await
     } else {
-        Ok(execute_sequential(mcp_calls, tool_index, bounded_options, callout).await)
+        execute_sequential(mcp_calls, tool_index, bounded_options, callout).await
     }
 }
 
@@ -2043,22 +2080,27 @@ async fn execute_mcp_calls(
 /// Avoid detached tasks: dropping the request must also cancel every pending
 /// external side effect. Panics are converted to per-call errors so one faulty
 /// future does not discard successful siblings.
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered cancellation and bounded per-call errors share one batch"
+)]
 async fn execute_parallel(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
     callout: &mcp_client::McpCallout,
-) -> Vec<McpCallResult> {
+) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     let mut remaining_calls = mcp_calls;
     while !remaining_calls.is_empty() {
         let chunk_size = remaining_calls.len().min(options.max_parallel_calls);
         let (chunk, rest) = remaining_calls.split_at(chunk_size);
         remaining_calls = rest;
-        let futures = chunk.iter().map(|tc| {
-            std::panic::AssertUnwindSafe(execute_single_call(tc, tool_index, &options, callout)).catch_unwind()
-        });
-        for (tc, outcome) in chunk.iter().zip(join_all(futures).await) {
+        let futures = chunk.iter().map(|tc| async move {
+            let outcome =
+                std::panic::AssertUnwindSafe(Box::pin(execute_single_call(tc, tool_index, &options, callout)))
+                    .catch_unwind()
+                    .await;
             let result = match outcome {
                 Ok(Some(result)) => result,
                 Ok(None) => {
@@ -2070,10 +2112,15 @@ async fn execute_parallel(
                     error_result_for_dropped_call(tc, "internal error: call future panicked")
                 },
             };
-            results.push(fit_result_or_limit_error(tc, result, options.max_result_bytes));
-        }
+            if aggregate_result_limit_exceeded(&result, &options) {
+                return Err(McpResultLimitExceeded);
+            }
+            Ok(fit_result_or_limit_error(tc, result, options.max_result_bytes))
+        });
+        // The first aggregate overflow drops any unfinished sibling futures.
+        results.extend(try_join_all(futures).await?);
     }
-    results
+    Ok(results)
 }
 
 /// Execute MCP tool calls sequentially, emitting error results
@@ -2083,7 +2130,7 @@ async fn execute_sequential(
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
     callout: &mcp_client::McpCallout,
-) -> Vec<McpCallResult> {
+) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     for tc in mcp_calls {
         let result = if let Some(result) = execute_single_call(tc, tool_index, &options, callout).await {
@@ -2092,9 +2139,12 @@ async fn execute_sequential(
             warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
             error_result_for_dropped_call(tc, "internal error: call produced no result")
         };
+        if aggregate_result_limit_exceeded(&result, &options) {
+            return Err(McpResultLimitExceeded);
+        }
         results.push(fit_result_or_limit_error(tc, result, options.max_result_bytes));
     }
-    results
+    Ok(results)
 }
 
 /// Resolve an encoded function name to its unique entry, rejecting
@@ -2192,27 +2242,32 @@ fn process_call_result(
                         tool_name, call_id, error = %e,
                         "failed to serialize MCP content blocks; returning tool error"
                     );
-                    build_error_result(
+                    let mut result = build_error_result(
                         call_id,
                         server_label,
                         tool_name,
                         arguments_string,
                         &e,
                         approval_request_id,
-                    )
+                    );
+                    result.size_limit_exceeded = true;
+                    result
                 },
             }
         },
         Err(e) => {
             warn!(tool_name, call_id, error = %e, "MCP tool call failed");
-            build_error_result(
+            let size_limit_exceeded = matches!(&e, mcp_client::McpClientError::ResponseTooLarge { .. });
+            let mut result = build_error_result(
                 call_id,
                 server_label,
                 tool_name,
                 arguments_string,
                 &e.to_string(),
                 approval_request_id,
-            )
+            );
+            result.size_limit_exceeded = size_limit_exceeded;
+            result
         },
     }
 }
@@ -2293,10 +2348,10 @@ async fn execute_single_call(
     // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
     // key and therefore remain fail-closed and unpooled.
     let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
-    let initialize_limit = if options.aggregate_budgeted {
-        payload_limit
-    } else {
+    let initialize_limit = if matches!(options.aggregate_result_policy, McpAggregateResultPolicy::Unbudgeted) {
         mcp_client::MAX_CONTROL_RESPONSE_BYTES
+    } else {
+        payload_limit
     };
     let result = mcp_client::call_tool_with_forwarded_headers_bounded_initialize(
         session_key.as_ref().map(|key| (options.session_pool, key)),
@@ -2423,7 +2478,11 @@ fn build_success_result(
         })
     };
 
-    McpCallResult { message, output_item }
+    McpCallResult {
+        message,
+        output_item,
+        size_limit_exceeded: false,
+    }
 }
 
 /// Build an error result for a tool call that was dropped
@@ -2480,5 +2539,9 @@ fn build_error_result(
         "error": error_message,
     });
 
-    McpCallResult { message, output_item }
+    McpCallResult {
+        message,
+        output_item,
+        size_limit_exceeded: false,
+    }
 }

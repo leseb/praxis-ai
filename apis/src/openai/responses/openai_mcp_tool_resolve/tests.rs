@@ -5913,7 +5913,7 @@ async fn aggregate_budget_rejects_cached_mcp_listing_before_commit() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(state.retained_payload_failed);
@@ -5938,7 +5938,7 @@ async fn aggregate_budget_rejects_fresh_mcp_listing_before_callout() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(state.retained_payload_failed);
@@ -5969,7 +5969,7 @@ async fn listener_budget_rejects_no_state_mcp_discovery_before_callout() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())
@@ -6070,7 +6070,7 @@ fn aggregate_budget_rejects_repeated_mcp_selectors_before_expansion() {
         );
     });
 
-    assert!(matches!(&action, Some(FilterAction::Reject(rejection)) if rejection.status == 502));
+    assert!(matches!(&action, Some(FilterAction::Reject(rejection)) if rejection.status == 413));
     assert!(
         allocation.bytes_max < 16 * 1024 * 1024,
         "expanded selectors must be projected before building JSON or wire owners: {allocation:?}"

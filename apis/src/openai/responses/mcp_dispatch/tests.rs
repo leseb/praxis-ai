@@ -141,7 +141,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
-        aggregate_budgeted: false,
+        aggregate_result_policy: super::McpAggregateResultPolicy::Unbudgeted,
         timeout,
         forwarded_header_names: &[],
         forwarded_headers: None,
@@ -1185,6 +1185,43 @@ fn process_call_result_transport_error() {
             .unwrap()
             .contains("tools/call failed")
     );
+}
+
+#[test]
+fn configured_mcp_wire_limit_stays_recoverable_when_aggregate_lowers_only_batch_limit() {
+    let (configured_per_call, _) = admitted_result_limits(1, 0, 64 * 1024, 1_048_576).unwrap();
+    let (admitted_per_call, _) = admitted_result_limits(1, 0, 64 * 1024, 900_000).unwrap();
+    assert_eq!(admitted_per_call, configured_per_call);
+
+    let error = crate::mcp_client::McpClientError::ResponseTooLarge {
+        url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
+        limit: admitted_per_call,
+    };
+    let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, admitted_per_call);
+    assert!(result.size_limit_exceeded);
+    let mut options = execution_options(false, std::time::Duration::from_secs(1));
+    options.max_result_bytes = admitted_per_call;
+    options.aggregate_result_policy = if admitted_per_call < configured_per_call {
+        super::McpAggregateResultPolicy::PerCallConstrained
+    } else {
+        super::McpAggregateResultPolicy::Budgeted
+    };
+    assert!(!super::aggregate_result_limit_exceeded(&result, &options));
+    let bounded = super::fit_result_or_limit_error(&json!({"call_id": "c1"}), result, admitted_per_call);
+    assert!(
+        bounded.output_item["error"].as_str().unwrap().contains("exceeding"),
+        "configured per-call overflow remains a truthful tool error"
+    );
+
+    let (lowered_per_call, _) = admitted_result_limits(1, 0, 64 * 1024, 8_192).unwrap();
+    options.max_result_bytes = lowered_per_call;
+    options.aggregate_result_policy = super::McpAggregateResultPolicy::PerCallConstrained;
+    let budget_error = crate::mcp_client::McpClientError::ResponseTooLarge {
+        url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
+        limit: lowered_per_call,
+    };
+    let result = process_call_result(Err(budget_error), "c1", "srv", "tool", "{}", None, lowered_per_call);
+    assert!(super::aggregate_result_limit_exceeded(&result, &options));
 }
 
 // =========================================================================
