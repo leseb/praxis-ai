@@ -52,7 +52,10 @@ use crate::{
         responses::{
             error::{responses_error_rejection, responses_error_sse_payload},
             openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
-            state::{EmittedItem, PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
+            state::{
+                ClientToolRestore, EmittedItem, PayloadMeter, ResponsesState, retained_json_bytes,
+                retained_json_values_bytes,
+            },
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
     },
@@ -1115,7 +1118,14 @@ fn projected_client_tool_restore_bytes(
     })?;
     let mut projected = tracked.checked_mul(2)?;
     let mut cached_echo_bytes = None;
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
+        projected = projected.checked_add(projected_restored_item_name_bytes(
+            responses,
+            stream,
+            events.get(..index)?,
+            event,
+            max_name_bytes,
+        )?)?;
         if event.is_terminal() {
             continue;
         }
@@ -1145,6 +1155,113 @@ fn projected_client_tool_restore_bytes(
         projected = projected.checked_add(snapshot_peak)?;
     }
     Some(projected)
+}
+
+/// An individual item event has no `response` snapshot. The restoration plan
+/// still owns a public name and namespace for each lowered item while the
+/// retyped event and growing wire buffer can hold further encoded copies.
+/// Reserve these copies before planning a co-batched set of item events.
+#[expect(
+    clippy::too_many_lines,
+    reason = "identify tracked and co-batched item ownership without allocating keys"
+)]
+fn projected_restored_item_name_bytes(
+    responses: &ResponsesState,
+    stream: &StreamEventsState,
+    prior_events: &[ResponsesEvent],
+    event: &ResponsesEvent,
+    max_name_bytes: usize,
+) -> Option<usize> {
+    let (payload, is_done) = match event {
+        ResponsesEvent::OutputItemAdded(payload) => (payload, false),
+        ResponsesEvent::OutputItemDone(payload) => (payload, true),
+        _ => return Some(0),
+    };
+    let item = payload.get("item");
+    if !is_done && item.and_then(|item| item.get("type")).and_then(Value::as_str) != Some("function_call") {
+        return Some(0);
+    }
+    let name = item.and_then(|item| item.get("name")).and_then(Value::as_str);
+    if is_done {
+        let tracked = stream
+            .client_tool_items
+            .iter()
+            .find(|tracked| tracked_item_key_matches(&tracked.key, payload));
+        if let Some(tracked) = tracked {
+            if name != Some(tracked.private_name.as_str()) {
+                return max_name_bytes.checked_mul(21)?.checked_add(128);
+            }
+        } else if name.is_none_or(|name| !responses.client_tool_lowering.contains_key(name))
+            && !prior_events.iter().any(|prior| {
+                matches!(prior, ResponsesEvent::OutputItemAdded(added)
+                    if item_event_keys_match(added, payload)
+                        && added.get("item")
+                            .and_then(|item| item.get("name"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| responses.client_tool_lowering.contains_key(name)))
+            })
+        {
+            // An unrelated native function call does not use any lowering.
+            return Some(0);
+        }
+    }
+    let Some(lowered) = name.and_then(|name| responses.client_tool_lowering.get(name)) else {
+        // A done item is resolved by its previously tracked ID, even when its
+        // name is absent or differs from the added item. Charge the largest
+        // possible restoration when this payload cannot identify the lowering.
+        return if is_done {
+            max_name_bytes.checked_mul(21)?.checked_add(128)
+        } else {
+            Some(0)
+        };
+    };
+    if !matches!(
+        lowered.restore,
+        ClientToolRestore::Namespace | ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom
+    ) {
+        return Some(0);
+    }
+    let native = lowered
+        .original_name
+        .len()
+        .checked_add(lowered.namespace.as_ref().map_or(0, String::len))?
+        .checked_add(64)?;
+    let encoded = retained_json_bytes(lowered.original_name.as_str())?
+        .checked_add(lowered.namespace.as_deref().map_or(Some(0), retained_json_bytes)?)?;
+    native
+        .checked_mul(3)?
+        .checked_add(encoded.checked_mul(3)?)?
+        .checked_add(128)
+}
+
+/// Read the ID chosen by the restoration planner, without copying it.
+fn item_event_id(payload: &Value) -> Option<&str> {
+    payload
+        .get("item")
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("item_id").and_then(Value::as_str))
+}
+
+/// Compare two item events using the planner's ID-first, index-fallback key.
+fn item_event_keys_match(added: &Value, done: &Value) -> bool {
+    match (item_event_id(added), item_event_id(done)) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => added
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .is_some_and(|index| done.get("output_index").and_then(Value::as_u64) == Some(index)),
+        _ => false,
+    }
+}
+
+/// Compare an existing tracked key with an item event without formatting a new key.
+fn tracked_item_key_matches(key: &str, payload: &Value) -> bool {
+    if let Some(id) = item_event_id(payload) {
+        return key.strip_prefix("item:") == Some(id);
+    }
+    key.strip_prefix("index:").and_then(|index| index.parse::<u64>().ok())
+        == payload.get("output_index").and_then(Value::as_u64)
 }
 
 /// Bound the owned key created while accumulating a function-call argument

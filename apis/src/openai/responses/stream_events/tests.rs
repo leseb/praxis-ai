@@ -70,6 +70,101 @@ fn lowered_snapshot_echo_fails_before_planning_many_owned_copies() {
 }
 
 #[test]
+fn lowered_namespace_batch_fails_before_restoration_fanout() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter());
+    let mut state = ResponsesState::default();
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "read".to_owned(),
+            namespace: Some("n".repeat(4_096)),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    state.apply_retained_payload_limit(512 * 1_024);
+    assert!(state.can_retain_payload(0), "the namespace definition itself must fit");
+    ctx.extensions.insert(state);
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({"response": {"id": "resp_batch", "status": "in_progress", "output": []}}),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    assert!(created.is_some(), "the lifecycle event must be admitted");
+
+    let mut wire = Vec::new();
+    for index in 0..150 {
+        wire.extend_from_slice(&make_sse_chunk(
+            "response.output_item.added",
+            &json!({
+                "output_index": index,
+                "item": {
+                    "type": "function_call",
+                    "name": "private",
+                    "id": format!("fc_{index}"),
+                    "call_id": format!("c{index}"),
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            }),
+        ));
+    }
+    let mut body = Some(Bytes::from(wire));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none(), "the over-budget batch must be withheld");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE),
+        "the committed stream must report aggregate exhaustion"
+    );
+    assert!(
+        allocations.bytes_max < 512 * 1_024 * 2,
+        "restoration must reject before retaining many namespace copies: {}",
+        allocations.bytes_max
+    );
+}
+
+#[test]
+fn native_item_done_does_not_reserve_an_unused_lowered_namespace() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter());
+    let mut state = ResponsesState::default();
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "read".to_owned(),
+            namespace: Some("n".repeat(4_096)),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    state.apply_retained_payload_limit(65_536);
+    ctx.extensions.insert(state);
+    let item = json!({
+        "type": "function_call", "name": "native_read", "id": "fc_native",
+        "call_id": "call_native", "arguments": "{}", "status": "completed"
+    });
+    for (event_type, payload) in [
+        (
+            "response.created",
+            json!({"response":{"id":"resp_native", "status":"in_progress", "output":[]}}),
+        ),
+        ("response.output_item.added", json!({"output_index":0, "item":item})),
+        (
+            "response.function_call_arguments.done",
+            json!({"output_index":0, "item_id":"fc_native", "arguments":"{}"}),
+        ),
+        ("response.output_item.done", json!({"output_index":0, "item":item})),
+    ] {
+        let mut body = Some(make_sse_chunk(event_type, &payload));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            body.is_some(),
+            "native event {event_type} must not reserve an unused namespace"
+        );
+    }
+}
+
+#[test]
 fn native_terminal_avoids_duplicate_restoration_staging() {
     assert_terminal_avoids_duplicate_staging(false);
 }
