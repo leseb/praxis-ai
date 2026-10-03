@@ -3329,6 +3329,98 @@ async fn oversized_pending_approval_is_retryable_with_a_larger_budget() {
 }
 
 #[tokio::test]
+async fn approval_result_reservation_failure_keeps_claim_retryable() {
+    let filter = make_dispatch_filter();
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_result_budget", "{}").await;
+
+    let make_state = || ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_result_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    register_store(&mut ctx, Arc::clone(&store));
+    let mut state = make_state();
+    // Enough for the small pending record and approved invocation, but below
+    // the result reservation required before an MCP call can execute.
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 2_048);
+    ctx.extensions.insert(state);
+    let pending = pending_record(
+        "call_result_budget",
+        "weather",
+        "get_weather",
+        "{}",
+        target_fingerprint(&weather_entry()),
+    );
+    let input = ApprovalResponseInput {
+        approval_id: "call_result_budget".to_owned(),
+        approve: true,
+        reason: None,
+    };
+    assert!(approval_resume_peak_fits(
+        &ctx,
+        &[input],
+        &[pending],
+        "call_result_budget".len() + APPROVAL_PREV_ID.len(),
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let removed = retained_json_bytes(&state.messages[0]).unwrap();
+    let approved = approved_tool_call_projection_bytes("call_result_budget", "weather__get_weather", "{}").unwrap();
+    assert!(state.can_replace_retained_payload(removed, approved, 0));
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let failed = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(failed.retained_payload_failed);
+    assert!(failed.accumulated_output.is_empty());
+
+    let retry_req = make_request(http::Method::POST, "/v1/responses");
+    let mut retry_ctx = make_owned_filter_context(&retry_req);
+    register_store(&mut retry_ctx, Arc::clone(&store));
+    let mut retry_state = make_state();
+    retry_state.apply_retained_payload_limit(2 * 1024 * 1024);
+    retry_ctx.extensions.insert(retry_state);
+    let mut retry_body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let retry_action = filter
+        .on_request_body(&mut retry_ctx, &mut retry_body, true)
+        .await
+        .unwrap();
+
+    assert!(matches!(retry_action, FilterAction::Continue));
+    assert_eq!(
+        retry_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .len(),
+        1
+    );
+
+    let replay_req = make_request(http::Method::POST, "/v1/responses");
+    let mut replay_ctx = make_owned_filter_context(&replay_req);
+    register_store(&mut replay_ctx, store);
+    let mut replay_state = make_state();
+    replay_state.apply_retained_payload_limit(2 * 1024 * 1024);
+    replay_ctx.extensions.insert(replay_state);
+    let mut replay_body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(
+        filter
+            .on_request_body(&mut replay_ctx, &mut replay_body, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rejection.status, 400);
+    assert!(reject_message(&rejection).contains("already been used"));
+}
+
+#[tokio::test]
 async fn resume_applies_multiple_approvals_in_one_batch() {
     // A round can emit multiple approval requests (batched/parallel tool calls),
     // so a resume turn may legitimately carry several matching approval responses.

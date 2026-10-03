@@ -2462,6 +2462,10 @@ async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), 
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional deferred discovery keeps preparation, preflight, and commit together"
+)]
 pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     state: &mut ResponsesState,
     forwarded_header_names: &[http::HeaderName],
@@ -2521,6 +2525,11 @@ struct PreparedDeferredListing {
 /// Run as many `tools/list` calls concurrently as their combined bounded peak
 /// permits. Stop before the next batch when prior listings exhaust the budget.
 /// Commit remains transactional.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "bounded parallel listing admission threads the callout context and prepared owners"
+)]
 async fn prepare_deferred_listings(
     state: &ResponsesState,
     pending: &[DeferredMcpConnector],
@@ -2582,7 +2591,7 @@ async fn prepare_deferred_listings(
         prepared_bytes = prepared_bytes
             .checked_add(prepared_deferred_bytes(&newly_prepared).ok_or(ResolveError::RetainedBudget)?)
             .ok_or(ResolveError::RetainedBudget)?;
-        if !baseline.checked_add(prepared_bytes).is_some_and(|bytes| bytes <= limit) {
+        if baseline.checked_add(prepared_bytes).is_none_or(|bytes| bytes > limit) {
             return Err(ResolveError::RetainedBudget);
         }
         prepared.extend(newly_prepared);
@@ -2609,12 +2618,14 @@ fn deferred_connector_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
     .try_fold(raw, |used, value| used.checked_add(retained_json_bytes(value)?))
 }
 
+/// Retained bytes in the pending deferred connector descriptors.
 fn pending_deferred_bytes(pending: &[DeferredMcpConnector]) -> Option<usize> {
     pending.iter().try_fold(0_usize, |used, connector| {
         used.checked_add(deferred_connector_bytes(connector)?)
     })
 }
 
+/// Retained bytes in prepared deferred listings before commit.
 fn prepared_deferred_bytes(prepared: &[PreparedDeferredListing]) -> Option<usize> {
     prepared.iter().try_fold(0_usize, |used, item| {
         used.checked_add(retained_json_bytes(&item.entry)?)?
