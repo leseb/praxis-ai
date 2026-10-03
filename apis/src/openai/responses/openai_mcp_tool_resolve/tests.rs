@@ -3858,22 +3858,28 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
         "allowed_tools": ["get_weather"],
         "require_approval": "never"
     });
-    let mut state = ResponsesState {
-        tools: vec![serde_json::json!({"type": "tool_search"}), deferred_tool.clone()],
-        request_body: serde_json::json!({
-            "model": "gpt-4o",
-            "tools": [
-                {"type": "tool_search"},
-                deferred_tool
-            ]
-        }),
-        deferred_mcp: vec![deferred_connector(
-            &server_url,
-            Some(serde_json::json!(["get_weather"])),
-            Some("Bearer secret".to_owned()),
-        )],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            tools: vec![serde_json::json!({"type": "tool_search"}), deferred_tool.clone()],
+            request_body: serde_json::json!({
+                "model": "gpt-4o",
+                "tools": [
+                    {"type": "tool_search"},
+                    deferred_tool
+                ]
+            }),
+            deferred_mcp: vec![deferred_connector(
+                &server_url,
+                Some(serde_json::json!(["get_weather"])),
+                Some("Bearer secret".to_owned()),
+            )],
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "tool_search_call",
+            vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        );
+        state
     };
 
     discover_deferred_connectors(&mut state).await.unwrap();
@@ -4131,18 +4137,24 @@ fn has_pending_deferred_discovery_requires_tool_search_and_connectors() {
     assert!(!has_pending_deferred_discovery(&state));
     state.deferred_mcp = vec![deferred_connector("https://a.example.com/mcp", None, None)];
     assert!(!has_pending_deferred_discovery(&state));
-    state.tool_search_calls = vec![serde_json::json!({"type": "tool_search_call"})];
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call"})],
+    );
     assert!(has_pending_deferred_discovery(&state));
 }
 
 #[test]
 fn has_pending_deferred_discovery_respects_exhausted_max_tool_calls() {
     let search = serde_json::json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-    let mut state = ResponsesState {
-        deferred_mcp: vec![deferred_connector("https://a.example.com/mcp", None, None)],
-        tool_search_calls: vec![search.clone()],
-        max_tool_calls: Some(0),
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            deferred_mcp: vec![deferred_connector("https://a.example.com/mcp", None, None)],
+            max_tool_calls: Some(0),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("tool_search_call", vec![search.clone()]);
+        state
     };
     assert!(
         !has_pending_deferred_discovery(&state),
@@ -4170,11 +4182,17 @@ async fn discover_deferred_connectors_skips_tools_list_when_budget_exhausted() {
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
     drop(listener);
 
-    let mut state = ResponsesState {
-        deferred_mcp: vec![deferred_connector(&server_url, None, None)],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
-        max_tool_calls: Some(0),
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            deferred_mcp: vec![deferred_connector(&server_url, None, None)],
+            max_tool_calls: Some(0),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "tool_search_call",
+            vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        );
+        state
     };
 
     discover_deferred_connectors(&mut state).await.unwrap();
