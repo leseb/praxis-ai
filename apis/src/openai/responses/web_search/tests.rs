@@ -1635,10 +1635,17 @@ async fn mixed_file_then_web_round_preserves_model_order_under_max_tool_calls() 
     let web = web_search_call("ws_second", "should not run");
     let mut state =
         ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 1}));
-    state.current_round_output_start = Some(0);
     state.accumulated_output = vec![file.clone(), web.clone()];
     state.response_object = serde_json::json!({"output": [file, web.clone()]});
     state.select_test_output("web_search_call", vec![web]);
+    // The test helper starts the round at its first selected web call. The
+    // production parse owner starts at the first model output item, including
+    // the earlier file-search placeholder.
+    state.current_round_output_start = Some(0);
+    assert_eq!(
+        current_round_tool_call_admissions(&state, &state.selected_web_search_calls()),
+        vec![false]
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
