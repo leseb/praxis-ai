@@ -1020,6 +1020,7 @@ fn push_search_turn(
             state.locally_executed_output_items.insert(id.to_owned());
         }
         *slot = output_item;
+        state.mark_replay_stable_payload_changed();
     }
 }
 
