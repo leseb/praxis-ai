@@ -984,6 +984,32 @@ async fn aggregate_budget_preflights_extraction_before_state_initialization() {
 }
 
 #[tokio::test]
+async fn aggregate_budget_rejects_raw_body_before_json_parse() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let config = serde_yaml::from_str("max_retained_bytes: 131072").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    // Invalid JSON would ordinarily be released by this adapter. The policy
+    // must reject it before serde_json can allocate a large parsed tree.
+    let mut body = Some(Bytes::from(vec![b'x'; 16_385]));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("oversized raw body must be rejected before parsing");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(
+        std::str::from_utf8(rejection.body.as_deref().unwrap())
+            .unwrap()
+            .contains("during document extraction")
+    );
+}
+
+#[tokio::test]
 async fn aggregate_budget_allows_small_document_extraction() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");

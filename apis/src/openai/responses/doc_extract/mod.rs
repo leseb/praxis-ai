@@ -164,6 +164,12 @@ impl HttpFilter for DocExtractFilter {
             return Ok(FilterAction::Release);
         };
 
+        // This adapter may run before the state-creating request filter. Apply
+        // the listener's raw/normalized JSON admission before parsing here too.
+        if super::initial_budget_rejection(ctx, raw).is_some() {
+            return Ok(reject_aggregate_extraction(ctx));
+        }
+
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
             Err(e) => {
