@@ -887,8 +887,12 @@ fn parse_and_accumulate(
     }
     // The existing two-phase commit enforces the stream's own item and byte caps
     // before it records any client-visible lifecycle milestones.
-    let Some(logical_output) = commit_chunk_events(state, ctx, events, commit_staging_bytes.unwrap_or(usize::MAX))?
-    else {
+    let staging = CommitChunkStaging {
+        pre_commit_bytes: commit_staging_bytes.unwrap_or(usize::MAX),
+        frame_payload_bytes,
+        logical_output_upper_bound,
+    };
+    let Some(logical_output) = commit_chunk_events(state, ctx, events, &staging)? else {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
@@ -1507,6 +1511,16 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
     })
 }
 
+/// Transient owners needed at each phase of one chunk commit.
+struct CommitChunkStaging {
+    /// Bound while accumulation may clone shared items.
+    pre_commit_bytes: usize,
+    /// Completed frame data remains live during restoration planning.
+    frame_payload_bytes: Option<usize>,
+    /// Maximum logical wire output built from this chunk.
+    logical_output_upper_bound: usize,
+}
+
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
 ///
 /// Split into two passes so both retained-state budgets are validated before any
@@ -1530,15 +1544,20 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 /// delivered; every recorded milestone therefore still corresponds to bytes that
 /// actually reach the client. Returns `None` after an aggregate payload failure;
 /// otherwise returns the logical-stream bytes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two-phase event commit and restoration admission share one atomic boundary"
+)]
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     mut events: Vec<ResponsesEvent>,
-    staging_bytes: usize,
+    staging: &CommitChunkStaging,
 ) -> Result<Option<Vec<u8>>, SseParseError> {
     // Phase 2a: accumulate events and capture lowered client-tool completion
     // artifacts for the restore plan.
-    let Some((completions, completion_bytes)) = accumulate_chunk(state, ctx, &mut events, staging_bytes)? else {
+    let Some((completions, completion_bytes)) = accumulate_chunk(state, ctx, &mut events, staging.pre_commit_bytes)?
+    else {
         return Ok(None);
     };
 
@@ -1550,19 +1569,26 @@ fn commit_chunk_events(
             return Err(error);
         }
 
-        // Native passthrough has no restoration plan. Its terminal response
-        // may already have moved from the event into shared state, so applying
-        // the earlier event staging here would charge that owner twice.
+        // Native passthrough has no restoration plan. For lowered traffic,
+        // remeasure event owners after accumulation because a terminal response
+        // may already have moved from the event into shared state.
         let has_restoration_plan = ctx
             .extensions
             .get::<ResponsesState>()
             .is_some_and(|responses| !responses.client_tool_lowering.is_empty());
-        if has_restoration_plan
-            && !projected_client_tool_restore_bytes(ctx, state, &events)
-                .and_then(|bytes| bytes.checked_add(staging_bytes))
-                .is_some_and(|bytes| stream_payload_fits(ctx, state, bytes))
-        {
-            return Ok(None);
+        if has_restoration_plan {
+            let post_commit_staging = staging
+                .frame_payload_bytes
+                .and_then(|frame_bytes| {
+                    events.iter().try_fold(frame_bytes, |used, event| {
+                        used.checked_add(retained_event_payload_bytes(event)?)
+                    })
+                })
+                .and_then(|bytes| bytes.checked_add(staging.logical_output_upper_bound.checked_mul(2)?))
+                .and_then(|bytes| bytes.checked_add(projected_client_tool_restore_bytes(ctx, state, &events)?));
+            if !post_commit_staging.is_some_and(|bytes| stream_payload_fits(ctx, state, bytes)) {
+                return Ok(None);
+            }
         }
 
         // Phase 2b: plan lowered client-tool restoration (fallible) then append every
