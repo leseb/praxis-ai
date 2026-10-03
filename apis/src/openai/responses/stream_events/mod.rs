@@ -33,7 +33,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
     StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
 };
-use serde::{Serialize, ser::SerializeMap};
+use serde::{Serialize, ser::SerializeMap as _};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -899,6 +899,7 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
 /// This is intentionally an upper bound: replacement writes may release the
 /// previous state owner during commit, but charging the projected owner keeps
 /// the preflight transactional at the allocation peak.
+#[expect(clippy::too_many_lines, reason = "event variants require distinct clone projections")]
 fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>();
     events.iter().try_fold(0_usize, |used, event| {
@@ -1086,6 +1087,46 @@ fn local_terminal_output_upper_bound(state: &ResponsesState) -> Option<usize> {
     Some(bound)
 }
 
+/// Reserve the owned ready-item copies and wire buffer before file-search EOS
+/// synthesis. Pending items are only re-queued, so they create no payload here.
+/// The lifecycle bound covers the two item envelopes, progress events, and
+/// temporary payload/Vec growth; the extra item charge covers the ready queue's
+/// clone, which stays live while those events are built.
+fn ready_file_search_synthesis_staging_bytes(state: &ResponsesState) -> Option<usize> {
+    state
+        .pending_local_tool_synthesis
+        .iter()
+        .try_fold(0_usize, |used, (index, _)| {
+            let item = state.accumulated_output.get(*index)?;
+            if !matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("completed" | "incomplete")
+            ) {
+                return Some(used);
+            }
+            used.checked_add(retained_json_bytes(item)?)?
+                .checked_add(local_item_sse_upper_bound(state, item)?)
+        })
+}
+
+/// Request-side local terminal builders already reserve the synthesized wire;
+/// add the ready queue's independent item clones before either builder drains it.
+fn ready_file_search_clone_bytes(state: &ResponsesState) -> Option<usize> {
+    state
+        .pending_local_tool_synthesis
+        .iter()
+        .try_fold(0_usize, |used, (index, _)| {
+            let item = state.accumulated_output.get(*index)?;
+            if !matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("completed" | "incomplete")
+            ) {
+                return Some(used);
+            }
+            used.checked_add(retained_json_bytes(item)?)
+        })
+}
+
 /// Bound all output that `commit_chunk_events` can append for this chunk.
 fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let mut bound = ctx
@@ -1112,6 +1153,10 @@ fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEv
 /// Canonicalization moves the accumulated output into `response_object` and
 /// borrows it for the wire. Reserve metadata, usage, citation, and client-tool
 /// restoration copies before mutating the canonical response.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one terminal projection covers several independent owners"
+)]
 fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes: usize) -> Option<usize> {
     let output = if state.accumulated_output.is_empty() {
         state.output_items()
@@ -2636,6 +2681,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     {
         let state = ctx.extensions.get::<ResponsesState>()?;
         if !canonicalization_staging_bytes(state, local_output_upper_bound)
+            .and_then(|staging| staging.checked_add(ready_file_search_clone_bytes(state)?))
             .is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging))
         {
             return Some(encode_retained_payload_error(ctx));
@@ -2771,7 +2817,9 @@ pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, me
             .checked_add(code.len())
             .and_then(|bytes| bytes.checked_mul(8))
             .and_then(|bytes| bytes.checked_add(512));
-        let projected = error_upper_bound.and_then(|bytes| bytes.checked_add(local_output_upper_bound));
+        let projected = error_upper_bound
+            .and_then(|bytes| bytes.checked_add(local_output_upper_bound))
+            .and_then(|bytes| bytes.checked_add(ready_file_search_clone_bytes(state)?));
         if !projected.is_some_and(|bytes| state.can_retain_payload(bytes)) {
             return Some(encode_retained_payload_error(ctx));
         }
@@ -2854,15 +2902,40 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // created/delta events and deferred terminal together in the end-of-stream
     // chunk; starting from an empty buffer here would drop those earlier events.
     let mut output = body.take().map_or_else(Vec::new, |bytes| bytes.to_vec());
-    // #1046 §4.2: drain file_search synthesis before terminal/error finalization,
-    // under the precedence policy. The owner queues each reconciled call by its
-    // absolute output index this round, but the request-phase dispatcher only
-    // reconciles it at the NEXT re-entry's request-body EOS; drain therefore defers
-    // still-pending items and synthesizes them at the finalize that follows their
-    // reconciliation. A validation failure here calls fs_end_stream_with_error_ctx
-    // (site (b), §7.3) so the error branch below is selected and the router does not
-    // re-fire.
-    local_tools::drain_local_tool_synthesis(ctx, &mut output);
+    // Agentic collection can append history immediately before this EOS callback.
+    // Refresh the shared baseline before admitting synthesis construction.
+    parser_state.shared_stable_bytes = OnceLock::new();
+    let synthesis_staging = if ctx.get_metadata("responses.stream_error_code").is_some() {
+        Some(0)
+    } else {
+        ctx.extensions
+            .get::<ResponsesState>()
+            .map_or(Some(0), ready_file_search_synthesis_staging_bytes)
+    };
+    let preflight_staging = synthesis_staging.and_then(|bytes| {
+        // Appending synthesized events can reallocate the existing EOS output
+        // while its old allocation is still live.
+        let existing = if bytes == 0 {
+            Some(output.len())
+        } else {
+            output.len().checked_mul(2)
+        }?;
+        existing.checked_add(bytes)
+    });
+    if preflight_staging.is_some_and(|bytes| stream_payload_fits(ctx, &parser_state, bytes)) {
+        // #1046 §4.2: drain file_search synthesis before terminal/error finalization,
+        // under the precedence policy. The owner queues each reconciled call by its
+        // absolute output index this round, but the request-phase dispatcher only
+        // reconciles it at the NEXT re-entry's request-body EOS; drain therefore defers
+        // still-pending items and synthesizes them at the finalize that follows their
+        // reconciliation. A validation failure here calls fs_end_stream_with_error_ctx
+        // (site (b), §7.3) so the error branch below is selected and the router does not
+        // re-fire.
+        local_tools::drain_local_tool_synthesis(ctx, &mut output);
+    } else {
+        output.clear();
+        record_retained_payload_overflow(ctx, &mut parser_state);
+    }
     // #313 P1 (DoS bound): this round's provider-streamed observation set is stale
     // once the round that recorded it finalizes; clear it unconditionally here — NOT
     // inside drain_local_tool_synthesis, which early-returns on an empty synthesis
@@ -2872,10 +2945,6 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.provider_streamed_terminal_ids.clear();
     }
-    // The agentic-loop callback runs before this finalizer and can append the
-    // just-finished round to messages/persisted_messages. Their per-stream
-    // baseline from the first chunk is therefore stale at EOS.
-    parser_state.shared_stable_bytes = OnceLock::new();
     if !stream_payload_fits(ctx, &parser_state, output.len()) {
         output.clear();
         record_retained_payload_overflow(ctx, &mut parser_state);
@@ -3137,6 +3206,10 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 ///
 /// Either way the id is only ever restored, never fabricated: a non-rehydrated
 /// turn keeps the real value the backend echoed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "canonical terminal construction follows ordered state transitions"
+)]
 fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
@@ -3228,7 +3301,9 @@ fn restore_terminal_client_tools(state: &mut ResponsesState) -> Result<(), SsePa
 /// owned by `ResponsesState` for persistence. The deferred metadata never owns
 /// another full response tree.
 struct BorrowedTerminalPayload<'a> {
+    /// Deferred lifecycle metadata and event type.
     metadata: &'a Value,
+    /// Canonical response owned by request state.
     response: &'a Value,
 }
 

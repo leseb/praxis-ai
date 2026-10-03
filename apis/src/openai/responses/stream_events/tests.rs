@@ -6889,6 +6889,108 @@ fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
     );
 }
 
+#[test]
+fn file_search_synthesis_peak_is_rejected_before_draining() {
+    let item = json!({
+        "type": "file_search_call",
+        "id": "fs_peak",
+        "status": "completed",
+        "queries": ["q"],
+        "results": [{"file_id": "file-a", "text": "x".repeat(32 * 1024)}]
+    });
+    // The old post-drain check saw only the serialized output. Measure that
+    // wire size separately to show it fits while the simultaneous ready clone,
+    // lifecycle payload, and output buffer do not.
+    let mut preview_ctx = test_ctx_without_file_search_tool();
+    let mut preview_state = ResponsesState::default();
+    preview_state.accumulated_output = vec![item.clone()];
+    preview_state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    preview_ctx.extensions.insert(preview_state);
+    let mut preview = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut preview_ctx, &mut preview);
+
+    let (_filter, mut ctx) = make_armed_context();
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    state.accumulated_output = vec![item.clone()];
+    state.response_object = json!({
+        "id": "resp_peak", "object": "response", "status": "completed", "output": [item]
+    });
+    state.logical_stream_response_id = Some("resp_peak".to_owned());
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    let baseline = state.retained_payload_bytes().unwrap();
+    let limit = 128 * 1024;
+    let staging = super::ready_file_search_synthesis_staging_bytes(&state).unwrap();
+    assert!(
+        baseline + preview.len() < limit,
+        "the old post-drain check would admit the wire copy"
+    );
+    assert!(
+        baseline + staging > limit,
+        "the simultaneous synthesis owners exceed the ceiling"
+    );
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+
+    let mut eos = None;
+    super::finalize_logical_stream(&mut ctx, &mut eos);
+    let wire = String::from_utf8(eos.expect("bounded error frame").to_vec()).unwrap();
+    assert_eq!(wire.matches("event: error").count(), 1, "one terminal error: {wire}");
+    assert!(
+        !wire.contains("response.output_item.done"),
+        "no synthesis escaped: {wire}"
+    );
+    assert!(
+        !wire.contains("event: response.completed"),
+        "no success terminal escaped: {wire}"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_agentic_loop")
+            .and_then(|result| result.get("action")),
+        Some("done")
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn local_completion_charges_ready_file_search_clone_before_drain() {
+    let mut ctx = test_ctx_without_file_search_tool();
+    let item = json!({
+        "type": "file_search_call", "id": "fs_local_peak", "status": "completed",
+        "results": [{"file_id": "file-a", "text": "x".repeat(8 * 1024)}]
+    });
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    state.accumulated_output = vec![item.clone()];
+    state.response_object = json!({"id": "resp_local_peak", "object": "response", "output": [item]});
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    let baseline = state.retained_payload_bytes().unwrap();
+    let wire_bound = super::local_terminal_output_upper_bound(&state).unwrap();
+    let old_projection = super::canonicalization_staging_bytes(&state, wire_bound).unwrap();
+    let ready_clone = super::ready_file_search_clone_bytes(&state).unwrap();
+    let limit = baseline + old_projection + ready_clone / 2;
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(old_projection),
+        "the old local-completion preflight admitted the peak"
+    );
+    ctx.extensions.insert(state);
+
+    let wire = String::from_utf8(encode_local_completion(&mut ctx).unwrap().to_vec()).unwrap();
+    assert_eq!(wire.matches("event: error").count(), 1, "one bounded error: {wire}");
+    assert!(
+        !wire.contains("response.output_item.done"),
+        "no synthesis escaped: {wire}"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
 // #1159 Task 4: end-to-end proof that a lowered `Namespace` member is retyped in
 // place through the real commit path (`commit_chunk_events` ->
 // `restore_and_append_chunk` -> `apply_client_tool_disposition`), asserting the

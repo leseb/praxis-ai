@@ -63,11 +63,10 @@ fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &mut Value, s
     // state owner before the event is deferred; the remaining envelope keeps
     // only the small lifecycle metadata. Malformed bare-response events retain
     // the old fallback copy so their original envelope remains available.
-    let response = payload
-        .as_object_mut()
-        .and_then(|object| object.get_mut("response"))
-        .map(std::mem::take)
-        .unwrap_or_else(|| payload.clone());
+    let response = match payload.as_object_mut().and_then(|object| object.get_mut("response")) {
+        Some(response) => std::mem::take(response),
+        None => payload.clone(),
+    };
     let _ = accumulate_response_object(ctx, response, Some(status));
 }
 
