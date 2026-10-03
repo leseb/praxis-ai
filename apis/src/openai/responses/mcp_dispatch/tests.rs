@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::FutureExt as _;
 use praxis_filter::FilterAction;
 use secrecy::SecretString;
 use serde_json::json;
@@ -77,13 +78,41 @@ async fn approval_remains_claimable_when_minimum_dispatch_cannot_fit() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(state.retained_payload_failed, "dispatch must be refused by the budget");
     assert!(state.accumulated_output.is_empty(), "no tool call should execute");
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
     let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
     let consumed = store
         .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_1"], 9999)
         .await
         .unwrap();
     assert_eq!(consumed, None, "unexecuted approval must remain retryable");
+}
+
+#[tokio::test]
+async fn initial_approval_budget_failure_is_http_413_before_stream_commitment() {
+    for streaming in [false, true] {
+        let filter = make_dispatch_filter();
+        let req = make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = make_owned_filter_context(&req);
+        let store = make_approval_store().await;
+        seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+        register_store(&mut ctx, store);
+        let mut state = ResponsesState {
+            request_body: json!({"stream": streaming}),
+            mcp_tool_map: approval_tool_map(),
+            previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+            messages: vec![approval_response("call_1", true, None)],
+            ..ResponsesState::default()
+        };
+        state.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(state);
+        let mut body = Some(Bytes::from_static(br#"{"model":"m"}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
 }
 
 const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
@@ -140,6 +169,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         parallel,
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
+        configured_max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
         aggregate_result_policy: super::McpAggregateResultPolicy::Unbudgeted,
         timeout,
@@ -1198,9 +1228,10 @@ fn configured_mcp_wire_limit_stays_recoverable_when_aggregate_lowers_only_batch_
         limit: admitted_per_call,
     };
     let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, admitted_per_call);
-    assert!(result.size_limit_exceeded);
+    assert!(result.size_limit_exceeded.is_some());
     let mut options = execution_options(false, std::time::Duration::from_secs(1));
     options.max_result_bytes = admitted_per_call;
+    options.configured_max_result_bytes = configured_per_call;
     options.aggregate_result_policy = if admitted_per_call < configured_per_call {
         super::McpAggregateResultPolicy::PerCallConstrained
     } else {
@@ -1215,13 +1246,103 @@ fn configured_mcp_wire_limit_stays_recoverable_when_aggregate_lowers_only_batch_
 
     let (lowered_per_call, _) = admitted_result_limits(1, 0, 64 * 1024, 8_192).unwrap();
     options.max_result_bytes = lowered_per_call;
+    options.configured_max_result_bytes = configured_per_call;
     options.aggregate_result_policy = super::McpAggregateResultPolicy::PerCallConstrained;
     let budget_error = crate::mcp_client::McpClientError::ResponseTooLarge {
         url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
-        limit: lowered_per_call,
+        limit: crate::mcp_client::tool_result_wire_cap(result_payload_limit(lowered_per_call)),
     };
     let result = process_call_result(Err(budget_error), "c1", "srv", "tool", "{}", None, lowered_per_call);
     assert!(super::aggregate_result_limit_exceeded(&result, &options));
+}
+
+#[test]
+fn fixed_initialization_ceiling_stays_recoverable_when_only_tool_cap_is_lowered() {
+    let configured = 8 * 1_048_576;
+    let admitted = 6 * 1_048_576;
+    let mut options = execution_options(false, std::time::Duration::from_secs(1));
+    options.max_result_bytes = admitted;
+    options.configured_max_result_bytes = configured;
+    options.aggregate_result_policy = super::McpAggregateResultPolicy::PerCallConstrained;
+    assert!(result_payload_limit(admitted) > crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES);
+    let error = crate::mcp_client::McpClientError::ResponseTooLarge {
+        url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
+        limit: crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+    };
+    let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, admitted);
+    assert!(!super::aggregate_result_limit_exceeded(&result, &options));
+
+    options.max_result_bytes = 2 * 1_048_576;
+    let lowered_initialize = result_payload_limit(options.max_result_bytes);
+    let error = crate::mcp_client::McpClientError::ResponseTooLarge {
+        url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
+        limit: lowered_initialize,
+    };
+    let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, options.max_result_bytes);
+    assert!(super::aggregate_result_limit_exceeded(&result, &options));
+}
+
+#[test]
+fn decoded_content_above_configured_cap_stays_a_recoverable_tool_error() {
+    let mut options = execution_options(false, std::time::Duration::from_secs(1));
+    options.max_result_bytes = 16 * 1024;
+    options.configured_max_result_bytes = 64 * 1024;
+    options.aggregate_result_policy = super::McpAggregateResultPolicy::PerCallConstrained;
+    let admitted_payload = result_payload_limit(options.max_result_bytes);
+
+    let configured_overflow =
+        rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("x".repeat(20 * 1024))]);
+    let result = process_call_result(
+        Ok(configured_overflow),
+        "c1",
+        "srv",
+        "tool",
+        "{}",
+        None,
+        admitted_payload,
+    );
+    assert!(!super::aggregate_result_limit_exceeded(&result, &options));
+    assert!(
+        result.output_item["error"]
+            .as_str()
+            .unwrap()
+            .contains("per-result byte limit")
+    );
+
+    let aggregate_overflow =
+        rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("x".repeat(8 * 1024))]);
+    let result = process_call_result(
+        Ok(aggregate_overflow),
+        "c1",
+        "srv",
+        "tool",
+        "{}",
+        None,
+        admitted_payload,
+    );
+    assert!(super::aggregate_result_limit_exceeded(&result, &options));
+}
+
+#[tokio::test]
+async fn parallel_overflow_cancels_later_error_before_pending_first_call() {
+    let futures: Vec<futures::future::BoxFuture<'static, Result<_, super::McpResultLimitExceeded>>> = (0..31)
+        .map(|index| {
+            async move {
+                if index == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Err(super::McpResultLimitExceeded)
+            }
+            .boxed()
+        })
+        .collect();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        super::collect_parallel_results(futures, 31),
+    )
+    .await
+    .expect("later overflow must not wait for the first pending call");
+    assert!(outcome.is_err());
 }
 
 // =========================================================================
@@ -2025,13 +2146,13 @@ async fn connector_binding_over_budget_stops_before_upstream_without_tool_calls(
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(
         state.retained_payload_failed,
         "the owner must reject before another inference request"
     );
-    assert!(state.dispatch_failure.is_some());
+    assert!(state.dispatch_failure.is_none());
     assert!(
         state.mcp_tool_map.is_empty(),
         "over-budget tool definitions must be released"

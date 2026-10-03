@@ -48,7 +48,7 @@ pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
         MAX_CONTROL_RESPONSE_BYTES, MIN_TOOL_INITIALIZE_BYTES, McpCallout, bind_mcp_outbound_chain,
-        build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+        build_bare_outbound_pipeline, tool_result_wire_cap, transport_signal_error, validate_mcp_target,
     },
 };
 use crate::StateOwner;

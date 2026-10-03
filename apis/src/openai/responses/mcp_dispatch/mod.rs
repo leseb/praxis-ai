@@ -49,13 +49,14 @@ mod tests;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    future::Future,
     sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt as _, future::try_join_all};
+use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
@@ -301,6 +302,7 @@ impl McpDispatchFilter {
             parallel: state.parallel_tool_calls,
             max_parallel_calls: self.max_parallel_calls,
             max_result_bytes: per_result_limit,
+            configured_max_result_bytes: configured_per_result_limit,
             max_total_result_bytes: execution_batch_limit,
             aggregate_result_policy,
             timeout: self.timeout,
@@ -420,15 +422,30 @@ impl McpDispatchFilter {
         if let Some(pool) = ctx.extensions.get::<mcp_client::McpSessionPool>() {
             pool.drain_in_background();
         }
+        let initial = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_none_or(|state| state.iteration == 0);
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.discard_payload_for_budget_error();
-            state.dispatch_failure = Some(DispatchFailure {
-                status: 502,
-                code: "server_error",
-                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while dispatching MCP tools".to_owned(),
-            });
+            state.dispatch_failure = if initial {
+                None
+            } else {
+                Some(DispatchFailure {
+                    status: 502,
+                    code: "server_error",
+                    message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while dispatching MCP tools".to_owned(),
+                })
+            };
         }
         ctx.set_metadata("responses.skip_persist", "true");
+        if initial {
+            return FilterAction::Reject(responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "request and MCP dispatch exceed openai_agentic_loop.max_retained_bytes",
+            ));
+        }
         FilterAction::Continue
     }
 
@@ -1307,6 +1324,13 @@ impl McpDispatchFilter {
         if let Err(rejection) = self.resume_approvals(ctx).await {
             return Ok(FilterAction::Reject(rejection));
         }
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_failed)
+        {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
 
         // Binding, parked sessions, and approval resume can each grow retained
         // state even when this round has no MCP call to execute.
@@ -1876,7 +1900,18 @@ struct McpCallResult {
     /// Output item for `output_items`.
     output_item: serde_json::Value,
     /// A transport or content size ceiling was hit before this error was built.
-    size_limit_exceeded: bool,
+    size_limit_exceeded: Option<McpSizeLimitFailure>,
+}
+
+/// Which admitted size ceiling prevented a completed MCP response.
+#[derive(Debug, Clone, Copy)]
+enum McpSizeLimitFailure {
+    /// Decoded content exceeded the admitted result allowance; retain its
+    /// measured size so the configured cap can still own a recoverable error.
+    Decoded(usize),
+    /// An MCP exchange exceeded this wire ceiling. Initialization and tool
+    /// result exchanges have different caps, so the cap must be identified.
+    Transport(usize),
 }
 
 impl McpCallResult {
@@ -1995,13 +2030,36 @@ fn fit_result_or_limit_error(
 /// Distinguish a request-wide size failure from a configured per-tool limit.
 /// The latter stays a bounded tool error so an executed call is not retried.
 fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
-    matches!(
+    if !matches!(
         options.aggregate_result_policy,
         McpAggregateResultPolicy::PerCallConstrained
-    ) && (result.size_limit_exceeded
+    ) {
+        return false;
+    }
+    let admitted_payload = result_payload_limit(options.max_result_bytes);
+    let configured_payload = result_payload_limit(options.configured_max_result_bytes);
+    let admitted_initialize = admitted_payload.clamp(
+        mcp_client::MIN_TOOL_INITIALIZE_BYTES,
+        mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+    );
+    let configured_initialize = configured_payload.clamp(
+        mcp_client::MIN_TOOL_INITIALIZE_BYTES,
+        mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+    );
+    let admitted_tool_wire = mcp_client::tool_result_wire_cap(admitted_payload);
+    let configured_tool_wire = mcp_client::tool_result_wire_cap(configured_payload);
+    let exceeded_aggregate_cap = match result.size_limit_exceeded {
+        Some(McpSizeLimitFailure::Decoded(actual)) => actual <= configured_payload,
+        Some(McpSizeLimitFailure::Transport(limit)) => {
+            (limit == admitted_initialize && admitted_initialize < configured_initialize)
+                || (limit == admitted_tool_wire && admitted_tool_wire < configured_tool_wire)
+        },
+        None => false,
+    };
+    exceeded_aggregate_cap
         || result
             .retained_bytes()
-            .is_none_or(|bytes| bytes > options.max_result_bytes))
+            .is_none_or(|bytes| bytes > options.max_result_bytes)
 }
 
 /// How the request-wide retained budget affects one MCP call's wire ceiling.
@@ -2024,6 +2082,8 @@ struct McpExecutionOptions<'a> {
     max_parallel_calls: usize,
     /// Maximum raw bytes accepted for one MCP result event.
     max_result_bytes: usize,
+    /// Configured per-result cap before request-wide admission lowered it.
+    configured_max_result_bytes: usize,
     /// Maximum serialized bytes retained by one result batch.
     max_total_result_bytes: usize,
     /// Whether the aggregate policy applies and lowered this call's ceiling.
@@ -2096,7 +2156,7 @@ async fn execute_parallel(
         let chunk_size = remaining_calls.len().min(options.max_parallel_calls);
         let (chunk, rest) = remaining_calls.split_at(chunk_size);
         remaining_calls = rest;
-        let futures = chunk.iter().map(|tc| async move {
+        let futures = chunk.iter().enumerate().map(|(index, tc)| async move {
             let outcome =
                 std::panic::AssertUnwindSafe(Box::pin(execute_single_call(tc, tool_index, &options, callout)))
                     .catch_unwind()
@@ -2115,12 +2175,33 @@ async fn execute_parallel(
             if aggregate_result_limit_exceeded(&result, &options) {
                 return Err(McpResultLimitExceeded);
             }
-            Ok(fit_result_or_limit_error(tc, result, options.max_result_bytes))
+            Ok((index, fit_result_or_limit_error(tc, result, options.max_result_bytes)))
         });
-        // The first aggregate overflow drops any unfinished sibling futures.
-        results.extend(try_join_all(futures).await?);
+        // FuturesUnordered reports a later overflow immediately, even when an
+        // earlier sibling is pending. Dropping it cancels every sibling.
+        results.extend(collect_parallel_results(futures, chunk.len()).await?);
     }
     Ok(results)
+}
+
+/// Complete a parallel chunk by readiness while retaining the original call order.
+async fn collect_parallel_results<F>(
+    futures: impl IntoIterator<Item = F>,
+    count: usize,
+) -> Result<Vec<McpCallResult>, McpResultLimitExceeded>
+where
+    F: Future<Output = Result<(usize, McpCallResult), McpResultLimitExceeded>>,
+{
+    let mut pending: FuturesUnordered<F> = futures.into_iter().collect();
+    let mut ordered: Vec<Option<McpCallResult>> = std::iter::repeat_with(|| None).take(count).collect();
+    while let Some(outcome) = pending.next().await {
+        let (index, result) = outcome?;
+        *ordered.get_mut(index).ok_or(McpResultLimitExceeded)? = Some(result);
+    }
+    ordered
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(McpResultLimitExceeded)
 }
 
 /// Execute MCP tool calls sequentially, emitting error results
@@ -2223,6 +2304,11 @@ fn process_call_result(
             let is_error = r.is_error.unwrap_or(false);
             let content_count = r.content.len();
             let output = content_blocks_to_output(&r.content, max_result_bytes);
+            let decoded_size_failure = output.as_ref().err().and_then(|error| {
+                (error == MCP_CONTENT_TOO_LARGE)
+                    .then(|| content_output_size(&r.content))
+                    .flatten()
+            });
             drop(r);
             match output {
                 Ok(output_text) => {
@@ -2250,14 +2336,19 @@ fn process_call_result(
                         &e,
                         approval_request_id,
                     );
-                    result.size_limit_exceeded = true;
+                    result.size_limit_exceeded = decoded_size_failure.map(McpSizeLimitFailure::Decoded);
                     result
                 },
             }
         },
         Err(e) => {
             warn!(tool_name, call_id, error = %e, "MCP tool call failed");
-            let size_limit_exceeded = matches!(&e, mcp_client::McpClientError::ResponseTooLarge { .. });
+            let size_limit_exceeded = match &e {
+                mcp_client::McpClientError::ResponseTooLarge { limit, .. } => {
+                    Some(McpSizeLimitFailure::Transport(*limit))
+                },
+                _ => None,
+            };
             let mut result = build_error_result(
                 call_id,
                 server_label,
@@ -2384,6 +2475,24 @@ async fn execute_single_call(
 // Result Construction
 // -----------------------------------------------------------------------------
 
+/// Bounded tool error used when converted MCP content exceeds its admitted cap.
+const MCP_CONTENT_TOO_LARGE: &str = "MCP tool result exceeded the configured per-result byte limit";
+
+/// Measure the exact converted output on the rare admitted-cap failure without
+/// constructing another provider payload copy.
+fn content_output_size(blocks: &[rmcp::model::ContentBlock]) -> Option<usize> {
+    let mut text_bytes = 0_usize;
+    for block in blocks {
+        let rmcp::model::ContentBlock::Text(text) = block else {
+            return serialized_len(blocks).ok();
+        };
+        text_bytes = text_bytes
+            .checked_add(usize::from(text_bytes != 0))?
+            .checked_add(text.text.len())?;
+    }
+    Some(text_bytes)
+}
+
 /// Serialize rmcp `ContentBlock` values into a lossless string for the
 /// Responses `output` field.
 ///
@@ -2394,12 +2503,7 @@ async fn execute_single_call(
 ///
 /// Returns `Err` when the content cannot be represented, so the caller can
 /// surface an explicit tool error instead of a lossy empty success.
-#[expect(
-    clippy::too_many_lines,
-    reason = "text and structured MCP blocks share one pre-allocation size policy"
-)]
 fn content_blocks_to_output(blocks: &[rmcp::model::ContentBlock], max_result_bytes: usize) -> Result<String, String> {
-    const TOO_LARGE: &str = "MCP tool result exceeded the configured per-result byte limit";
     if blocks
         .iter()
         .all(|block| matches!(block, rmcp::model::ContentBlock::Text(_)))
@@ -2414,9 +2518,9 @@ fn content_blocks_to_output(blocks: &[rmcp::model::ContentBlock], max_result_byt
                 .len()
                 .checked_add(separator_bytes)
                 .and_then(|bytes| bytes.checked_add(text.text.len()))
-                .ok_or_else(|| TOO_LARGE.to_owned())?;
+                .ok_or_else(|| MCP_CONTENT_TOO_LARGE.to_owned())?;
             if next_bytes > max_result_bytes {
-                return Err(TOO_LARGE.to_owned());
+                return Err(MCP_CONTENT_TOO_LARGE.to_owned());
             }
             if separator_bytes != 0 {
                 output.push('\n');
@@ -2428,7 +2532,7 @@ fn content_blocks_to_output(blocks: &[rmcp::model::ContentBlock], max_result_byt
 
     let output = serde_json::to_string(blocks).map_err(|e| format!("failed to serialize MCP content blocks: {e}"))?;
     if output.len() > max_result_bytes {
-        return Err(TOO_LARGE.to_owned());
+        return Err(MCP_CONTENT_TOO_LARGE.to_owned());
     }
     Ok(output)
 }
@@ -2481,7 +2585,7 @@ fn build_success_result(
     McpCallResult {
         message,
         output_item,
-        size_limit_exceeded: false,
+        size_limit_exceeded: None,
     }
 }
 
@@ -2542,6 +2646,6 @@ fn build_error_result(
     McpCallResult {
         message,
         output_item,
-        size_limit_exceeded: false,
+        size_limit_exceeded: None,
     }
 }

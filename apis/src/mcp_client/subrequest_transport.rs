@@ -39,7 +39,7 @@ use praxis_filter::{
     StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime, TraceContext,
 };
 use rmcp::{
-    model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
+    model::{ClientJsonRpcMessage, ClientNotification, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
     transport::{
         common::http_header::{HEADER_LAST_EVENT_ID, HEADER_SESSION_ID},
         streamable_http_client::{
@@ -82,7 +82,7 @@ const DEFAULT_MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
 /// Translate a configured *decoded* `tools/call` result cap into the *wire* byte
 /// ceiling to enforce before deserialization (worst-case JSON expansion plus the
 /// JSON-RPC envelope allowance).
-fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
+pub(crate) fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
     max_result_bytes
         .saturating_mul(MAX_JSON_STRING_EXPANSION)
         .saturating_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)
@@ -682,7 +682,8 @@ impl McpSubrequestClient {
     /// Select the wire byte ceiling for one outbound message.
     ///
     /// `tools/call` uses the configured result ceiling. Tool-session
-    /// `initialize` is separately bounded because rmcp retains its metadata;
+    /// `initialize` and its following `initialized` acknowledgment share the
+    /// admitted handshake ceiling because both can buffer a response body;
     /// other exchanges use the control ceiling.
     fn response_limit(&self, message: &ClientJsonRpcMessage) -> usize {
         match message {
@@ -691,6 +692,14 @@ impl McpSubrequestClient {
             },
             ClientJsonRpcMessage::Request(request)
                 if matches!(request.request, ClientRequest::InitializeRequest(_)) =>
+            {
+                self.initialize_bytes
+            },
+            ClientJsonRpcMessage::Notification(notification)
+                if matches!(
+                    notification.notification,
+                    ClientNotification::InitializedNotification(_)
+                ) =>
             {
                 self.initialize_bytes
             },
@@ -1932,6 +1941,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "exercise all three MCP request ceilings together")]
     fn tool_session_initialize_uses_admitted_payload_cap() {
         let client = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
@@ -1951,6 +1961,10 @@ mod tests {
         )
         .expect("deserialize initialize");
         assert_eq!(client.response_limit(&initialize), 2048);
+        let initialized: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .expect("deserialize initialized notification");
+        assert_eq!(client.response_limit(&initialized), 2048);
         let unbudgeted = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
@@ -1959,11 +1973,61 @@ mod tests {
             None,
         );
         assert_eq!(unbudgeted.response_limit(&initialize), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(unbudgeted.response_limit(&initialized), MAX_CONTROL_RESPONSE_BYTES);
 
         let list: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
                 .expect("deserialize tools/list");
         assert_eq!(client.response_limit(&list), MAX_CONTROL_RESPONSE_BYTES);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real HTTP ACK exercises the admitted handshake cap"
+    )]
+    async fn initialized_ack_cannot_buffer_beyond_admitted_handshake_cap() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 32768\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            socket.write_all(&vec![b'x'; 32_768]).unwrap();
+        });
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(true).unwrap(),
+            Duration::from_secs(5),
+            1024,
+            1024,
+            None,
+        );
+        let initialized: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).unwrap();
+        let result = client
+            .post_message_with_max_sse_event_size(
+                Arc::from(format!("http://{address}/mcp")),
+                initialized,
+                None,
+                None,
+                HashMap::new(),
+                1024,
+            )
+            .await;
+        server.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+            ),
+            "an oversized initialized ACK must hit the admitted handshake cap"
+        );
     }
 
     #[test]
