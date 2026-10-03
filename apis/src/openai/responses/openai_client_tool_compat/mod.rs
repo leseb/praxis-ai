@@ -157,9 +157,14 @@ use tracing::debug;
 
 use self::config::{ClientToolCompatConfig, build_config};
 use super::{
+    agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
     body_limits::reject_rewritten_body_too_large,
+    budget_error::reject_retained_payload_budget,
     error::responses_error_rejection,
-    state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call},
+    state::{
+        ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call,
+        retained_json_bytes,
+    },
 };
 use crate::json_body::{SerializedJson, serialize_json_body};
 
@@ -214,6 +219,94 @@ const TOOL_SEARCH_DEFAULT_QUERY_DESCRIPTION: &str = "A concise description of th
 /// the proxy's synthesized web-search bridge. These mirror the un-centralized
 /// sentinels in `translation/chat_completions.rs` and `file_search_callout`.
 const RESERVED_HOSTED_TOOL_NAMES: [&str; 2] = ["file_search", "web_search"];
+
+/// The parsed response, one replaced output item and its decoded arguments,
+/// and the serialized response may coexist during restoration. This factor
+/// also covers numeric normalization in nested argument JSON and small fields
+/// synthesized by the typed-call constructors. The echoed tools are charged
+/// separately because they do not originate in the provider response.
+const RESTORATION_RESPONSE_RESERVATION: usize = 32;
+
+/// Stable error text for aggregate rejection and persistence cleanup.
+const RESTORATION_BUDGET_ERROR: &str =
+    "client tool response restoration exceeded openai_agentic_loop.max_retained_bytes";
+
+/// Distinguish aggregate exhaustion from an ordinary invalid provider output
+/// so the response hook can clear state and disable successful persistence.
+#[derive(Debug)]
+struct RestoreError {
+    /// Wire action for a lossless-restoration or budget failure.
+    action: FilterAction,
+    /// Whether the caller must discard retained state and successful persistence.
+    budget: bool,
+}
+
+impl RestoreError {
+    /// Build a request-wide aggregate budget rejection.
+    fn budget() -> Self {
+        Self {
+            action: FilterAction::Reject(responses_error_rejection(
+                413,
+                "invalid_request_error",
+                RESTORATION_BUDGET_ERROR,
+            )),
+            budget: true,
+        }
+    }
+}
+
+impl From<FilterAction> for RestoreError {
+    fn from(action: FilterAction) -> Self {
+        Self { action, budget: false }
+    }
+}
+
+impl std::ops::Deref for RestoreError {
+    type Target = FilterAction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.action
+    }
+}
+
+/// Parse a genuine buffered Responses object after reserving each owned copy.
+/// Non-JSON or non-Responses bodies keep the existing passthrough behavior.
+fn parse_response_for_restoration(
+    state: &ResponsesState,
+    echo: &ClientToolEcho,
+    bytes: &[u8],
+) -> Result<Option<Value>, RestoreError> {
+    let parsed_bound = if state.retained_payload_limit().is_some() {
+        let bound = buffered_parsed_json_bytes_upper_bound(bytes).ok_or_else(RestoreError::budget)?;
+        if !state.can_retain_payload(bound) {
+            return Err(RestoreError::budget());
+        }
+        Some(bound)
+    } else {
+        None
+    };
+    let Ok(response) = serde_json::from_slice::<Value>(bytes) else {
+        return Ok(None);
+    };
+    if response.get("object").and_then(Value::as_str) != Some("response") {
+        return Ok(None);
+    }
+    if let Some(parsed_bound) = parsed_bound {
+        let echoed_bytes = retained_json_bytes(&echo.tools)
+            .and_then(|bytes| bytes.checked_add(retained_json_bytes(&echo.tool_choice)?))
+            .ok_or_else(RestoreError::budget)?;
+        // The echoed values are cloned into the parsed response and then
+        // serialized again while both owners are still live.
+        let reservation = parsed_bound
+            .checked_mul(RESTORATION_RESPONSE_RESERVATION)
+            .and_then(|bytes| bytes.checked_add(echoed_bytes.checked_mul(2)?))
+            .ok_or_else(RestoreError::budget)?;
+        if !state.can_retain_payload(reservation) {
+            return Err(RestoreError::budget());
+        }
+    }
+    Ok(Some(response))
+}
 
 // -----------------------------------------------------------------------------
 // ClientToolCompatFilter
@@ -425,17 +518,14 @@ impl ClientToolCompatFilter {
     ///
     /// Returns `Ok(None)` when nothing needs rewriting (the body is not a buffered
     /// Responses object, or the request lowered nothing).
-    fn restore_response(&self, state: &ResponsesState, bytes: &[u8]) -> Result<Option<SerializedJson>, FilterAction> {
-        if state.client_tool_echo.is_none() {
-            return Ok(None);
-        }
-        let Ok(mut response) = serde_json::from_slice::<Value>(bytes) else {
-            // Streaming SSE or a non-JSON body: leave it for `openai_stream_events`.
+    fn restore_response(&self, state: &ResponsesState, bytes: &[u8]) -> Result<Option<SerializedJson>, RestoreError> {
+        let Some(echo) = state.client_tool_echo.as_ref() else {
             return Ok(None);
         };
-        if response.get("object").and_then(Value::as_str) != Some("response") {
+        let Some(mut response) = parse_response_for_restoration(state, echo, bytes)? else {
+            // Streaming SSE or non-Responses bodies remain untouched.
             return Ok(None);
-        }
+        };
 
         if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
             for item in output.iter_mut() {
@@ -449,10 +539,7 @@ impl ClientToolCompatFilter {
             FilterAction::Reject(responses_error_rejection(502, "server_error", &error.to_string()))
         })?;
         if serialized.len() > self.max_rewritten_body_bytes {
-            return Err(reject_rewritten_body_too_large(
-                serialized.len(),
-                self.max_rewritten_body_bytes,
-            ));
+            return Err(reject_rewritten_body_too_large(serialized.len(), self.max_rewritten_body_bytes).into());
         }
         Ok(Some(serialized))
     }
@@ -556,16 +643,28 @@ impl HttpFilter for ClientToolCompatFilter {
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        let listener_limit = ctx
+            .extensions
+            .get::<AgenticBudgetPolicy>()
+            .copied()
+            .map(AgenticBudgetPolicy::max_retained_bytes);
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if let Some(limit) = listener_limit {
+            state.apply_retained_payload_limit(limit);
+        }
         match self.restore_response(state, bytes) {
             Ok(Some(serialized)) => {
                 serialized.commit(body, self.name(), "body");
                 Ok(FilterAction::Continue)
             },
             Ok(None) => Ok(FilterAction::Continue),
-            Err(action) => Ok(action),
+            Err(error) if error.budget => {
+                *body = None;
+                Ok(reject_retained_payload_budget(ctx, RESTORATION_BUDGET_ERROR))
+            },
+            Err(error) => Ok(error.action),
         }
     }
 }

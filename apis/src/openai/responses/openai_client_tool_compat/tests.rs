@@ -9,7 +9,10 @@ use praxis_filter::body::MAX_JSON_BODY_BYTES;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    openai::responses::AgenticBudgetPolicy,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Test helpers
@@ -1063,6 +1066,84 @@ fn state_with_custom_lowered() -> ResponsesState {
         .lower_request(&mut state, false, false)
         .expect("lowering succeeds");
     state
+}
+
+#[test]
+fn buffered_restoration_preflights_parse_and_rewrite_owners() {
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "run_python", "arguments": "{\"input\":\"print(1)\"}"
+        }],
+        "payload": "x".repeat(16 * 1024),
+    });
+    let raw = response.to_string();
+    let mut state = state_with_custom_lowered();
+    let baseline = state.retained_payload_bytes().expect("bounded baseline");
+    state.apply_retained_payload_limit(baseline + 4_096);
+    let error = filter()
+        .restore_response(&state, raw.as_bytes())
+        .expect_err("a provider body larger than remaining headroom must not be parsed");
+    assert_eq!(
+        reject_parts(&error).0,
+        413,
+        "preparse admission rejects aggregate exhaustion"
+    );
+
+    let small = json!({"object": "response", "output": [], "payload": "x".repeat(512)}).to_string();
+    state.apply_retained_payload_limit(baseline + small.len() + 16);
+    let error = filter()
+        .restore_response(&state, small.as_bytes())
+        .expect_err("the parse may fit while restoration and serialization do not");
+    assert_eq!(
+        reject_parts(&error).0,
+        413,
+        "restoration peak is admitted before mutation"
+    );
+}
+
+#[test]
+fn buffered_restoration_uses_listener_budget_and_discards_failed_state() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(state_with_custom_lowered());
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap())
+            .expect("valid listener policy"),
+    );
+    let mut body = Some(Bytes::from(
+        json!({"object": "response", "output": [], "payload": "x".repeat(16 * 1024)}).to_string(),
+    ));
+    let action = filter()
+        .on_response_body(&mut ctx, &mut body, true)
+        .expect("budget rejection is a filter action");
+    assert_eq!(reject_parts(&action).0, 413, "first-round budget rejection is HTTP 413");
+    assert!(body.is_none(), "the oversized buffered provider body is released");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().expect("state remains present");
+    assert!(
+        state.retained_payload_failed,
+        "the request cannot persist a successful response"
+    );
+    assert_eq!(state.retained_payload_limit(), Some(4096));
+}
+
+#[test]
+fn buffered_restoration_without_state_has_no_owned_echo_to_restore() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap())
+            .expect("valid listener policy"),
+    );
+    let raw = json!({"object": "response", "payload": "x".repeat(16 * 1024)}).to_string();
+    let mut body = Some(Bytes::from(raw.clone()));
+    let action = filter()
+        .on_response_body(&mut ctx, &mut body, true)
+        .expect("no-state traffic passes through this compatibility filter");
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body.as_ref().unwrap().as_ref(), raw.as_bytes());
 }
 
 #[test]
