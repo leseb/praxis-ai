@@ -4104,33 +4104,36 @@ class TestResponsesCompactionVLLM:
     def test_usage_less_rehydration_rejects_tokenizer_peak_before_callout(
         self, usage_less_compact_client
     ):
-        client, db_path = usage_less_compact_client
-        first = client.responses.create(
-            model=VLLM_MODEL,
-            input="abcdefghijklmnopqrstuvwxyz0123456789" * 90,
-            store=True,
-        )
-        assert first.usage is None, "backend intentionally omits usage"
-        backend_calls = len(NativeCompactionBackendHandler.requests)
-        callouts = len(CompactionHandler.requests)
-        with sqlite3.connect(db_path) as store:
-            persisted_before = store.execute("SELECT count(*) FROM openai_responses").fetchone()[0]
-        assert persisted_before == 1
-
-        with pytest.raises(APIStatusError) as exc_info:
-            client.responses.create(
+        client, _ = usage_less_compact_client
+        conversation = client.conversations.create()
+        try:
+            first = client.responses.create(
                 model=VLLM_MODEL,
-                input="continue",
-                previous_response_id=first.id,
-                context_management=[{"type": "compaction", "compact_threshold": 1000}],
+                input="abcdefghijklmnopqrstuvwxyz0123456789" * 90,
+                conversation=conversation.id,
                 store=True,
             )
+            assert first.usage is None, "backend intentionally omits usage"
+            backend_calls = len(NativeCompactionBackendHandler.requests)
+            callouts = len(CompactionHandler.requests)
+            persisted_before = len(client.conversations.items.list(conversation.id).data)
+            assert persisted_before == 2
 
-        assert exc_info.value.status_code == 413
-        assert len(NativeCompactionBackendHandler.requests) == backend_calls
-        assert len(CompactionHandler.requests) == callouts
-        with sqlite3.connect(db_path) as store:
-            assert store.execute("SELECT count(*) FROM openai_responses").fetchone()[0] == persisted_before
+            with pytest.raises(APIStatusError) as exc_info:
+                client.responses.create(
+                    model=VLLM_MODEL,
+                    input="continue",
+                    conversation=conversation.id,
+                    context_management=[{"type": "compaction", "compact_threshold": 1000}],
+                    store=True,
+                )
+
+            assert exc_info.value.status_code == 413
+            assert len(NativeCompactionBackendHandler.requests) == backend_calls
+            assert len(CompactionHandler.requests) == callouts
+            assert len(client.conversations.items.list(conversation.id).data) == persisted_before
+        finally:
+            client.conversations.delete(conversation.id)
 
     @requires_real_inference
     def test_over_threshold_compacts_rehydrated_history(
