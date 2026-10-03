@@ -1073,6 +1073,10 @@ fn evaluate_loop_decision(
 
 /// Rewrite queued hosted searches to `incomplete` when they cannot consume
 /// remaining `max_tool_calls` budget, and drop them from dispatch.
+#[expect(
+    clippy::too_many_lines,
+    reason = "updates canonical output and the matching persisted round"
+)]
 fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
         return;
@@ -1772,10 +1776,8 @@ fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
         };
         let copies = match item.get("type").and_then(Value::as_str) {
             Some("function_call" | "reasoning" | "compaction") => 3,
-            Some("web_search_call") => 2,
-            Some("file_search_call") => 2,
+            Some("web_search_call" | "file_search_call") => 2,
             Some("tool_search_call") if is_completed_output_item(item) => 2,
-            Some("tool_search_call") => 1,
             _ => 1,
         };
         let Some(total) = bytes
