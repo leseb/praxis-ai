@@ -881,12 +881,10 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
             ResponsesEvent::ResponseCompleted(payload)
             | ResponsesEvent::ResponseIncomplete(payload)
             | ResponsesEvent::ResponseFailed(payload) => {
-                let response_bytes = retained_json_bytes(payload.get("response").unwrap_or(payload))?;
+                let response = payload.get("response").unwrap_or(payload);
+                let response_bytes = retained_json_bytes(response)?;
                 let previous_usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
-                let incoming_usage_bytes = payload
-                    .get("response")
-                    .and_then(|response| response.get("usage"))
-                    .map_or(Some(0), retained_json_bytes)?;
+                let incoming_usage_bytes = response.get("usage").map_or(Some(0), retained_json_bytes)?;
                 // The conformant terminal response moves from the parsed event
                 // into shared state. Usage merging can still grow the distinct
                 // accumulator and clone the merged usage into that response.

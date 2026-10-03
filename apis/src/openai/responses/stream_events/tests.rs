@@ -2450,6 +2450,28 @@ fn commit_projection_charges_argument_delta_and_terminal_usage_owners() {
     );
 }
 
+#[test]
+fn commit_projection_charges_bare_terminal_usage_clones() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.extensions.insert(ResponsesState::default());
+    let response = json!({
+        "type": "response.completed",
+        "id": "resp_bare_usage",
+        "output": [],
+        "usage": {"large_detail": "x".repeat(64 * 1024)}
+    });
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let usage_bytes = crate::openai::responses::state::retained_json_bytes(&response["usage"]).unwrap();
+    let event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(response);
+
+    let projection = super::projected_responses_state_clone_bytes(&ctx, &[event]).unwrap();
+    assert!(
+        projection >= response_bytes + usage_bytes * 2,
+        "the bare fallback clones the response and usage merging retains two more owners"
+    );
+}
+
 /// Record execution provenance for every item currently in `accumulated_output`,
 /// mirroring what a dispatch filter (`openai_mcp_dispatch`, `openai_web_search`)
 /// records when it actually executes a tool. Tests that seed `accumulated_output`
