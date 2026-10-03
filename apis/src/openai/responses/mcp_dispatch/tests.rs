@@ -1792,11 +1792,19 @@ fn prepare_response_round_emits_resumable_approval() {
     );
     assert_eq!(state.mcp_approval_state, McpApprovalState::ApprovalPendingThenReturn);
     assert_eq!(state.pending_approvals.len(), 1);
-    assert_eq!(state.accumulated_output.len(), 1);
-    assert_eq!(state.accumulated_output[0]["type"], "mcp_approval_request");
-    assert_eq!(state.accumulated_output[0]["id"], "c1");
     assert_eq!(
-        state.accumulated_output[0]["arguments"], "{\"city\":\"Paris\"}",
+        state.accumulated_output.len(),
+        2,
+        "model call and approval request remain canonical"
+    );
+    let approval = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["type"] == "mcp_approval_request")
+        .expect("gated call should emit an approval request");
+    assert_eq!(approval["id"], "c1");
+    assert_eq!(
+        approval["arguments"], "{\"city\":\"Paris\"}",
         "approval arguments must remain encoded exactly once"
     );
 }
@@ -1864,7 +1872,10 @@ fn prepare_response_round_rejects_unresumable_approval() {
             "a rejected approval must not create durable pending state"
         );
         assert!(
-            state.accumulated_output.is_empty(),
+            state
+                .accumulated_output
+                .iter()
+                .all(|item| item["type"] != "mcp_approval_request"),
             "a rejected approval must not emit a stranded approval request"
         );
     }
@@ -1898,17 +1909,17 @@ fn prepare_response_round_partitions_gated_and_executable_calls() {
     prepare_response_round(&mut state, 2).unwrap();
 
     assert_eq!(state.mcp_approval_state, McpApprovalState::ExecuteUngatedThenReturn);
-    assert_eq!(
-        state.tool_calls,
-        vec![json!({
-            "name":"docs__search_docs",
-            "call_id":"c2",
-            "arguments":"{}"
-        })],
-        "only the ungated sibling remains executable"
-    );
-    assert_eq!(state.accumulated_output[0]["type"], "mcp_approval_request");
-    assert_eq!(state.accumulated_output[0]["id"], "c1");
+    let executable = state.selected_tool_calls();
+    assert_eq!(executable.len(), 1, "only the ungated sibling remains executable");
+    assert_eq!(executable[0]["name"], "docs__search_docs");
+    assert_eq!(executable[0]["call_id"], "c2");
+    assert_eq!(executable[0]["arguments"], "{}");
+    let approval = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["type"] == "mcp_approval_request")
+        .expect("gated call should emit an approval request");
+    assert_eq!(approval["id"], "c1");
 }
 
 #[test]
@@ -2285,17 +2296,17 @@ async fn max_tool_calls_does_not_gate_mcp_execution() {
     assert!(matches!(action, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(state.tool_calls.is_empty(), "executed MCP calls are cleared");
-    assert_eq!(
-        state.accumulated_output.len(),
-        2,
-        "both MCP calls execute despite max_tool_calls=0"
-    );
+    let mcp_results: Vec<_> = state
+        .accumulated_output
+        .iter()
+        .filter(|item| item["type"] == "mcp_call")
+        .collect();
+    assert_eq!(mcp_results.len(), 2, "both MCP calls execute despite max_tool_calls=0");
     assert!(
-        state.accumulated_output.iter().all(|item| {
-            item["type"] == "mcp_call"
-                && item["error"]
-                    .as_str()
-                    .is_none_or(|error| !error.contains("max_tool_calls"))
+        mcp_results.iter().all(|item| {
+            item["error"]
+                .as_str()
+                .is_none_or(|error| !error.contains("max_tool_calls"))
         }),
         "MCP results must never carry a max_tool_calls rejection"
     );
@@ -2342,11 +2353,11 @@ async fn deferred_web_limit_does_not_gate_mcp_siblings() {
 
     assert!(matches!(action, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.accumulated_output.len(), 4);
+    assert_eq!(state.accumulated_output.len(), 6);
     assert_eq!(state.accumulated_output[0]["id"], "ws_1");
     assert_eq!(state.accumulated_output[1]["id"], "ws_2");
     assert!(
-        state.accumulated_output[2..].iter().all(|item| {
+        state.accumulated_output[4..].iter().all(|item| {
             item["type"] == "mcp_call"
                 && item["error"]
                     .as_str()
@@ -2454,14 +2465,13 @@ async fn resolve_to_dispatch_execute_with_original_name() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(!state.messages.is_empty(), "should append result messages");
 
-    let output = &state.accumulated_output;
-    assert!(!output.is_empty(), "should append output items to accumulated_output");
-    assert_eq!(output[0]["type"], "mcp_call");
-    assert_eq!(
-        output[0]["name"], tool_name,
-        "should use original tool name, not encoded"
-    );
-    assert_eq!(output[0]["server_label"], label);
+    let output = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["type"] == "mcp_call")
+        .expect("should append MCP result to accumulated_output");
+    assert_eq!(output["name"], tool_name, "should use original tool name, not encoded");
+    assert_eq!(output["server_label"], label);
     assert!(state.tool_calls.is_empty(), "should clear executed MCP tool calls");
 }
 
