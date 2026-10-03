@@ -1466,6 +1466,31 @@ async fn non_create_operations_rehydrate_small_history_with_agentic_budget() {
 }
 
 #[tokio::test]
+async fn non_create_history_read_still_rejects_oversized_record() {
+    let store = MockStore::with_completed_response(
+        "resp_large",
+        json!("Earlier turn"),
+        json!([{"role": "user", "content": "x".repeat(8_192)}]),
+    );
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(setup_registry(store));
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Count","previous_response_id":"resp_large"}"#,
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
 async fn rehydrates_from_conversation_string_id() {
     let messages = json!([
         {"role": "user", "content": "turn one"},
