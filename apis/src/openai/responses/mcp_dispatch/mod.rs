@@ -47,7 +47,7 @@ pub(crate) use approval::{OWNER_FINGERPRINT, owner_fingerprint};
 mod tests;
 
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
@@ -347,7 +347,13 @@ impl McpDispatchFilter {
             state.accumulated_output.push(result.output_item);
         }
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-        state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+        let output = &state.accumulated_output;
+        state.tool_calls.retain(|assignment| {
+            !assignment
+                .resolve(output, "function_call")
+                .is_some_and(|call| is_mcp_tool_call(call, &tool_index))
+        });
+        state.approved_tool_calls.clear();
     }
 
     /// Fail closed when no shared sub-request client is available to dial the
@@ -974,7 +980,7 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
             tool_name = %decision.tool_name,
             "resuming approved MCP tool call"
         );
-        state.tool_calls.push(build_approved_tool_call(decision));
+        state.approved_tool_calls.push(build_approved_tool_call(decision));
     } else {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
@@ -1186,11 +1192,12 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Continue);
         };
         let needs_discovery = has_pending_deferred_discovery(state);
-        if !needs_discovery && (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty()) {
+        let selected_calls = state.selected_tool_calls();
+        if !needs_discovery && (selected_calls.is_empty() || state.mcp_tool_map.is_empty()) {
             return Ok(FilterAction::Continue);
         }
 
-        let has_connector_calls = state.tool_calls.iter().any(|call| {
+        let has_connector_calls = selected_calls.iter().any(|call| {
             let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
                 return false;
             };
@@ -1242,12 +1249,13 @@ impl McpDispatchFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+        let selected_calls = state.selected_tool_calls();
+        if selected_calls.is_empty() || state.mcp_tool_map.is_empty() {
             return Ok(FilterAction::Continue);
         }
 
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-        let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+        let mcp_calls = extract_mcp_tool_calls(&selected_calls, &tool_index);
         if mcp_calls.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -1343,11 +1351,12 @@ pub(crate) fn prepare_response_round(
     state: &mut ResponsesState,
     max_calls_per_round: usize,
 ) -> Result<(), DispatchFailure> {
-    if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+    let selected_calls = state.selected_tool_calls();
+    if selected_calls.is_empty() || state.mcp_tool_map.is_empty() {
         return Ok(());
     }
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-    let mcp_call_count = count_mcp_tool_calls(&state.tool_calls, &tool_index);
+    let mcp_call_count = count_mcp_tool_calls(&selected_calls, &tool_index);
     if mcp_call_count > max_calls_per_round {
         return Err(DispatchFailure {
             status: 502,
@@ -1355,7 +1364,7 @@ pub(crate) fn prepare_response_round(
             message: "model response exceeded the configured MCP call limit".to_owned(),
         });
     }
-    let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+    let mcp_calls = extract_mcp_tool_calls(&selected_calls, &tool_index);
     if mcp_calls.is_empty() {
         return Ok(());
     }
@@ -1382,7 +1391,13 @@ pub(crate) fn prepare_response_round(
         if let Some(approval) = check_single_approval(call, &tool_index) {
             pending.push(approval);
         } else {
-            executable.push(call.clone());
+            if let Some(assignment) = state.tool_calls.iter().find(|assignment| {
+                assignment
+                    .resolve(&state.accumulated_output, "function_call")
+                    .is_some_and(|item| std::ptr::eq(item, call))
+            }) {
+                executable.push(assignment.clone());
+            }
         }
     }
     if pending.is_empty() {
@@ -1405,19 +1420,19 @@ pub(crate) fn prepare_response_round(
             .checked_add(call.arguments.len())?
             .checked_add(call.target_fingerprint.len())
     });
-    let executable_bytes = executable
-        .iter()
-        .try_fold(0_usize, |used, call| used.checked_add(retained_json_bytes(call)?));
-    let admission = pending_bytes
-        .and_then(|bytes| bytes.checked_mul(4))
-        .and_then(|bytes| executable_bytes?.checked_add(bytes));
+    let admission = pending_bytes.and_then(|bytes| bytes.checked_mul(4));
     if !admission.is_some_and(|bytes| state.can_retain_payload(bytes)) {
         state.discard_payload_for_budget_error();
         return Err(mcp_budget_failure());
     }
     record_and_emit_approvals(state, pending);
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-    state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+    let output = &state.accumulated_output;
+    state.tool_calls.retain(|assignment| {
+        !assignment
+            .resolve(output, "function_call")
+            .is_some_and(|call| is_mcp_tool_call(call, &tool_index))
+    });
     if executable.is_empty() {
         state.mcp_approval_state = McpApprovalState::ApprovalPendingThenReturn;
     } else {
@@ -1464,19 +1479,23 @@ struct PendingApproval {
 
 /// Borrow the MCP tool calls from the `tool_calls` list by checking
 /// `mcp_tool_map`.
-fn extract_mcp_tool_calls<'a>(
-    tool_calls: &'a [serde_json::Value],
+fn extract_mcp_tool_calls<'a, T: Borrow<serde_json::Value>>(
+    tool_calls: &'a [T],
     tool_index: &McpToolIndex<'_>,
 ) -> Vec<&'a serde_json::Value> {
     tool_calls
         .iter()
+        .map(Borrow::borrow)
         .filter(|tc| is_mcp_tool_call(tc, tool_index))
         .collect()
 }
 
 /// Count MCP-owned function calls without cloning provider payloads.
-fn count_mcp_tool_calls(tool_calls: &[serde_json::Value], tool_index: &McpToolIndex<'_>) -> usize {
-    tool_calls.iter().filter(|tc| is_mcp_tool_call(tc, tool_index)).count()
+fn count_mcp_tool_calls<T: Borrow<serde_json::Value>>(tool_calls: &[T], tool_index: &McpToolIndex<'_>) -> usize {
+    tool_calls
+        .iter()
+        .filter(|tc| is_mcp_tool_call((*tc).borrow(), tool_index))
+        .count()
 }
 
 /// Require every MCP function call to carry a distinct non-empty correlation ID.
