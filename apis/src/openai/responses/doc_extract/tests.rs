@@ -932,7 +932,6 @@ async fn aggregate_budget_rejects_escaped_file_growth_before_state_rewrite() {
     ]));
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.apply_retained_payload_limit(131_072);
-    let initial = state.retained_payload_bytes().unwrap();
     ctx.extensions.insert(state);
     let raw = Bytes::from(serde_json::to_vec(&body_json).unwrap());
     let mut body = Some(raw.clone());
@@ -950,8 +949,8 @@ async fn aggregate_budget_rejects_escaped_file_growth_before_state_rewrite() {
     );
     assert_eq!(body, Some(raw));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.retained_payload_bytes(), Some(initial));
-    assert_eq!(state.request_body, body_json);
+    assert!(state.messages.is_empty());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]
@@ -1005,8 +1004,49 @@ async fn aggregate_budget_rejects_escaped_history_file_before_rewrite() {
     };
     assert_eq!(rejection.status, 413);
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.messages[0], prior);
-    assert_eq!(state.persisted_messages[0], prior);
+    assert!(state.messages.is_empty());
+    assert!(state.persisted_messages.is_empty());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn aggregate_budget_failure_after_stream_commit_is_terminal_sse() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let mut body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "controls.txt", "file_data": text_file_data(&"\u{0001}".repeat(8_192))}
+        ]}
+    ]));
+    body_json["stream"] = serde_json::Value::Bool(true);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.iteration = 1;
+    state.apply_retained_payload_limit(131_072);
+    ctx.extensions.insert(state);
+    ctx.extensions.insert(super::super::ObservedResponsesSse);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a committed stream must end in an SSE error");
+    };
+    assert_eq!(rejection.status, 200);
+    assert!(
+        rejection
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type") && value == "text/event-stream")
+    );
+    let wire = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(wire.contains("event: error"), "{wire}");
+    assert!(wire.contains("during document extraction"), "{wire}");
+    assert!(!wire.contains("{\"error\":"), "{wire}");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.messages.is_empty());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[test]

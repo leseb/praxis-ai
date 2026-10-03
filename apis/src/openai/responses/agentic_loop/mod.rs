@@ -1103,6 +1103,10 @@ fn evaluate_loop_decision(
 
 /// Rewrite queued hosted searches to `incomplete` when they cannot consume
 /// remaining `max_tool_calls` budget, and drop them from dispatch.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass reconciles queue, public output, and persisted history"
+)]
 fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     if state.tool_search_calls.is_empty() {
         return;

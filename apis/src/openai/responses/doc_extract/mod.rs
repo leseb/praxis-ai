@@ -66,7 +66,6 @@ use super::{
     body_limits::reject_rewritten_body_too_large,
     bound_body_outcome,
     content_parts::{content_parts, content_parts_mut},
-    error::responses_error_rejection,
     openai_responses_proxy::serialized_outbound_body_len,
     state::{ResponsesState, retained_json_bytes},
 };
@@ -206,14 +205,13 @@ fn extract_and_rewrite(
     // One extracted string can exist in the parsed body, rewritten wire body,
     // request state, and both history projections before the old owners drop.
     // Bound the total decoded text before base64 decoding or JSON rewriting.
-    let aggregate_constrained = match constrain_aggregate_extraction(ctx, body, &parsed, &mut budget) {
-        Ok(constrained) => constrained,
-        Err(action) => return Ok(action),
+    let Ok(aggregate_constrained) = constrain_aggregate_extraction(ctx, body, &parsed, &mut budget) else {
+        return Ok(reject_aggregate_extraction(ctx));
     };
 
     let count = match extract_current_input(&mut parsed, &mut budget) {
         Ok(count) => count,
-        Err(ExtractError::TooLarge { .. }) if aggregate_constrained => return Ok(reject_aggregate_extraction()),
+        Err(ExtractError::TooLarge { .. }) if aggregate_constrained => return Ok(reject_aggregate_extraction(ctx)),
         Err(e) => return Ok(reject_extract_error(&e)),
     };
 
@@ -221,7 +219,7 @@ fn extract_and_rewrite(
         trace!("no input_file parts to extract");
         if let Err(e) = extract_state_history(ctx, &mut budget) {
             if matches!(e, ExtractError::TooLarge { .. }) && aggregate_constrained {
-                return Ok(reject_aggregate_extraction());
+                return Ok(reject_aggregate_extraction(ctx));
             }
             return Ok(reject_extract_error(&e));
         }
@@ -237,7 +235,7 @@ fn extract_and_rewrite(
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
         if matches!(e, ExtractError::TooLarge { .. }) && aggregate_constrained {
-            return Ok(reject_aggregate_extraction());
+            return Ok(reject_aggregate_extraction(ctx));
         }
         return Ok(reject_extract_error(&e));
     }
@@ -264,7 +262,7 @@ fn constrain_aggregate_extraction(
     body: &Option<Bytes>,
     parsed: &serde_json::Value,
     budget: &mut ExtractionBudget,
-) -> Result<bool, FilterAction> {
+) -> Result<bool, ()> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return Ok(false);
     };
@@ -286,18 +284,18 @@ fn constrain_aggregate_extraction(
         return Ok(false);
     }
 
-    let parsed_bytes = retained_json_bytes(parsed).ok_or_else(reject_aggregate_extraction)?;
-    let live_body_copies = parsed_bytes.checked_mul(4).ok_or_else(reject_aggregate_extraction)?;
+    let parsed_bytes = retained_json_bytes(parsed).ok_or(())?;
+    let live_body_copies = parsed_bytes.checked_mul(4).ok_or(())?;
     let headroom = state
         .retained_payload_bytes_bounded(limit)
         .and_then(|current| limit.checked_sub(current))
         .and_then(|remaining| remaining.checked_sub(body.as_ref().map_or(0, Bytes::len)))
         .and_then(|remaining| remaining.checked_sub(live_body_copies))
         .and_then(|remaining| remaining.checked_sub(4_096))
-        .ok_or_else(reject_aggregate_extraction)?;
+        .ok_or(())?;
     let text_limit = headroom / 48;
     if text_limit == 0 {
-        return Err(reject_aggregate_extraction());
+        return Err(());
     }
     let constrained = text_limit < budget.max_content_bytes || text_limit < budget.max_total_text_bytes;
     budget.max_content_bytes = budget.max_content_bytes.min(text_limit);
@@ -318,13 +316,12 @@ fn has_inline_file_data(items: &[serde_json::Value]) -> bool {
     })
 }
 
-/// Shared retained-budget failure before the request has committed a response.
-fn reject_aggregate_extraction() -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(
-        413,
-        "invalid_request_error",
+/// Clear retained owners and honor a response already committed by IRR.
+fn reject_aggregate_extraction(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    super::budget_error::reject_retained_payload_budget(
+        ctx,
         "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during document extraction",
-    ))
+    )
 }
 
 /// Walk the current request input and extract text-safe `input_file` parts.
