@@ -653,14 +653,16 @@ fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]
 
 /// Retain each newly approved call's minimum result and dispatch staging owners.
 fn approved_result_reservation_bytes(state: &ResponsesState, decisions: &[ResolvedApproval]) -> Option<usize> {
-    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     decisions
         .iter()
         .filter(|decision| decision.approve)
         .try_fold(0_usize, |used, decision| {
-            let McpToolMatch::Unique { entry, .. } = tool_index.get(&decision.encoded_name)? else {
-                return None;
-            };
+            // resolve_approval already proved this pair uniquely owns the
+            // encoded target. Borrow it here rather than allocating an index
+            // of every tool name just to preflight one approved result.
+            let entry = state.mcp_tool_map.iter().find_map(|((server, tool), entry)| {
+                (server == &decision.server_label && tool == &decision.tool_name).then_some(entry)
+            })?;
             let staging = decision
                 .approval_id
                 .len()
