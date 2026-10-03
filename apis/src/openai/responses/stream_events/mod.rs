@@ -1100,8 +1100,14 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
         &state.citation_files,
     )
     .ok()?;
-    let id_bytes = state.logical_stream_response_id.as_ref().map_or(0, String::len);
-    let previous_id_bytes = state.previous_response_id.as_ref().map_or(0, String::len);
+    let id_bytes = state
+        .logical_stream_response_id
+        .as_ref()
+        .map_or(Some(0), retained_json_bytes)?;
+    let previous_id_bytes = state
+        .previous_response_id
+        .as_ref()
+        .map_or(Some(0), retained_json_bytes)?;
     let usage_bytes = if state.usage.is_null() {
         0
     } else {
