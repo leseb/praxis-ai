@@ -34,25 +34,25 @@
 //!
 //! For non-streaming responses,
 //! this filter parses the response body JSON and routes each `output`
-//! item to its dispatch target: `function_call` items into
-//! `state.tool_calls`, `web_search_call` items into
-//! `state.web_search_calls`, and each pending `file_search_call` item —
-//! appended to the canonical `state.accumulated_output` — into a
-//! `state.file_search_assignments` entry recording its absolute output
-//! index and synthesis origin. Client `function_call` and `reasoning`
+//! item to its dispatch target. It moves output into the canonical
+//! `state.accumulated_output` and records compact selections for
+//! `function_call` and `web_search_call` items. Each pending
+//! `file_search_call` gets a `state.file_search_assignments` entry
+//! recording its absolute output index and synthesis origin. Client
+//! `function_call` and `reasoning`
 //! items are appended to `state.messages` so the model sees its own
 //! calls on re-entry. Hosted `web_search_call` and `file_search_call`
 //! items are **not** valid `OpenResponses` input (issue #808), so they
-//! never enter `state.messages`; `web_search_call`s remain in
-//! `state.web_search_calls` and `file_search_call`s are reached by index
-//! through `state.file_search_assignments`, for `openai_web_search` /
+//! never enter `state.messages`; `web_search_call`s are selected through
+//! `state.web_search_calls` and `file_search_call`s through
+//! `state.file_search_assignments`, for `openai_web_search` /
 //! `openai_file_search_callout` to dispatch and bridge into backend
 //! history, and reach the client only through `state.accumulated_output`.
 //!
-//! For streaming responses, `stream_events` populates
-//! `state.tool_calls` via SSE event parsing. When the body is
-//! `None` at end-of-stream (consumed by streaming filters), this
-//! filter skips body parsing and checks `state.tool_calls` as-is.
+//! For streaming responses, `stream_events` accumulates the response
+//! output via SSE event parsing. When the body is `None` at end-of-stream
+//! (consumed by streaming filters), this filter moves that output into
+//! `state.accumulated_output` and records the same dispatch selections.
 //!
 //! `on_request_body` handles iteration bookkeeping: clearing stale
 //! tool calls, web search calls, and file search assignments from the
@@ -66,8 +66,8 @@
 //! `openai_mcp_dispatch`, and `openai_file_search_callout` and before
 //! `openai_responses_proxy`. Response filters execute in reverse
 //! order, so the owner parses and classifies each round's output
-//! *before* the dispatchers run, routing every call to the vector the
-//! matching dispatcher consumes. Because the owner is the sole filter
+//! *before* the dispatchers run, recording selections that each matching
+//! dispatcher resolves against canonical output. Because the owner is the sole filter
 //! that publishes the IRR transition, `on_result` keys **only** on
 //! `openai_agentic_loop.action`; the dispatchers publish no action of
 //! their own.
@@ -604,7 +604,7 @@ fn admit_retained_payload_budget(
 )]
 fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     if let Some(max_calls) = configured_web_max_calls(ctx)
-        && state.web_search_calls.len() > max_calls
+        && state.selected_web_search_calls().len() > max_calls
     {
         return Err(DispatchFailure {
             status: 502,
@@ -1333,6 +1333,7 @@ fn dispatch_assignment_id_bytes(item: &Value) -> usize {
     let selected = match item.get("type").and_then(Value::as_str) {
         Some("function_call") => is_dispatchable_function_call(item),
         Some("web_search_call") => true,
+        Some("file_search_call") => is_pending_file_search_call(item),
         Some("tool_search_call") => is_hosted_completed_tool_search(item),
         _ => false,
     };
@@ -1518,13 +1519,23 @@ fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usiz
     if pending.is_empty() {
         return;
     }
-    let candidates = pending
-        .into_iter()
-        .map(|(output_index, synthesis)| FileSearchAssignment {
+    let mut candidates = Vec::with_capacity(pending.len());
+    for (output_index, synthesis) in pending {
+        let Some(item_id) = state
+            .accumulated_output
+            .get(output_index)
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+        else {
+            terminalize_file_search_item(state, output_index);
+            continue;
+        };
+        candidates.push(FileSearchAssignment {
             output_index,
+            item_id: item_id.to_owned(),
             synthesis,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     let admissions = current_round_file_search_admissions(state, &candidates);
     for (index, assignment) in candidates.into_iter().enumerate() {
         let admitted = admissions.get(index).copied().unwrap_or(false);
