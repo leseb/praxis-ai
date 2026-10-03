@@ -328,9 +328,10 @@ impl ResponseStoreFilter {
         };
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
         let previously_retained = state.retained_payload_bytes();
+        let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
         if let Some(responses) = ctx.extensions.get::<ResponsesState>()
             && let Some(limit) = responses.retained_payload_limit()
-            && (end_of_stream
+            && (terminal_ready
                 || state
                     .shared_stable_bytes
                     .is_none_or(|(round, _)| round != responses.iteration))
@@ -705,7 +706,8 @@ struct ResponseStoreRequestState {
     charged_retained_bytes: Option<usize>,
     /// Request, history, and prior output stay stable while a streamed round
     /// is delivered. Cache their charge instead of serializing them on every
-    /// replay chunk. Refresh at EOS after the agentic loop may append output.
+    /// replay chunk. Refresh when a terminal is ready, including a non-EOS
+    /// synthesized terminal, after the agentic loop may append output.
     shared_stable_bytes: Option<(u32, usize)>,
     /// Store request-body validation completed before a later filter created
     /// `ResponsesState`; transfer its approval-persistence signal with the charge.
@@ -2490,27 +2492,29 @@ mod encode_replay_event_tests {
     }
 
     #[test]
-    fn replay_meter_refreshes_accumulated_output_at_end_of_stream() {
+    fn replay_meter_refreshes_accumulated_output_at_terminal_chunk() {
         let filter =
             ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
-        let mut responses = ResponsesState::default();
-        responses
-            .accumulated_output
-            .push(json!({"type": "message", "content": "prior".repeat(100_000)}));
-        responses.apply_retained_payload_limit(1_048_576);
-        ctx.extensions.insert(responses);
         let frame = Some(Bytes::from_static(
             b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
         ));
-        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        for terminal_is_eos in [false, true] {
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            let mut responses = ResponsesState::default();
+            responses
+                .accumulated_output
+                .push(json!({"type": "message", "content": "prior".repeat(100_000)}));
+            responses.apply_retained_payload_limit(1_048_576);
+            ctx.extensions.insert(responses);
+            assert!(filter.capture_stream_events(&mut ctx, &frame, false));
 
-        ctx.extensions
-            .get_mut::<ResponsesState>()
-            .unwrap()
-            .accumulated_output
-            .push(json!({"type": "message", "content": "x".repeat(700_000)}));
-        assert!(!filter.capture_stream_events(&mut ctx, &frame, true));
+            let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+            responses
+                .accumulated_output
+                .push(json!({"type": "message", "content": "x".repeat(700_000)}));
+            responses.logical_stream_terminal_emitted = !terminal_is_eos;
+            assert!(!filter.capture_stream_events(&mut ctx, &frame, terminal_is_eos));
+        }
     }
 }
