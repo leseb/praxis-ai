@@ -655,17 +655,12 @@ fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> FilterA
     ))
 }
 
-/// Reject a provider-bound request while it can still become an HTTP error.
+/// Reject a provider-bound request in the already established wire format.
+/// A later IRR round may follow a committed Responses SSE stream, even though
+/// this selected-upstream hook has not sent its own request yet.
 fn outbound_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstreamBodyOutcome {
-    ctx.set_metadata("responses.skip_persist", "true");
-    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-        state.discard_payload_for_budget_error();
-    }
-    #[cfg(feature = "store")]
-    super::store::discard_retained_request_payload(ctx);
-    SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
-        502,
-        "server_error",
+    SelectedUpstreamBodyOutcome::Reject(super::budget_error::retained_payload_response_budget_rejection(
+        ctx,
         OUTBOUND_TRANSLATION_OVERFLOW_MESSAGE,
     ))
 }

@@ -2732,6 +2732,57 @@ fn outbound_chat_translation_rejects_before_allocating_near_retained_limit() {
 }
 
 #[test]
+fn committed_stream_outbound_budget_failure_emits_terminal_sse_error() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi", "stream":true}));
+    state.iteration = 1;
+    let message = json!({"role":"assistant", "content":"x".repeat(16_384)});
+    state.messages.push(message.clone());
+    state.persisted_messages.push(message);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    context.extensions.insert(state);
+    context.extensions.insert(super::ObservedResponsesSse);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let result = filter.translated_request_bytes(&mut context).unwrap();
+    let Err(SelectedUpstreamBodyOutcome::Reject(rejection)) = result else {
+        panic!("expected a terminal budget rejection after SSE commitment");
+    };
+    assert_eq!(rejection.status, 200, "committed SSE cannot switch to HTTP 502");
+    assert!(
+        rejection
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type") && value == "text/event-stream"),
+        "the terminal error keeps SSE framing: {:?}",
+        rejection.headers
+    );
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap());
+    assert!(body.contains("event: error\n"), "one terminal error is emitted: {body}");
+    assert!(
+        body.contains("server_error"),
+        "the budget failure is server side: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "no successful completion follows exhaustion: {body}"
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed,
+        "successful response persistence is disabled"
+    );
+}
+
+#[test]
 fn outbound_chat_translation_admits_large_prompt_with_sufficient_payload_headroom() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);

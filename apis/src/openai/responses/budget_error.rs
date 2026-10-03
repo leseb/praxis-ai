@@ -28,21 +28,23 @@ fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
 /// when a buffered step has replaced `IterationState.previous_response`.
 pub(super) fn reject_retained_payload_budget(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
     let initial = is_initial_request(ctx);
-    reject_retained_payload_budget_with_status(ctx, message, initial)
+    FilterAction::Reject(retained_payload_budget_rejection(ctx, message, initial))
 }
 
 /// Reject payload growth caused by a provider response as a server error,
 /// including when it happens in the first inference round.
 pub(super) fn reject_retained_payload_response_budget(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
-    reject_retained_payload_budget_with_status(ctx, message, false)
+    FilterAction::Reject(retained_payload_response_budget_rejection(ctx, message))
+}
+
+/// Return a response-phase rejection for selected-upstream hooks, which must
+/// produce a [`Rejection`] rather than a [`FilterAction`].
+pub(super) fn retained_payload_response_budget_rejection(ctx: &mut HttpFilterContext<'_>, message: &str) -> Rejection {
+    retained_payload_budget_rejection(ctx, message, false)
 }
 
 /// Shared cleanup and committed-stream encoding for both admission phases.
-fn reject_retained_payload_budget_with_status(
-    ctx: &mut HttpFilterContext<'_>,
-    message: &str,
-    initial: bool,
-) -> FilterAction {
+fn retained_payload_budget_rejection(ctx: &mut HttpFilterContext<'_>, message: &str, initial: bool) -> Rejection {
     let committed_stream = ctx.extensions.get::<ObservedResponsesSse>().is_some();
     ctx.set_metadata("responses.skip_persist", "true");
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -53,17 +55,15 @@ fn reject_retained_payload_budget_with_status(
     if committed_stream {
         let body =
             encode_local_error(ctx, "server_error", message).unwrap_or_else(|| encode_retained_payload_error(ctx));
-        return FilterAction::Reject(
-            Rejection::status(200)
-                .with_header("content-type", "text/event-stream")
-                .with_body(body)
-                .preserving_keepalive(),
-        );
+        return Rejection::status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .preserving_keepalive();
     }
     let (status, code) = if initial {
         (413, "invalid_request_error")
     } else {
         (502, "server_error")
     };
-    FilterAction::Reject(responses_error_rejection(status, code, message))
+    responses_error_rejection(status, code, message)
 }
