@@ -40,6 +40,10 @@ const FILES_PATH_PREFIX: &str = "v1/files";
 const AGGREGATE_RESOLUTION_OWNER_RESERVATION: usize = 8;
 /// Four serialized owners may each expand metadata control bytes to `\u00xx`.
 const ESCAPED_METADATA_OWNERS: usize = 4;
+/// Replacing a reference can add `file_data`/`image_url` and an empty
+/// `filename` field even when the resolved value contains zero bytes. Twenty
+/// bytes bounds that JSON field framing per independently rewritten part.
+const REWRITE_FIELD_FRAMING_BYTES: usize = 20;
 
 /// Identifies the source of a file reference for dispatch and caching.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,6 +436,12 @@ impl ResolutionBudget {
             && retained_resolved_bytes(part_type, source, resolved).is_none_or(|bytes| bytes > remaining)
         {
             return Err(ResolveError::RetainedBudget);
+        }
+        if let Err(error) = &resolution {
+            // A failed lookup is cached under `on_missing: continue`. Its
+            // owned labels/details and the returned error are separate from
+            // the source key already reserved above.
+            self.consume_aggregate_bytes(retained_error_bytes(error).ok_or(ResolveError::RetainedBudget)?)?;
         }
 
         // Retain one owned outcome for repeated references while
@@ -831,6 +841,11 @@ async fn resolve_content_part(
 
     debug!(source = %source, part_type = %part_type, "resolving file reference");
 
+    // Charge the structural JSON growth for every occurrence, including
+    // cache hits with empty content. Do this before the callout or cache
+    // clone, so a tight budget cannot perform another resolution first.
+    resolver.budget.consume_aggregate_bytes(REWRITE_FIELD_FRAMING_BYTES)?;
+
     let max_resolved_bytes = resolver
         .budget
         .aggregate_remaining_bytes
@@ -993,6 +1008,21 @@ fn retained_resolved_bytes(part_type: &str, source: ReferenceSource<'_>, resolve
         .checked_add(resolved.content_type.len())?
         .checked_add(resolved.filename.as_ref().map_or(0, String::len))?
         .checked_add(escaped_units)
+}
+
+/// Owned string bytes in a cached failure, excluding its separately charged
+/// cache key. The eight-owner aggregate reserve covers the cache clone and
+/// the returned error while it is handled by the missing-file policy.
+fn retained_error_bytes(error: &ResolveError) -> Option<usize> {
+    match error {
+        ResolveError::CalloutFailed { file_id, detail } | ResolveError::InvalidFileId { file_id, detail } => {
+            file_id.len().checked_add(detail.len())
+        },
+        ResolveError::TooLarge { reference, .. } => Some(reference.len()),
+        ResolveError::FileUrlBlocked { label } => Some(label.len()),
+        ResolveError::FileUrlFailed { label, detail } => label.len().checked_add(detail.len()),
+        ResolveError::TooManyReferences { .. } | ResolveError::RetainedBudget => Some(0),
+    }
 }
 
 /// Replace the reference field with the resolved content in a content part.
@@ -1280,6 +1310,83 @@ mod tests {
         };
         assert!(matches!(error, ResolveError::RetainedBudget));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_resolution_cache_cannot_exceed_aggregate_headroom() {
+        let client = test_client("http://127.0.0.1:1");
+        let mut budget = client.resolution_budget(None);
+        let headroom = 2048;
+        budget.apply_aggregate_headroom(headroom);
+        let content: Vec<_> = (0..32)
+            .map(|id| serde_json::json!({"type":"input_file","file_id":format!("file-{id}")}))
+            .collect();
+        let mut items = vec![serde_json::json!({"role":"user","content":content})];
+
+        let result = resolve_items(
+            &mut items,
+            &client,
+            OnMissing::Continue,
+            &http::HeaderMap::new(),
+            None,
+            &mut budget,
+        )
+        .await;
+        assert!(matches!(result, Err(ResolveError::RetainedBudget)));
+        let cached_bytes: usize = budget
+            .cache
+            .values()
+            .flat_map(|entries| entries.iter())
+            .map(|(key, result)| key.len() + retained_error_bytes(result.as_ref().unwrap_err()).unwrap())
+            .sum();
+        assert!(cached_bytes <= headroom / AGGREGATE_RESOLUTION_OWNER_RESERVATION);
+        assert!(
+            budget.references_seen < 32,
+            "failure cache must exhaust before all callouts"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the HTTP stub proves both file callouts precede the cached rewrite bound"
+    )]
+    async fn empty_cached_resolution_charges_each_rewritten_field() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = test_client(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            for body in [r#"{"content_type":"","filename":"","bytes":0}"#, ""] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _read = stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut budget = client.resolution_budget(None);
+        budget.apply_aggregate_headroom(512);
+        let content: Vec<_> = (0..64)
+            .map(|_| serde_json::json!({"type":"input_file","file_id":"a"}))
+            .collect();
+        let mut items = vec![serde_json::json!({"role":"user","content":content})];
+
+        let result = resolve_items(
+            &mut items,
+            &client,
+            OnMissing::Reject,
+            &http::HeaderMap::new(),
+            None,
+            &mut budget,
+        )
+        .await;
+        assert!(matches!(result, Err(ResolveError::RetainedBudget)));
+        server.join().unwrap();
+        let rewritten = items[0]["content"].as_array().unwrap();
+        assert!(rewritten.iter().filter(|part| part.get("file_data").is_some()).count() < 64);
     }
 
     #[tokio::test]
