@@ -1619,6 +1619,46 @@ async fn on_request_body_honors_client_max_tool_calls() {
 }
 
 #[tokio::test]
+async fn mixed_file_then_web_round_preserves_model_order_under_max_tool_calls() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let file = serde_json::json!({"type": "file_search_call", "id": "fs_first", "status": "searching"});
+    let web = web_search_call("ws_second", "should not run");
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 1}));
+    state.current_round_output_start = Some(0);
+    state.accumulated_output = vec![file.clone(), web.clone()];
+    state.response_object = serde_json::json!({"output": [file, web.clone()]});
+    state.select_test_output("web_search_call", vec![web]);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.accumulated_output.len(),
+        2,
+        "both output slots remain in model order"
+    );
+    assert_eq!(state.accumulated_output[0]["id"], "fs_first");
+    assert_eq!(state.accumulated_output[0]["status"], "searching");
+    assert_eq!(state.accumulated_output[1]["id"], "ws_second");
+    assert_ne!(state.accumulated_output[1]["status"], "completed");
+    assert_eq!(state.web_search_calls_executed, 0);
+    assert!(state.deferred_tool_limit_completion);
+    let bridge = find_bridge_output(&state.messages, "should not run").expect("truthful web bridge");
+    assert_eq!(bridge["output"], "Web search not performed.");
+}
+
+#[tokio::test]
 async fn on_request_body_budget_spans_iterations() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
