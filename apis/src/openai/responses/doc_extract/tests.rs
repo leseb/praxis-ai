@@ -954,6 +954,36 @@ async fn aggregate_budget_rejects_escaped_file_growth_before_state_rewrite() {
 }
 
 #[tokio::test]
+async fn aggregate_budget_preflights_extraction_before_state_initialization() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let config = serde_yaml::from_str("max_retained_bytes: 131072").unwrap();
+    let policy = AgenticBudgetPolicy::from_config(&config).unwrap();
+    ctx.extensions.insert(policy);
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "controls.txt", "file_data": text_file_data(&"\u{0001}".repeat(8_192))}
+        ]}
+    ]));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("pipeline budget must apply before ResponsesState exists");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(
+        std::str::from_utf8(rejection.body.as_deref().unwrap())
+            .unwrap()
+            .contains("during document extraction")
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn aggregate_budget_allows_small_document_extraction() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");

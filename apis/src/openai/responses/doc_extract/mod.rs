@@ -63,6 +63,7 @@ use self::{
     extract::{ExtractError, ExtractionBudget, extract_input_file},
 };
 use super::{
+    agentic_loop::AgenticBudgetPolicy,
     body_limits::reject_rewritten_body_too_large,
     bound_body_outcome,
     content_parts::{content_parts, content_parts_mut},
@@ -263,31 +264,35 @@ fn constrain_aggregate_extraction(
     parsed: &serde_json::Value,
     budget: &mut ExtractionBudget,
 ) -> Result<bool, ()> {
-    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-        return Ok(false);
-    };
-    let Some(limit) = state.retained_payload_limit() else {
+    let state = ctx.extensions.get::<ResponsesState>();
+    let Some(limit) = state.and_then(ResponsesState::retained_payload_limit).or_else(|| {
+        ctx.extensions
+            .get::<AgenticBudgetPolicy>()
+            .map(|policy| policy.max_retained_bytes())
+    }) else {
         return Ok(false);
     };
     let current_items = parsed
         .get("input")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|items| has_inline_file_data(items));
-    let history_end = state.messages.len().saturating_sub(state.input.len());
-    let persisted_history_end = state.persisted_messages.len().saturating_sub(state.input.len());
-    let history_items = state.messages.get(..history_end).is_some_and(has_inline_file_data)
-        || state
-            .persisted_messages
-            .get(..persisted_history_end)
-            .is_some_and(has_inline_file_data);
+    let history_items = state.is_some_and(|state| {
+        let history_end = state.messages.len().saturating_sub(state.input.len());
+        let persisted_history_end = state.persisted_messages.len().saturating_sub(state.input.len());
+        state.messages.get(..history_end).is_some_and(has_inline_file_data)
+            || state
+                .persisted_messages
+                .get(..persisted_history_end)
+                .is_some_and(has_inline_file_data)
+    });
     if !current_items && !history_items {
         return Ok(false);
     }
 
     let parsed_bytes = retained_json_bytes(parsed).ok_or(())?;
     let live_body_copies = parsed_bytes.checked_mul(4).ok_or(())?;
-    let headroom = state
-        .retained_payload_bytes_bounded(limit)
+    let baseline = state.map_or(Some(0), |state| state.retained_payload_bytes_bounded(limit));
+    let headroom = baseline
         .and_then(|current| limit.checked_sub(current))
         .and_then(|remaining| remaining.checked_sub(body.as_ref().map_or(0, Bytes::len)))
         .and_then(|remaining| remaining.checked_sub(live_body_copies))
