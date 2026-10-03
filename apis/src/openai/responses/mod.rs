@@ -336,7 +336,7 @@ impl ResponsesFormatFilter {
 
 /// Conservative raw-body allowance before JSON parsing creates owned copies.
 #[cfg(feature = "openai-responses")]
-const INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER: usize = 8;
+pub(crate) const INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER: usize = 8;
 
 /// Reject a known oversized create body before classification parses JSON.
 #[cfg(feature = "openai-responses")]

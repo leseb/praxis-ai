@@ -1251,6 +1251,14 @@ impl ResponsesState {
         self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
     }
 
+    /// The response store caches request/history and prior output while
+    /// capturing replay chunks, but must still count all changing owners,
+    /// including the parser charge published by `openai_stream_events`.
+    #[cfg(feature = "store")]
+    pub(crate) fn store_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+    }
+
     /// The translated upstream round cannot append prior output until its
     /// converter has finished. The converter caches that large owner once;
     /// this counts all other changing owners, including the stream parser.
