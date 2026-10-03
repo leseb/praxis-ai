@@ -157,11 +157,9 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return publish_bodyless_operation(ctx, &self.config);
         }
 
-        // The consolidated path owns the same pre-parse admission boundary as
-        // the legacy format filter. Reject before JSON and state allocate.
-        if matched.operation == ResponsesOperation::CreateResponse
-            && let Some(action) = super::initial_budget_rejection(ctx, body.as_deref().unwrap_or_default())
-        {
+        // The consolidated path owns the first pre-parse admission boundary
+        // for create and history-bearing operations.
+        if let Some(action) = super::initial_budget_rejection(ctx, body.as_deref().unwrap_or_default()) {
             return Ok(action);
         }
 

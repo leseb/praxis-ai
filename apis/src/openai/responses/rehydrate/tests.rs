@@ -1417,6 +1417,130 @@ async fn an_explicit_null_conversation_is_treated_as_absent() {
 }
 
 #[tokio::test]
+async fn token_count_without_history_does_not_use_create_body_allowance() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "m",
+            "input": "x".repeat(1_024),
+        }))
+        .unwrap(),
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
+async fn token_count_history_with_budget_rehydrates_without_create_state() {
+    let registry = setup_registry(MockStore::with_conversation("conv_count", json!([])));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"m","input":"count me","conversation":"conv_count"}"#,
+    ));
+
+    let request_filter =
+        crate::openai::responses::request::OpenaiResponsesRequestFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    assert!(matches!(
+        request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Release
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+    let parsed = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        history_read_limit(&ctx, &parsed, body.as_ref().unwrap().len()).is_ok(),
+        "token-count history needs a bounded read allowance without create state"
+    );
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "unexpected rehydrate action: {action:?}"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.history_rehydrated)
+    );
+}
+
+#[tokio::test]
+async fn token_count_previous_response_with_budget_rehydrates_without_create_state() {
+    let registry = setup_registry(MockStore::with_status("resp_count", "completed"));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"m","input":"count me","previous_response_id":"resp_count"}"#,
+    ));
+
+    let request_filter =
+        crate::openai::responses::request::OpenaiResponsesRequestFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    assert!(matches!(
+        request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Release
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "unexpected rehydrate action: {action:?}"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.history_rehydrated)
+    );
+}
+
+#[tokio::test]
+async fn token_count_history_with_budget_rejects_oversized_store_row() {
+    let registry = setup_registry(MockStore::with_conversation(
+        "conv_large",
+        json!([{"role": "user", "content": "x".repeat(8_000)}]),
+    ));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"m","input":"count me","conversation":"conv_large"}"#,
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
 async fn rehydrates_from_conversation_string_id() {
     let messages = json!([
         {"role": "user", "content": "turn one"},
@@ -3874,6 +3998,25 @@ impl ResponseStore for MockStore {
         Ok(self.records.get(id).filter(|r| &r.owner == tenant_id).cloned())
     }
 
+    async fn get_response_bounded(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        if let Some(record) = self.records.get(id).filter(|record| &record.owner == tenant_id) {
+            let bytes = [&record.response_object, &record.input, &record.messages]
+                .iter()
+                .try_fold(0_usize, |used, value| {
+                    super::super::state::retained_json_bytes(*value).and_then(|bytes| used.checked_add(bytes))
+                });
+            if bytes.is_none_or(|bytes| bytes > max_bytes) {
+                return Err(StoreError::PayloadTooLarge);
+            }
+        }
+        ResponseStore::get_response(self, tenant_id, id).await
+    }
+
     async fn delete_response(&self, _tenant_id: &StateOwner, _id: &str) -> Result<bool, StoreError> {
         Ok(false)
     }
@@ -3970,6 +4113,26 @@ impl ResponseStore for MockStore {
                 metadata: c.metadata.clone(),
                 messages: c.messages.clone(),
             }))
+    }
+
+    async fn get_conversation_bounded(
+        &self,
+        tenant_id: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        if let Some(record) = self
+            .conversations
+            .get(conversation_id)
+            .filter(|record| &record.owner == tenant_id)
+        {
+            let bytes = super::super::state::retained_json_bytes(&record.metadata)
+                .and_then(|metadata| super::super::state::retained_json_bytes(&record.messages)?.checked_add(metadata));
+            if bytes.is_none_or(|bytes| bytes > max_bytes) {
+                return Err(StoreError::PayloadTooLarge);
+            }
+        }
+        ResponseStore::get_conversation(self, tenant_id, conversation_id).await
     }
 }
 

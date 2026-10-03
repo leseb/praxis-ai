@@ -334,20 +334,185 @@ impl ResponsesFormatFilter {
     }
 }
 
-/// Conservative raw-body allowance before JSON parsing creates owned copies.
+/// Conservative body allowance before JSON parsing creates owned copies.
 #[cfg(feature = "openai-responses")]
 pub(crate) const INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER: usize = 8;
 
-/// Reject a known oversized create body before classification parses JSON.
+/// Compare a JSON key with an ASCII selector, decoding escapes in place.
+/// Invalid escapes fail closed instead of allocating a decoded key.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "allocation-free JSON key decoding keeps escape handling local"
+)]
+fn selector_key_matches(raw: &[u8], target: &[u8]) -> Option<bool> {
+    fn hex_digit(byte: u8) -> Option<u16> {
+        match byte {
+            b'0'..=b'9' => Some(u16::from(byte - b'0')),
+            b'a'..=b'f' => Some(u16::from(byte - b'a' + 10)),
+            b'A'..=b'F' => Some(u16::from(byte - b'A' + 10)),
+            _ => None,
+        }
+    }
+
+    let mut index = 0;
+    let mut matched = 0;
+    while let Some(&byte) = raw.get(index) {
+        let (decoded, next) = if byte == b'\\' {
+            match *raw.get(index.checked_add(1)?)? {
+                b'u' => {
+                    let end = index.checked_add(6)?;
+                    let digits = raw.get(index + 2..end)?;
+                    let code = digits.iter().try_fold(0_u16, |code, digit| {
+                        code.checked_mul(16)?.checked_add(hex_digit(*digit)?)
+                    })?;
+                    let Ok(decoded) = u8::try_from(code) else {
+                        return Some(false);
+                    };
+                    (decoded, end)
+                },
+                b'"' => (b'"', index + 2),
+                b'\\' => (b'\\', index + 2),
+                b'/' => (b'/', index + 2),
+                b'b' => (8, index + 2),
+                b'f' => (12, index + 2),
+                b'n' => (b'\n', index + 2),
+                b'r' => (b'\r', index + 2),
+                b't' => (b'\t', index + 2),
+                _ => return None,
+            }
+        } else {
+            (byte, index + 1)
+        };
+        if target.get(matched) != Some(&decoded) {
+            return Some(false);
+        }
+        matched += 1;
+        index = next;
+    }
+    Some(matched == target.len())
+}
+
+/// Detect top-level, non-null history selectors without allocating payload.
+/// Malformed structure is conservatively admitted to the size preflight.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass structural scan must fail closed on malformed nesting"
+)]
+fn may_rehydrate_history(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'{') {
+        return true;
+    }
+    let mut stack = [0_u8; 128];
+    let mut depth = 0_usize;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'"' {
+            let start = index + 1;
+            index = start;
+            let mut escaped = false;
+            while let Some(&part) = bytes.get(index) {
+                if escaped {
+                    escaped = false;
+                } else if part == b'\\' {
+                    escaped = true;
+                } else if part == b'"' {
+                    break;
+                }
+                index += 1;
+            }
+            if bytes.get(index) != Some(&b'"') {
+                return true;
+            }
+            let Some(raw_key) = bytes.get(start..index) else {
+                return true;
+            };
+            index += 1;
+            if depth == 1 {
+                let mut tail = index;
+                while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                    tail += 1;
+                }
+                if bytes.get(tail) == Some(&b':') {
+                    let matched = selector_key_matches(raw_key, b"previous_response_id")
+                        .zip(selector_key_matches(raw_key, b"conversation"));
+                    let Some((previous, conversation)) = matched else {
+                        return true;
+                    };
+                    if previous || conversation {
+                        tail += 1;
+                        while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                            tail += 1;
+                        }
+                        if bytes.get(tail..tail.saturating_add(4)) != Some(b"null") {
+                            return true;
+                        }
+                        tail += 4;
+                        while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                            tail += 1;
+                        }
+                        if !matches!(bytes.get(tail), Some(b',' | b'}')) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        match byte {
+            b'{' | b'[' => {
+                if depth == stack.len() {
+                    return true;
+                }
+                let Some(slot) = stack.get_mut(depth) else {
+                    return true;
+                };
+                *slot = byte;
+                depth += 1;
+            },
+            b'}' | b']' => {
+                let Some(open) = depth.checked_sub(1).and_then(|slot| stack.get(slot)).copied() else {
+                    return true;
+                };
+                if !matches!((open, byte), (b'{', b'}') | (b'[', b']')) {
+                    return true;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return bytes
+                        .get(index + 1..)
+                        .is_none_or(|tail| tail.iter().any(|byte| !byte.is_ascii_whitespace()));
+                }
+            },
+            _ => {},
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Reject a known oversized create or history-bearing body before parsing JSON.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
-    if is_responses_create(&ctx.request.method, ctx.request.uri.path())
-        && let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>()
-    {
-        let raw_body_limit = policy.max_retained_bytes() / INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER;
-        if bytes.len() > raw_body_limit {
+    let policy = ctx.extensions.get::<AgenticBudgetPolicy>()?;
+    let path = ctx.request.uri.path().trim_end_matches('/');
+    let may_rehydrate = ctx.request.method == http::Method::POST
+        && matches!(path, "/v1/responses/input_tokens" | "/v1/responses/compact")
+        && may_rehydrate_history(bytes);
+    if is_responses_create(&ctx.request.method, ctx.request.uri.path()) || may_rehydrate {
+        let body_limit = policy.max_retained_bytes() / INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER;
+        // Exponent-form numbers can grow when serde_json materializes Values.
+        // Reserve that normalized size before the first owned JSON tree exists.
+        if bytes.len() > body_limit
+            || agentic_loop::buffered_parsed_json_bytes_upper_bound(bytes)
+                .is_none_or(|parsed_bytes| parsed_bytes > body_limit)
+        {
             let message = format!(
-                "raw request body exceeds the {raw_body_limit}-byte limit derived from openai_agentic_loop.max_retained_bytes"
+                "request body exceeds the {body_limit}-byte admission limit derived from openai_agentic_loop.max_retained_bytes"
             );
             return Some(FilterAction::Reject(error::responses_error_rejection(
                 413,
