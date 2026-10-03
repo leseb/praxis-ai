@@ -4322,11 +4322,11 @@ async fn escaped_deferred_label_is_reserved_before_tools_list() {
 
 #[tokio::test]
 async fn deferred_discovery_stops_before_the_next_call_when_prepared_results_fill_budget() {
-    let (first_url, cancel_first) = start_single_tool_mcp_server().await;
+    let (first_url, cancel_first, first_list_calls) = start_counted_single_tool_mcp_server().await;
     let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let second_url = format!("http://{}/mcp", second_listener.local_addr().unwrap());
     let first = deferred_connector(&first_url, None, None);
-    let first_entry_bytes = deferred_connector_bytes(&first).unwrap();
+    let first_staging_bytes = deferred_listing_staging_bytes(&first).unwrap();
     let mut second = deferred_connector(&second_url, None, None);
     second.connector_id = "c2".to_owned();
     second.server_label = "other".to_owned();
@@ -4340,13 +4340,17 @@ async fn deferred_discovery_stops_before_the_next_call_when_prepared_results_fil
     );
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(
-        baseline + mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION + first_entry_bytes * 2,
+        baseline + mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION + first_staging_bytes,
     );
 
     let error = discover_deferred_connectors(&mut state).await.unwrap_err();
     cancel_first.cancel();
 
     assert!(matches!(error, ResolveError::RetainedBudget));
+    assert!(
+        first_list_calls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the first listing must run before the second batch is rejected"
+    );
     assert_eq!(
         state.deferred_mcp.len(),
         2,
@@ -4653,6 +4657,61 @@ async fn start_single_tool_mcp_server() -> (String, tokio_util::sync::Cancellati
         );
     });
     (format!("http://{addr}/mcp"), ct)
+}
+
+/// Start a single-tool server that counts completed tools/list requests.
+async fn start_counted_single_tool_mcp_server() -> (
+    String,
+    tokio_util::sync::CancellationToken,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<SingleToolMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(SingleToolMcpServer::new()), Arc::default(), config);
+    let counted = Arc::clone(&list_calls);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    if serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("method")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("tools/list")
+                    {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    next.run(http::Request::from_parts(parts, axum::body::Body::from(bytes)))
+                        .await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, list_calls)
 }
 
 /// End-to-end regression: a credentialed MCP entry whose permitted
