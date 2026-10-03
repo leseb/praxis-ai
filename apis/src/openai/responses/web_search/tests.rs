@@ -2327,6 +2327,35 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
     );
 }
 
+#[test]
+#[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+fn large_web_search_argument_allocation_avoids_a_second_query_tree() {
+    // Fixed pre-refactor baseline: json! first clones the query array into a
+    // second Value tree, then to_string allocates the serialized arguments.
+    let action = serde_json::json!({
+        "type": "search",
+        "queries": (0..64).map(|index| format!("{index}:{}", "q".repeat(4_096))).collect::<Vec<_>>()
+    });
+    let legacy = || serde_json::json!({"queries": action["queries"]}).to_string();
+    assert_eq!(search_arguments(&action), legacy());
+
+    let optimized = allocation_counter::measure(|| {
+        std::hint::black_box(search_arguments(&action));
+    });
+    let baseline = allocation_counter::measure(|| {
+        std::hint::black_box(legacy());
+    });
+    eprintln!("hosted web arguments allocation fixture: optimized={optimized:?}, baseline={baseline:?}");
+    assert!(
+        optimized.count_total < baseline.count_total,
+        "borrowed serialization must remove query clones"
+    );
+    assert!(
+        optimized.bytes_max < baseline.bytes_max,
+        "the query tree must not coexist with its serialized copy"
+    );
+}
+
 
 #[test]
 fn web_search_construction_reserves_provider_result_owners() {
@@ -2364,6 +2393,25 @@ fn web_search_response_limit_is_derived_before_dispatch() {
     let limit = web_search_response_limit(&ctx, "query", &[]).unwrap();
     assert!(limit < MAX_SEARCH_RESPONSE_BYTES);
     assert!(limit <= (32_768 - 4_096 - "query".len() * 8) / 32);
+}
+
+#[test]
+fn web_search_body_admission_respects_below_at_above_boundary() {
+    let query = "query";
+    let request_reserve = 4_096 + query.len() * 8;
+    let admitted = |extra: usize| {
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+        let current = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(current + request_reserve + extra);
+        ctx.extensions.insert(state);
+        web_search_response_limit(&ctx, query, &[])
+    };
+
+    assert_eq!(admitted(31), None, "31 bytes cannot reserve one 32-byte response unit");
+    assert_eq!(admitted(32), Some(1));
+    assert_eq!(admitted(64), Some(2));
 }
 
 #[test]

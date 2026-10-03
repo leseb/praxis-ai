@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::model_context::{MAX_FILE_ID_BYTES, MAX_FILENAME_BYTES, is_valid_file_id};
 
-/// Maximum marker candidates processed in one output-text part.
+/// Maximum marker candidates processed across one response.
 const MAX_CITATION_MARKERS: usize = 4_096;
 
 /// Maximum existing plus generated annotations processed in one response.
@@ -98,7 +98,7 @@ impl CitationBudget {
 /// valid unknown markers are removed without producing an annotation.
 #[cfg(test)]
 fn extract_citations(text: &str, citation_files: &HashMap<String, String>) -> (String, Vec<Value>) {
-    match extract_citations_bounded(text, citation_files, &mut CitationBudget::default()) {
+    match extract_citations_bounded(text, citation_files, &mut CitationBudget::default(), false) {
         Ok(extraction) => (extraction.cleaned, extraction.annotations),
         Err(_error) => (text.to_owned(), Vec::new()),
     }
@@ -110,6 +110,7 @@ fn extract_citations_bounded(
     text: &str,
     citation_files: &HashMap<String, String>,
     budget: &mut CitationBudget,
+    collect_removals: bool,
 ) -> Result<CitationExtraction, CitationRewriteError> {
     let mut cleaned = String::with_capacity(text.len());
     let mut annotations = Vec::new();
@@ -168,10 +169,12 @@ fn extract_citations_bounded(
         } else {
             marker_start
         };
-        removals.push(RemovedRange {
-            start: removal_start,
-            end: marker_start.saturating_add(marker_chars),
-        });
+        if collect_removals {
+            removals.push(RemovedRange {
+                start: removal_start,
+                end: marker_start.saturating_add(marker_chars),
+            });
+        }
         record_valid_marker(file_id, citation_files, cleaned_chars, &mut annotations, budget)?;
         original_chars = original_chars.saturating_add(prefix_chars).saturating_add(marker_chars);
         remaining = after_marker;
@@ -284,6 +287,7 @@ pub(crate) fn annotation_staging_bytes(
             })?;
             let mut remaining = text;
             let mut modifies_text = false;
+            let mut removed_markers = 0_usize;
             while let Some(marker_start) = remaining.find("<|file-") {
                 markers_remaining = markers_remaining.checked_sub(1).ok_or(CitationRewriteError {
                     budget: "marker",
@@ -299,6 +303,7 @@ pub(crate) fn annotation_staging_bytes(
                     continue;
                 }
                 modifies_text = true;
+                removed_markers = removed_markers.saturating_add(1);
                 if let Some(filename) = citation_files.get(file_id)
                     && filename.len() <= MAX_FILENAME_BYTES
                 {
@@ -319,6 +324,7 @@ pub(crate) fn annotation_staging_bytes(
                                 limit: usize::MAX,
                             })?,
                         )
+                        .and_then(|bytes| bytes.checked_add(size_of::<Value>() * 2))
                         .ok_or(CitationRewriteError {
                             budget: "payload byte",
                             limit: usize::MAX,
@@ -328,6 +334,21 @@ pub(crate) fn annotation_staging_bytes(
             }
             if modifies_text {
                 let existing = part.get("annotations").and_then(Value::as_array).map_or(0, Vec::len);
+                if existing > 0 {
+                    // Existing offsets need one removal range per marker. Vec
+                    // growth can retain both capacities during reallocation.
+                    staging = staging
+                        .checked_add(removed_markers.checked_mul(size_of::<RemovedRange>() * 2).ok_or(
+                            CitationRewriteError {
+                                budget: "payload byte",
+                                limit: usize::MAX,
+                            },
+                        )?)
+                        .ok_or(CitationRewriteError {
+                            budget: "payload byte",
+                            limit: usize::MAX,
+                        })?;
+                }
                 annotations_remaining = annotations_remaining
                     .checked_sub(existing)
                     .ok_or(CitationRewriteError {
@@ -403,7 +424,11 @@ fn annotate_text_part(
     if !text.contains("<|file-") {
         return Ok(false);
     }
-    let extraction = extract_citations_bounded(text, citation_files, budget)?;
+    let collect_removals = part
+        .get("annotations")
+        .and_then(Value::as_array)
+        .is_some_and(|annotations| !annotations.is_empty());
+    let extraction = extract_citations_bounded(text, citation_files, budget, collect_removals)?;
     if extraction.cleaned == text {
         return Ok(false);
     }
@@ -497,6 +522,44 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+    fn citation_heavy_output_allocation_skips_unused_offset_ranges() {
+        // Fixed baseline: 2048 markers, no existing annotations to remap.
+        // The old scanner still retained a RemovedRange for every marker.
+        let text = "source <|file-a|>\n".repeat(MAX_CITATION_ANNOTATIONS);
+        let files = HashMap::from([("file-a".to_owned(), "a.txt".to_owned())]);
+        let optimized = || extract_citations_bounded(&text, &files, &mut CitationBudget::default(), false).unwrap();
+        let legacy = || extract_citations_bounded(&text, &files, &mut CitationBudget::default(), true).unwrap();
+        let current = optimized();
+        let baseline = legacy();
+        assert_eq!(current.cleaned, baseline.cleaned);
+        assert_eq!(current.annotations, baseline.annotations);
+        assert!(
+            current.removals.is_empty(),
+            "no offset ranges are needed without existing annotations"
+        );
+        assert_eq!(baseline.removals.len(), MAX_CITATION_ANNOTATIONS);
+
+        let current_allocations = allocation_counter::measure(|| {
+            std::hint::black_box(optimized());
+        });
+        let baseline_allocations = allocation_counter::measure(|| {
+            std::hint::black_box(legacy());
+        });
+        eprintln!(
+            "hosted citation rewrite allocation fixture: optimized={current_allocations:?}, baseline={baseline_allocations:?}"
+        );
+        assert!(
+            current_allocations.count_total < baseline_allocations.count_total,
+            "unused offset staging must allocate fewer times"
+        );
+        assert!(
+            current_allocations.bytes_max < baseline_allocations.bytes_max,
+            "unused offset staging must consume fewer live bytes"
+        );
+    }
 
     #[test]
     fn extracts_provider_compatible_citations() {
@@ -663,6 +726,23 @@ mod tests {
 
         let error = annotate_output_items(&mut output, &files).unwrap_err();
         assert!(error.to_string().contains("marker"));
+    }
+
+    #[test]
+    fn marker_limit_still_applies_without_offset_range_staging() {
+        let files = HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]);
+        let marker = "<|file-unknown|>";
+        let extract = |count| {
+            let text = marker.repeat(count);
+            extract_citations_bounded(&text, &files, &mut CitationBudget::default(), false)
+        };
+
+        assert!(extract(MAX_CITATION_MARKERS - 1).is_ok());
+        assert!(extract(MAX_CITATION_MARKERS).is_ok());
+        let error = extract(MAX_CITATION_MARKERS + 1)
+            .err()
+            .expect("one excess marker must fail");
+        assert_eq!(error.budget, "marker");
     }
 
     #[test]
