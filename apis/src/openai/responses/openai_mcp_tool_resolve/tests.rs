@@ -4170,6 +4170,9 @@ fn has_pending_deferred_discovery_respects_exhausted_max_tool_calls() {
     let web = serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
     state.accumulated_output = vec![web.clone(), search.clone()];
     state.response_object = serde_json::json!({"output": [web, search]});
+    state.tool_search_calls.clear();
+    state.select_test_output("tool_search_call", vec![state.accumulated_output[1].clone()]);
+    state.current_round_output_start = Some(0);
     assert!(
         !has_pending_deferred_discovery(&state),
         "an earlier current-round built-in call consumes the shared cap first"

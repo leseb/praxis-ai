@@ -157,6 +157,8 @@ impl ResponsesState {
     /// Install model items in their production owner for dispatcher unit tests.
     pub(crate) fn select_test_output(&mut self, kind: &str, items: Vec<serde_json::Value>) {
         for mut item in items {
+            let first_selection =
+                self.tool_calls.is_empty() && self.web_search_calls.is_empty() && self.tool_search_calls.is_empty();
             let existing_index = self.accumulated_output.iter().position(|existing| existing == &item);
             if item.get("type").and_then(serde_json::Value::as_str).is_none() {
                 item.as_object_mut()
@@ -191,10 +193,12 @@ impl ResponsesState {
                     self.accumulated_output.push(item.clone());
                     index
                 });
-            self.current_round_output_start = Some(
+            self.current_round_output_start = Some(if first_selection {
+                output_index
+            } else {
                 self.current_round_output_start
-                    .map_or(output_index, |start| start.min(output_index)),
-            );
+                    .map_or(output_index, |start| start.min(output_index))
+            });
             let assignment = OutputAssignment::new(output_index, &item).expect("test output id");
             match kind {
                 "function_call" => self.tool_calls.push(assignment),

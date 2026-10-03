@@ -201,6 +201,67 @@ fn buffered_round_assignments_keep_output_and_history_order_across_rounds() {
     );
 }
 
+#[test]
+fn streamed_round_assignments_keep_one_output_owner_across_rounds() {
+    let mut state = ResponsesState {
+        response_object: json!({"object": "response", "status": "completed", "output": [
+            {"type": "function_call", "id": "fc_1", "call_id": "c_1", "name": "server__lookup", "arguments": "{}", "status": "completed"},
+            {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": "first"}}
+        ]}),
+        ..ResponsesState::default()
+    };
+    super::collect_streaming_output_items(&mut state).unwrap();
+    assert!(state.output_items().is_empty());
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_1");
+    assert_eq!(state.selected_web_search_calls()[0]["id"], "ws_1");
+    let first_assignment = state.tool_calls[0].clone();
+
+    super::prepare_iteration(&mut state);
+    state.response_object = json!({"object": "response", "status": "completed", "output": [
+        {"type": "reasoning", "id": "r_2", "summary": []},
+        {"type": "function_call", "id": "fc_2", "call_id": "c_2", "name": "client", "arguments": "{}", "status": "completed"},
+        {"type": "tool_search_call", "id": "ts_2", "status": "completed"}
+    ]});
+    super::collect_streaming_output_items(&mut state).unwrap();
+
+    assert_eq!(state.current_round_output_start, Some(2));
+    assert!(state.output_items().is_empty());
+    assert_eq!(state.selected_tool_calls().len(), 1);
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_2");
+    assert!(state.selected_web_search_calls().is_empty());
+    assert_eq!(state.selected_tool_search_calls()[0]["id"], "ts_2");
+    assert_eq!(
+        state
+            .accumulated_output
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("ws_1"), Some("r_2"), Some("fc_2"), Some("ts_2")]
+    );
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("r_2"), Some("fc_2")]
+    );
+    assert_eq!(
+        state
+            .persisted_messages
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("ws_1"), Some("r_2"), Some("fc_2"), Some("ts_2")]
+    );
+    state.tool_calls.push(first_assignment);
+    assert_eq!(
+        state.selected_tool_calls().len(),
+        1,
+        "a stale prior-round selection cannot dispatch"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
