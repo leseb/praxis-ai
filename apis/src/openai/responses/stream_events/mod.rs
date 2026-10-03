@@ -1207,10 +1207,10 @@ fn parse_chunk_events(
 /// buffered path would accept.
 ///
 /// Terminal lifecycle events (`response.completed`/`incomplete`/`failed`) are
-/// charged: their payload snapshots the full accumulated output plus usage into
-/// `response_object` and is retained a second time as the deferred terminal, so a
-/// terminal frame that alone exceeds the ceiling (yet still fits
-/// `max_buffer_bytes`) must fail closed like any other accumulator growth. The
+/// charged: their frame owns a full response snapshot while the parsed response
+/// moves into `response_object`, so a terminal frame that alone exceeds the
+/// ceiling (yet still fits `max_buffer_bytes`) must fail closed. The deferred
+/// terminal retains only envelope metadata after that move. The
 /// per-frame `added`/`done`/terminal charges over-count an item that also streams
 /// the paired envelopes; that is a deliberately conservative, fail-closed-earlier
 /// byte bound. The distinct item-count dimension is enforced separately from the
