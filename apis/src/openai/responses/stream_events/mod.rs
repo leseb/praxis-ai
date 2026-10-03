@@ -840,8 +840,22 @@ fn parse_and_accumulate(
             .iter()
             .filter(|frame| frame.data != b"[DONE]")
             .try_fold(0_usize, |used, frame| {
+                // serde_json can expand compact numeric spellings: `1e15`
+                // serializes as `1000000000000000.0`. Reserve that parsed
+                // owner before from_frame allocates its Value tree.
                 used.checked_add(frame.data.len())
+                    .and_then(|used| used.checked_add(json_number_normalization_bound(&frame.data)?))
                     .and_then(|used| used.checked_add(frame.event_type.as_ref().map_or(0, String::len)))
+                    // An unknown event with no SSE `event:` line also owns a
+                    // copy of its JSON `type` string. It cannot exceed the
+                    // complete raw data length.
+                    .and_then(|used| {
+                        if frame.event_type.is_none() {
+                            used.checked_add(frame.data.len())
+                        } else {
+                            Some(used)
+                        }
+                    })
             });
     // `frames` stays live while `ResponsesEvent` owns newly parsed JSON values.
     // The incoming chunk is framework-owned and separately bounded, so reserve
@@ -906,6 +920,46 @@ fn retained_frame_payload_bytes(frames: &[SseFrame]) -> Option<usize> {
         used.checked_add(frame.event_type.as_ref().map_or(0, String::len))?
             .checked_add(frame.data.len())
     })
+}
+
+/// Bound compact JSON growth when `serde_json` normalizes exponent notation.
+///
+/// This build does not enable `serde_json`'s arbitrary-precision feature, so a
+/// parsed number is an i64/u64/f64; 32 extra bytes per lexical number cover
+/// its longest compact output. Strings and escaped quotes are skipped, and the
+/// source length is already charged separately by the caller. Invalid JSON
+/// may overcount but is rejected by the parser without committing any event.
+fn json_number_normalization_bound(data: &[u8]) -> Option<usize> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_number = false;
+    let mut numbers = 0_usize;
+    for &byte in data {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            in_number = false;
+            continue;
+        }
+        if in_number && matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+            continue;
+        }
+        in_number = false;
+        if matches!(byte, b'0'..=b'9' | b'-') {
+            numbers = numbers.checked_add(1)?;
+            in_number = true;
+        }
+    }
+    numbers.checked_mul(32)
 }
 
 /// Count one parsed event's independently owned payloads.
@@ -2951,11 +3005,33 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // releasing it (e.g. `responses_to_chat_completions`) delivers the
     // created/delta events and deferred terminal together in the end-of-stream
     // chunk; starting from an empty buffer here would drop those earlier events.
-    let mut output = body.take().map_or_else(Vec::new, |bytes| bytes.to_vec());
     // Agentic collection can append history immediately before this EOS callback.
     // Refresh the shared baseline before admitting synthesis construction.
     parser_state.shared_stable_bytes = OnceLock::new();
     parser_state.shared_prior_output_bytes = OnceLock::new();
+    let mut output = match body.take() {
+        None => Vec::new(),
+        Some(bytes) => {
+            // A unique Bytes can move its allocation into Vec. A shared or
+            // sliced Bytes needs a second buffer, so admit both live owners
+            // before copying the final callback's already-normalized wire.
+            let buffer = bytes.try_into_mut();
+            let copy_peak = match &buffer {
+                Ok(unique) => Some(unique.len()),
+                Err(shared) => shared.len().checked_mul(2),
+            };
+            if copy_peak.is_some_and(|bytes| stream_payload_fits(ctx, &parser_state, bytes)) {
+                match buffer {
+                    Ok(unique) => Vec::from(unique),
+                    Err(shared) => shared.to_vec(),
+                }
+            } else {
+                drop(buffer);
+                record_retained_payload_overflow(ctx, &mut parser_state);
+                Vec::new()
+            }
+        },
+    };
     let synthesis_staging = if ctx.get_metadata("responses.stream_error_code").is_some() {
         Some(0)
     } else {

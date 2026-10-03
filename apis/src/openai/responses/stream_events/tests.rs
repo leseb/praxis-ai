@@ -666,6 +666,65 @@ fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
 }
 
 #[test]
+fn shared_eos_wire_rejects_before_copying_a_second_large_buffer() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    let wire = Bytes::from(vec![b'x'; 32 * 1024]);
+    // A downstream handle keeps the normalized EOS chunk shared while this
+    // filter finalizes it. The old and new buffers coexist during a copy.
+    let _other_owner = wire.clone();
+    responses.apply_retained_payload_limit(baseline + wire.len() * 2 - 1);
+    ctx.extensions.insert(responses);
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "loop");
+
+    let mut body = Some(wire);
+    let allocations = allocation_counter::measure(|| {
+        super::finalize_logical_stream(&mut ctx, &mut body);
+    });
+    let output = String::from_utf8(body.expect("bounded error frame").to_vec()).unwrap();
+    assert_eq!(output.matches("event: error").count(), 1);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(
+        allocations.bytes_max < 32 * 1024,
+        "the oversized second wire buffer must never be allocated: {allocations:?}"
+    );
+}
+
+#[test]
+fn numeric_sse_payload_rejects_before_parsed_value_expands() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    responses.apply_retained_payload_limit(45 * 1024);
+    ctx.extensions.insert(responses);
+
+    // serde_json normalizes each four-byte `1e15` into an eighteen-byte
+    // decimal. The raw frame fits the parser preflight, but its parsed JSON
+    // and the retained frame cannot coexist under this limit.
+    let data = format!(
+        "{{\"type\":\"vendor.extension\",\"numbers\":[{}]}}",
+        vec!["1e15"; 2_000].join(",")
+    );
+    let mut body = Some(Bytes::from(format!("event: vendor.extension\ndata: {data}\n\n")));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none(), "the overflowing frame must not be forwarded");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+    assert!(
+        allocations.bytes_max < 40 * 1024,
+        "reject before allocating the expanded JSON tree: {allocations:?}"
+    );
+}
+
+#[test]
 fn store_budget_error_drops_later_stream_events() {
     let (filter, mut ctx) = make_armed_context();
     ctx.set_metadata("responses.store_stream_budget_failed", "true");
