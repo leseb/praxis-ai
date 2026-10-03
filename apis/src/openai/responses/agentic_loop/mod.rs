@@ -1296,9 +1296,13 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
             Some("tool_search_call") => usize::from(is_completed_output_item(item)),
             _ => 0,
         };
+        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
+            .filter(|id| !state.provider_compaction_ids.contains(*id))
+            .map_or(0, str::len);
         let Some(total) = bytes
             .checked_mul(copies)
             .and_then(|bytes| bytes.checked_add(dispatch_assignment_id_bytes(item)))
+            .and_then(|bytes| bytes.checked_add(id_bytes))
             .and_then(|bytes| copied_item_bytes.checked_add(bytes))
         else {
             return false;
@@ -1778,9 +1782,13 @@ fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
             Some("tool_search_call") if is_completed_output_item(item) => 2,
             _ => 1,
         };
+        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
+            .filter(|id| !state.provider_compaction_ids.contains(*id))
+            .map_or(0, str::len);
         let Some(total) = bytes
             .checked_mul(copies)
             .and_then(|bytes| bytes.checked_add(dispatch_assignment_id_bytes(item)))
+            .and_then(|bytes| bytes.checked_add(id_bytes))
             .and_then(|bytes| added.checked_add(bytes))
         else {
             return false;

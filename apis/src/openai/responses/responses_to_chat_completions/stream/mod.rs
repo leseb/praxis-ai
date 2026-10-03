@@ -9,10 +9,11 @@
 //! resource by reusing the finite translation builders so the streamed terminal
 //! matches the non-streaming translation exactly.
 //!
-//! The converter never buffers a full response: each [`push`](StreamConverter::push)
-//! returns only the bytes for events completed by that chunk. Framing is
-//! isolated in the `framing` module so a future shared SSE codec can replace
-//! it without touching this state machine.
+//! Each [`push_into`](StreamConverter::push_into) appends only the events
+//! completed by that chunk to the callback buffer. The converter retains the
+//! semantic state needed for its terminal response. Framing is isolated in the
+//! `framing` module so a future shared SSE codec can replace it without
+//! touching this state machine.
 
 mod chat;
 mod events;
