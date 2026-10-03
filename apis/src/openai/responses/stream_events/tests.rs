@@ -2106,6 +2106,19 @@ async fn committed_stream_budget_overflow_emits_one_error_without_completion_or_
     filter.on_response_body(&mut ctx, &mut offending, false).unwrap();
     assert!(offending.is_none(), "the offending chunk must be suppressed");
 
+    let mut after_failure = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"id": "call_after_failure", "type": "function_call", "name": "tool", "arguments": "{}"}
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut after_failure, false).unwrap();
+    assert!(
+        after_failure.is_none(),
+        "later input must not revive the poisoned stream"
+    );
+
     let mut eos = None;
     filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
     let terminal = String::from_utf8(eos.unwrap().to_vec()).unwrap();
