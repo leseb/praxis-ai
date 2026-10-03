@@ -67,8 +67,8 @@ use tracing::{debug, warn};
 use self::{
     approval::{
         ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context, bind_owner_context,
-        build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
-        parse_approval_response, resolve_approval, target_fingerprint,
+        build_approved_tool_call, build_denial_message, connector_binding_growth_bytes, extract_approval_responses,
+        is_approval_response, parse_approval_response, resolve_approval, target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
@@ -320,15 +320,30 @@ impl McpDispatchFilter {
         ctx: &mut HttpFilterContext<'_>,
         headers: &http::HeaderMap,
         connector_identity: Option<&McpCalloutIdentity>,
-    ) {
+    ) -> bool {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
-            return;
+            return true;
         };
+        if state.retained_payload_limit().is_some() {
+            let growth = state.mcp_tool_map.values().try_fold(0_usize, |used, entry| {
+                used.checked_add(connector_binding_growth_bytes(
+                    entry,
+                    connector_identity.is_some(),
+                    connector_identity
+                        .and_then(McpCalloutIdentity::user_credential)
+                        .is_some(),
+                )?)
+            });
+            if !growth.is_some_and(|bytes| state.can_retain_payload(bytes)) {
+                return false;
+            }
+        }
         for entry in state.mcp_tool_map.values_mut() {
             bind_forwarded_header_context(entry, &self.forward_headers, headers);
             bind_owner_context(entry, connector_identity.map(McpCalloutIdentity::owner));
             bind_credential_context(entry, connector_identity.and_then(McpCalloutIdentity::user_credential));
         }
+        true
     }
 
     /// Append MCP execution results to private continuation and public output state.
@@ -1215,7 +1230,9 @@ impl McpDispatchFilter {
         } else {
             None
         };
-        self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
+        if !self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref()) {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
 
         // Fetch (or lazily create) the per-execution MCP session pool. It lives
         // in the request's threaded `RequestExtensions`, so this same pool is
@@ -1304,6 +1321,12 @@ impl McpDispatchFilter {
             .await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
+            }
+            // Discovery inserts connector tools after the first binding pass.
+            // Bind those new entries before the model can request approval, so
+            // the pending target fingerprint matches the next request's map.
+            if !self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref()) {
+                return Ok(Self::aggregate_budget_action(ctx));
             }
         }
 
