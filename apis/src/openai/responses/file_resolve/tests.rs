@@ -609,6 +609,148 @@ async fn resolves_history_when_current_input_has_no_file_id() {
 }
 
 #[tokio::test]
+async fn aggregate_budget_rejects_file_before_content_callout() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let files_api_url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let requests = std::thread::spawn(move || {
+        let mut paths = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            };
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let first_line = String::from_utf8_lossy(&request[..count])
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned();
+            paths.push(first_line.clone());
+            let response = if first_line.contains("/content") {
+                "x".repeat(49_152)
+            } else {
+                json!({"id":"file-a","filename":"a.txt","content_type":"text/plain","bytes":49_152}).to_string()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            if paths.len() >= 2 {
+                break;
+            }
+        }
+        paths
+    });
+
+    let filter = make_filter_with_outbound_for_url(&files_api_url);
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-a"}]}]});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let mut state = ResponsesState::from_request_body(original);
+    state.apply_retained_payload_limit(4096);
+    assert!(state.can_retain_payload(body.as_ref().unwrap().len()));
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(response) => assert_eq!(response.status, 502),
+        other => panic!("over-budget file must fail closed: {other:?}"),
+    }
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    let paths = requests.join().unwrap();
+    assert_eq!(
+        paths.len(),
+        1,
+        "content callout must not start after metadata reports an oversized file"
+    );
+    assert!(!paths[0].contains("/content"));
+}
+
+#[tokio::test]
+async fn aggregate_budget_allows_small_resolved_file() {
+    let files_api_url = start_files_api_stub();
+    let filter = make_filter_with_outbound_for_url(&files_api_url);
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original =
+        json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-history"}]}]});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let mut state = ResponsesState::from_request_body(original);
+    state.apply_retained_payload_limit(4096);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.can_retain_payload(0));
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(rewritten["input"][0]["content"][0]["file_data"], "aGlzdG9yeQ==");
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_before_reparsing_near_limit_state() {
+    let filter = make_filter_with_outbound_for_url("http://127.0.0.1:1");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-a"}]}]});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let raw_len = body.as_ref().unwrap().len();
+    let mut state = ResponsesState::from_request_body(original);
+    state
+        .messages
+        .insert(0, json!({"role":"user","content":"x".repeat(raw_len * 8)}));
+    let baseline = state.retained_payload_bytes().unwrap();
+    let limit = baseline + raw_len - 1;
+    assert!(raw_len * super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER <= limit);
+    state.apply_retained_payload_limit(limit);
+    assert!(state.can_retain_payload(0));
+    assert!(!state.can_retain_payload(raw_len));
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn aggregate_budget_reserves_numeric_expansion_before_file_parse() {
+    let filter = make_filter_with_outbound_for_url("http://127.0.0.1:1");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let raw = br#"{"model":"m","temperature":1e15,"input":[{"role":"user","content":[{"type":"input_file","file_id":"file-a"}]}]}"#;
+    let parsed_bound = buffered_parsed_json_bytes_upper_bound(raw).unwrap();
+    assert!(parsed_bound > raw.len());
+    let mut state = ResponsesState::from_request_body(serde_json::from_slice(raw).unwrap());
+    state
+        .messages
+        .insert(0, json!({"role":"user","content":"x".repeat(raw.len() * 8)}));
+    let baseline = state.retained_payload_bytes().unwrap();
+    let limit = baseline + raw.len() + 5;
+    assert!(raw.len() * super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER <= limit);
+    state.apply_retained_payload_limit(limit);
+    assert!(state.can_retain_payload(raw.len()));
+    assert!(!state.can_retain_payload(parsed_bound));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn missing_scoped_credential_rejects_before_file_id_dispatch() {
     let files_api_url = start_files_api_stub();
     let filter = make_filter_with_outbound_from_yaml(&format!(

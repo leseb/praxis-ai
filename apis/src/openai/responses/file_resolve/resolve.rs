@@ -34,6 +34,11 @@ use crate::{
 /// Files API path prefix used in resource URL construction.
 const FILES_PATH_PREFIX: &str = "v1/files";
 
+/// A resolved value can coexist in the cache, returned value, parsed request,
+/// both state history mirrors, and rewritten wire body. The extra slots cover
+/// raw response/metadata parsing during a callout and JSON string framing.
+const AGGREGATE_RESOLUTION_OWNER_RESERVATION: usize = 8;
+
 /// Identifies the source of a file reference for dispatch and caching.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReferenceSource<'a> {
@@ -163,6 +168,9 @@ pub(crate) enum ResolveError {
         limit: usize,
     },
 
+    /// The request-wide agentic payload budget cannot retain this resolution.
+    RetainedBudget,
+
     /// The file URL target is blocked by SSRF policy.
     FileUrlBlocked {
         /// Redacted URL label for client-facing messages.
@@ -196,6 +204,7 @@ impl std::fmt::Display for ResolveError {
                     "resolved file reference '{reference}' exceeds configured limit ({limit} bytes)"
                 )
             },
+            Self::RetainedBudget => write!(f, "agentic retained payload budget exceeded during file resolution"),
             Self::FileUrlBlocked { label } => {
                 write!(f, "file URL '{label}' blocked by security policy")
             },
@@ -256,6 +265,9 @@ pub(crate) struct ResolutionBudget {
     references_seen: usize,
     /// Inline bytes still available across current input and state history.
     remaining_resolved_bytes: usize,
+    /// Conservative remaining inline allowance derived from the aggregate
+    /// request budget. Unlike the independent resolver cap, mirror walks do not reset it.
+    aggregate_remaining_bytes: Option<usize>,
     /// Bound outbound chain execution for configured Files API
     /// (`file_id`) callouts. `None` on the chain-less construction paths,
     /// which fall back to the direct client transport.
@@ -312,6 +324,11 @@ struct ContentResolver<'a> {
 }
 
 impl ResolutionBudget {
+    /// Bound all later callout reads and independently owned inline copies.
+    pub(crate) fn apply_aggregate_headroom(&mut self, headroom: usize) {
+        self.aggregate_remaining_bytes = Some(headroom / AGGREGATE_RESOLUTION_OWNER_RESERVATION);
+    }
+
     /// Look up a resolution without constructing an owned cache key.
     fn cached(
         &self,
@@ -354,17 +371,32 @@ impl ResolutionBudget {
         } = request;
         let cache_kind = (part_type, source.kind());
         if let Some(cached) = self.cached(part_type, source) {
+            if let (Some(remaining), Ok(resolved)) = (self.aggregate_remaining_bytes, cached)
+                && retained_resolved_bytes(part_type, source, resolved).is_none_or(|bytes| bytes > remaining)
+            {
+                return Err(ResolveError::RetainedBudget);
+            }
             return cached.clone();
         }
 
         self.register_reference()?;
 
         let outbound = self.outbound.as_ref();
+        let aggregate_remaining_bytes = self.aggregate_remaining_bytes;
+        let aggregate_binding =
+            aggregate_remaining_bytes.is_some_and(|remaining| remaining < self.remaining_resolved_bytes);
         let resolution = tokio::time::timeout_at(self.deadline, async {
             match source {
                 ReferenceSource::FileId(file_id) => {
                     client
-                        .resolve_file(file_id, request_headers, max_resolved_bytes, part_type, outbound)
+                        .resolve_file(
+                            file_id,
+                            request_headers,
+                            max_resolved_bytes,
+                            part_type,
+                            aggregate_remaining_bytes,
+                            outbound,
+                        )
                         .await
                 },
                 ReferenceSource::FileUrl(url) => {
@@ -380,6 +412,19 @@ impl ResolutionBudget {
         })
         .await
         .unwrap_or_else(|_elapsed| overall_timeout_error_for_source(source));
+        let resolution = match resolution {
+            Err(ResolveError::TooLarge { limit, .. })
+                if aggregate_binding && aggregate_remaining_bytes == Some(limit) =>
+            {
+                Err(ResolveError::RetainedBudget)
+            },
+            other => other,
+        };
+        if let (Some(remaining), Ok(resolved)) = (aggregate_remaining_bytes, &resolution)
+            && retained_resolved_bytes(part_type, source, resolved).is_none_or(|bytes| bytes > remaining)
+        {
+            return Err(ResolveError::RetainedBudget);
+        }
 
         // Retain one owned outcome for repeated references while
         // returning an independently owned value to the JSON part.
@@ -410,6 +455,14 @@ impl ResolutionBudget {
                     reference: "<aggregate>".to_owned(),
                     limit,
                 })?;
+        Ok(())
+    }
+
+    /// Charge the inline value and metadata retained in the resolution cache.
+    fn consume_aggregate_bytes(&mut self, bytes: usize) -> Result<(), ResolveError> {
+        if let Some(remaining) = self.aggregate_remaining_bytes.as_mut() {
+            *remaining = remaining.checked_sub(bytes).ok_or(ResolveError::RetainedBudget)?;
+        }
         Ok(())
     }
 }
@@ -456,6 +509,7 @@ impl FilesApiClient {
             max_resolved_bytes: self.max_resolved_bytes,
             references_seen: 0,
             remaining_resolved_bytes: self.max_resolved_bytes,
+            aggregate_remaining_bytes: None,
             outbound,
         }
     }
@@ -478,6 +532,7 @@ impl FilesApiClient {
         &self,
         file_id: &str,
         request_headers: &http::HeaderMap,
+        aggregate_response_limit: Option<usize>,
         outbound: Option<&OutboundExecution>,
     ) -> Result<FileMetadata, ResolveError> {
         let url = self
@@ -485,7 +540,10 @@ impl FilesApiClient {
             .resource_url(FILES_PATH_PREFIX, file_id, None)
             .map_err(|e| map_api_error(e, file_id))?;
 
-        let max_bytes = self.client.max_response_bytes();
+        let max_bytes = aggregate_response_limit.map_or_else(
+            || self.client.max_response_bytes(),
+            |limit| self.client.max_response_bytes().min(limit),
+        );
         // Box the callout future so the large transport frame is not inlined
         // into this and every ancestor resolve future (clippy::large_futures).
         let response = match outbound {
@@ -570,9 +628,12 @@ impl FilesApiClient {
         request_headers: &http::HeaderMap,
         max_resolved_bytes: usize,
         part_type: &str,
+        aggregate_response_limit: Option<usize>,
         outbound: Option<&OutboundExecution>,
     ) -> Result<ResolvedFile, ResolveError> {
-        let metadata = self.fetch_metadata(file_id, request_headers, outbound).await?;
+        let metadata = self
+            .fetch_metadata(file_id, request_headers, aggregate_response_limit, outbound)
+            .await?;
         let max_content_bytes = match part_type {
             "input_image" => max_content_bytes_for_data_url(max_resolved_bytes, &metadata.content_type),
             _ => Some(max_content_bytes_for_base64(max_resolved_bytes)),
@@ -722,10 +783,11 @@ async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolv
     };
     let mut resolved_count = 0_usize;
     for part in parts {
-        if let Some(resolved_len) = resolve_content_part(part, resolver).await? {
+        if let Some((resolved_len, aggregate_bytes)) = resolve_content_part(part, resolver).await? {
             resolver
                 .budget
                 .consume_resolved_bytes(resolved_len, resolver.client.max_resolved_bytes)?;
+            resolver.budget.consume_aggregate_bytes(aggregate_bytes)?;
             resolved_count += 1;
         }
     }
@@ -733,10 +795,14 @@ async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolv
 }
 
 /// Resolve a single content part if it contains a resolvable reference.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the aggregate admission stays adjacent to reference resolution"
+)]
 async fn resolve_content_part(
     part: &mut serde_json::Value,
     resolver: &mut ContentResolver<'_>,
-) -> Result<Option<usize>, ResolveError> {
+) -> Result<Option<(usize, usize)>, ResolveError> {
     let Some((part_type, source)) = resolvable_reference(part) else {
         return Ok(None);
     };
@@ -748,11 +814,24 @@ async fn resolve_content_part(
 
     debug!(source = %source, part_type = %part_type, "resolving file reference");
 
-    let max_resolved_bytes = resolver.budget.remaining_resolved_bytes;
+    let max_resolved_bytes = resolver
+        .budget
+        .aggregate_remaining_bytes
+        .map_or(resolver.budget.remaining_resolved_bytes, |aggregate| {
+            resolver.budget.remaining_resolved_bytes.min(aggregate)
+        });
     let Some(resolved) = resolve_reference(source, part_type, max_resolved_bytes, resolver).await? else {
         return Ok(None);
     };
     let len = output_len_for_part(part_type, source, &resolved);
+    let aggregate_bytes = retained_resolved_bytes(part_type, source, &resolved).ok_or(ResolveError::RetainedBudget)?;
+    if resolver
+        .budget
+        .aggregate_remaining_bytes
+        .is_some_and(|remaining| aggregate_bytes > remaining)
+    {
+        return Err(ResolveError::RetainedBudget);
+    }
     if len > max_resolved_bytes {
         return Err(ResolveError::TooLarge {
             reference: source.to_string(),
@@ -761,7 +840,7 @@ async fn resolve_content_part(
     }
     let source_kind = source.kind();
     rewrite_part(part, part_type, source_kind, resolved);
-    Ok(Some(len))
+    Ok(Some((len, aggregate_bytes)))
 }
 
 /// Resolve one reference and apply the configured missing-file policy.
@@ -792,7 +871,7 @@ async fn resolve_reference(
         .await
     {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
+        Err(e @ (ResolveError::TooManyReferences { .. } | ResolveError::RetainedBudget)) => Err(e),
         Err(e) if matches!(source, ReferenceSource::FileUrl(_)) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
             warn!(source = %source, error = %e, "file resolution failed, passing through");
@@ -880,6 +959,13 @@ fn output_len_for_part(part_type: &str, source: ReferenceSource<'_>, resolved: &
         ("input_image", _) => "data:".len() + resolved.content_type.len() + ";base64,".len() + resolved.base64.len(),
         _ => 0,
     }
+}
+
+/// Bytes that each independently owned resolved value can retain.
+fn retained_resolved_bytes(part_type: &str, source: ReferenceSource<'_>, resolved: &ResolvedFile) -> Option<usize> {
+    output_len_for_part(part_type, source, resolved)
+        .checked_add(resolved.content_type.len())?
+        .checked_add(resolved.filename.as_ref().map_or(0, String::len))
 }
 
 /// Replace the reference field with the resolved content in a content part.
@@ -1146,7 +1232,7 @@ mod tests {
             });
             let client = test_client(&format!("http://{address}"));
             let Err(err) = client
-                .fetch_metadata("file-missing", &http::HeaderMap::new(), None)
+                .fetch_metadata("file-missing", &http::HeaderMap::new(), None, None)
                 .await
             else {
                 panic!("metadata response must fail for a non-success status");
