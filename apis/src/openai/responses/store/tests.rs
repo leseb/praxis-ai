@@ -1672,8 +1672,9 @@ async fn compressed_stream_replay_persists_at_exact_aggregate_staging_bound() {
     let response_bytes = crate::openai::responses::state::retained_json_bytes(&state.response_object).unwrap();
     let history_bytes = crate::openai::responses::state::retained_json_values_bytes(&state.persisted_messages).unwrap();
     let captured_bytes = super::filter::retained_request_payload_bytes(&ctx).unwrap();
-    let staging = response_bytes * 5
+    let staging = response_bytes * 6
         + history_bytes * 3
+        + super::filter::encoded_column_headroom(response_bytes, history_bytes, 0).unwrap()
         + captured_bytes
         + response_id.len() * replay_count
         + payload_bytes * 2
