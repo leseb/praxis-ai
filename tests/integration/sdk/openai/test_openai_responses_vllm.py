@@ -2660,6 +2660,17 @@ class TestOpenAIResponsesVLLM:
             assert BraveSearchHandler.request_count == searches_before + 1
             assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
             assert "Mock Search Result" in json.dumps(forwarded[1]["input"])
+            bridge = [
+                item
+                for item in forwarded[1]["input"]
+                if isinstance(item, dict)
+                and item.get("type") in {"function_call", "function_call_output"}
+            ]
+            assert [item["type"] for item in bridge] == [
+                "function_call",
+                "function_call_output",
+            ], "the backend history keeps the web-search bridge in call/result order"
+            assert bridge[0]["call_id"] == bridge[1]["call_id"]
 
             items = client.conversations.items.list(conversation.id, order="asc")
             assert [item.type for item in items.data] == [

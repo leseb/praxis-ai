@@ -283,6 +283,28 @@ fn stale_tool_search_selection_cannot_rewrite_prior_output_or_history() {
     assert_eq!(state.persisted_messages[1]["status"], "completed");
 }
 
+#[test]
+fn over_budget_tool_search_reusing_prior_id_marks_only_current_round() {
+    let prior = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "prior"});
+    let current = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "current"});
+    let mut state = ResponsesState {
+        accumulated_output: vec![prior.clone(), current.clone()],
+        persisted_messages: vec![prior.clone(), current.clone()],
+        current_round_output_start: Some(1),
+        max_tool_calls: Some(0),
+        ..ResponsesState::default()
+    };
+    state.select_test_output("tool_search_call", vec![current]);
+
+    super::mark_over_budget_tool_searches_incomplete(&mut state);
+
+    assert!(state.tool_search_calls.is_empty());
+    assert_eq!(state.accumulated_output[0], prior);
+    assert_eq!(state.persisted_messages[0], prior);
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert_eq!(state.persisted_messages[1]["status"], "incomplete");
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
