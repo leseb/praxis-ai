@@ -662,7 +662,7 @@ fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> FilterA
 /// A later IRR round may follow a committed Responses SSE stream, even though
 /// this selected-upstream hook has not sent its own request yet.
 fn outbound_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstreamBodyOutcome {
-    SelectedUpstreamBodyOutcome::Reject(super::budget_error::retained_payload_response_budget_rejection(
+    SelectedUpstreamBodyOutcome::Reject(super::budget_error::retained_payload_request_budget_rejection(
         ctx,
         OUTBOUND_TRANSLATION_OVERFLOW_MESSAGE,
     ))

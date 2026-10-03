@@ -27,8 +27,14 @@ fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
 /// by the logical response. An IRR step can run after SSE was committed even
 /// when a buffered step has replaced `IterationState.previous_response`.
 pub(super) fn reject_retained_payload_budget(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
+    FilterAction::Reject(retained_payload_request_budget_rejection(ctx, message))
+}
+
+/// Return a phase-aware rejection for request construction before a provider
+/// call, including selected-upstream body hooks.
+pub(super) fn retained_payload_request_budget_rejection(ctx: &mut HttpFilterContext<'_>, message: &str) -> Rejection {
     let initial = is_initial_request(ctx);
-    FilterAction::Reject(retained_payload_budget_rejection(ctx, message, initial))
+    retained_payload_budget_rejection(ctx, message, initial)
 }
 
 /// Reject payload growth caused by a provider response as a server error,

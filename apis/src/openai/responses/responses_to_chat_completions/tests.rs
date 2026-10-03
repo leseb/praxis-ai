@@ -2809,7 +2809,38 @@ fn outbound_chat_translation_rejects_before_allocating_near_retained_limit() {
     };
 
     let result = filter.translated_request_bytes(&mut context).unwrap();
-    assert!(matches!(result, Err(SelectedUpstreamBodyOutcome::Reject(rejection)) if rejection.status == 502));
+    let Err(SelectedUpstreamBodyOutcome::Reject(rejection)) = result else {
+        panic!("expected initial outbound translation budget rejection");
+    };
+    assert_eq!(rejection.status, 413);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_request_error");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn outbound_chat_translation_overflow_on_continuation_remains_502() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi"}));
+    state.iteration = 1;
+    let message = json!({"role":"assistant", "content":"x".repeat(16_384)});
+    state.messages.push(message.clone());
+    state.persisted_messages.push(message);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    context.extensions.insert(state);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let result = filter.translated_request_bytes(&mut context).unwrap();
+    let Err(SelectedUpstreamBodyOutcome::Reject(rejection)) = result else {
+        panic!("expected continuation outbound translation budget rejection");
+    };
+    assert_eq!(rejection.status, 502);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(error["error"]["code"], "server_error");
     assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
 }
 
