@@ -379,8 +379,14 @@ impl ResolutionBudget {
             return cached.clone();
         }
 
+        // A newly cached outcome owns its source key even when the reference
+        // came from rehydrated history rather than the current raw body.
+        self.consume_aggregate_bytes(source.value().len())?;
         self.register_reference()?;
 
+        let max_resolved_bytes = self
+            .aggregate_remaining_bytes
+            .map_or(max_resolved_bytes, |remaining| max_resolved_bytes.min(remaining));
         let outbound = self.outbound.as_ref();
         let aggregate_remaining_bytes = self.aggregate_remaining_bytes;
         let aggregate_binding =

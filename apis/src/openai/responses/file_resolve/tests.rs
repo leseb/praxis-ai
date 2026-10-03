@@ -751,6 +751,30 @@ async fn aggregate_budget_reserves_numeric_expansion_before_file_parse() {
 }
 
 #[tokio::test]
+async fn aggregate_budget_reserves_history_file_id_cache_key_before_callout() {
+    let filter = make_filter_with_outbound_for_url("http://127.0.0.1:1");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"summarize"}]}]});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let history =
+        json!({"role":"user","content":[{"type":"input_file","file_id":format!("file-{}", "a".repeat(2048))}]});
+    let mut state = ResponsesState::from_request_body(original);
+    state.messages.insert(0, history.clone());
+    state.persisted_messages.insert(0, history);
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 1024);
+    assert!(state.can_retain_payload(body.as_ref().unwrap().len()));
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
 async fn missing_scoped_credential_rejects_before_file_id_dispatch() {
     let files_api_url = start_files_api_stub();
     let filter = make_filter_with_outbound_from_yaml(&format!(
