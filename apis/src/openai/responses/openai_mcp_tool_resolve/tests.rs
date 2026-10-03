@@ -4256,7 +4256,8 @@ async fn deferred_discovery_budget_rejects_before_any_tools_list_call() {
         "a rejected discovery must leave its connector pending"
     );
     assert!(state.mcp_tool_map.is_empty());
-    assert!(state.accumulated_output.is_empty());
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(state.accumulated_output[0]["type"], "tool_search_call");
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())
             .await
@@ -4298,7 +4299,8 @@ async fn deferred_discovery_stops_before_the_next_call_when_prepared_results_fil
         "neither connector is committed on overflow"
     );
     assert!(state.mcp_tool_map.is_empty());
-    assert!(state.accumulated_output.is_empty());
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(state.accumulated_output[0]["type"], "tool_search_call");
     assert!(
         tokio::time::timeout(Duration::from_millis(50), second_listener.accept())
             .await
