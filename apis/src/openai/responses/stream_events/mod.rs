@@ -1143,7 +1143,7 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
     let limit = responses.retained_payload_limit()?;
     let stable = *stream.shared_stable_bytes.get_or_init(|| {
         responses
-            .stream_stable_payload_bytes_bounded_for_parser(limit)
+            .stream_stable_payload_bytes_bounded(limit)
             .unwrap_or(usize::MAX)
     });
     // A resumed round can carry megabytes of completed prior output. It does
