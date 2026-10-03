@@ -111,11 +111,14 @@ impl FileSearchAssignment {
 /// so a malformed or stale index fails closed rather than changing ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputAssignment {
+    /// Absolute index in the canonical output array.
     pub output_index: usize,
+    /// ID of the selected item, used to reject a replaced slot.
     pub item_id: String,
 }
 
 impl ResponsesState {
+    /// Resolve current-round selections of one output type without copying items.
     fn selected_output<'a>(
         &'a self,
         assignments: &'a [OutputAssignment],
@@ -129,6 +132,7 @@ impl ResponsesState {
         })
     }
 
+    /// Borrow selected function calls, including approved calls on resume.
     pub(crate) fn selected_tool_calls(&self) -> Vec<&serde_json::Value> {
         let calls: Vec<_> = self.selected_output(&self.tool_calls, "function_call").collect();
         #[cfg(feature = "openai-mcp-tools")]
@@ -140,6 +144,7 @@ impl ResponsesState {
         calls
     }
 
+    /// Borrow current-round hosted web-search calls.
     pub(crate) fn selected_web_search_calls(&self) -> Vec<&serde_json::Value> {
         self.selected_output(&self.web_search_calls, "web_search_call")
             .collect()
@@ -164,6 +169,7 @@ impl ResponsesState {
             .collect()
     }
 
+    /// Borrow current-round hosted tool-search calls.
     pub(crate) fn selected_tool_search_calls(&self) -> Vec<&serde_json::Value> {
         self.selected_output(&self.tool_search_calls, "tool_search_call")
             .collect()
@@ -171,6 +177,7 @@ impl ResponsesState {
 }
 
 impl OutputAssignment {
+    /// Select an item by absolute index and its current public ID.
     pub(crate) fn new(output_index: usize, item: &serde_json::Value) -> Option<Self> {
         Some(Self {
             output_index,
@@ -178,6 +185,7 @@ impl OutputAssignment {
         })
     }
 
+    /// Resolve only when the indexed item still has the expected ID and type.
     pub(crate) fn resolve<'a>(
         &self,
         output: &'a [serde_json::Value],
@@ -191,6 +199,13 @@ impl OutputAssignment {
 #[cfg(test)]
 impl ResponsesState {
     /// Install model items in their production owner for dispatcher unit tests.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        reason = "test fixture builder rejects malformed test items and unknown kinds"
+    )]
     pub(crate) fn select_test_output(&mut self, kind: &str, items: Vec<serde_json::Value>) {
         for mut item in items {
             let first_selection =
@@ -1127,6 +1142,10 @@ impl Default for ResponsesState {
     }
 }
 
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "selection helpers are colocated with assignment types"
+)]
 impl ResponsesState {
     /// Apply an aggregate retained-payload limit. The smallest limit seen by
     /// this request wins, so conditionally composed loop instances cannot
@@ -2005,6 +2024,7 @@ fn extract_bool_or(body: &serde_json::Value, field: &str, default: bool) -> bool
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "tests"
 )]
 mod tests {
