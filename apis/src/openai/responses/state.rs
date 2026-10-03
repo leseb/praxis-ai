@@ -1078,12 +1078,6 @@ impl ResponsesState {
         Some(meter.used())
     }
 
-    /// Count the owners which may change during a streaming response. The
-    /// stream-local meter adds the cached request/history charge separately.
-    pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
-    }
-
     /// Rehydration runs after the stream parser and can see new canonical output
     /// between chunks; count both while reusing only stable request/history bytes.
     #[cfg(feature = "store")]
@@ -1104,6 +1098,12 @@ impl ResponsesState {
     /// this counts all other changing owners, including the stream parser.
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
         self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+    }
+
+    /// Stream events separately charges its parser state and cached prior
+    /// output, so neither owner belongs in the shared changing charge.
+    pub(crate) fn stream_changing_payload_bytes_bounded_for_parser(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, false, true)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
