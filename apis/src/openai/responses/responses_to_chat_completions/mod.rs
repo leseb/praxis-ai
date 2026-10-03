@@ -89,6 +89,11 @@ const FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES: usize = 64 * 3;
 /// provider tree, translated tree, and output Vec with additional headroom.
 const FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES: usize = 64;
 
+/// A compact function tool gains `description`, `parameters`, and `strict`
+/// when echoed in the Responses resource. Their fixed JSON fields add at most
+/// 64 bytes to the translated tree and each live wire Vec allocation.
+const FINITE_TRANSLATION_FUNCTION_TOOL_EXPANSION_BYTES: usize = 64 * 4;
+
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
 /// The filter consumes the classification metadata and `ResponsesState`
@@ -532,12 +537,8 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
     let Some(limit) = state.retained_payload_limit() else {
         return true;
     };
-    let choice = state.original_tool_choice.as_ref().unwrap_or(&state.tool_choice);
     let staging = (|| {
-        let request_echo = bounded_json_size(&state.request_body, limit).ok().flatten()?;
-        let tools_echo = bounded_json_size(&state.tools, limit).ok().flatten()?;
-        let choice_echo = bounded_json_size(choice, limit).ok().flatten()?;
-        let echo = request_echo.checked_add(tools_echo)?.checked_add(choice_echo)?;
+        let (echo, normalized_tool_expansion) = finite_translation_echo_bytes(state, limit)?;
         let response_id_bytes = ctx
             .get_metadata("responses.response_id")
             .or(state.response_id.as_deref())
@@ -546,20 +547,38 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
         let object_expansion = objects.checked_mul(FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES)?;
         let number_expansion = numbers.checked_mul(FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES)?;
         // Function-call IDs can be emitted as both `id` and `call_id`.
-        // During serialization, the wire Vec can also hold a new capacity
-        // alongside its previous allocation. Seven raw-sized owners cover the
-        // parsed provider tree, both translated ID copies, and that Vec peak.
+        // During serialization, the wire Vec can hold both its old and new
+        // capacities. Ten raw-sized owners cover the provider tree, translated
+        // ID copies, and this observed worst-case doubling peak.
         body.len()
-            .checked_mul(7)?
+            .checked_mul(10)?
             .checked_add(object_expansion)?
             .checked_add(number_expansion)?
-            .checked_add(echo.checked_mul(3)?)?
+            .checked_add(echo.checked_mul(4)?)?
+            .checked_add(normalized_tool_expansion)?
             .checked_add(response_id_bytes.checked_mul(12)?)?
             // The fixed Responses resource fields exist even for a minimal
             // provider object; reserve them in the tree and wire buffer.
-            .checked_add(1024)
+            .checked_add(1536)
     })();
     staging.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Count request fields copied onto the resource and the additional fixed
+/// fields added while normalizing compact function-tool declarations.
+fn finite_translation_echo_bytes(state: &ResponsesState, limit: usize) -> Option<(usize, usize)> {
+    let choice = state.original_tool_choice.as_ref().unwrap_or(&state.tool_choice);
+    let request_echo = bounded_json_size(&state.request_body, limit).ok().flatten()?;
+    let tools_echo = bounded_json_size(&state.tools, limit).ok().flatten()?;
+    let choice_echo = bounded_json_size(choice, limit).ok().flatten()?;
+    let echo = request_echo.checked_add(tools_echo)?.checked_add(choice_echo)?;
+    let function_tools = state
+        .tools
+        .iter()
+        .filter(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+        .count();
+    let normalized_tool_expansion = function_tools.checked_mul(FINITE_TRANSLATION_FUNCTION_TOOL_EXPANSION_BYTES)?;
+    Some((echo, normalized_tool_expansion))
 }
 
 /// Count structural objects and numeric tokens without allocating or mistaking
