@@ -1824,7 +1824,7 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels, None)
         .expect("rewrite must not error")
         .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
@@ -1884,7 +1884,7 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels, None)
         .expect("rewrite must not error")
         .expect("mixed request must be rewritten");
 
@@ -1935,7 +1935,7 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels, None)
         .expect("rewrite must not error")
         .expect("resolved-empty entry must trigger a rewrite");
 
@@ -5957,4 +5957,59 @@ async fn aggregate_budget_rejects_deferred_mcp_listing_before_callout() {
             .is_err(),
         "deferred tools/list must not start without enough room for its bounded response"
     );
+}
+
+#[test]
+fn aggregate_budget_rejects_repeated_mcp_selectors_before_expansion() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let names: Vec<String> = (0..128).map(|i| format!("t{i:03}_{}", "x".repeat(60))).collect();
+    let listed_tools: Vec<_> = names
+        .iter()
+        .map(|name| serde_json::json!({"name": name, "inputSchema": {"type": "object"}}))
+        .collect();
+    let selectors = vec![serde_json::json!({"type": "mcp", "server_label": "weather"}); 4_000];
+    let body_json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "tools": [{
+            "type": "mcp", "server_label": "weather", "server_url": server_url,
+            "allowed_tools": names,
+        }],
+        "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": selectors},
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url, "tools": listed_tools,
+    })];
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut action = None;
+    let allocation = allocation_counter::measure(|| {
+        action = Some(
+            runtime
+                .block_on(filter.on_request_body(&mut ctx, &mut body, true))
+                .unwrap(),
+        );
+    });
+
+    assert!(matches!(&action, Some(FilterAction::Reject(rejection)) if rejection.status == 502));
+    assert!(
+        allocation.bytes_max < 16 * 1024 * 1024,
+        "expanded selectors must be projected before building JSON or wire owners: {allocation:?}"
+    );
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
 }

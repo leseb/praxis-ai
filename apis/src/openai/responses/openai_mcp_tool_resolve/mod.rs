@@ -452,7 +452,27 @@ impl McpToolResolveFilter {
             listings,
             ..
         } = resolution;
-        let Some(serialized) = rewrite_request_body(&mut parsed, mcp_entries, per_entry, &tool_map, &resolved_labels)?
+        let rewrite_budget = if let Some(state) = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .filter(|state| state.retained_payload_limit().is_some())
+        {
+            Some(EagerRewriteBudget {
+                state,
+                fixed_bytes: eager_commit_fixed_bytes(&tool_map, &deferred_mcp, &listings, &connector_context_policy)
+                    .ok_or(ResolveError::RetainedBudget)?,
+            })
+        } else {
+            None
+        };
+        let Some(serialized) = rewrite_request_body(
+            &mut parsed,
+            mcp_entries,
+            per_entry,
+            &tool_map,
+            &resolved_labels,
+            rewrite_budget.as_ref(),
+        )?
         else {
             return Ok(FilterAction::Continue);
         };
@@ -1072,34 +1092,61 @@ fn eager_commit_fits(
     if state.retained_payload_limit().is_none() {
         return true;
     }
-    let projected = retained_json_bytes(parsed)
+    let projected = eager_commit_fixed_bytes(tool_map, deferred_mcp, listings, connector_context_policy)
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(parsed)?))
         .and_then(|bytes| bytes.checked_add(serialized_bytes))
         // write_state clones these two fields from the rewritten request.
         .and_then(|bytes| bytes.checked_add(optional_json_bytes(parsed.get("tools"))?))
-        .and_then(|bytes| bytes.checked_add(optional_json_bytes(parsed.get("tool_choice"))?))
-        .and_then(|bytes| {
-            tool_map.iter().try_fold(bytes, |used, ((server, tool), entry)| {
-                used.checked_add(server.len())?
-                    .checked_add(tool.len())?
-                    .checked_add(retained_json_bytes(entry)?)
-            })
-        })
-        .and_then(|bytes| {
-            deferred_mcp.iter().try_fold(bytes, |used, connector| {
-                used.checked_add(deferred_connector_bytes(connector)?)
-            })
-        })
-        .and_then(|bytes| {
-            listings.iter().try_fold(bytes, |used, listing| {
-                let owner = retained_json_bytes(&listing.tools)?
-                    .checked_add(listing.server_label.len())?
-                    .checked_add(listing.server_url.as_ref().map_or(0, String::len))?
-                    .checked_add(64)?;
-                used.checked_add(owner.checked_mul(4)?)
-            })
-        })
-        .and_then(|bytes| bytes.checked_add(connector_context_policy.retained_payload_bytes()?));
+        .and_then(|bytes| bytes.checked_add(optional_json_bytes(parsed.get("tool_choice"))?));
     projected.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Owners independent of the expanded JSON tree and serialized wire body.
+fn eager_commit_fixed_bytes(
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+    deferred_mcp: &[DeferredMcpConnector],
+    listings: &[McpListing],
+    connector_context_policy: &McpConnectorContextPolicy,
+) -> Option<usize> {
+    let map = tool_map.iter().try_fold(0_usize, |used, ((server, tool), entry)| {
+        used.checked_add(server.len())?
+            .checked_add(tool.len())?
+            .checked_add(retained_json_bytes(entry)?)
+    })?;
+    let deferred = deferred_mcp.iter().try_fold(map, |used, connector| {
+        used.checked_add(deferred_connector_bytes(connector)?)
+    })?;
+    let listings = listings.iter().try_fold(deferred, |used, listing| {
+        let owner = retained_json_bytes(&listing.tools)?
+            .checked_add(listing.server_label.len())?
+            .checked_add(listing.server_url.as_ref().map_or(0, String::len))?
+            .checked_add(64)?;
+        used.checked_add(owner.checked_mul(4)?)
+    })?;
+    listings.checked_add(connector_context_policy.retained_payload_bytes()?)
+}
+
+/// Project the complete commit while `tool_choice` still holds its compact
+/// selectors. Both the expanded tree and wire body remain live at the peak.
+struct EagerRewriteBudget<'a> {
+    /// Request-wide meter that owns the existing canonical state.
+    state: &'a ResponsesState,
+    /// Dispatch and discovery owners independent of the rewritten request.
+    fixed_bytes: usize,
+}
+
+impl EagerRewriteBudget<'_> {
+    /// Admit both request owners plus the cloned tools and choice projections.
+    fn admits(&self, obj: &serde_json::Map<String, serde_json::Value>, expansion_bytes: usize) -> bool {
+        let projected = retained_json_bytes(obj)
+            .and_then(|bytes| bytes.checked_add(expansion_bytes))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_add(optional_json_bytes(obj.get("tools"))?))
+            .and_then(|bytes| bytes.checked_add(optional_json_bytes(obj.get("tool_choice"))?))
+            .and_then(|bytes| bytes.checked_add(expansion_bytes))
+            .and_then(|bytes| bytes.checked_add(self.fixed_bytes));
+        projected.is_some_and(|bytes| self.state.can_retain_payload(bytes))
+    }
 }
 
 /// Measured retained size of an optional request field.
@@ -2160,12 +2207,14 @@ fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) 
 /// Connector-backed deferred entries are sanitized so the
 /// pipeline-local `connector_id`, configured URL, and credentials
 /// never reach the inference backend.
+#[expect(clippy::too_many_arguments, reason = "rewrite needs the independent request budget")]
 fn rewrite_request_body(
     parsed: &mut serde_json::Value,
     mcp_entries: ExtractedMcpEntries,
     per_entry: Vec<EntryResolution>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
+    budget: Option<&EagerRewriteBudget<'_>>,
 ) -> Result<Option<SerializedJson>, ResolveError> {
     let Some(obj) = parsed.as_object_mut() else {
         return Ok(None);
@@ -2184,7 +2233,23 @@ fn rewrite_request_body(
 
     let rewritten_count = rewritten.len();
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
+    if let Some(budget) = budget {
+        let expansion = projected_tool_choice_expansion_bytes(obj.get("tool_choice"), tool_map)
+            .ok_or(ResolveError::RetainedBudget)?;
+        if !budget.admits(obj, expansion) {
+            return Err(ResolveError::RetainedBudget);
+        }
+    }
     rewrite_tool_choice(obj, tool_map, resolved_labels)?;
+
+    // Guard the wire allocation with the measured rewritten tree as well. The
+    // earlier projection must admit the selector growth before its JSON objects
+    // exist; this check covers any later rewrite shape added to this function.
+    if let Some(budget) = budget
+        && !budget.admits(obj, 0)
+    {
+        return Err(ResolveError::RetainedBudget);
+    }
 
     let serialized = serialize_json_body(parsed).map_err(|e| {
         debug!(error = %e, "failed to serialize rewritten body");
@@ -2192,6 +2257,79 @@ fn rewrite_request_body(
     })?;
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(Some(serialized))
+}
+
+/// Upper bound for function references produced by MCP `tool_choice` selectors.
+/// Each generated name is sanitized to ASCII and capped at 64 bytes, so its
+/// compact JSON size can be computed from source names without allocating refs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "both named and server-level selector projections share one label index"
+)]
+fn projected_tool_choice_expansion_bytes(
+    choice: Option<&serde_json::Value>,
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+) -> Option<usize> {
+    let Some(choice) = choice.and_then(serde_json::Value::as_object) else {
+        return Some(0);
+    };
+    let mut by_label = HashMap::<&str, usize>::new();
+    for (server, tool) in tool_map.keys() {
+        let bytes = projected_function_ref_bytes(server, tool)?;
+        let total = by_label.get(server.as_str()).copied().unwrap_or(0).checked_add(bytes)?;
+        by_label.insert(server.as_str(), total);
+    }
+    let selector_bytes = |label: &str, name: Option<&str>| -> Option<usize> {
+        if let Some(name) = name {
+            return tool_map
+                .keys()
+                .find(|(server, tool)| server.as_str() == label && tool.as_str() == name)
+                .map_or(Some(0), |(server, tool)| projected_function_ref_bytes(server, tool));
+        }
+        Some(by_label.get(label).copied().unwrap_or(0))
+    };
+    match choice.get("type").and_then(serde_json::Value::as_str) {
+        Some("mcp") => {
+            let label = choice
+                .get("server_label")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let name = choice.get("name").and_then(serde_json::Value::as_str);
+            let bytes = selector_bytes(label, name)?;
+            // Server-level selectors add `mode` and a `tools` wrapper.
+            bytes.checked_add(64)
+        },
+        Some("allowed_tools") => {
+            choice
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .map_or(Some(0), |selectors| {
+                    selectors.iter().try_fold(0_usize, |total, selector| {
+                        if selector.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
+                            return Some(total);
+                        }
+                        let label = selector
+                            .get("server_label")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        let name = selector.get("name").and_then(serde_json::Value::as_str);
+                        total.checked_add(selector_bytes(label, name)?)
+                    })
+                })
+        },
+        _ => Some(0),
+    }
+}
+
+/// Include an array separator for each possible generated reference.
+fn projected_function_ref_bytes(server: &str, tool: &str) -> Option<usize> {
+    let name_bytes = server
+        .chars()
+        .count()
+        .checked_add(2)?
+        .checked_add(tool.chars().count())?
+        .min(MAX_FUNCTION_NAME_LEN);
+    br#"{"type":"function","name":""}"#.len().checked_add(name_bytes)?.checked_add(1)
 }
 
 /// Rewrite a tools array, replacing resolved MCP entries with
