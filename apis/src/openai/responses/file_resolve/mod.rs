@@ -87,6 +87,7 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
+    ObservedResponsesSse,
     agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
     body_limits::reject_rewritten_body_too_large,
     bound_body_outcome,
@@ -574,16 +575,17 @@ fn file_state_fits_budget(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// A prior IRR step's SSE response has already fixed the downstream wire format.
 fn irr_stream_was_committed(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.extensions.get::<IterationState>().is_some_and(|iteration| {
-        iteration.iteration() > 0
-            && iteration.previous_response.as_ref().is_some_and(|response| {
-                response
-                    .headers
-                    .get(http::header::CONTENT_TYPE)
-                    .and_then(|value| value.as_bytes().get(..b"text/event-stream".len()))
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/event-stream"))
-            })
-    })
+    ctx.extensions.get::<ObservedResponsesSse>().is_some()
+        || ctx.extensions.get::<IterationState>().is_some_and(|iteration| {
+            iteration.iteration() > 0
+                && iteration.previous_response.as_ref().is_some_and(|response| {
+                    response
+                        .headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.as_bytes().get(..b"text/event-stream".len()))
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/event-stream"))
+                })
+        })
 }
 
 /// Clear payload and disable successful persistence on aggregate exhaustion.

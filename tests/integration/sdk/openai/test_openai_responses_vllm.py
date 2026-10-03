@@ -5484,8 +5484,11 @@ def retained_tool_search_client(tmp_path, request):
         os.unlink(config_path)
 
 
-def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(tmp_path):
-    """A later IRR file failure must finish the SSE stream, not append raw JSON."""
+@pytest.mark.parametrize("intermediate_buffered_step", [False, True])
+def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
+    tmp_path, intermediate_buffered_step
+):
+    """An IRR file failure must terminate SSE even across a buffered step."""
 
     class StubHandler(BaseHTTPRequestHandler):
         paths: ClassVar[list[str]] = []
@@ -5578,6 +5581,26 @@ insecure_options:
   allow_private_endpoints: true
   allow_private_upstreams: true
 """
+    if intermediate_buffered_step:
+        config = config.replace("max_iterations: 2", "max_iterations: 3", 1)
+        config = config.replace("next: resolve", "next: middle", 1)
+        config = config.replace(
+            "          - name: resolve\n",
+            """          - name: middle
+            filters:
+              - filter: static_response
+                status: 200
+                body: '{}'
+                headers:
+                  - name: Content-Type
+                    value: application/json
+            on_result:
+              - default: true
+                next: resolve
+          - name: resolve
+""",
+            1,
+        )
     config_path = _persist_config(config)
     log_path = tmp_path / "praxis.log"
     with log_path.open("w") as log_file:
