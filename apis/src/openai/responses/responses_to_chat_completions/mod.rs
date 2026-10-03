@@ -88,6 +88,7 @@ const OUTBOUND_TRANSLATION_OVERFLOW_MESSAGE: &str =
 /// copies plus fixed room for synthetic hosted-tool schemas cover these owners
 /// before the first converted message is allocated.
 const OUTBOUND_TRANSLATION_SOURCE_COPIES: usize = 8;
+/// Fixed fields for synthesized hosted-tool and Chat request schemas.
 const OUTBOUND_TRANSLATION_FIXED_BYTES: usize = 4_096;
 
 /// One compact `{"text":"x"}` part expands to a 64-byte Responses

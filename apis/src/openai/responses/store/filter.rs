@@ -210,6 +210,10 @@ impl ResponseStoreFilter {
         clippy::too_many_lines,
         reason = "checks aggregate admission before constructing the store record"
     )]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "distinguishes absent state from an unmeasurable response before persistence"
+    )]
     fn persist_from_streaming_state(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
