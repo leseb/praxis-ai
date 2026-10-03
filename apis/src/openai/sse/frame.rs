@@ -161,7 +161,9 @@ impl SseFrameParser {
         reason = "one pass over completed SSE lines bounds parser copies"
     )]
     pub(crate) fn previous_chunk_copy_bound(&self, chunk: &[u8]) -> Option<usize> {
-        let mut start = 0;
+        // Match parse_chunk_inner: a CRLF is one terminator, even when the
+        // CR and LF arrive in separate chunks.
+        let mut start = usize::from(self.prev_cr && chunk.first() == Some(&b'\n'));
         let mut first_line = true;
         let mut pending_line_copy = 0;
         let mut appends_data = false;
@@ -196,9 +198,6 @@ impl SseFrameParser {
                     0
                 };
                 appends_data |= data_field && prior_data_live;
-                if self.line_buf.is_empty() && line.is_empty() {
-                    prior_data_live = false;
-                }
             } else {
                 appends_data |= line.starts_with(b"data:") && prior_data_live;
                 if line.is_empty() {
@@ -207,6 +206,9 @@ impl SseFrameParser {
             }
             first_line = false;
             start = end.checked_add(1)?;
+            if chunk.get(end) == Some(&b'\r') && chunk.get(start) == Some(&b'\n') {
+                start = start.checked_add(1)?;
+            }
         }
         pending_line_copy.checked_add(if appends_data { self.data_buf.len() } else { 0 })
     }

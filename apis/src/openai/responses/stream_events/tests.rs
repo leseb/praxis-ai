@@ -2984,6 +2984,49 @@ fn multiline_data_rejects_before_reallocating_prior_frame_buffer() {
 }
 
 #[test]
+fn crlf_does_not_hide_carried_data_buffer_copy() {
+    for split_crlf in [false, true] {
+        let (filter, mut ctx) = make_armed_context();
+        ctx.extensions.insert(ResponsesState::from_request_body(json!({
+            "model": "test-model", "input": "hello", "stream": true
+        })));
+
+        let mut first_line = Some(Bytes::from(format!("data: {}\n", "x".repeat(30_000))));
+        filter.on_response_body(&mut ctx, &mut first_line, false).unwrap();
+        if split_crlf {
+            let mut event_line = Some(Bytes::from_static(b"event: ping\r"));
+            filter.on_response_body(&mut ctx, &mut event_line, false).unwrap();
+        }
+
+        let suffix = if split_crlf {
+            Bytes::from_static(b"\ndata: x\n")
+        } else {
+            Bytes::from_static(b"event: ping\r\ndata: x\n")
+        };
+        let response = ctx.extensions.get::<ResponsesState>().unwrap();
+        let shared = response.retained_payload_bytes().unwrap() - response.retained_stream_parser_bytes;
+        let local = ctx
+            .get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        let limit = shared + local + suffix.len() * 4 + 30_000 - 1;
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(limit);
+
+        let mut body = Some(suffix);
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "carried data must stay live across CRLF, split={split_crlf}"
+        );
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+}
+
+#[test]
 fn completed_event_field_needs_no_second_copy_on_blank_line() {
     let (filter, mut ctx) = make_armed_context();
     ctx.extensions.insert(ResponsesState::from_request_body(json!({
