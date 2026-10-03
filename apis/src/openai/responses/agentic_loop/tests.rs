@@ -3840,7 +3840,11 @@ fn buffered_usage_replacement_charges_commit_peak_with_copied_output() {
     let old_usage = json!({"detail": "a".repeat(1_000_000)});
     let response = json!({
         "object": "response",
-        "output": [{"type": "message", "id": "msg_1", "content": "x".repeat(2_000_000)}],
+        "output": [{
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "x".repeat(2_000_000)}]
+        }],
         "usage": {"detail": "b".repeat(1_500_000)}
     });
     let body = Bytes::from(serde_json::to_vec(&response).unwrap());
@@ -3854,7 +3858,7 @@ fn buffered_usage_replacement_charges_commit_peak_with_copied_output() {
     let old_usage_bytes = super::super::state::retained_json_bytes(&state.usage).unwrap();
     let incoming_usage_bytes = super::super::state::retained_json_bytes(&response["usage"]).unwrap();
     let usage_growth = incoming_usage_bytes - old_usage_bytes;
-    let limit = baseline + response_bytes + item_bytes + usage_growth + 64_000;
+    let limit = baseline + response_bytes + 2 * item_bytes + usage_growth + 64_000;
     state.apply_retained_payload_limit(limit);
     assert!(
         state.can_retain_payload(response_bytes + old_usage_bytes + incoming_usage_bytes),
