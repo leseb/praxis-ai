@@ -38,6 +38,8 @@ const FILES_PATH_PREFIX: &str = "v1/files";
 /// both state history mirrors, and rewritten wire body. The extra slots cover
 /// raw response/metadata parsing during a callout and JSON string framing.
 const AGGREGATE_RESOLUTION_OWNER_RESERVATION: usize = 8;
+/// Four serialized owners may each expand metadata control bytes to `\u00xx`.
+const ESCAPED_METADATA_OWNERS: usize = 4;
 
 /// Identifies the source of a file reference for dispatch and caching.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,6 +536,10 @@ impl FilesApiClient {
     ///
     /// When `outbound` is present the callout routes through the bound
     /// outbound filter chain; otherwise it uses the direct client transport.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "metadata read and aggregate cap classification stay together"
+    )]
     async fn fetch_metadata(
         &self,
         file_id: &str,
@@ -550,13 +556,18 @@ impl FilesApiClient {
             || self.client.max_response_bytes(),
             |limit| self.client.max_response_bytes().min(limit),
         );
+        let aggregate_controls_response =
+            aggregate_response_limit.is_some_and(|limit| limit <= self.client.max_response_bytes());
         // Box the callout future so the large transport frame is not inlined
         // into this and every ancestor resolve future (clippy::large_futures).
         let response = match outbound {
             Some(outbound) => Box::pin(self.client.get_via_chain(&url, request_headers, max_bytes, outbound)).await,
             None => Box::pin(self.client.get(&url, request_headers, max_bytes)).await,
         }
-        .map_err(|e| map_api_error(e, file_id))?;
+        .map_err(|e| match e {
+            ApiClientError::ResponseTooLarge { .. } if aggregate_controls_response => ResolveError::RetainedBudget,
+            other => map_api_error(other, file_id),
+        })?;
         if !(200..300).contains(&response.status) {
             return Err(ResolveError::CalloutFailed {
                 file_id: file_id.to_owned(),
@@ -969,9 +980,19 @@ fn output_len_for_part(part_type: &str, source: ReferenceSource<'_>, resolved: &
 
 /// Bytes that each independently owned resolved value can retain.
 fn retained_resolved_bytes(part_type: &str, source: ReferenceSource<'_>, resolved: &ResolvedFile) -> Option<usize> {
+    let metadata_bytes = resolved
+        .content_type
+        .len()
+        .checked_add(resolved.filename.as_ref().map_or(0, String::len))?;
+    // The base reservation covers raw metadata in independently owned values.
+    // Reserve the extra JSON escaping in the rewritten body and three state
+    // projections without allocating their serialized forms here.
+    let escaped_extra = metadata_bytes.checked_mul(5)?.checked_mul(ESCAPED_METADATA_OWNERS)?;
+    let escaped_units = escaped_extra.div_ceil(AGGREGATE_RESOLUTION_OWNER_RESERVATION);
     output_len_for_part(part_type, source, resolved)
         .checked_add(resolved.content_type.len())?
-        .checked_add(resolved.filename.as_ref().map_or(0, String::len))
+        .checked_add(resolved.filename.as_ref().map_or(0, String::len))?
+        .checked_add(escaped_units)
 }
 
 /// Replace the reference field with the resolved content in a content part.
@@ -1214,6 +1235,51 @@ mod tests {
                 max_resolved_bytes,
             },
         )
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "transport-level tie behavior requires an HTTP stub"
+    )]
+    async fn metadata_limit_tied_with_configured_cap_remains_budget_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            let body = "x".repeat(256);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let api = ApiClient::new(ApiClientConfig {
+            api_base_url: url,
+            client: crate::subrequest::isolated_client(4),
+            timeout: std::time::Duration::from_secs(5),
+            max_response_bytes: 128,
+            forward_header_names: Vec::new(),
+            address_policy: crate::callout_target::AddressPolicy::AllowPrivate,
+        });
+        let client = FilesApiClient::new(
+            api,
+            FilesApiClientOptions {
+                max_file_references: 1,
+                max_resolved_bytes: 64,
+            },
+        );
+        let Err(error) = client
+            .fetch_metadata("file-a", &http::HeaderMap::new(), Some(128), None)
+            .await
+        else {
+            panic!("metadata response above the tied aggregate cap must fail");
+        };
+        assert!(matches!(error, ResolveError::RetainedBudget));
+        server.join().unwrap();
     }
 
     #[tokio::test]

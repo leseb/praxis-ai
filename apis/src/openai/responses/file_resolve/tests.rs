@@ -718,7 +718,10 @@ async fn aggregate_budget_rejects_before_reparsing_near_limit_state() {
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(response) if response.status == 502));
+    assert!(
+        matches!(&action, FilterAction::Reject(response) if response.status == 502),
+        "near-limit reparsing action: {action:?}"
+    );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
@@ -772,6 +775,107 @@ async fn aggregate_budget_reserves_history_file_id_cache_key_before_callout() {
     assert!(matches!(action, FilterAction::Reject(response) if response.status == 502));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn aggregate_metadata_read_limit_is_not_swallowed_by_missing_file_policy() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let files_api_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _read = stream.read(&mut request).unwrap();
+        let metadata =
+            json!({"id":"file-a","filename":"x".repeat(1000),"content_type":"text/plain","bytes":0}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{metadata}",
+            metadata.len()
+        )
+        .unwrap();
+    });
+    let filter = make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: {files_api_url}\nallow_pre_security_callout: true\non_missing: continue\nmax_resolved_bytes: 64"
+    ));
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-a"}]}]});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let mut state = ResponsesState::from_request_body(original);
+    state.apply_retained_payload_limit(4096);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn aggregate_budget_bounds_escaped_metadata_across_file_fanout() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let files_api_url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let mut count = 0;
+        while matches!(stop_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            };
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let is_content = String::from_utf8_lossy(&request[..read])
+                .lines()
+                .next()
+                .unwrap()
+                .contains("/content");
+            count += 1;
+            let response = if is_content {
+                String::new()
+            } else {
+                json!({"filename":"\0".repeat(50),"content_type":"x","bytes":0}).to_string()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            if count == 32 {
+                break;
+            }
+        }
+        count
+    });
+    let filter = make_filter_with_outbound_for_url(&files_api_url);
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let content: Vec<_> = (0..16)
+        .map(|index| json!({"type":"input_file","file_id":format!("file-{index}")}))
+        .collect();
+    let original = json!({"model":"m","input":[{"role":"user","content":content}]});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let mut state = ResponsesState::from_request_body(original);
+    state.apply_retained_payload_limit(16 * 1024);
+    assert!(state.can_retain_payload(body.as_ref().unwrap().len()));
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    drop(stop_tx);
+    let callouts = server.join().unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(response) if response.status == 502),
+        "escaped metadata action: {action:?}"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        callouts > 2 && callouts < 32,
+        "the budget must stop the file fanout before every callout"
+    );
 }
 
 #[tokio::test]
