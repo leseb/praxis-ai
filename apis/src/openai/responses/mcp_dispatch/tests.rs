@@ -2166,6 +2166,10 @@ async fn deferred_budget_failure_skips_successful_response_persistence() {
         }],
         ..ResponsesState::default()
     };
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({"type": "tool_search_call", "id": "tsc_budget"})],
+    );
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
     ctx.extensions.insert(state);
     let callout = crate::mcp_client::McpCallout::fabricated(true).unwrap();
