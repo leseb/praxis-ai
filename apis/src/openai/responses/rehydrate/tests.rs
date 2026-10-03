@@ -2140,6 +2140,51 @@ async fn streaming_restore_emits_one_error_before_near_limit_frame_rewrite() {
 }
 
 #[tokio::test]
+async fn buffered_rewrite_reserves_later_plain_frame_output_growth() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let head = format!(
+        "event: response.created\ndata: {}\n",
+        json!({"type": "response.created", "response": {"id": "resp_new", "object": "response"}})
+    );
+    let plain =
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n";
+    let tail = format!("\n{}", plain.repeat(100));
+    let buffered_len = head.len() + tail.len();
+
+    let mut state = rehydrated_state("resp_prev");
+    state.messages.push(json!("h".repeat(32_000)));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + buffered_len * 3);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::copy_from_slice(head.as_bytes()));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none());
+    let mut body = Some(Bytes::from(tail));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let error = body.expect("the pending-frame output growth must be rejected");
+    let frames = parse_sse_frames(&error);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn streaming_restore_forwards_plain_delta_with_no_rewrite_headroom() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
