@@ -520,11 +520,18 @@ pub(crate) struct ResponsesState {
     pub(crate) retained_external_payload_bytes: usize,
     /// Parser payload published by `openai_stream_events` for other filters.
     pub(crate) retained_stream_parser_bytes: usize,
+    /// Incomplete SSE frame held by the outer rehydration response rewrite.
+    pub(crate) retained_rehydrate_stream_bytes: usize,
     /// Semantic and framing payload published by the Chat stream translator.
     pub(crate) retained_chat_converter_bytes: usize,
     /// Initialized MCP peer metadata retained in the request-scoped session pool.
     #[cfg(feature = "openai-mcp-tools")]
     pub(crate) retained_mcp_session_bytes: usize,
+
+    /// Revision of request/history/output owners cached by response-store
+    /// replay admission. In-place changes do not alter collection lengths.
+    /// `None` means the counter overflowed and replay must fail closed.
+    pub(crate) replay_stable_payload_revision: Option<u64>,
 
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
@@ -1095,9 +1102,11 @@ impl Default for ResponsesState {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
             retained_stream_parser_bytes: 0,
+            retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
             #[cfg(feature = "openai-mcp-tools")]
             retained_mcp_session_bytes: 0,
+            replay_stable_payload_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -1264,6 +1273,13 @@ impl ResponsesState {
         self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
     }
 
+    /// Rehydration runs after the stream parser and can see new canonical output
+    /// between chunks; count both while reusing only stable request/history bytes.
+    #[cfg(feature = "store")]
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
+    }
+
     /// The response store caches request/history and prior output while
     /// capturing replay chunks, but must still count all changing owners,
     /// including the parser charge published by `openai_stream_events`.
@@ -1310,6 +1326,7 @@ impl ResponsesState {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
             meter.raw(self.retained_external_payload_bytes)?;
+            meter.raw(self.retained_rehydrate_stream_bytes)?;
         }
         if include_stream_parser {
             meter.raw(self.retained_stream_parser_bytes)?;
@@ -1555,6 +1572,7 @@ impl ResponsesState {
         self.locally_executed_output_items.clear();
         self.provider_streamed_terminal_ids.clear();
         self.provider_compaction_ids.clear();
+        self.retained_rehydrate_stream_bytes = 0;
         self.dispatch_failure = None;
     }
 
@@ -1621,6 +1639,15 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+        self.mark_replay_stable_payload_changed();
+    }
+
+    /// Invalidate the store replay meter after an in-place mutation of a
+    /// cached request, history, tool, or accumulated output owner.
+    pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
+        self.replay_stable_payload_revision = self
+            .replay_stable_payload_revision
+            .and_then(|revision| revision.checked_add(1));
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
