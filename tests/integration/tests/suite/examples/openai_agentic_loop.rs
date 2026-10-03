@@ -317,6 +317,72 @@ fn store_replay_rows_exhaust_shared_retained_budget() {
     assert_eq!(status, 404, "failed stream must not be stored");
 }
 
+#[test]
+fn rehydrated_stream_rewrite_overflow_emits_error_without_persisting_completion() {
+    let db = TempSqlite::new("agentic_rehydrate_response_budget");
+    let first_response = serde_json::json!({
+        "id": "resp_rehydrate_seed",
+        "object": "response",
+        "created_at": 1_780_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": []
+    });
+    let first_model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let first_config = load_rehydrate_budget_fixture_config(free_port(), first_model.port(), db.url(), 67_108_864);
+    let first_proxy = start_proxy(&first_config);
+    let first_request = serde_json::json!({"model": "gpt-4.1", "input": "Seed history", "store": true});
+    let first = http_send(
+        first_proxy.addr(),
+        &json_post("/v1/responses", &first_request.to_string()),
+    );
+    assert_eq!(parse_status(&first), 200, "{first}");
+    drop(first_proxy);
+    drop(first_model);
+
+    let response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "sequence_number": 0,
+                "response": {"id": "resp_rehydrate_rewrite", "object": "response", "status": "in_progress", "output": []}
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "sequence_number": 1,
+                "response": {
+                    "id": "resp_rehydrate_rewrite", "object": "response", "status": "completed",
+                    "previous_response_id": null,
+                    "output": [{"type": "message", "id": "msg_rehydrate_rewrite", "role": "assistant",
+                        "status": "completed", "content": [{"type": "output_text", "text": "x".repeat(2_000)}]}]
+                }
+            }),
+        ),
+    ];
+    let (model_port, model_requests, _model_thread) = start_streaming_model(vec![response]);
+    let config = load_rehydrate_budget_fixture_config(free_port(), model_port, db.url(), 20_480);
+    let proxy = start_proxy(&config);
+    let next = serde_json::json!({
+        "model": "gpt-4.1", "input": "Continue", "previous_response_id": "resp_rehydrate_seed",
+        "stream": true, "store": true
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &next.to_string()));
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+    let body = parse_body(&raw);
+    let frames = parse_sse_frames(&body);
+    assert_eq!(event_count(&frames, "error"), 1, "{body}");
+    assert_eq!(event_count(&frames, "response.completed"), 0, "{body}");
+    assert!(
+        body.contains("during response restoration"),
+        "the outer rehydrate gate should fail: {body}"
+    );
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_rehydrate_rewrite", None);
+    assert_eq!(status, 404, "the failed terminal must not be stored");
+}
+
 // -----------------------------------------------------------------------------
 // Single-Pass
 // -----------------------------------------------------------------------------
@@ -7721,6 +7787,23 @@ fn load_overflow_fixture_config(proxy_port: u16, model_port: u16, db_url: &str) 
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse retained overflow fixture")
+}
+
+fn load_rehydrate_budget_fixture_config(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop-fixture.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic fixture");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = yaml.replace(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse rehydrate budget fixture")
 }
 
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
