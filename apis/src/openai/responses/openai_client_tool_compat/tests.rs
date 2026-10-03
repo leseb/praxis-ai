@@ -1104,6 +1104,40 @@ fn buffered_restoration_preflights_parse_and_rewrite_owners() {
 }
 
 #[test]
+fn buffered_restoration_charges_repeated_namespace_metadata() {
+    let namespace = "n".repeat(64 * 1024);
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{
+            "type": "namespace", "name": namespace, "description": "group",
+            "tools": [{"type": "function", "name": "m", "parameters": {"type": "object"}}]
+        }]
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("large namespace declaration lowers within independent rewrite cap");
+    let wire_name = namespace_member_name(&namespace, "m");
+    let output: Vec<_> = (0..100)
+        .map(|i| {
+            json!({
+                "type": "function_call", "id": format!("fc_{i}"),
+                "call_id": format!("call_{i}"), "name": wire_name,
+                "arguments": "{}"
+            })
+        })
+        .collect();
+    let raw = json!({"object": "response", "output": output}).to_string();
+    assert!(raw.len() < 16 * 1024, "private wire names keep the provider body small");
+    let baseline = state.retained_payload_bytes().expect("bounded baseline");
+    state.apply_retained_payload_limit(baseline + 1024 * 1024);
+    let rejected = filter().restore_response(&state, raw.as_bytes());
+    assert!(
+        rejected.is_err(),
+        "the repeated restored namespace must exceed one MiB of headroom"
+    );
+    assert_eq!(reject_parts(&rejected.err().unwrap()).0, 413);
+}
+
+#[test]
 fn buffered_restoration_uses_listener_budget_and_discards_failed_state() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);

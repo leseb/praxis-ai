@@ -271,6 +271,10 @@ impl std::ops::Deref for RestoreError {
 
 /// Parse a genuine buffered Responses object after reserving each owned copy.
 /// Non-JSON or non-Responses bodies keep the existing passthrough behavior.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one parse and its two aggregate admission boundaries"
+)]
 fn parse_response_for_restoration(
     state: &ResponsesState,
     echo: &ClientToolEcho,
@@ -285,27 +289,62 @@ fn parse_response_for_restoration(
     } else {
         None
     };
-    let Ok(response) = serde_json::from_slice::<Value>(bytes) else {
+    let Some(response) = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .filter(|response| response.get("object").and_then(Value::as_str) == Some("response"))
+    else {
         return Ok(None);
     };
-    if response.get("object").and_then(Value::as_str) != Some("response") {
-        return Ok(None);
-    }
     if let Some(parsed_bound) = parsed_bound {
         let echoed_bytes = retained_json_bytes(&echo.tools)
             .and_then(|bytes| bytes.checked_add(retained_json_bytes(&echo.tool_choice)?))
             .ok_or_else(RestoreError::budget)?;
+        let restored_names = restored_namespace_metadata_bytes(&response, &state.client_tool_lowering)
+            .ok_or_else(RestoreError::budget)?;
         // The echoed values are cloned into the parsed response and then
-        // serialized again while both owners are still live.
+        // serialized again while both owners are still live. A single long
+        // namespace can also be restored into many output items, independent
+        // of its one echoed declaration and the short private wire names.
         let reservation = parsed_bound
             .checked_mul(RESTORATION_RESPONSE_RESERVATION)
             .and_then(|bytes| bytes.checked_add(echoed_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(restored_names.checked_mul(2)?))
             .ok_or_else(RestoreError::budget)?;
         if !state.can_retain_payload(reservation) {
             return Err(RestoreError::budget());
         }
     }
     Ok(Some(response))
+}
+
+/// Count namespaced metadata inserted into every matching output item.
+/// Each name can be owned by the restored JSON tree and serialized body at
+/// once, even though the reverse map and echoed declaration store it once.
+fn restored_namespace_metadata_bytes(response: &Value, reverse: &HashMap<String, LoweredClientTool>) -> Option<usize> {
+    let mut total = 0_usize;
+    for item in response.get("output").and_then(Value::as_array).into_iter().flatten() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let Some(lowered) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| reverse.get(name))
+        else {
+            continue;
+        };
+        if !matches!(
+            lowered.restore,
+            ClientToolRestore::Namespace | ClientToolRestore::NamespaceCustom
+        ) {
+            continue;
+        }
+        total = total.checked_add(retained_json_bytes(&lowered.original_name)?)?;
+        if let Some(namespace) = lowered.namespace.as_ref() {
+            total = total.checked_add(retained_json_bytes(namespace)?)?;
+        }
+    }
+    Some(total)
 }
 
 // -----------------------------------------------------------------------------
