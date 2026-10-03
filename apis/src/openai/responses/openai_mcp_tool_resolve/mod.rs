@@ -2274,17 +2274,16 @@ fn projected_tool_choice_expansion_bytes(
         return Some(0);
     };
     let mut by_label = HashMap::<&str, usize>::new();
+    let mut by_name = HashMap::<(&str, &str), usize>::new();
     for (server, tool) in tool_map.keys() {
         let bytes = projected_function_ref_bytes(server, tool)?;
         let total = by_label.get(server.as_str()).copied().unwrap_or(0).checked_add(bytes)?;
         by_label.insert(server.as_str(), total);
+        by_name.insert((server.as_str(), tool.as_str()), bytes);
     }
     let selector_bytes = |label: &str, name: Option<&str>| -> Option<usize> {
         if let Some(name) = name {
-            return tool_map
-                .keys()
-                .find(|(server, tool)| server.as_str() == label && tool.as_str() == name)
-                .map_or(Some(0), |(server, tool)| projected_function_ref_bytes(server, tool));
+            return Some(by_name.get(&(label, name)).copied().unwrap_or(0));
         }
         Some(by_label.get(label).copied().unwrap_or(0))
     };
