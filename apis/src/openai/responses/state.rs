@@ -1858,10 +1858,13 @@ fn current_round_tool_call_admissions_by<'a>(
 ///
 /// Deferred connector discovery is the server-side execution of that search, so
 /// it must not run `tools/list` or start another inference round after
-/// `max_tool_calls` is exhausted. An omitted limit leaves discovery allowed.
-/// When the current round's output is not yet replayable, remaining prior-round
-/// budget is the admission signal.
+/// `max_tool_calls` is exhausted. A stale or invalid selection cannot authorize
+/// an outbound listing, even when the limit is omitted.
 pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
+    let selected = state.selected_tool_search_calls();
+    if selected.is_empty() {
+        return false;
+    }
     let Some(max) = state.max_tool_calls else {
         return true;
     };
@@ -1871,8 +1874,9 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
     if remaining == 0 {
         return false;
     }
-    let admissions = current_round_tool_call_admissions(state, &state.selected_tool_search_calls());
-    admissions.is_empty() || admissions.into_iter().any(|admitted| admitted)
+    current_round_tool_call_admissions(state, &selected)
+        .into_iter()
+        .any(|admitted| admitted)
 }
 
 /// Normalize the `input` field into a message array.
