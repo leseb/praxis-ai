@@ -1439,18 +1439,45 @@ pub(crate) fn resolve_error_action(
     body: &[u8],
 ) -> FilterAction {
     if streaming && is_mcp_listing_runtime_failure(err) {
-        let (_, error_type) = resolve_error_status(err);
-        let msg = err.to_string();
-        debug!(error = %msg, "openai_mcp_tool_resolve rejected");
-        ctx.insert_filter_state(PendingListToolsFailure {
-            server_label: failure_server_label(err).to_owned(),
-            error_type,
-            message: msg,
-            options: capture_echoed_options(body),
-        });
-        return FilterAction::Continue;
+        return stash_list_tools_failure(ctx, err, capture_echoed_options(body));
     }
     resolve_error_rejection(err)
+}
+
+/// Use the already parsed request when deferred discovery has no body buffer.
+/// Serializing that request and parsing it again would create two unadmitted
+/// full-body owners just to echo a small set of failure options.
+pub(crate) fn resolve_error_action_from_request_state(
+    ctx: &mut HttpFilterContext<'_>,
+    err: &ResolveError,
+    streaming: bool,
+) -> FilterAction {
+    if streaming && is_mcp_listing_runtime_failure(err) {
+        let options = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(capture_echoed_options_from_state);
+        return stash_list_tools_failure(ctx, err, options);
+    }
+    resolve_error_rejection(err)
+}
+
+/// Hold the small failure descriptor until the request header phase emits SSE.
+fn stash_list_tools_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    err: &ResolveError,
+    options: Option<serde_json::Value>,
+) -> FilterAction {
+    let (_, error_type) = resolve_error_status(err);
+    let msg = err.to_string();
+    debug!(error = %msg, "openai_mcp_tool_resolve rejected");
+    ctx.insert_filter_state(PendingListToolsFailure {
+        server_label: failure_server_label(err).to_owned(),
+        error_type,
+        message: msg,
+        options,
+    });
+    FilterAction::Continue
 }
 
 /// Consume a stashed streaming listing failure and emit the terminal SSE.
@@ -1595,6 +1622,37 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
         total += len;
         captured.insert(field.to_owned(), value);
     }
+    (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
+}
+
+/// Copy only echoable fields from an existing request tree. Reserve eight
+/// copies of their compact payload against the request-wide budget for the
+/// pending descriptor and the failure snapshots before cloning any field.
+fn capture_echoed_options_from_state(state: &ResponsesState) -> Option<serde_json::Value> {
+    let obj = state.request_body.as_object()?;
+    let max_bytes = state
+        .retained_payload_limit()
+        .map_or(Some(MAX_ECHOED_OPTIONS_BYTES), |limit| {
+            let current = state.retained_payload_bytes_bounded(limit)?;
+            Some(MAX_ECHOED_OPTIONS_BYTES.min(limit.saturating_sub(current) / 8))
+        })?;
+    let mut total = 0_usize;
+    let mut selected = Vec::with_capacity(ECHOED_REQUEST_FIELDS.len());
+    for &field in ECHOED_REQUEST_FIELDS {
+        let Some(value) = obj.get(field) else {
+            continue;
+        };
+        let len = serialized_len(value).unwrap_or(usize::MAX);
+        if total.saturating_add(len) > max_bytes {
+            continue;
+        }
+        total += len;
+        selected.push((field, value));
+    }
+    let captured = selected
+        .into_iter()
+        .map(|(field, value)| (field.to_owned(), value.clone()))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
     (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
 }
 

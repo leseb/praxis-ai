@@ -5244,6 +5244,23 @@ fn capture_echoed_options_drops_oversized_field_keeps_small_ones() {
     );
 }
 
+#[test]
+fn bodyless_failure_echo_omits_fields_that_exceed_remaining_aggregate_budget() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o-mini",
+        "metadata": {"trace": "x".repeat(2_048)},
+    }));
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 1_024);
+
+    let captured = capture_echoed_options_from_state(&state).expect("model fits in the headroom");
+    assert_eq!(captured["model"], "gpt-4o-mini");
+    assert!(
+        captured.get("metadata").is_none(),
+        "metadata would multiply past the headroom"
+    );
+}
+
 /// End to end, an oversized `instructions` must not be amplified across the three
 /// SSE snapshots: the terminal failure echoes the default `instructions` (null)
 /// while still echoing the small fields, and the whole SSE body stays far below

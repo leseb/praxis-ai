@@ -78,6 +78,7 @@ use super::{
     openai_mcp_tool_resolve::{
         McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
+        resolve_error_action_from_request_state,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -1213,18 +1214,7 @@ impl McpDispatchFilter {
         };
 
         if needs_discovery {
-            let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
-                ctx.extensions
-                    .get::<ResponsesState>()
-                    .and_then(|state| serde_json::to_vec(&state.request_body).ok())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let bytes = body
-                .as_ref()
-                .filter(|bytes| !bytes.is_empty())
-                .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
+            let bytes = body.as_ref().filter(|bytes| !bytes.is_empty()).map(Bytes::as_ref);
             let action = discover_pending_connectors(
                 ctx,
                 bytes,
@@ -1296,7 +1286,7 @@ impl McpDispatchFilter {
 )]
 async fn discover_pending_connectors(
     ctx: &mut HttpFilterContext<'_>,
-    body: &[u8],
+    body: Option<&[u8]>,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
@@ -1332,7 +1322,10 @@ async fn discover_pending_connectors(
             let streaming = ctx
                 .get_metadata("openai_responses_format.stream")
                 .is_some_and(|v| v == "true");
-            Ok(resolve_error_action(ctx, &err, streaming, body))
+            Ok(match body {
+                Some(body) => resolve_error_action(ctx, &err, streaming, body),
+                None => resolve_error_action_from_request_state(ctx, &err, streaming),
+            })
         },
     }
 }
