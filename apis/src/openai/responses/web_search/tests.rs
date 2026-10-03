@@ -1651,11 +1651,11 @@ async fn mixed_file_then_web_round_preserves_model_order_under_max_tool_calls() 
     assert_eq!(state.accumulated_output[0]["id"], "fs_first");
     assert_eq!(state.accumulated_output[0]["status"], "searching");
     assert_eq!(state.accumulated_output[1]["id"], "ws_second");
-    assert_ne!(state.accumulated_output[1]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["status"], "failed");
     assert_eq!(state.web_search_calls_executed, 0);
     assert!(state.deferred_tool_limit_completion);
     let bridge = find_bridge_output(&state.messages, "should not run").expect("truthful web bridge");
-    assert_eq!(bridge["output"], "Web search not performed.");
+    assert_eq!(bridge["output"], TOOL_LIMIT_OUTPUT);
 }
 
 #[tokio::test]
