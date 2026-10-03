@@ -2730,3 +2730,23 @@ fn outbound_chat_translation_rejects_before_allocating_near_retained_limit() {
     assert!(matches!(result, Err(SelectedUpstreamBodyOutcome::Reject(rejection)) if rejection.status == 502));
     assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
 }
+
+#[test]
+fn outbound_chat_translation_admits_large_prompt_with_sufficient_payload_headroom() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"x".repeat(512 * 1024)}));
+    let retained = state.retained_payload_bytes().unwrap();
+    // Room for the converted tree and serialization buffers, including one
+    // Vec growth boundary. The original request is already counted in state.
+    state.apply_retained_payload_limit(retained + 4_196_668);
+    context.extensions.insert(state);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let translated = filter.translated_request_bytes(&mut context).unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&translated).unwrap();
+    assert_eq!(body["messages"][0]["content"].as_str().map(str::len), Some(512 * 1024));
+    assert_ne!(context.get_metadata("responses.skip_persist"), Some("true"));
+}

@@ -84,10 +84,10 @@ const OUTBOUND_TRANSLATION_OVERFLOW_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during outbound Chat translation";
 
 /// A translated request may briefly own converted messages, a Chat JSON tree,
-/// and the old and new capacities of its serialized wire buffer. Eight source
-/// copies plus fixed room for synthetic hosted-tool schemas cover these owners
-/// before the first converted message is allocated.
-const OUTBOUND_TRANSLATION_SOURCE_COPIES: usize = 8;
+/// and the old and new capacities of its serialized wire buffer. Six compact
+/// source copies plus fixed room for synthetic hosted-tool schemas bound those
+/// payload owners before the first converted message is allocated.
+const OUTBOUND_TRANSLATION_SOURCE_COPIES: usize = 6;
 /// Fixed fields for synthesized hosted-tool and Chat request schemas.
 const OUTBOUND_TRANSLATION_FIXED_BYTES: usize = 4_096;
 
@@ -680,16 +680,31 @@ fn outbound_translation_source_fits(ctx: &HttpFilterContext<'_>) -> bool {
     if state.retained_payload_limit().is_none() {
         return true;
     }
-    let source_bytes = (|| {
-        super::state::retained_json_bytes(&state.request_body)?
-            .checked_add(super::state::retained_json_bytes(&state.messages)?)?
-            .checked_add(super::state::retained_json_bytes(state.request_tools())?)?
-            .checked_add(super::state::retained_json_bytes(state.request_tool_choice())?)
-    })();
-    source_bytes
+    outbound_translation_source_bytes(state)
         .and_then(|bytes| bytes.checked_mul(OUTBOUND_TRANSLATION_SOURCE_COPIES))
         .and_then(|bytes| bytes.checked_add(OUTBOUND_TRANSLATION_FIXED_BYTES))
         .is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Only the selected message, tool, and choice owners feed the Chat builder.
+/// The corresponding request-body fields are replaced by those selections, so
+/// counting both would charge the same prompt twice during preflight.
+fn outbound_translation_source_bytes(state: &ResponsesState) -> Option<usize> {
+    let request_bytes = super::state::retained_json_bytes(&state.request_body)?;
+    let overridden = ["input", "tools", "tool_choice"]
+        .into_iter()
+        .try_fold(0_usize, |used, key| {
+            state
+                .request_body
+                .get(key)
+                .map_or(Some(0), super::state::retained_json_bytes)?
+                .checked_add(used)
+        })?;
+    request_bytes
+        .checked_sub(overridden)?
+        .checked_add(super::state::retained_json_bytes(&state.messages)?)?
+        .checked_add(super::state::retained_json_bytes(state.request_tools())?)?
+        .checked_add(super::state::retained_json_bytes(state.request_tool_choice())?)
 }
 
 /// Check the exact translated JSON size before allocating its serialized Vec.
@@ -702,7 +717,7 @@ fn outbound_translation_wire_fits(ctx: &HttpFilterContext<'_>, translated: &serd
         return true;
     }
     super::state::retained_json_bytes(translated)
-        .and_then(|bytes| bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_mul(4))
         .is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
