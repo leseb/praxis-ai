@@ -5493,7 +5493,7 @@ def retained_tool_search_client(tmp_path, request):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["direct", "buffered_middle", "empty_stream", "buffered_sse"]
+    "scenario", ["direct", "buffered_middle", "empty_stream", "buffered_sse", "translated"]
 )
 def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
     tmp_path, scenario
@@ -5520,11 +5520,22 @@ def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
         def do_POST(self):
             self.paths.append("POST " + self.path)
             self.rfile.read(int(self.headers["Content-Length"]))
-            payload = (
-                b'event: response.created\ndata: {"type":"response.created",'
-                b'"response":{"id":"resp_file_budget","object":"response",'
-                b'"status":"in_progress","output":[]}}\n\n'
-            )
+            if scenario == "translated":
+                payload = (
+                    b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
+                    b'"created":1,"model":"m","choices":[{"index":0,'
+                    b'"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
+                    b'"created":1,"model":"m","choices":[{"index":0,'
+                    b'"delta":{},"finish_reason":"stop"}]}\n\n'
+                    b'data: [DONE]\n\n'
+                )
+            else:
+                payload = (
+                    b'event: response.created\ndata: {"type":"response.created",'
+                    b'"response":{"id":"resp_file_budget","object":"response",'
+                    b'"status":"in_progress","output":[]}}\n\n'
+                )
             if self.empty_stream:
                 payload = b""
             self.send_response(200)
@@ -5594,6 +5605,14 @@ insecure_options:
   allow_private_endpoints: true
   allow_private_upstreams: true
 """
+    if scenario == "translated":
+        config = config.replace(
+            "              - filter: openai_responses_proxy\n",
+            "              - filter: openai_stream_events\n"
+            "              - filter: responses_to_chat_completions\n",
+            1,
+        )
+        config = config.replace("max_retained_bytes: 4096", "max_retained_bytes: 65536")
     if scenario in {"buffered_middle", "empty_stream"}:
         config = config.replace("max_iterations: 2", "max_iterations: 3", 1)
         config = config.replace("next: resolve", "next: middle", 1)
@@ -5663,11 +5682,13 @@ insecure_options:
                 assert response.status_code == 200, response.text
                 assert response.headers["content-type"].startswith("text/event-stream")
                 frames = [frame for frame in response.text.split("\n\n") if frame]
-                expected = [] if scenario == "empty_stream" else ["event: response.created"]
-                assert [frame.split("\n", 1)[0] for frame in frames] == [
-                    *expected,
-                    "event: error",
-                ], response.text
+                event_names = [frame.split("\n", 1)[0] for frame in frames]
+                if scenario == "translated":
+                    assert "event: response.created" in event_names, response.text
+                    assert event_names[-1] == "event: error", response.text
+                else:
+                    expected = [] if scenario == "empty_stream" else ["event: response.created"]
+                    assert event_names == [*expected, "event: error"], response.text
                 error = json.loads(frames[-1].split("data: ", 1)[1])
                 assert error["type"] == "error"
                 assert error["code"] == "server_error"

@@ -38,6 +38,7 @@ use self::{
     stream::{SnapshotInputs, StreamConverter},
 };
 use super::{
+    ObservedResponsesSse,
     body_limits::rewritten_body_too_large_rejection,
     bounded_json_size, enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
@@ -731,7 +732,18 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         }
 
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
+            Some(RESPONSE_TRANSFORM_STREAM) => {
+                let action = Self::transform_stream_response(ctx, body, end_of_stream)?;
+                // The translated adapter can be the selected streaming IRR
+                // upstream without openai_responses_proxy in the chain. Record
+                // actual SSE body delivery for later request-side failures.
+                if ctx.extensions.get::<praxis_filter::IterationState>().is_some()
+                    && (end_of_stream || body.as_ref().is_some_and(|bytes| !bytes.is_empty()))
+                {
+                    ctx.extensions.insert(ObservedResponsesSse);
+                }
+                Ok(action)
+            },
             Some(_) => {
                 if end_of_stream {
                     if !finite_translation_fits(ctx, body.as_deref().unwrap_or_default()) {
