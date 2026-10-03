@@ -5982,6 +5982,57 @@ async fn eager_resolution_does_not_call_later_server_after_budget_exhaustion() {
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
+#[tokio::test]
+async fn eager_entry_metadata_fanout_rejects_before_tools_list() {
+    let (url, cancel, calls) = start_counted_single_tool_mcp_server().await;
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let mut body_json = mcp_body(&url);
+    body_json["tools"][0]["authorization"] = serde_json::json!("x".repeat(300_000));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    cancel.cancel();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn eager_cached_listing_charges_entry_metadata_per_tool() {
+    let server_url = "http://8.8.8.8/mcp";
+    let names: Vec<_> = (0..128)
+        .map(|index| format!("tool_{index:03}_{}", "x".repeat(50)))
+        .collect();
+    let mut body_json = mcp_body(server_url);
+    body_json["tools"][0]["allowed_tools"] = serde_json::json!(&names);
+    body_json["tools"][0]["require_approval"] = serde_json::json!({"never": &names});
+    let mut listing = cached_weather_listing(server_url);
+    listing["tools"] = serde_json::json!(
+        names
+            .iter()
+            .map(|name| serde_json::json!({"name": name}))
+            .collect::<Vec<_>>()
+    );
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![listing];
+    state.apply_retained_payload_limit(1_000_000);
+    let entry = &body_json["tools"][0];
+    let cached = find_cached_listing_borrowed(Some(&state.previous_tools), "weather", server_url, None, Some(&names))
+        .expect("cached listing covers every allowed tool");
+    let charge = eager_listing_charge(entry, retained_json_bytes(cached).unwrap(), cached.len(), 1).unwrap();
+    assert!(charge > 1_000_000, "per-tool entry copies exceed the aggregate budget");
+    assert!(!state.can_retain_payload(charge));
+}
+
 /// `commit_discovery_items` appends one item per server in request order.
 #[test]
 fn commit_discovery_items_preserves_request_order() {
