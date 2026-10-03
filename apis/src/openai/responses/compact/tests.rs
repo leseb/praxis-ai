@@ -783,6 +783,91 @@ fn make_filter(on_failure: &str) -> CompactFilter {
     }
 }
 
+#[tokio::test]
+async fn reactive_compaction_aggregate_cap_rejects_oversized_summary_even_fail_open() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(5));
+                },
+                Err(error) => panic!("summary stub accept failed: {error}"),
+            }
+        };
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut received = [0_u8; 4096];
+        drop(socket.read(&mut received));
+        let body = serde_json::to_vec(&json!({
+            "choices": [{"message": {"content": "y".repeat(131_072)}}]
+        }))
+        .unwrap();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        drop(socket.write_all(headers.as_bytes()));
+        drop(socket.write_all(&body));
+        true
+    });
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{address}/v1/chat/completions");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({
+        "model": "m",
+        "input": [{"role":"user","content":"new turn"}],
+        "context_management": [{"type":"compaction","compact_threshold":1000}],
+        "store": false
+    });
+    let mut state = ResponsesState::from_request_body(original.clone());
+    state.history_rehydrated = true;
+    state.messages = vec![json!({"role":"user","content":"x ".repeat(4096)})];
+    state.persisted_messages = state.messages.clone();
+    state.previous_usage = Some(json!({"total_tokens":2000}));
+    state.apply_retained_payload_limit(65_536);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        server.join().unwrap(),
+        "summary callout should be admitted up to the bounded read cap"
+    );
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
+        "{action:?}"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn reactive_compaction_rejects_compaction_item_peak_before_allocation() {
+    let filter = make_filter("open");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    let original = json!({"model":"m","input":"new turn"});
+    let mut state = ResponsesState::from_request_body(original);
+    state.apply_retained_payload_limit(32_768);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let result = filter.apply_compaction(&mut ctx, &"summary".repeat(4096));
+    assert!(matches!(result, Err(ReactiveCompactionError::RetainedBudget)));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(0));
+}
+
 #[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");
