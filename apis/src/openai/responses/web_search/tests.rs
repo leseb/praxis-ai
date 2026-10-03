@@ -185,7 +185,7 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
     let both = serde_json::json!({
         "action": {"query": "legacy", "queries": ["current one", "current two"]}
     });
-    let current = parse_search_request(&both, "ws_both", 0).unwrap();
+    let current = parse_search_request(&both, "ws_both", 0, 0).unwrap();
     assert_eq!(current.queries, ["current one", "current two"]);
     assert_eq!(
         current.action,
@@ -193,7 +193,7 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
     );
 
     let legacy = serde_json::json!({"action": {"query": "legacy"}});
-    let legacy = parse_search_request(&legacy, "ws_legacy", 0).unwrap();
+    let legacy = parse_search_request(&legacy, "ws_legacy", 0, 0).unwrap();
     assert_eq!(legacy.queries, ["legacy"]);
     assert_eq!(legacy.action, serde_json::json!({"type": "search", "query": "legacy"}));
 
@@ -201,7 +201,7 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
     // deprecated `query`, so an empty array carries no queries to prefer and
     // must not discard a usable legacy query.
     let empty_current = serde_json::json!({"action": {"query": "legacy", "queries": []}});
-    let empty_current = parse_search_request(&empty_current, "ws_empty", 0).unwrap();
+    let empty_current = parse_search_request(&empty_current, "ws_empty", 0, 0).unwrap();
     assert_eq!(
         empty_current.queries,
         ["legacy"],
@@ -215,19 +215,19 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
 
     let empty_without_legacy = serde_json::json!({"action": {"queries": []}});
     assert!(
-        parse_search_request(&empty_without_legacy, "ws_empty_only", 0).is_none(),
+        parse_search_request(&empty_without_legacy, "ws_empty_only", 0, 0).is_none(),
         "an empty queries array with no legacy query leaves nothing to dispatch"
     );
 
     let invalid_current = serde_json::json!({"action": {"query": "legacy", "queries": [42]}});
     assert!(
-        parse_search_request(&invalid_current, "ws_invalid", 0).is_none(),
+        parse_search_request(&invalid_current, "ws_invalid", 0, 0).is_none(),
         "a non-string queries member must not fall back to query"
     );
 
     let non_array_current = serde_json::json!({"action": {"query": "legacy", "queries": "rust"}});
     assert!(
-        parse_search_request(&non_array_current, "ws_non_array", 0).is_none(),
+        parse_search_request(&non_array_current, "ws_non_array", 0, 0).is_none(),
         "a non-array queries field must not fall back to query"
     );
 }
@@ -1274,66 +1274,6 @@ fn build_tool_result_messages_failed_carry_bounded_notice() {
 }
 
 #[test]
-fn upsert_output_item_replaces_current_round_position() {
-    let mut accumulated = vec![
-        serde_json::json!({"type": "message", "id": "msg_1"}),
-        serde_json::json!({"type": "web_search_call", "id": "duplicate", "status": "completed"}),
-        serde_json::json!({"type": "web_search_call", "id": "duplicate", "status": "completed"}),
-    ];
-    upsert_output_item(
-        &mut accumulated,
-        1,
-        1,
-        serde_json::json!({"type": "web_search_call", "id": "duplicate", "status": "failed"}),
-    );
-    assert_eq!(accumulated.len(), 3, "the indexed placeholder is replaced");
-    assert_eq!(accumulated[1]["status"], "completed");
-    assert_eq!(accumulated[2]["status"], "failed");
-}
-
-#[test]
-fn upsert_output_item_appends_when_no_match() {
-    let mut accumulated = vec![serde_json::json!({"type": "web_search_call", "id": "ws_1"})];
-    upsert_output_item(
-        &mut accumulated,
-        0,
-        1,
-        serde_json::json!({"type": "web_search_call", "id": "ws_2", "status": "failed"}),
-    );
-    assert_eq!(
-        accumulated.len(),
-        2,
-        "a missing indexed placeholder appends a fresh item"
-    );
-    assert_eq!(accumulated[1]["id"], "ws_2");
-}
-
-#[test]
-fn upsert_output_item_replaces_missing_id_placeholders_independently() {
-    let mut accumulated = vec![
-        serde_json::json!({"type": "web_search_call", "status": "in_progress"}),
-        serde_json::json!({"type": "web_search_call", "status": "in_progress"}),
-    ];
-
-    upsert_output_item(
-        &mut accumulated,
-        0,
-        0,
-        serde_json::json!({"type": "web_search_call", "id": "ws_unknown", "status": "completed"}),
-    );
-    upsert_output_item(
-        &mut accumulated,
-        0,
-        1,
-        serde_json::json!({"type": "web_search_call", "id": "ws_unknown", "status": "failed"}),
-    );
-
-    assert_eq!(accumulated.len(), 2);
-    assert_eq!(accumulated[0]["status"], "completed");
-    assert_eq!(accumulated[1]["status"], "failed");
-}
-
-#[test]
 fn build_tool_result_messages_incomplete_reports_not_performed() {
     // A non-dispatched call (over-budget or missing query) must not be
     // misrepresented to the model as a completed search with no results.
@@ -1821,6 +1761,42 @@ async fn on_request_body_without_max_tool_calls_dispatches_all_under_cap() {
             .all(|item| item["status"] == "completed"),
         "all searches completed under the server cap"
     );
+}
+
+#[tokio::test]
+async fn stale_web_selection_cannot_replace_another_search_output() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.select_test_output(
+        "web_search_call",
+        vec![
+            web_search_call("ws_stale", "must stay untouched"),
+            web_search_call("ws_valid", "execute"),
+        ],
+    );
+    state.accumulated_output[0]["id"] = serde_json::json!("ws_replaced");
+    let replaced = state.accumulated_output[0].clone();
+    assert_eq!(state.selected_web_search_calls().len(), 1);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.accumulated_output.len(), 2);
+    assert_eq!(state.accumulated_output[0], replaced);
+    assert_eq!(state.accumulated_output[1]["id"], "ws_valid");
+    assert_eq!(state.accumulated_output[1]["status"], "completed");
+    assert!(find_bridge_output(&state.messages, "execute").is_some());
+    assert!(find_bridge_output(&state.messages, "must stay untouched").is_none());
 }
 
 #[tokio::test]
@@ -2481,7 +2457,7 @@ fn web_search_construction_reserves_provider_result_owners() {
     let source_bytes = web_search_results_bytes(&results).unwrap();
     state.apply_retained_payload_limit(current + source_bytes - 1);
     ctx.extensions.insert(state);
-    let ids = SearchCallIds::new("ws_1", &["query"], 0);
+    let ids = SearchCallIds::new("ws_1", &["query"], 0, 0);
 
     assert!(!web_search_construction_fits(
         &ctx,
@@ -2542,7 +2518,7 @@ fn pending_search_projection_reserves_parsed_action_owner_without_moving_public_
     let call_bytes = retained_json_bytes(&state.selected_web_search_calls()[0]).unwrap();
 
     let bytes = reserve_pending_search_projection(&mut state).unwrap();
-    let calls = prepare_calls(&state.selected_web_search_calls());
+    let calls = prepare_calls(&state.selected_web_search_outputs());
 
     assert_eq!(bytes, call_bytes * 2 + 128);
     assert_eq!(state.retained_payload_bytes().unwrap(), before + bytes);

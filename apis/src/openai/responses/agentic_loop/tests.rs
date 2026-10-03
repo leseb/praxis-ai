@@ -3299,6 +3299,7 @@ async fn dispatch_failure_buffered_rejects_with_json_envelope() {
     );
     state.file_search_assignments = vec![FileSearchAssignment {
         output_index: 0,
+        item_id: "fs_stale".to_owned(),
         synthesis: SynthesisKind::Native,
     }];
     state.dispatch_failure = Some(DispatchFailure {
