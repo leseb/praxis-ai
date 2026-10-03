@@ -520,6 +520,20 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if assignments.iter().any(|assignment| {
+            assignment
+                .resolve(state)
+                .is_none_or(|item| !is_pending_file_search_call(item))
+        }) {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.dispatch_failure = Some(DispatchFailure {
+                    status: 502,
+                    code: "server_error",
+                    message: "file-search output selection became stale before dispatch".to_owned(),
+                });
+            }
+            return Ok(FilterAction::Continue);
+        }
         if !file_search_plan_projection_fits(state, &assignments) {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
