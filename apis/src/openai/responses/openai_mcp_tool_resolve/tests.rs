@@ -3848,6 +3848,15 @@ fn deferred_connector(
     }
 }
 
+fn select_deferred_discovery_search(state: &mut ResponsesState) {
+    // Production discovery only follows a selected search in the current
+    // canonical output. Keep direct resolver tests behind that same gate.
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_discovery", "status": "completed"})],
+    );
+}
+
 #[tokio::test]
 async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpoint() {
     let (server_url, ct) = start_single_tool_mcp_server().await;
@@ -3963,6 +3972,7 @@ async fn discover_deferred_connectors_applies_allowed_tools() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     discover_deferred_connectors(&mut state).await.unwrap();
     ct.cancel();
 
@@ -3986,6 +3996,7 @@ async fn discover_deferred_connectors_redacts_endpoint_on_error() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("unreachable MCP endpoint should fail");
@@ -4018,6 +4029,7 @@ async fn discover_deferred_connectors_is_transactional_across_connectors() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("second connector should fail closed");
@@ -4056,6 +4068,7 @@ async fn discover_deferred_connectors_rejects_name_collision() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("colliding generated name should be rejected");
@@ -4091,6 +4104,7 @@ async fn discover_deferred_connectors_enforces_rewritten_body_cap() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("oversized expansion should be rejected");
