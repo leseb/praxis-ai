@@ -5492,14 +5492,17 @@ def retained_tool_search_client(tmp_path, request):
         os.unlink(config_path)
 
 
-@pytest.mark.parametrize("intermediate_buffered_step", [False, True])
+@pytest.mark.parametrize(
+    "scenario", ["direct", "buffered_middle", "empty_stream", "buffered_sse"]
+)
 def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
-    tmp_path, intermediate_buffered_step
+    tmp_path, scenario
 ):
-    """An IRR file failure must terminate SSE even across a buffered step."""
+    """Only an actually streamed IRR response changes the later error wire format."""
 
     class StubHandler(BaseHTTPRequestHandler):
         paths: ClassVar[list[str]] = []
+        empty_stream: ClassVar[bool] = scenario == "empty_stream"
 
         def do_GET(self):
             self.paths.append(self.path)
@@ -5522,6 +5525,8 @@ def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
                 b'"response":{"id":"resp_file_budget","object":"response",'
                 b'"status":"in_progress","output":[]}}\n\n'
             )
+            if self.empty_stream:
+                payload = b""
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(payload)))
@@ -5589,7 +5594,7 @@ insecure_options:
   allow_private_endpoints: true
   allow_private_upstreams: true
 """
-    if intermediate_buffered_step:
+    if scenario in {"buffered_middle", "empty_stream"}:
         config = config.replace("max_iterations: 2", "max_iterations: 3", 1)
         config = config.replace("next: resolve", "next: middle", 1)
         config = config.replace(
@@ -5608,6 +5613,22 @@ insecure_options:
           - name: resolve
 """,
             1,
+        )
+    if scenario == "buffered_sse":
+        first = config.index("          - name: first\n")
+        filters_start = config.index("            filters:\n", first)
+        filters_end = config.index("            on_result:\n", filters_start)
+        config = (
+            config[:filters_start]
+            + """            filters:
+              - filter: static_response
+                status: 200
+                body: 'ignored'
+                headers:
+                  - name: Content-Type
+                    value: text/event-stream
+"""
+            + config[filters_end:]
         )
     config_path = _persist_config(config)
     log_path = tmp_path / "praxis.log"
@@ -5630,23 +5651,31 @@ insecure_options:
                         }
                     ],
                     "store": False,
-                    "stream": True,
+                    "stream": scenario != "buffered_sse",
                 },
                 timeout=20,
             )
-            assert response.status_code == 200, response.text
-            assert response.headers["content-type"].startswith("text/event-stream")
-            frames = [frame for frame in response.text.split("\n\n") if frame]
-            assert [frame.split("\n", 1)[0] for frame in frames] == [
-                "event: response.created",
-                "event: error",
-            ], response.text
-            error = json.loads(frames[1].split("data: ", 1)[1])
-            assert error["type"] == "error"
-            assert error["code"] == "server_error"
-            assert "agentic retained payload exceeded" in error["message"]
-            assert "{\"error\":" not in response.text
-            assert StubHandler.paths.count("POST /v1/responses") == 1
+            if scenario == "buffered_sse":
+                assert response.status_code == 502, response.text
+                assert response.headers["content-type"].startswith("application/json")
+                assert response.json()["error"]["type"] == "server_error"
+            else:
+                assert response.status_code == 200, response.text
+                assert response.headers["content-type"].startswith("text/event-stream")
+                frames = [frame for frame in response.text.split("\n\n") if frame]
+                expected = [] if scenario == "empty_stream" else ["event: response.created"]
+                assert [frame.split("\n", 1)[0] for frame in frames] == [
+                    *expected,
+                    "event: error",
+                ], response.text
+                error = json.loads(frames[-1].split("data: ", 1)[1])
+                assert error["type"] == "error"
+                assert error["code"] == "server_error"
+                assert "agentic retained payload exceeded" in error["message"]
+                assert "{\"error\":" not in response.text
+            assert StubHandler.paths.count("POST /v1/responses") == (
+                0 if scenario == "buffered_sse" else 1
+            )
             assert StubHandler.paths.count("/v1/files/file-budget") == 1
             assert "/v1/files/file-budget/content" not in StubHandler.paths
         finally:

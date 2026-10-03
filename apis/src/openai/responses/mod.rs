@@ -30,6 +30,8 @@
 pub(crate) mod agentic_loop;
 #[cfg(feature = "openai-responses")]
 mod body_limits;
+#[cfg(feature = "openai-responses")]
+pub(crate) mod budget_error;
 #[cfg(feature = "openai-compact")]
 pub(crate) mod compact;
 mod config;
@@ -76,8 +78,8 @@ pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticBudgetPolicy;
-/// An SSE chunk was observed in an earlier Responses IRR step. The marker
-/// survives buffered steps, unlike `IterationState.previous_response`.
+/// A streaming SSE step reached response-body delivery. The marker survives
+/// buffered IRR steps, unlike `IterationState.previous_response`.
 #[cfg(feature = "openai-responses")]
 pub(crate) struct ObservedResponsesSse;
 #[cfg(feature = "openai-responses")]

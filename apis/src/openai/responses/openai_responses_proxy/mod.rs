@@ -53,7 +53,7 @@ use super::{
 };
 use crate::json_body::SerializedJson;
 
-/// Per-step header evidence paired with a streamed body chunk below.
+/// Per-step header evidence paired with streaming body delivery below.
 const PROXY_SSE_HEADER_KEY: &str = "responses.proxy_sse_header";
 
 // -----------------------------------------------------------------------------
@@ -598,16 +598,16 @@ impl HttpFilter for ResponsesProxyFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         // IRR retains extensions across steps but replaces `previous_response`
-        // after each one. Remember that a streamed SSE chunk reached this
-        // response-body path so a later request-phase failure cannot append
-        // a JSON rejection after the already-started event stream.
+        // after each one. Remember that SSE body delivery started, including
+        // an empty stream whose headers were already committed, so a later
+        // request-phase failure cannot append a JSON rejection.
         if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming
             && ctx.extensions.get::<IterationState>().is_some()
             && ctx.extensions.get::<ObservedResponsesSse>().is_none()
-            && body.as_ref().is_some_and(|bytes| !bytes.is_empty())
+            && (end_of_stream || body.as_ref().is_some_and(|bytes| !bytes.is_empty()))
             && ctx.get_metadata(PROXY_SSE_HEADER_KEY) == Some("true")
         {
             ctx.extensions.insert(ObservedResponsesSse);

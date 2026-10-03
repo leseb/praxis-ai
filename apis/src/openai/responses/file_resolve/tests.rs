@@ -621,6 +621,7 @@ async fn aggregate_budget_rejects_file_before_content_callout() {
                 std::thread::park_timeout(Duration::from_millis(10));
                 continue;
             };
+            stream.set_nonblocking(false).unwrap();
             let mut request = [0_u8; 4096];
             let count = stream.read(&mut request).unwrap();
             let first_line = String::from_utf8_lossy(&request[..count])
@@ -923,6 +924,7 @@ async fn aggregate_budget_bounds_escaped_metadata_across_file_fanout() {
                 std::thread::park_timeout(Duration::from_millis(10));
                 continue;
             };
+            stream.set_nonblocking(false).unwrap();
             let mut request = [0_u8; 4096];
             let read = stream.read(&mut request).unwrap();
             let is_content = String::from_utf8_lossy(&request[..read])
