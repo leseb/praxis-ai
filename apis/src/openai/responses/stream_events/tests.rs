@@ -70,17 +70,81 @@ fn lowered_snapshot_echo_fails_before_planning_many_owned_copies() {
 }
 
 #[test]
-fn native_terminal_does_not_pay_restoration_staging_after_move() {
-    assert_terminal_does_not_pay_moved_staging(false);
+fn native_terminal_avoids_duplicate_restoration_staging() {
+    assert_terminal_avoids_duplicate_staging(false);
 }
 
 #[test]
-fn lowered_terminal_does_not_pay_restoration_staging_after_move() {
-    assert_terminal_does_not_pay_moved_staging(true);
+fn lowered_terminal_avoids_duplicate_restoration_staging() {
+    assert_terminal_avoids_duplicate_staging(true);
 }
 
-/// A terminal payload moves into shared state before the restoration plan.
-fn assert_terminal_does_not_pay_moved_staging(lowered: bool) {
+#[test]
+fn lowered_completion_snapshots_count_toward_both_budgets() {
+    for aggregate_limit in [None, Some(65_536)] {
+        let stream_limit = if aggregate_limit.is_some() { 1_048_576 } else { 65_536 };
+        let (filter, mut ctx) =
+            make_armed_context_with_filter(make_filter_from(&format!("max_accumulated_bytes: {stream_limit}")));
+        let mut responses = ResponsesState::default();
+        responses.client_tool_lowering.insert(
+            "agentic_ns__fs__read".to_owned(),
+            LoweredClientTool {
+                original_name: "read".to_owned(),
+                namespace: Some("fs".to_owned()),
+                restore: ClientToolRestore::Namespace,
+            },
+        );
+        ctx.extensions.insert(responses);
+
+        let mut added = Some(make_sse_chunk(
+            "response.output_item.added",
+            &json!({
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "name": "agentic_ns__fs__read",
+                    "call_id": "c1",
+                    "id": "fc_1",
+                    "arguments": "",
+                    "status": "in_progress",
+                    "padding": "x".repeat(8_192)
+                }
+            }),
+        ));
+        filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+        assert!(added.is_some(), "the large item itself must fit");
+        if let Some(limit) = aggregate_limit {
+            ctx.extensions
+                .get_mut::<ResponsesState>()
+                .unwrap()
+                .apply_retained_payload_limit(limit);
+        }
+
+        // Small done frames each clone the large completed item into the
+        // restoration plan. Their snapshots coexist until planning finishes.
+        let mut frames = Vec::new();
+        for _ in 0..50 {
+            frames.extend_from_slice(&make_sse_chunk(
+                "response.function_call_arguments.done",
+                &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
+            ));
+        }
+        let mut body = Some(Bytes::from(frames));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(body.is_none(), "the snapshot copies must trip the byte ceiling");
+        if aggregate_limit.is_some() {
+            let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+            assert!(responses.retained_payload_failed);
+            assert_eq!(responses.retained_external_payload_bytes, 0);
+        } else {
+            assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
+        }
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+}
+
+/// A terminal response is retained in shared state before restoration planning.
+fn assert_terminal_avoids_duplicate_staging(lowered: bool) {
     let (filter, mut ctx) = make_armed_context();
     let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
     if lowered {
@@ -97,7 +161,7 @@ fn assert_terminal_does_not_pay_moved_staging(lowered: bool) {
             tool_choice: json!("auto"),
         });
     }
-    responses.apply_retained_payload_limit(12_000);
+    responses.apply_retained_payload_limit(30_000);
     ctx.extensions.insert(responses);
     let metadata: serde_json::Map<String, serde_json::Value> =
         (0..8).map(|i| (format!("key{i}"), json!("x".repeat(512)))).collect();
