@@ -1087,7 +1087,7 @@ fn buffered_restoration_preflights_parse_and_rewrite_owners() {
         .expect_err("a provider body larger than remaining headroom must not be parsed");
     assert_eq!(
         reject_parts(&error).0,
-        413,
+        502,
         "preparse admission rejects aggregate exhaustion"
     );
 
@@ -1098,7 +1098,7 @@ fn buffered_restoration_preflights_parse_and_rewrite_owners() {
         .expect_err("the parse may fit while restoration and serialization do not");
     assert_eq!(
         reject_parts(&error).0,
-        413,
+        502,
         "restoration peak is admitted before mutation"
     );
 }
@@ -1134,7 +1134,7 @@ fn buffered_restoration_charges_repeated_namespace_metadata() {
         rejected.is_err(),
         "the repeated restored namespace must exceed one MiB of headroom"
     );
-    assert_eq!(reject_parts(&rejected.err().unwrap()).0, 413);
+    assert_eq!(reject_parts(&rejected.err().unwrap()).0, 502);
 }
 
 #[test]
@@ -1152,7 +1152,7 @@ fn buffered_restoration_uses_listener_budget_and_discards_failed_state() {
     let action = filter()
         .on_response_body(&mut ctx, &mut body, true)
         .expect("budget rejection is a filter action");
-    assert_eq!(reject_parts(&action).0, 413, "first-round budget rejection is HTTP 413");
+    assert_eq!(reject_parts(&action).0, 502, "provider output growth is a server error");
     assert!(body.is_none(), "the oversized buffered provider body is released");
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     let state = ctx.extensions.get::<ResponsesState>().expect("state remains present");

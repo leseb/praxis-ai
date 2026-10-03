@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Request-side aggregate budget failures shared by Responses filters.
+//! Aggregate budget failures shared by request and response filters.
 
 use praxis_filter::{FilterAction, HttpFilterContext, IterationState, Rejection};
 
@@ -27,8 +27,23 @@ fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
 /// by the logical response. An IRR step can run after SSE was committed even
 /// when a buffered step has replaced `IterationState.previous_response`.
 pub(super) fn reject_retained_payload_budget(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
-    let committed_stream = ctx.extensions.get::<ObservedResponsesSse>().is_some();
     let initial = is_initial_request(ctx);
+    reject_retained_payload_budget_with_status(ctx, message, initial)
+}
+
+/// Reject payload growth caused by a provider response as a server error,
+/// including when it happens in the first inference round.
+pub(super) fn reject_retained_payload_response_budget(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
+    reject_retained_payload_budget_with_status(ctx, message, false)
+}
+
+/// Shared cleanup and committed-stream encoding for both admission phases.
+fn reject_retained_payload_budget_with_status(
+    ctx: &mut HttpFilterContext<'_>,
+    message: &str,
+    initial: bool,
+) -> FilterAction {
+    let committed_stream = ctx.extensions.get::<ObservedResponsesSse>().is_some();
     ctx.set_metadata("responses.skip_persist", "true");
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.discard_payload_for_budget_error();

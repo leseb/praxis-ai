@@ -4998,6 +4998,91 @@ def _assert_multi_round_usage_and_trace(response, *, transport):
     )
 
 
+class CompatBudgetBackendHandler(BaseHTTPRequestHandler):
+    """Return a small private call beside an oversized buffered response."""
+
+    requests: ClassVar[int] = 0
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        type(self).requests += 1
+        payload = json.dumps({
+            "id": "resp_compat_budget",
+            "object": "response",
+            "status": "completed",
+            "model": "test-model",
+            "output": [{
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "run_python", "arguments": '{"input":"print(1)"}',
+            }],
+            "payload": "x" * (256 * 1024),
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@pytest.fixture()
+def client_tool_compat_budget_client(tmp_path, request):
+    """SDK proxy with a 64 KiB loop budget and deterministic rich-tool output."""
+    CompatBudgetBackendHandler.requests = 0
+    backend = HTTPServer(("127.0.0.1", 0), CompatBudgetBackendHandler)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    port = _free_port()
+    config = _load_example_config(
+        CLIENT_TOOL_COMPAT_CONFIG_PATH,
+        port,
+        backend_endpoint=f"127.0.0.1:{backend.server_port}",
+        db_path=str(tmp_path / "responses.db"),
+    )
+    anchor = "                max_infer_iters: 4\n"
+    assert config.count(anchor) == 1, "compat example loop configuration changed"
+    config = config.replace(anchor, anchor + "                max_retained_bytes: 65536\n", 1)
+    config_path = _persist_config(config)
+    log_path = str(tmp_path / "praxis.log")
+    log_file = open(log_path, "w")
+    proc = subprocess.Popen([_find_binary(), "-c", config_path], stdout=log_file, stderr=subprocess.STDOUT)
+    started = False
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(port, timeout=60)
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        backend.server_close()
+        if not started or request.session.testsfailed > 0:
+            print(f"\n=== Client tool budget Praxis logs ===\n{_read_log_tail(log_path)}", file=sys.stderr)
+        os.unlink(config_path)
+
+
+def test_client_tool_compat_provider_restoration_budget_rejects_through_sdk(client_tool_compat_budget_client):
+    """Provider-side restoration overflow is 502 and cannot persist a response."""
+    with pytest.raises(APIStatusError) as exc_info:
+        client_tool_compat_budget_client.responses.create(
+            model="test-model",
+            input="x",
+            tools=[{"type": "custom", "name": "run_python", "format": {"type": "text"}}],
+            store=True,
+        )
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.response.json()["error"]["type"] == "server_error"
+    assert CompatBudgetBackendHandler.requests == 1, "inference occurred before restoration failed"
+    with pytest.raises(NotFoundError):
+        client_tool_compat_budget_client.responses.retrieve("resp_compat_budget")
+
+
 class TestClientToolCompatVLLM:
     """Issue #1131: rich Codex client tools round-trip through a function-only
     vLLM Responses backend via ``openai_client_tool_compat``.

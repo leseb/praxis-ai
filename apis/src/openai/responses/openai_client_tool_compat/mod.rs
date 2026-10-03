@@ -159,7 +159,7 @@ use self::config::{ClientToolCompatConfig, build_config};
 use super::{
     agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
     body_limits::reject_rewritten_body_too_large,
-    budget_error::reject_retained_payload_budget,
+    budget_error::reject_retained_payload_response_budget,
     error::responses_error_rejection,
     state::{
         ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call,
@@ -245,11 +245,7 @@ impl RestoreError {
     /// Build a request-wide aggregate budget rejection.
     fn budget() -> Self {
         Self {
-            action: FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                RESTORATION_BUDGET_ERROR,
-            )),
+            action: FilterAction::Reject(responses_error_rejection(502, "server_error", RESTORATION_BUDGET_ERROR)),
             budget: true,
         }
     }
@@ -701,7 +697,7 @@ impl HttpFilter for ClientToolCompatFilter {
             Ok(None) => Ok(FilterAction::Continue),
             Err(error) if error.budget => {
                 *body = None;
-                Ok(reject_retained_payload_budget(ctx, RESTORATION_BUDGET_ERROR))
+                Ok(reject_retained_payload_response_budget(ctx, RESTORATION_BUDGET_ERROR))
             },
             Err(error) => Ok(error.action),
         }
