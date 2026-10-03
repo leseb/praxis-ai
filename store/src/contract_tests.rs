@@ -279,7 +279,10 @@ async fn approvals_consume_all_or_nothing(backend: &dyn PersistedStateBackend) {
 }
 
 /// The size-only query sees exactly the issuing owner's matching records.
-#[expect(clippy::too_many_lines, reason = "linear owner and issuing-response scope contract assertions")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear owner and issuing-response scope contract assertions"
+)]
 async fn approval_payload_size_is_scoped(backend: &dyn PersistedStateBackend) {
     let issuing_owner = owner("approval-size");
     let other_owner = owner("approval-size-other");
