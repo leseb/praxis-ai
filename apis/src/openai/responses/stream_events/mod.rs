@@ -2922,10 +2922,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
         }?;
         existing.checked_add(bytes)
     });
-    if !preflight_staging.is_some_and(|bytes| stream_payload_fits(ctx, &parser_state, bytes)) {
-        output.clear();
-        record_retained_payload_overflow(ctx, &mut parser_state);
-    } else {
+    if preflight_staging.is_some_and(|bytes| stream_payload_fits(ctx, &parser_state, bytes)) {
         // #1046 §4.2: drain file_search synthesis before terminal/error finalization,
         // under the precedence policy. The owner queues each reconciled call by its
         // absolute output index this round, but the request-phase dispatcher only
@@ -2935,6 +2932,9 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
         // (site (b), §7.3) so the error branch below is selected and the router does not
         // re-fire.
         local_tools::drain_local_tool_synthesis(ctx, &mut output);
+    } else {
+        output.clear();
+        record_retained_payload_overflow(ctx, &mut parser_state);
     }
     // #313 P1 (DoS bound): this round's provider-streamed observation set is stale
     // once the round that recorded it finalizes; clear it unconditionally here — NOT
