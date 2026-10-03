@@ -1076,19 +1076,22 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
         return;
     }
     let queued_ids: Vec<String> = state
-        .tool_search_calls
+        .selected_tool_search_calls()
         .iter()
-        .map(|item| item.item_id.clone())
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
-    let mark_unidentified = queued_ids.is_empty();
+    if queued_ids.is_empty() {
+        state.tool_search_calls.clear();
+        return;
+    }
     let mark = |item: &mut Value| {
         if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
             return;
         }
-        let matches = match item.get("id").and_then(Value::as_str) {
-            Some(id) => queued_ids.iter().any(|queued| queued == id),
-            None => mark_unidentified,
-        };
+        let matches = item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| queued_ids.iter().any(|queued| queued == id));
         if matches && let Some(obj) = item.as_object_mut() {
             obj.insert("status".to_owned(), json!("incomplete"));
         }
