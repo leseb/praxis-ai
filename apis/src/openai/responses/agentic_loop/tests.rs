@@ -3807,6 +3807,71 @@ fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
 }
 
 #[test]
+fn buffered_usage_projection_rejects_before_copying_large_usage() {
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "object": "response",
+            "output": [],
+            "usage": {"detail": "x".repeat(2_000_000)}
+        }))
+        .unwrap(),
+    );
+    let limit = 3_000_000;
+    assert!(body.len() < limit, "the initial parsed response fits");
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(limit);
+
+    let mut rejected = false;
+    let allocation = allocation_counter::measure(|| {
+        rejected = super::extract_tool_calls_from_body(&body, &mut state).is_err();
+    });
+
+    assert!(rejected, "the duplicate usage owner exceeds the budget");
+    assert!(
+        allocation.bytes_max < 3_000_000,
+        "reject before the second large usage allocation: {allocation:?}"
+    );
+    assert!(state.response_object.is_null());
+    assert!(state.usage.is_null());
+}
+
+#[test]
+fn buffered_usage_replacement_charges_commit_peak_with_copied_output() {
+    let old_usage = json!({"detail": "a".repeat(1_000_000)});
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "x".repeat(2_000_000)}]
+        }],
+        "usage": {"detail": "b".repeat(1_500_000)}
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut state = ResponsesState {
+        usage: old_usage,
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let old_usage_bytes = super::super::state::retained_json_bytes(&state.usage).unwrap();
+    let incoming_usage_bytes = super::super::state::retained_json_bytes(&response["usage"]).unwrap();
+    let usage_growth = incoming_usage_bytes - old_usage_bytes;
+    let limit = baseline + response_bytes + 2 * item_bytes + usage_growth + 64_000;
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(response_bytes + old_usage_bytes + incoming_usage_bytes),
+        "the usage projection alone fits; copied output makes commit unsafe"
+    );
+
+    assert!(super::extract_tool_calls_from_body(&body, &mut state).is_err());
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.response_object.is_null());
+    assert_eq!(state.usage["detail"].as_str().unwrap().len(), 1_000_000);
+}
+
+#[test]
 fn buffered_parse_projection_is_rejected_before_state_mutation() {
     let body = Bytes::from(
         serde_json::to_vec(&json!({
