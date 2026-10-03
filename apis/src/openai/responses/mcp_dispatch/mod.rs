@@ -77,7 +77,7 @@ use super::{
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
+        McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
@@ -1325,6 +1325,18 @@ async fn discover_pending_connectors(
     {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
+            if matches!(&err, ResolveError::RetainedBudget) {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.discard_payload_for_budget_error();
+                    state.dispatch_failure = Some(DispatchFailure {
+                        status: 502,
+                        code: "server_error",
+                        message: err.to_string(),
+                    });
+                }
+                ctx.set_metadata("responses.skip_persist", "true");
+                return Ok(FilterAction::Continue);
+            }
             let streaming = ctx
                 .get_metadata("openai_responses_format.stream")
                 .is_some_and(|v| v == "true");

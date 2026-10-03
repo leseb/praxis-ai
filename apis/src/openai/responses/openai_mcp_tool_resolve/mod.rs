@@ -74,7 +74,7 @@ use self::config::{McpToolResolveConfig, build_config};
 use super::{
     bound_body_outcome,
     error::responses_error_rejection,
-    state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
+    state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
 use crate::{
     StateOwner,
@@ -87,6 +87,10 @@ use crate::{
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
 const MAX_FUNCTION_NAME_LEN: usize = 64;
+
+/// Raw control page, decoded listing, converted JSON, function tools, public
+/// listing, and one owner for transformation overlap.
+const DEFERRED_LISTING_OWNER_RESERVATION: usize = 6;
 
 // -----------------------------------------------------------------------------
 // McpToolResolveFilter
@@ -716,6 +720,11 @@ pub(crate) enum ResolveError {
         limit: usize,
     },
 
+    /// Deferred discovery cannot fit its next listing or commit staging in
+    /// the request-wide retained-payload budget.
+    #[error("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during deferred MCP discovery")]
+    RetainedBudget,
+
     /// Unknown `connector_id` was referenced.
     #[error("unknown connector_id \"{0}\"")]
     UnknownConnector(String),
@@ -1061,7 +1070,9 @@ fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
             source: mcp_client::McpClientError::ResponseTooLarge { .. },
             ..
         } => (413, "invalid_request_error"),
-        ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } => (502, "server_error"),
+        ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } | ResolveError::RetainedBudget => {
+            (502, "server_error")
+        },
         ResolveError::SecurityContext(_) => (401, "missing_callout_context"),
         ResolveError::Serialization(_) | ResolveError::NoSubrequestClient => (500, "server_error"),
     }
@@ -2464,6 +2475,7 @@ pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
 
     let pending = std::mem::take(&mut state.deferred_mcp);
     let prepared = match prepare_deferred_listings(
+        state,
         &pending,
         forwarded_header_names,
         forwarded_headers,
@@ -2481,6 +2493,10 @@ pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     let max_bytes = pending
         .first()
         .map_or(MAX_JSON_BODY_BYTES, |connector| connector.max_rewritten_body_bytes);
+    if !deferred_commit_fits(state, &pending, &prepared) {
+        state.deferred_mcp = pending;
+        return Err(ResolveError::RetainedBudget);
+    }
     if let Err(err) = commit_deferred_listings(state, prepared, max_bytes) {
         state.deferred_mcp = pending;
         return Err(err);
@@ -2502,28 +2518,156 @@ struct PreparedDeferredListing {
     server_label: String,
 }
 
-/// Call `tools/list` for every deferred connector without mutating state.
-///
-/// Independent servers are listed concurrently so total latency is bounded by
-/// the slowest connector rather than the sum of per-server timeouts. Commit
-/// remains transactional in [`discover_deferred_connectors_with_forwarded_headers`].
+/// Run as many `tools/list` calls concurrently as their combined bounded peak
+/// permits. Stop before the next batch when prior listings exhaust the budget.
+/// Commit remains transactional.
 async fn prepare_deferred_listings(
+    state: &ResponsesState,
     pending: &[DeferredMcpConnector],
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
 ) -> Result<Vec<PreparedDeferredListing>, ResolveError> {
-    futures::future::try_join_all(pending.iter().map(|connector| {
-        prepare_deferred_listing(
-            connector,
-            forwarded_header_names,
-            forwarded_headers,
-            callout,
-            connector_identity,
-        )
-    }))
-    .await
+    if state.retained_payload_limit().is_none() {
+        return futures::future::try_join_all(pending.iter().map(|connector| {
+            prepare_deferred_listing(
+                connector,
+                forwarded_header_names,
+                forwarded_headers,
+                callout,
+                connector_identity,
+            )
+        }))
+        .await;
+    }
+    let limit = state.retained_payload_limit().ok_or(ResolveError::RetainedBudget)?;
+    let baseline = state
+        .retained_payload_bytes_bounded(limit)
+        .and_then(|bytes| bytes.checked_add(pending_deferred_bytes(pending)?))
+        .ok_or(ResolveError::RetainedBudget)?;
+    let mut prepared = Vec::with_capacity(pending.len());
+    let mut prepared_bytes = 0_usize;
+    let mut start = 0;
+    while start < pending.len() {
+        let mut end = start;
+        let mut entry_staging = 0_usize;
+        while let Some(connector) = pending.get(end) {
+            let Some(next_entry_staging) = deferred_connector_bytes(connector)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| entry_staging.checked_add(bytes))
+            else {
+                return Err(ResolveError::RetainedBudget);
+            };
+            if !deferred_listing_batch_fits(baseline, prepared_bytes, next_entry_staging, end - start + 1, limit) {
+                break;
+            }
+            entry_staging = next_entry_staging;
+            end += 1;
+        }
+        if end == start {
+            return Err(ResolveError::RetainedBudget);
+        }
+        let batch = pending.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+        let newly_prepared = futures::future::try_join_all(batch.iter().map(|connector| {
+            prepare_deferred_listing(
+                connector,
+                forwarded_header_names,
+                forwarded_headers,
+                callout,
+                connector_identity,
+            )
+        }))
+        .await?;
+        prepared_bytes = prepared_bytes
+            .checked_add(prepared_deferred_bytes(&newly_prepared).ok_or(ResolveError::RetainedBudget)?)
+            .ok_or(ResolveError::RetainedBudget)?;
+        if !baseline.checked_add(prepared_bytes).is_some_and(|bytes| bytes <= limit) {
+            return Err(ResolveError::RetainedBudget);
+        }
+        prepared.extend(newly_prepared);
+        start = end;
+    }
+    Ok(prepared)
+}
+
+/// Count a connector that was moved out of `ResponsesState` but remains live.
+fn deferred_connector_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
+    let raw = connector
+        .connector_id
+        .len()
+        .checked_add(connector.server_label.len())?
+        .checked_add(connector.server_url.len())?
+        .checked_add(connector.authorization.as_ref().map_or(0, String::len))?;
+    [
+        connector.allowed_tools.as_ref(),
+        connector.headers.as_ref(),
+        connector.require_approval.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(raw, |used, value| used.checked_add(retained_json_bytes(value)?))
+}
+
+fn pending_deferred_bytes(pending: &[DeferredMcpConnector]) -> Option<usize> {
+    pending.iter().try_fold(0_usize, |used, connector| {
+        used.checked_add(deferred_connector_bytes(connector)?)
+    })
+}
+
+fn prepared_deferred_bytes(prepared: &[PreparedDeferredListing]) -> Option<usize> {
+    prepared.iter().try_fold(0_usize, |used, item| {
+        used.checked_add(retained_json_bytes(&item.entry)?)?
+            .checked_add(retained_json_bytes(&item.filtered)?)?
+            .checked_add(retained_json_bytes(&item.functions)?)?
+            .checked_add(retained_json_bytes(&item.listing_item)?)?
+            .checked_add(item.server_label.len())
+    })
+}
+
+/// The MCP transport caps a complete listing at 4 MiB. Reserve each in-flight
+/// call's raw page, decoded tools, function tools, and public listing before
+/// dialing while earlier prepared listings remain live.
+fn deferred_listing_batch_fits(
+    baseline: usize,
+    prepared_bytes: usize,
+    entry_staging: usize,
+    batch_count: usize,
+    limit: usize,
+) -> bool {
+    baseline
+        .checked_add(prepared_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(
+                mcp_client::MAX_LISTING_RESPONSE_BYTES
+                    .checked_mul(DEFERRED_LISTING_OWNER_RESERVATION)?
+                    .checked_mul(batch_count)?,
+            )
+        })
+        .and_then(|bytes| bytes.checked_add(entry_staging))
+        .is_some_and(|bytes| bytes <= limit)
+}
+
+/// Admit the copies made while expanding the request and inserting dispatch
+/// entries before cloning either tree or changing the canonical state.
+fn deferred_commit_fits(
+    state: &ResponsesState,
+    pending: &[DeferredMcpConnector],
+    prepared: &[PreparedDeferredListing],
+) -> bool {
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let fanout = prepared.iter().try_fold(0_usize, |used, item| {
+        let per_tool = retained_json_bytes(&item.entry)?.checked_mul(2)?;
+        used.checked_add(per_tool.checked_mul(item.filtered.len())?)
+    });
+    let staging = pending_deferred_bytes(pending)
+        .and_then(|bytes| bytes.checked_add(prepared_deferred_bytes(prepared)?.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(&state.tools)?.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(&state.request_body)?.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(fanout?));
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
 /// List and rewrite one deferred connector without mutating shared state.

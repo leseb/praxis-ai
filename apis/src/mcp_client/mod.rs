@@ -81,7 +81,7 @@ pub(crate) struct McpConnectorContext<'a> {
 /// server, amplified across concurrently resolved servers). This bounds that
 /// union. It is deliberately generous relative to a realistic listing (128
 /// tools averaging 32 KiB) so well-behaved servers are never rejected.
-pub(super) const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
+pub(crate) const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
 
 // -----------------------------------------------------------------------------
 // McpDisplayUrl

@@ -16,11 +16,11 @@ use serde_json::json;
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
     approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result, build_success_result,
-    content_blocks_to_output, denial_message_projection_bytes, execute_mcp_calls, execute_single_call,
-    extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry,
-    is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits, normalize_arguments,
-    parse_call_arguments, partition_calls_by_approval, prepare_response_round, process_call_result, resolve_tool_entry,
-    result_payload_limit,
+    content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls,
+    execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
+    is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits,
+    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
+    process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -2157,6 +2157,59 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
 }
 
 #[tokio::test]
+async fn deferred_budget_failure_skips_successful_response_persistence() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    let mut state = ResponsesState {
+        deferred_mcp: vec![DeferredMcpConnector {
+            authorization: None,
+            allowed_tools: None,
+            connector_id: "weather".to_owned(),
+            headers: None,
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: None,
+            server_label: "weather".to_owned(),
+            server_url,
+            timeout: std::time::Duration::from_secs(1),
+        }],
+        ..ResponsesState::default()
+    };
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({"type": "tool_search_call", "id": "tsc_budget"})],
+    );
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+    ctx.extensions.insert(state);
+    let callout = crate::mcp_client::McpCallout::fabricated(true).unwrap();
+
+    let action = discover_pending_connectors(
+        &mut ctx,
+        br#"{"model":"gpt-4.1"}"#,
+        &[],
+        &http::HeaderMap::new(),
+        &callout,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "budget rejection must not dial the next MCP server"
+    );
+}
+
+#[tokio::test]
 #[expect(clippy::too_many_lines, reason = "header-phase SSE lifecycle assertions")]
 async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3197,6 +3250,82 @@ async fn resume_approval_batch_exceeding_cap_is_rejected() {
         1,
         "the compliant retry executes the approved call exactly once"
     );
+}
+
+#[tokio::test]
+async fn oversized_pending_approval_is_retryable_with_a_larger_budget() {
+    let filter = make_dispatch_filter();
+    let store = make_approval_store().await;
+    let arguments = format!("{{\"padding\":\"{}\"}}", "x".repeat(8_192));
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_budget", &arguments).await;
+
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    register_store(&mut ctx, Arc::clone(&store));
+    let mut state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let failed = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(failed.retained_payload_failed);
+    assert!(failed.dispatch_failure.is_some());
+    assert!(
+        failed.accumulated_output.is_empty(),
+        "no MCP call may execute after size rejection"
+    );
+
+    let retry_req = make_request(http::Method::POST, "/v1/responses");
+    let mut retry_ctx = make_owned_filter_context(&retry_req);
+    register_store(&mut retry_ctx, Arc::clone(&store));
+    let mut retry_state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    retry_state.apply_retained_payload_limit(2 * 1024 * 1024);
+    retry_ctx.extensions.insert(retry_state);
+    let mut retry_body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let retry_action = filter
+        .on_request_body(&mut retry_ctx, &mut retry_body, true)
+        .await
+        .unwrap();
+    assert!(matches!(retry_action, FilterAction::Continue));
+    let resumed = retry_ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        resumed.accumulated_output.len(),
+        1,
+        "the larger budget executes the approval once"
+    );
+
+    let replay_req = make_request(http::Method::POST, "/v1/responses");
+    let mut replay_ctx = make_owned_filter_context(&replay_req);
+    register_store(&mut replay_ctx, store);
+    let mut replay_state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    replay_state.apply_retained_payload_limit(2 * 1024 * 1024);
+    replay_ctx.extensions.insert(replay_state);
+    let mut replay_body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(
+        filter
+            .on_request_body(&mut replay_ctx, &mut replay_body, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rejection.status, 400);
+    assert!(reject_message(&rejection).contains("already been used"));
 }
 
 #[tokio::test]
