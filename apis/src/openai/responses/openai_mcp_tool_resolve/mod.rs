@@ -628,7 +628,7 @@ impl McpToolResolveFilter {
                         let entry = task_entries.get(task_idx).ok_or(ResolveError::RetainedBudget)?;
                         let consumers = *consumers.get(task_idx).ok_or(ResolveError::RetainedBudget)?;
                         let charge = eager_listing_charge(
-                            server_label(entry),
+                            entry,
                             retained_json_bytes(tools).ok_or(ResolveError::RetainedBudget)?,
                             tools.len(),
                             consumers,
@@ -683,7 +683,7 @@ impl McpToolResolveFilter {
             <[serde_json::Value]>::len,
         );
         eager_listing_charge(
-            server_label(entry),
+            entry,
             listed_bytes.ok_or(ResolveError::RetainedBudget)?,
             tool_count,
             consumers,
@@ -1095,16 +1095,28 @@ fn optional_json_bytes(value: Option<&serde_json::Value>) -> Option<usize> {
 
 /// Conservative peak for a decoded eager listing and each entry consuming it.
 /// The function name is capped, but the label remains in private and public
-/// listing owners once per tool. All arithmetic fails closed.
+/// listing owners once per tool. Dispatch clones the entry's target, headers,
+/// authorization, approval policy, and connector ID into every tool map entry.
+/// Charge those repeated fields twice to cover map construction overlap.
+/// All arithmetic fails closed.
 fn eager_listing_charge(
-    label: &str,
+    entry: &serde_json::Value,
     listed_bytes: usize,
     tool_count: usize,
     consumers: usize,
 ) -> Result<usize, ResolveError> {
+    let repeated_metadata = server_label(entry)
+        .len()
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(resolvable_server_url(entry)?.len()))
+        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("headers"))?))
+        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("authorization"))?))
+        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("require_approval"))?))
+        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("connector_id"))?))
+        .ok_or(ResolveError::RetainedBudget)?;
     listed_bytes
         .checked_mul(EAGER_LISTING_OWNER_RESERVATION)
-        .and_then(|bytes| bytes.checked_add(label.len().checked_mul(tool_count)?.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(repeated_metadata.checked_mul(tool_count)?.checked_mul(2)?))
         .and_then(|bytes| bytes.checked_mul(consumers))
         .ok_or(ResolveError::RetainedBudget)
 }
