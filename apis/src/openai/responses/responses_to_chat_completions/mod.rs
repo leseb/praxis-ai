@@ -642,9 +642,14 @@ fn json_structure_counts(body: &[u8]) -> Option<(usize, usize)> {
     Some((objects, numbers))
 }
 
-/// A finite response has not committed its translated wire body; reject it and
-/// prevent the outer response store from recording a successful completion.
-fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+/// A finite response may arrive on a later IRR round after the logical SSE
+/// stream was committed. In that case, arm its in-band terminal error instead
+/// of rejecting the body hook and aborting the transport.
+fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> FilterAction {
+    if ctx.extensions.get::<ObservedResponsesSse>().is_some() {
+        record_converter_budget_failure(ctx, body);
+        return FilterAction::Continue;
+    }
     ctx.set_metadata("responses.skip_persist", "true");
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.discard_payload_for_budget_error();
@@ -830,7 +835,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(_) => {
                 if end_of_stream {
                     if !finite_translation_fits(ctx, body.as_deref().unwrap_or_default()) {
-                        return Ok(finite_translation_budget_failure(ctx));
+                        return Ok(finite_translation_budget_failure(ctx, body));
                     }
                     self.transform_finite_response(ctx, body)?;
                 }

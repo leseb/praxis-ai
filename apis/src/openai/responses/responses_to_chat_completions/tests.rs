@@ -2271,6 +2271,54 @@ async fn finite_provider_error_rejects_over_budget_body_before_normalization() {
 }
 
 #[tokio::test]
+async fn committed_stream_finite_provider_error_arms_in_band_budget_failure() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi", "stream":true, "store":false}));
+    state.iteration = 1;
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    context.extensions.insert(super::ObservedResponsesSse);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut body = Some(Bytes::from(json!({"error":{"message":"x".repeat(8192)}}).to_string()));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(body.is_none(), "the finite error body must not leak into the SSE wire");
+    assert_eq!(
+        context.get_metadata("responses.stream_error_code"),
+        Some("server_error")
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        context.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "the logical stream finalizer must emit the terminal error"
+    );
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+}
+
+#[tokio::test]
 async fn malformed_success_shape_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
