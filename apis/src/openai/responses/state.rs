@@ -1301,7 +1301,9 @@ impl ResponsesState {
             meter.raw(self.retained_chat_converter_bytes)?;
         }
         #[cfg(feature = "openai-mcp-tools")]
-        meter.raw(self.retained_mcp_session_bytes)?;
+        if include_external {
+            meter.raw(self.retained_mcp_session_bytes)?;
+        }
 
         if !skip_stream_stable {
             meter.json(&self.request_body)?;
