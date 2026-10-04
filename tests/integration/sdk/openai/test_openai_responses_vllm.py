@@ -2363,7 +2363,7 @@ def usage_less_compact_client(tmp_path_factory, request, compaction_server):
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
         compact_callout_port=compaction_server,
-        retained_limit=65_536,
+        retained_limit=131_072,
     )
     log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
@@ -4655,6 +4655,7 @@ class TestResponsesCompactionVLLM:
                 )
 
             assert exc_info.value.status_code == 413
+            assert "during compaction" in str(exc_info.value)
             assert len(NativeCompactionBackendHandler.requests) == backend_calls
             assert len(CompactionHandler.requests) == callouts
             assert len(client.conversations.items.list(conversation.id).data) == persisted_before

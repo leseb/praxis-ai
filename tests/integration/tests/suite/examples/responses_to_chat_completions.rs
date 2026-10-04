@@ -92,9 +92,10 @@ fn buffered_chat_translation_budget_rejects_before_persisting() {
     let backend = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
     let db = TempSqlite::new("buffered_chat_translation_budget");
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
+    // Admit the compact outbound Chat request while rejecting the 64 KiB response.
     let yaml = yaml.replace(
         "              - filter: responses_to_chat_completions",
-        "              - filter: openai_agentic_loop\n                max_infer_iters: 1\n                max_retained_bytes: 4096\n\n              - filter: responses_to_chat_completions",
+        "              - filter: openai_agentic_loop\n                max_infer_iters: 1\n                max_retained_bytes: 32768\n\n              - filter: responses_to_chat_completions",
     );
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url());
     let yaml = patch_yaml(&yaml, free_port(), &HashMap::from([("127.0.0.1:3001", backend.port())]));

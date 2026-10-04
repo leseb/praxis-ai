@@ -199,6 +199,13 @@ pub fn final_conversation_buffer_budget_rejection(ctx: &HttpFilterContext<'_>) -
 ///
 /// Returns an error only if the delegated conversation hook cannot run.
 #[cfg(feature = "store")]
+#[cfg_attr(
+    not(feature = "openai-conversations"),
+    expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the conversation-enabled hook requires mutable context"
+    )
+)]
 pub async fn finish_unselected_store_conversation_append(
     ctx: &mut HttpFilterContext<'_>,
 ) -> Result<FilterAction, FilterError> {
