@@ -456,11 +456,6 @@ impl CurrentOutputCharge {
 }
 
 impl StreamConverter {
-    /// Whether a successful terminal has already been emitted downstream.
-    pub(super) fn successful_terminal_emitted(&self) -> bool {
-        self.phase == Phase::EmittedTerminal
-    }
-
     /// Payload still owned after a callback. The caller publishes this in the
     /// request-shared aggregate meter because other filters cannot access this
     /// filter's local state through their own filter IDs.
