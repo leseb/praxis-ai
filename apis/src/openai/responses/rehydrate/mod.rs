@@ -275,6 +275,23 @@ impl HttpFilter for RehydrateFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The direct restore path owns the original provider body while parsing
+        // and serializing a second full response (or buffering an SSE frame).
+        // Until that overlap has a shared-budget preflight, fail before the
+        // response headers or a successful store write can be committed.
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+            && (eligible_previous_response_id(ctx).is_some() || eligible_previous_response_id_stream(ctx).is_some())
+        {
+            ctx.set_metadata("responses.skip_persist", "true");
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+            }
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                "response restoration cannot be admitted under openai_agentic_loop.max_retained_bytes",
+            )));
+        }
         // The response header is only available in this header phase, so every
         // eligibility decision (status + content-type + rehydration state) is
         // made here and carried into `on_response_body` via filter state. A finite

@@ -1773,6 +1773,30 @@ async fn restores_previous_response_id_into_response_body() {
 }
 
 #[tokio::test]
+async fn budgeted_direct_restore_rejects_before_response_headers() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.response_header = Some(&mut response);
+
+    let action = RehydrateFilter.on_response(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("unmeasured restore must fail before headers are committed");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_failed)
+    );
+}
+
+#[tokio::test]
 async fn does_not_restore_without_rehydration() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -1895,6 +1919,25 @@ fn sse_ok_response() -> praxis_filter::Response {
         http::HeaderValue::from_static("text/event-stream"),
     );
     response
+}
+
+#[tokio::test]
+async fn budgeted_direct_sse_restore_rejects_before_stream_commitment() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.response_header = Some(&mut response);
+
+    let action = RehydrateFilter.on_response(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("unmeasured SSE restore must fail before stream commitment");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 /// Re-parse assembled SSE output bytes into frames for assertions.
