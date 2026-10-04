@@ -2448,6 +2448,10 @@ fn terminal_probe_uses_last_sse_event_field() {
         !frame_sequence_and_terminal(b"event: response.completed\nevent: response.output_text.delta\ndata: {}\n\n").1
     );
     assert!(!frame_sequence_and_terminal(b": response.completed\ndata: {}\n\n").1);
+    assert!(
+        !frame_sequence_and_terminal(b"event: response.completed\n\n").1,
+        "an event-only SSE frame is not dispatched to the client"
+    );
 }
 
 #[tokio::test]

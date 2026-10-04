@@ -1419,7 +1419,12 @@ fn frame_sequence_and_terminal(frame: &[u8]) -> (Option<u64>, bool) {
             }
         }
     });
-    ((saw_digit && (valid || !done)).then_some(sequence), terminal)
+    // Event-only frames are not dispatched by the shared SSE parser, so they
+    // have not delivered a terminal event to the client.
+    (
+        (saw_digit && (valid || !done)).then_some(sequence),
+        terminal && had_data,
+    )
 }
 
 /// Preserve the largest forwarded sequence when a chunk contains several frames.
