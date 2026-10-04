@@ -2104,6 +2104,33 @@ fn prepare_response_round_rejects_approval_before_output_projection() {
 }
 
 #[test]
+fn prepare_response_round_rejects_escaped_approval_output_before_recording() {
+    let label = "\u{1}".repeat(65_536);
+    let name = encode_function_name(&label, "tool");
+    let entry = json!({
+        "server_label": label,
+        "server_url": "https://example.com/mcp",
+        "require_approval": "always"
+    });
+    let mut state = ResponsesState {
+        mcp_tool_map: HashMap::from([((label, "tool".to_owned()), entry)]),
+        tool_calls: vec![json!({"name": name, "call_id": "call_1", "arguments": "{}"})],
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+    let before = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(before + 300_000);
+
+    let failure = prepare_response_round(&mut state, 1).expect_err("escaped approval output must fit before mutation");
+
+    assert_eq!(failure.status, 502);
+    assert!(state.retained_payload_failed);
+    assert!(state.pending_approvals.is_empty());
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.locally_executed_output_items.is_empty());
+}
+
+#[test]
 fn prepare_response_round_rejects_unresumable_approval() {
     for (request_body, expected_status) in [
         (json!({"model":"gpt-4.1", "store":false}), 400),

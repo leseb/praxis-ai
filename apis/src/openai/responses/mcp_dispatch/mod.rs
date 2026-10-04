@@ -1595,19 +1595,11 @@ pub(crate) fn prepare_response_round(
             message: rejection.message,
         });
     }
-    let pending_bytes = pending.iter().try_fold(0_usize, |used, call| {
-        used.checked_add(call.call_id.len())?
-            .checked_add(call.server_label.len())?
-            .checked_add(call.tool_name.len())?
-            .checked_add(call.arguments.len())?
-            .checked_add(call.target_fingerprint.len())
-    });
     let executable_bytes = executable
         .iter()
         .try_fold(0_usize, |used, call| used.checked_add(retained_json_bytes(call)?));
-    let admission = pending_bytes
-        .and_then(|bytes| bytes.checked_mul(4))
-        .and_then(|bytes| executable_bytes?.checked_add(bytes));
+    let admission =
+        approval_record_and_output_staging_bytes(&pending).and_then(|bytes| executable_bytes?.checked_add(bytes));
     if !admission.is_some_and(|bytes| state.can_retain_payload(bytes)) {
         state.discard_payload_for_budget_error();
         return Err(mcp_budget_failure());
@@ -1623,6 +1615,32 @@ pub(crate) fn prepare_response_round(
     }
     state.mark_current_output_changed();
     Ok(())
+}
+
+/// Reserve every pending record, its execution-origin ID, and the escaped
+/// public JSON item while the current tool calls and local pending values live.
+/// Raw-string multipliers cannot cover a control-character label: JSON emits
+/// each byte as `\u00xx` in the public approval item.
+fn approval_record_and_output_staging_bytes(pending: &[PendingApproval]) -> Option<usize> {
+    const OUTPUT_FIXED_BYTES: usize =
+        br#"{"type":"mcp_approval_request","id":,"name":,"server_label":,"arguments":}"#.len();
+    pending.iter().try_fold(0_usize, |used, call| {
+        let record = call
+            .call_id
+            .len()
+            .checked_add(call.server_label.len())?
+            .checked_add(call.tool_name.len())?
+            .checked_add(call.arguments.len())?
+            .checked_add(call.target_fingerprint.len())?;
+        let output = OUTPUT_FIXED_BYTES
+            .checked_add(retained_json_bytes(&call.call_id)?)?
+            .checked_add(retained_json_bytes(&call.tool_name)?)?
+            .checked_add(retained_json_bytes(&call.server_label)?)?
+            .checked_add(retained_json_bytes(&call.arguments)?)?;
+        used.checked_add(record)?
+            .checked_add(call.call_id.len())?
+            .checked_add(output)
+    })
 }
 
 /// Describe a failed approval classification caused by the aggregate budget.
