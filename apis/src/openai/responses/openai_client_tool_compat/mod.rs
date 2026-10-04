@@ -585,6 +585,10 @@ impl ClientToolCompatFilter {
 /// the lowered tree, outbound serialization, and rewrite staging can coexist.
 /// Check both declared and discovered namespaces while the original tools still
 /// belong to `state`, so the shared budget includes their live ownership too.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one checked preflight covers declared and discovered namespace members before allocation"
+)]
 fn preflight_namespace_expansion(state: &ResponsesState, discovered: &[Value]) -> Result<(), FilterAction> {
     if state.retained_payload_limit().is_none() {
         return Ok(());
