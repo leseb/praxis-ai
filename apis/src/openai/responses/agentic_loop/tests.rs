@@ -3789,6 +3789,37 @@ fn file_search_argument_normalization_is_reserved_before_allocation() {
     assert!(state.accumulated_output.is_empty());
 }
 
+#[test]
+fn file_search_numeric_arguments_reject_before_nested_parse() {
+    let arguments = format!(r#"{{"query":"x","unused":[{}]}}"#, vec!["1e15"; 2_000].join(","));
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "name": "file_search",
+            "call_id": "call_1",
+            "arguments": arguments,
+        }]
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let parsed_arguments: Value = serde_json::from_str(&arguments).unwrap();
+    let parsed_bytes = super::super::state::retained_json_bytes(&parsed_arguments).unwrap();
+    assert!(parsed_bytes > arguments.len() * 2);
+    assert!(
+        super::output_normalization_staging_bytes(&response, true).unwrap() >= parsed_bytes + arguments.len(),
+        "the preflight must include normalized nested arguments and query copies"
+    );
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "test", "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}], "input": "Hi"
+    }));
+    state.apply_retained_payload_limit(32_768);
+    assert!(state.can_retain_payload(body.len()));
+    assert!(super::extract_tool_calls_from_body(&body, &mut state).is_err());
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
 #[tokio::test]
 async fn dispatcher_failure_does_not_become_retained_budget_failure() {
     let req = make_request(Method::POST, "/v1/responses");

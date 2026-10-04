@@ -799,6 +799,7 @@ fn prepare_streamed_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesStat
     if !super::streamed_round_is_dispatchable(ctx, state) {
         collect_streaming_output_items(state)?;
         state.tool_calls.clear();
+        state.mark_tool_calls_changed();
         state.tool_search_calls.clear();
         state.web_search_calls.clear();
         // No dispatcher runs on a non-dispatchable (terminal) round, so drop the
@@ -820,6 +821,7 @@ fn end_stream_with_error(
     message: &str,
 ) -> Result<(), FilterError> {
     state.tool_calls.clear();
+    state.mark_tool_calls_changed();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
@@ -842,6 +844,7 @@ fn prepare_iteration(state: &mut ResponsesState) {
     state.buffered_canonical_parsed_bound_bytes = None;
     state.buffered_canonical_body_digest = None;
     state.tool_calls.clear();
+    state.mark_tool_calls_changed();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
 
@@ -1205,8 +1208,9 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
         .ok()
         .filter(is_responses_api_output);
     let Some(mut response) = response else {
-        state.response_object = Value::Null;
+        state.replace_response_object(Value::Null);
         state.tool_calls.clear();
+        state.mark_tool_calls_changed();
         return Ok(());
     };
     let normalization_staging = output_normalization_staging_bytes(&response, has_file_search_tool(state))
@@ -1237,7 +1241,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
     if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
         merge_usage(&mut state.usage, usage);
     }
-    state.response_object = response;
+    state.replace_response_object(response);
     Ok(())
 }
 
@@ -1365,10 +1369,11 @@ fn retained_payload_failure() -> DispatchFailure {
 /// Bound payload allocated while provider output is normalized in place.
 ///
 /// Private file-search translation parses the arguments JSON and clones its
-/// decoded queries before removing the original argument string. Two argument
-/// lengths cover the parsed tree plus decoded-query owner; call-id copies and
-/// fixed rewritten fields are charged separately. Synthetic public IDs are
-/// bounded without formatting them first.
+/// decoded queries before removing the original argument string. The parsed
+/// tree can grow when exponent-form numbers normalize; the raw length covers
+/// the copied query strings. Call-id copies and fixed rewritten fields are
+/// charged separately. Synthetic public IDs are bounded without formatting
+/// them first.
 fn output_normalization_staging_bytes(response: &Value, translate_file_search: bool) -> Option<usize> {
     let Some(output) = response.get("output").and_then(Value::as_array) else {
         return Some(0);
@@ -1376,10 +1381,12 @@ fn output_normalization_staging_bytes(response: &Value, translate_file_search: b
     output.iter().try_fold(0_usize, |used, item| {
         let mut added = 0_usize;
         if translate_file_search && is_file_search_function_call(item) {
-            let arguments = item.get("arguments").and_then(Value::as_str).map_or(0, str::len);
+            let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+            let parsed_arguments = buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())?;
             let call_id = item.get("call_id").and_then(Value::as_str).map_or(0, str::len);
             added = arguments
-                .checked_mul(2)?
+                .len()
+                .checked_add(parsed_arguments)?
                 .checked_add(call_id.checked_mul(2)?)?
                 .checked_add(256)?;
         }
@@ -1470,6 +1477,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") if is_dispatchable_function_call(item) => {
                 state.tool_calls.push(item.clone());
+                state.mark_tool_calls_changed();
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
@@ -1627,6 +1635,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
     // MCP tool map, a recorded assignment) as mixed client/server ownership.
     if !private_indices.is_empty() {
         state.tool_calls.retain(|call| !is_file_search_function_call(call));
+        state.mark_tool_calls_changed();
     }
     // Stamp stable synthetic IDs on any id-less streamed items before draining the
     // round into the accumulator (issue #955), mirroring the buffered path.
@@ -1817,6 +1826,7 @@ fn is_responses_api_output(response: &Value) -> bool {
 /// Drop this round's dispatcher queues so a terminal outcome cannot re-dispatch.
 fn clear_round_dispatch_state(state: &mut ResponsesState) {
     state.tool_calls.clear();
+    state.mark_tool_calls_changed();
     state.web_search_calls.clear();
     state.tool_search_calls.clear();
     state.file_search_assignments.clear();

@@ -163,6 +163,76 @@ pub(crate) struct ClientToolEcho {
     pub tool_choice: serde_json::Value,
 }
 
+/// Exact response-object charge reused by response filters while the object is unchanged.
+#[cfg(feature = "store")]
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseObjectChargeCache {
+    /// Agentic round whose response object was measured.
+    iteration: u32,
+    /// Explicit mutation revision; an overflow disables reuse.
+    revision: u64,
+    /// Compact JSON bytes of the response object.
+    bytes: usize,
+}
+
+#[cfg(feature = "store")]
+impl ResponseObjectChargeCache {
+    /// Measure once per revision, including after an in-place output-item rewrite.
+    pub(crate) fn measure(cache: &mut Option<Self>, state: &ResponsesState, max_bytes: usize) -> Option<usize> {
+        if let Some(existing) = cache
+            && existing.iteration == state.iteration
+            && Some(existing.revision) == state.response_object_revision
+        {
+            return (existing.bytes <= max_bytes).then_some(existing.bytes);
+        }
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json(&state.response_object)?;
+        let bytes = meter.used();
+        *cache = state.response_object_revision.map(|revision| Self {
+            iteration: state.iteration,
+            revision,
+            bytes,
+        });
+        Some(bytes)
+    }
+}
+
+/// Exact completed-call charge reused by Store and Rehydrate during one SSE
+/// response. Every production write advances the dedicated call revision;
+/// overflow disables reuse rather than admitting a stale size.
+#[cfg(feature = "store")]
+#[derive(Clone, Copy)]
+pub(crate) struct CompletedToolCallsChargeCache {
+    iteration: u32,
+    revision: u64,
+    length: usize,
+    bytes: usize,
+}
+
+#[cfg(feature = "store")]
+impl CompletedToolCallsChargeCache {
+    /// Measure once per stream mutation revision, respecting a smaller later limit.
+    pub(crate) fn measure(cache: &mut Option<Self>, state: &ResponsesState, max_bytes: usize) -> Option<usize> {
+        if let Some(existing) = cache
+            && existing.iteration == state.iteration
+            && Some(existing.revision) == state.tool_calls_revision
+            && existing.length == state.tool_calls.len()
+        {
+            return (existing.bytes <= max_bytes).then_some(existing.bytes);
+        }
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json_values(&state.tool_calls)?;
+        let bytes = meter.used();
+        *cache = state.tool_calls_revision.map(|revision| Self {
+            iteration: state.iteration,
+            revision,
+            length: state.tool_calls.len(),
+            bytes,
+        });
+        Some(bytes)
+    }
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
@@ -345,6 +415,14 @@ pub(crate) struct ResponsesState {
     /// Invalidates the store replay cache after in-place request, history, or
     /// output changes that do not alter collection lengths. Overflow fails closed.
     pub(crate) replay_stable_payload_revision: Option<u64>,
+
+    /// Invalidates response-object byte caches after an owned or in-place edit.
+    /// Overflow disables reuse so a stale charge can never be admitted.
+    pub(crate) response_object_revision: Option<u64>,
+
+    /// Invalidates Store and Rehydrate's completed-call charge after any write.
+    /// Overflow disables cache reuse.
+    pub(crate) tool_calls_revision: Option<u64>,
 
     /// Parser buffers published by `openai_stream_events`. Its filter-local
     /// slot is invisible to other filters, so the request-wide meter owns this
@@ -927,6 +1005,8 @@ impl Default for ResponsesState {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
             replay_stable_payload_revision: Some(0),
+            response_object_revision: Some(0),
+            tool_calls_revision: Some(0),
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
@@ -1068,13 +1148,13 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false, None, None)?
             .checked_add(stream_bytes)
     }
 
-    /// Request and history owners cannot change while one upstream stream is
-    /// being parsed. Measure them once per round; the stream meter measures all
-    /// other owners after each chunk.
+    /// Request, history, and resolved tool snapshots stay fixed during one
+    /// upstream round. Streaming owners cache these while measuring changing
+    /// response state on each callback.
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1090,40 +1170,107 @@ impl ResponsesState {
         for id in &self.provider_compaction_ids {
             meter.raw(id.len())?;
         }
+        for ((server, tool), value) in &self.mcp_tool_map {
+            meter.raw(server.len())?;
+            meter.raw(tool.len())?;
+            meter.json(value)?;
+        }
+        if let Some(echo) = &self.client_tool_echo {
+            meter.json_values(&echo.tools)?;
+            meter.json(&echo.tool_choice)?;
+        }
         Some(meter.used())
     }
 
     /// Count the owners which may change during a streaming response. The
     /// stream-local meter adds the cached request/history and prior-round
     /// output and tool-snapshot charges separately; all are fixed until EOS.
+    #[cfg(test)]
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, None, None)?
             .checked_add(self.retained_rehydrate_stream_bytes)
     }
 
+    /// Use the stream parser's exact charges for unchanged output items and
+    /// completed tool calls. Other filters pass `None` and keep measuring their
+    /// own tool-call owners because they do not share the parser's invalidation.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: usize,
+        tool_calls_bytes: Option<usize>,
+    ) -> Option<usize> {
+        let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            true,
+            true,
+            Some(response_object_bytes),
+            tool_calls_bytes,
+        )?
+        .checked_add(self.retained_rehydrate_stream_bytes)
+    }
+
     /// Count changing owners while a response filter caches request, history,
-    /// and prior output. Include the stream parsers' published charges.
+    /// fixed tool snapshots, and prior output. Include the stream parsers'
+    /// published charges.
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        self.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(max_bytes, None, None)
+    }
+
+    /// The Store and Chat changing meter with an exact cached response-object
+    /// charge when the Store has already measured this revision.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
+    ) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, false)?
-            .checked_add(stream_bytes)
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            true,
+            true,
+            response_object_bytes,
+            tool_calls_bytes,
+        )?
+        .checked_add(stream_bytes)
     }
 
     /// Count owners that may change between Rehydrate SSE callbacks, including
     /// accumulated output and both published stream-parser charges. The stable
-    /// request and history owners are measured once by the Rehydrate stream.
+    /// request, history, and tool snapshots are measured once by Rehydrate.
     #[cfg(feature = "store")]
-    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+    /// Rehydrate's changing meter with an exact cached response-object charge.
+    #[cfg(feature = "store")]
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
+    ) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, false)?
-            .checked_add(stream_bytes)
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            false,
+            true,
+            response_object_bytes,
+            tool_calls_bytes,
+        )?
+        .checked_add(stream_bytes)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1134,7 +1281,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, None, None)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1152,6 +1299,8 @@ impl ResponsesState {
         skip_stream_stable: bool,
         skip_accumulated_output: bool,
         skip_stream_fixed_tools: bool,
+        response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
@@ -1174,18 +1323,23 @@ impl ResponsesState {
                 meter.raw(id.len())?;
             }
         }
-        for value in [
-            &self.response_object,
-            &self.local_completion_response_template,
-            &self.tool_choice,
-            &self.usage,
-        ] {
+        if let Some(bytes) = response_object_bytes {
+            meter.raw(bytes)?;
+        } else {
+            meter.json(&self.response_object)?;
+        }
+        for value in [&self.local_completion_response_template, &self.tool_choice, &self.usage] {
             meter.json(value)?;
         }
         if !skip_accumulated_output {
             meter.json_values(&self.accumulated_output)?;
         }
-        for values in [&self.tool_calls, &self.tool_search_calls, &self.web_search_calls] {
+        if let Some(bytes) = tool_calls_bytes {
+            meter.raw(bytes)?;
+        } else {
+            meter.json_values(&self.tool_calls)?;
+        }
+        for values in [&self.tool_search_calls, &self.web_search_calls] {
             meter.json_values(values)?;
         }
         for value in [
@@ -1331,6 +1485,7 @@ impl ResponsesState {
     pub(crate) fn fail_retained_payload_budget(&mut self) {
         self.retained_payload_failed = true;
         self.tool_calls.clear();
+        self.mark_tool_calls_changed();
         self.tool_search_calls.clear();
         self.web_search_calls.clear();
         self.file_search_assignments.clear();
@@ -1368,7 +1523,7 @@ impl ResponsesState {
         self.original_tool_choice = None;
         self.response_id = None;
         self.request_body = serde_json::json!({ "stream": streaming });
-        self.response_object = serde_json::Value::Null;
+        self.replace_response_object(serde_json::Value::Null);
         self.buffered_canonical_finalized = false;
         self.buffered_canonical_wire_bytes = None;
         self.buffered_canonical_parsed_bound_bytes = None;
@@ -1455,6 +1610,36 @@ impl ResponsesState {
             .and_then(|revision| revision.checked_add(1));
     }
 
+    /// Invalidate exact response-object charges before an owned or in-place edit.
+    pub(crate) fn mark_response_object_changed(&mut self) {
+        self.response_object_revision = self
+            .response_object_revision
+            .and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Invalidate completed-call byte charges before an append, replacement, or clear.
+    pub(crate) fn mark_tool_calls_changed(&mut self) {
+        self.tool_calls_revision = self.tool_calls_revision.and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Borrow the response object for mutation and invalidate response-filter byte caches.
+    pub(crate) fn response_object_mut(&mut self) -> &mut serde_json::Value {
+        self.mark_response_object_changed();
+        &mut self.response_object
+    }
+
+    /// Replace the response object and invalidate response-filter byte caches.
+    pub(crate) fn replace_response_object(&mut self, response: serde_json::Value) {
+        self.response_object = response;
+        self.mark_response_object_changed();
+    }
+
+    /// Move the response object out and invalidate response-filter byte caches.
+    pub(crate) fn take_response_object(&mut self) -> serde_json::Value {
+        self.mark_response_object_changed();
+        std::mem::take(&mut self.response_object)
+    }
+
     /// Borrow the public output owned by [`Self::response_object`].
     pub(crate) fn output_items(&self) -> &[serde_json::Value] {
         self.response_object
@@ -1466,6 +1651,7 @@ impl ResponsesState {
 
     /// Mutably borrow public output, creating a valid array when absent.
     pub(crate) fn output_items_mut(&mut self) -> &mut Vec<serde_json::Value> {
+        self.mark_response_object_changed();
         if !self.response_object.is_object() {
             self.response_object = serde_json::Value::Object(serde_json::Map::new());
         }
@@ -1588,7 +1774,7 @@ impl ResponsesState {
         // the retained-state mutation transactional through annotation and both
         // size admissions; on failure no oversized response or serialization
         // buffer becomes an additional state owner.
-        let mut response = std::mem::take(&mut self.response_object);
+        let mut response = self.take_response_object();
         if let Some(obj) = response.as_object_mut() {
             if !self.accumulated_output.is_empty() {
                 obj.insert(
@@ -1602,11 +1788,11 @@ impl ResponsesState {
         }
         if let Err(error) = annotate_response(&mut response, &self.citation_files) {
             tracing::warn!(%error, "failed to annotate final response");
-            self.response_object = response;
+            self.replace_response_object(response);
             return Err(finalize_rejection("failed to annotate final response"));
         }
         let Some(serialized_bytes) = bounded_json_size(&response, MAX_JSON_BODY_BYTES).ok().flatten() else {
-            self.response_object = response;
+            self.replace_response_object(response);
             return Err(finalize_rejection(
                 "final response exceeds the JSON response byte limit",
             ));
@@ -1632,7 +1818,7 @@ impl ResponsesState {
             Ok(serialized) => serialized,
             Err(error) => {
                 tracing::warn!(%error, "failed to encode final response");
-                self.response_object = response;
+                self.replace_response_object(response);
                 return Err(finalize_rejection("failed to encode final response"));
             },
         };
@@ -1643,7 +1829,7 @@ impl ResponsesState {
             return Err(finalize_rejection("failed to bound final response JSON"));
         };
         let body_digest = crate::hash::Sha256::digest(&serialized);
-        self.response_object = response;
+        self.replace_response_object(response);
         *body = Some(Bytes::from(serialized));
         self.buffered_canonical_finalized = true;
         self.buffered_canonical_wire_bytes = Some(serialized_bytes);
@@ -1969,6 +2155,126 @@ mod tests {
             state.retained_payload_bytes().unwrap() - baseline,
             bytes * 4,
             "each of the four owned JSON copies contributes its bytes"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks all four stream meter partitions against the full owner charge"
+    )]
+    fn streaming_meters_charge_fixed_tool_snapshots_once() {
+        let mut state = ResponsesState::from_request_body(json!({"input": "hello"}));
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "tool".to_owned()),
+            json!({"schema": "m".repeat(4_096)}),
+        );
+        state.client_tool_echo = Some(ClientToolEcho {
+            tools: vec![json!({"type": "function", "name": "t", "description": "e".repeat(4_096)})],
+            tool_choice: json!("auto"),
+        });
+        state.response_object = json!({"output": [{"text": "changing"}]});
+
+        let total = state.retained_payload_bytes().unwrap();
+        let stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing = state
+            .stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+            .unwrap();
+        assert_eq!(
+            stable + changing,
+            total,
+            "Store and Chat charge each fixed tool snapshot once"
+        );
+        #[cfg(feature = "store")]
+        assert_eq!(
+            stable
+                + state
+                    .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None, None)
+                    .unwrap(),
+            total,
+            "Rehydrate charges each fixed tool snapshot once"
+        );
+        assert_eq!(
+            stable + state.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
+            total,
+            "StreamEvents charges each fixed tool snapshot once"
+        );
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn response_object_charge_cache_remeasures_after_revision_overflow() {
+        let mut state = ResponsesState::default();
+        state.replace_response_object(json!({"output": "small"}));
+        let mut cache = None;
+        let first = ResponseObjectChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        state.response_object_revision = Some(u64::MAX);
+        state.replace_response_object(json!({"output": "x".repeat(4_096)}));
+        let next = ResponseObjectChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert!(next > first, "overflowed revisions must remeasure the new object");
+        assert!(cache.is_none(), "an overflowed revision must disable reuse");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn completed_tool_calls_charge_cache_remeasures_after_revision_overflow() {
+        let mut state = ResponsesState::default();
+        state.tool_calls.push(json!({"arguments": "small"}));
+        state.mark_tool_calls_changed();
+        let mut cache = None;
+        let first = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        state.tool_calls_revision = Some(u64::MAX);
+        state.tool_calls[0]["arguments"] = json!("x".repeat(4_096));
+        state.mark_tool_calls_changed();
+        let next = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert!(next > first);
+        assert!(cache.is_none(), "an overflowed revision must disable reuse");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn cached_completed_tool_calls_preserve_store_and_rehydrate_meter_parity() {
+        let mut state = ResponsesState::from_request_body(json!({"input":"hello"}));
+        state
+            .tool_calls
+            .push(json!({"type":"function_call", "arguments":"x".repeat(4_096)}));
+        state.mark_tool_calls_changed();
+        let mut cache = None;
+        let charge = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert_eq!(
+            state.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+                usize::MAX,
+                None,
+                Some(charge)
+            ),
+            state.stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+        );
+        assert_eq!(
+            state.rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+                usize::MAX,
+                None,
+                Some(charge)
+            ),
+            state.rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None, None)
+        );
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn response_object_charge_cache_respects_smaller_measurement_limits() {
+        let mut state = ResponsesState::default();
+        state.replace_response_object(json!({"output": "x".repeat(4_096)}));
+        let mut cache = None;
+        assert!(
+            ResponseObjectChargeCache::measure(&mut cache, &state, 512).is_none(),
+            "the first measurement must stop at the available budget"
+        );
+        assert!(cache.is_none(), "a failed measurement must not be cached");
+        let bytes = ResponseObjectChargeCache::measure(&mut cache, &state, 8_192).unwrap();
+        assert!(bytes > 512, "the exact charge must exceed the smaller limit");
+        assert!(
+            ResponseObjectChargeCache::measure(&mut cache, &state, 512).is_none(),
+            "a cached charge must still honor each callback's limit"
         );
     }
 

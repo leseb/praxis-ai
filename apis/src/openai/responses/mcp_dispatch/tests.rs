@@ -109,6 +109,8 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+        max_control_response_bytes: crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+        retain_session: true,
         timeout,
         forwarded_header_names: &[],
         forwarded_headers: None,
@@ -607,7 +609,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    state.apply_retained_payload_limit(current + result_id_bytes + 4_000);
+    state.apply_retained_payload_limit(current + result_id_bytes + 8_000_000);
     let calls = call_refs(&state.tool_calls);
 
     let arguments = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap() * 3;
@@ -616,9 +618,16 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
         panic!("weather tool must resolve")
     };
     let entry = retained_json_bytes(entry).unwrap();
-    assert_eq!(
-        aggregate_mcp_result_limit(&state, &calls, 8_192),
-        Some(((4_000 - arguments - entry) / 3, true))
+    let admission = aggregate_mcp_result_limit(&state, &calls, 8_192).expect("normal MCP call should fit");
+    let available = 8_000_000 - arguments - entry;
+    let initialization_peak = admission.control_response_bytes * 256;
+    assert!(admission.control_response_bytes >= 1_024);
+    assert!(initialization_peak + admission.result_limit * 3 <= available);
+    assert_eq!(admission.result_limit, 8_192);
+    assert!(admission.aggregate_constrained);
+    assert!(
+        !admission.retain_session,
+        "budgeted calls must not retain peer metadata in the pool"
     );
 }
 
@@ -646,6 +655,34 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
     let calls = call_refs(&state.tool_calls);
 
     assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+}
+
+#[tokio::test]
+async fn budgeted_mcp_dispatch_rejects_before_initialize_without_headroom() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "call_1",
+            "arguments": {}
+        })],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 100_000);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert!(state.messages.is_empty(), "no MCP result may be committed");
+    assert!(state.accumulated_output.is_empty(), "no tool call may be dispatched");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -2727,7 +2764,9 @@ async fn resume_approval_replay_is_rejected() {
         ..ResponsesState::default()
     };
     let baseline = replay_state.retained_payload_bytes().unwrap();
-    replay_state.apply_retained_payload_limit(baseline + 1_000_000);
+    // Leave room for a fresh initialization preflight so replay ownership,
+    // rather than the aggregate budget, determines the terminal error.
+    replay_state.apply_retained_payload_limit(baseline + 8_000_000);
     ctx2.extensions.insert(replay_state);
     let mut body2 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx2, &mut body2, true).await.unwrap());

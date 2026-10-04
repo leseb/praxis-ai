@@ -277,6 +277,8 @@ impl McpDispatchFilter {
         connector_identity: Option<&McpCalloutIdentity>,
         session_pool: &mcp_client::McpSessionPool,
         max_total_result_bytes: usize,
+        max_control_response_bytes: usize,
+        retain_session: bool,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -290,6 +292,8 @@ impl McpDispatchFilter {
             max_parallel_calls: self.max_parallel_calls,
             max_result_bytes: per_result_limit,
             max_total_result_bytes: execution_batch_limit,
+            max_control_response_bytes,
+            retain_session,
             timeout: self.timeout,
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
@@ -348,6 +352,7 @@ impl McpDispatchFilter {
         }
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
         state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+        state.mark_tool_calls_changed();
     }
 
     /// Fail closed when no shared sub-request client is available to dial the
@@ -370,6 +375,7 @@ impl McpDispatchFilter {
     fn result_limit_action(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.tool_calls.clear();
+            state.mark_tool_calls_changed();
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
@@ -386,7 +392,8 @@ impl McpDispatchFilter {
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while appending MCP results".to_owned(),
+                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during MCP dispatch"
+                    .to_owned(),
             });
         }
         ctx.set_metadata("responses.skip_persist", "true");
@@ -613,6 +620,7 @@ impl McpDispatchFilter {
                 let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
                 let fits = aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes).is_some();
                 state.tool_calls.truncate(original_calls);
+                state.mark_tool_calls_changed();
                 state.messages.truncate(original_messages);
                 state.persisted_messages.truncate(original_persisted);
                 fits
@@ -1001,6 +1009,7 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
             "resuming approved MCP tool call"
         );
         state.tool_calls.push(build_approved_tool_call(decision));
+        state.mark_tool_calls_changed();
     } else {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
@@ -1199,6 +1208,17 @@ impl McpDispatchFilter {
             .extensions
             .get_or_insert_with(mcp_client::McpSessionPool::new)
             .clone();
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(ResponsesState::retained_payload_limit)
+            .is_some()
+        {
+            // A prior unbudgeted round may have left rmcp peer metadata in the
+            // request pool. Close it before using the aggregate policy; every
+            // budgeted tool call below then owns only a call-local session.
+            session_pool.drain().await;
+        }
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -1278,9 +1298,7 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some((result_limit, aggregate_constrained)) =
-            aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes)
-        else {
+        let Some(admission) = aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes) else {
             return Ok(Self::aggregate_budget_action(ctx));
         };
 
@@ -1293,12 +1311,14 @@ impl McpDispatchFilter {
                 &callout,
                 connector_identity.as_ref(),
                 &session_pool,
-                result_limit,
+                admission.result_limit,
+                admission.control_response_bytes,
+                admission.retain_session,
             )
             .await
         {
             Ok(results) => results,
-            Err(_limit) if aggregate_constrained => return Ok(Self::aggregate_budget_action(ctx)),
+            Err(_limit) if admission.aggregate_constrained => return Ok(Self::aggregate_budget_action(ctx)),
             Err(_limit) => return Ok(Self::result_limit_action(ctx)),
         };
         if !ctx
@@ -1447,10 +1467,12 @@ pub(crate) fn prepare_response_round(
     record_and_emit_approvals(state, pending);
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+    state.mark_tool_calls_changed();
     if executable.is_empty() {
         state.mcp_approval_state = McpApprovalState::ApprovalPendingThenReturn;
     } else {
         state.tool_calls.extend(executable);
+        state.mark_tool_calls_changed();
         state.mcp_approval_state = McpApprovalState::ExecuteUngatedThenReturn;
     }
     Ok(())
@@ -1742,15 +1764,43 @@ impl McpCallResult {
     }
 }
 
-/// Reserve raw callout bodies and parsed result staging alongside the three
-/// final result owners before making an external MCP call.
+/// Admission for one complete MCP tool-call batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct McpResultAdmission {
+    /// Aggregate serialized result allowance.
+    result_limit: usize,
+    /// Initialize response wire cap enforced by the MCP transport before parse.
+    control_response_bytes: usize,
+    /// Whether the request-wide budget narrowed either allowance.
+    aggregate_constrained: bool,
+    /// Only unbudgeted calls may retain rmcp peer metadata in a pooled session.
+    retain_session: bool,
+}
+
+/// Parsed JSON metadata, the raw initialize body, and rmcp's peer-info owner
+/// can coexist. This also covers pathological tiny-object/array node overhead.
+const MCP_INITIALIZE_PEAK_MULTIPLIER: usize = 256;
+/// A smaller response cap cannot reliably admit a normal MCP handshake.
+const MIN_BUDGETED_INITIALIZE_BYTES: usize = 1_024;
+
+/// Reserve raw callout bodies, parsed initialization state, and parsed result
+/// staging alongside the three final result owners before any MCP call.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checked pre-dial accounting remains one transactional decision"
+)]
 fn aggregate_mcp_result_limit(
     state: &ResponsesState,
     mcp_calls: &[&serde_json::Value],
     configured_limit: usize,
-) -> Option<(usize, bool)> {
+) -> Option<McpResultAdmission> {
     let Some(limit) = state.retained_payload_limit() else {
-        return Some((configured_limit, false));
+        return Some(McpResultAdmission {
+            result_limit: configured_limit,
+            control_response_bytes: mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+            aggregate_constrained: false,
+            retain_session: true,
+        });
     };
     let current = state.retained_payload_bytes_bounded(limit)?;
     // Argument normalization and transport serialization can coexist with the
@@ -1777,9 +1827,33 @@ fn aggregate_mcp_result_limit(
             .checked_add(tool_bytes)
     })?;
     let available = limit.checked_sub(current)?.checked_sub(staging)?;
-    let admitted = configured_limit.min(available / 3);
     let minimum = mcp_calls.len().checked_mul(MIN_RETAINED_RESULT_BYTES)?;
-    (admitted >= minimum).then_some((admitted, admitted < configured_limit))
+    let result_floor = minimum.checked_mul(3)?;
+    // At most a quarter of discretionary headroom goes to initialization.
+    // Every call can open a fresh session, even in a sequential batch, and
+    // already completed results may coexist with later handshakes.
+    let control_divisor = mcp_calls
+        .len()
+        .checked_mul(MCP_INITIALIZE_PEAK_MULTIPLIER)?
+        .checked_mul(4)?;
+    let control_response_bytes = available
+        .checked_sub(result_floor)?
+        .checked_div(control_divisor)?
+        .min(mcp_client::MAX_CONTROL_RESPONSE_BYTES);
+    if control_response_bytes < MIN_BUDGETED_INITIALIZE_BYTES {
+        return None;
+    }
+    let control_peak = control_response_bytes
+        .checked_mul(MCP_INITIALIZE_PEAK_MULTIPLIER)?
+        .checked_mul(mcp_calls.len())?;
+    let result_limit = configured_limit.min(available.checked_sub(control_peak)? / 3);
+    (result_limit >= minimum).then_some(McpResultAdmission {
+        result_limit,
+        control_response_bytes,
+        aggregate_constrained: result_limit < configured_limit
+            || control_response_bytes < mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+        retain_session: false,
+    })
 }
 
 /// Bound the parsed argument value, canonical string, and transport owner.
@@ -1865,6 +1939,11 @@ struct McpExecutionOptions<'a> {
     max_result_bytes: usize,
     /// Maximum serialized bytes retained by one result batch.
     max_total_result_bytes: usize,
+    /// Pre-dial ceiling for an initialize response while its parsed peer info is live.
+    max_control_response_bytes: usize,
+    /// Budgeted calls close their session before returning, so peer metadata
+    /// cannot escape the call's request-wide reservation through the pool.
+    retain_session: bool,
     /// Timeout applied independently to each MCP call.
     timeout: Duration,
     /// Names reserved for trusted forwarding, including when values are absent.
@@ -2166,7 +2245,10 @@ async fn execute_single_call(
     // The opaque key binds target identity to this dispatcher's outbound
     // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
     // key and therefore remain fail-closed and unpooled.
-    let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
+    let session_key = options
+        .retain_session
+        .then(|| mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry)))
+        .flatten();
     let result = mcp_client::call_tool_with_forwarded_headers(
         session_key.as_ref().map(|key| (options.session_pool, key)),
         server_url,
@@ -2179,6 +2261,7 @@ async fn execute_single_call(
         arguments,
         options.timeout,
         payload_limit,
+        options.max_control_response_bytes,
         callout,
     )
     .await;

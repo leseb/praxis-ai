@@ -151,6 +151,21 @@ impl SseFrameParser {
             .saturating_add(self.event_type.as_ref().map_or(0, String::len))
     }
 
+    /// Bound the new field owner made when this chunk terminates a prior line.
+    /// A lossy `event:` conversion can expand each invalid byte to three bytes;
+    /// `data:` copies the raw line while the old line buffer remains live.
+    pub(crate) fn pending_line_transition_bytes(&self, chunk: &[u8]) -> Option<usize> {
+        if self.line_buf.is_empty() || !chunk.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            return Some(0);
+        }
+        let factor = if std::str::from_utf8(&self.line_buf).is_ok() {
+            1
+        } else {
+            3
+        };
+        self.line_buf.len().checked_mul(factor)
+    }
+
     /// Release all partial frame payload after a terminal aggregate failure.
     pub(crate) fn clear(&mut self) {
         self.line_buf.clear();

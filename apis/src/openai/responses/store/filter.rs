@@ -69,7 +69,10 @@ use super::{
         bound_body_outcome,
         error::responses_error_rejection,
         rehydrate::{DirectFiniteRestoreFraming, FinalizedFiniteRestoreAdmission, FinalizedRestoredBodyDigest},
-        state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
+        state::{
+            CompletedToolCallsChargeCache, PayloadMeter, ResponseObjectChargeCache, ResponsesState,
+            retained_json_bytes, retained_json_values_bytes,
+        },
     },
     config::{ResponseStoreConfig, validate_config},
 };
@@ -401,6 +404,10 @@ impl ResponseStoreFilter {
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
         let previously_retained = state.retained_payload_bytes();
         let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
+        if terminal_ready {
+            state.response_object_charge = None;
+            state.tool_calls_charge = None;
+        }
         if let Some(responses) = ctx.extensions.get::<ResponsesState>()
             && let Some(limit) = responses.retained_payload_limit()
             && (terminal_ready
@@ -448,9 +455,16 @@ impl ResponseStoreFilter {
                     }
                 })
                 .is_some_and(|peak| {
-                    ctx.extensions
-                        .get::<ResponsesState>()
-                        .is_none_or(|responses| store_stream_budget_fits(responses, state.shared_stable_bytes, 0, peak))
+                    ctx.extensions.get::<ResponsesState>().is_none_or(|responses| {
+                        store_stream_budget_fits(
+                            responses,
+                            state.shared_stable_bytes,
+                            &mut state.response_object_charge,
+                            &mut state.tool_calls_charge,
+                            0,
+                            peak,
+                        )
+                    })
                 });
         if !admitted {
             ctx.extensions.insert(state);
@@ -467,6 +481,8 @@ impl ResponseStoreFilter {
                 store_stream_budget_fits(
                     responses,
                     state.shared_stable_bytes,
+                    &mut state.response_object_charge,
+                    &mut state.tool_calls_charge,
                     state.charged_retained_bytes.unwrap_or(0),
                     next,
                 )
@@ -778,8 +794,8 @@ struct StoreStableCache {
     revision: u64,
     /// Lengths of every cached collection. Dispatch may append after synthesis
     /// has already advanced the iteration.
-    collection_lengths: [usize; 7],
-    /// Serialized payload charge of the cached request, history, and output.
+    collection_lengths: [usize; 10],
+    /// Serialized payload charge of cached request, history, output, and tools.
     bytes: usize,
 }
 
@@ -802,7 +818,7 @@ impl StoreStableCache {
     }
 
     /// Lengths of the collections covered by the stable charge.
-    fn collection_lengths(state: &ResponsesState) -> [usize; 7] {
+    fn collection_lengths(state: &ResponsesState) -> [usize; 10] {
         [
             state.input.len(),
             state.messages.len(),
@@ -811,11 +827,33 @@ impl StoreStableCache {
             state.tools.len(),
             state.provider_compaction_ids.len(),
             state.accumulated_output.len(),
+            state.mcp_tool_map.len(),
+            usize::from(state.client_tool_echo.is_some()),
+            state.client_tool_echo.as_ref().map_or(0, |echo| echo.tools.len()),
         ]
     }
 }
 
-/// Request-phase data needed when persisting the response.
+/// Position of the last raw SSE line boundary across chunk splits.
+#[derive(Default)]
+enum PendingWireLineBoundary {
+    /// A line has content, or no line ending has yet been observed.
+    #[default]
+    Content,
+    /// A line ended with LF, or the optional LF after CR was consumed.
+    EndedLine,
+    /// A line ended with CR, which may be followed by LF in the next chunk.
+    EndedWithCr,
+}
+
+impl PendingWireLineBoundary {
+    /// Whether another line ending completes an empty SSE record boundary.
+    fn line_ended(&self) -> bool {
+        !matches!(self, Self::Content)
+    }
+}
+
+/// Request-phase input and response-phase SSE replay data retained by Store.
 #[derive(Default)]
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
@@ -831,6 +869,10 @@ struct ResponseStoreRequestState {
     shared_stable_bytes: Option<StoreStableCache>,
     /// Request-side persistence arming that can precede shared state creation.
     persistence_arm: PersistenceArm,
+    /// Exact current-round response object charge, keyed by its mutation revision.
+    response_object_charge: Option<ResponseObjectChargeCache>,
+    /// Exact completed-call charge, keyed by the request-wide call revision.
+    tool_calls_charge: Option<CompletedToolCallsChargeCache>,
     /// Owner captured before inference begins.
     owner: Option<StateOwner>,
     /// Incremental SSE decoder over the outbound stream, lazily created on the
@@ -842,13 +884,12 @@ struct ResponseStoreRequestState {
     event_bytes: u64,
     /// Raw bytes in independently owned captured event names.
     event_name_bytes: usize,
-    /// Upper bound on raw bytes after the last complete LF-delimited record.
+    /// Upper bound on raw bytes after the last complete SSE record.
     /// The retained meter charges this twice because the decoder may keep a
-    /// field value and the current line independently. CR-delimited records
-    /// are deliberately overcounted.
+    /// field value and the current line independently.
     pending_wire_bytes: usize,
-    /// Whether the previous wire byte was LF, including across chunk edges.
-    last_wire_byte_was_lf: bool,
+    /// Track complete SSE records and pair CR with an optional following LF.
+    pending_wire_boundary: PendingWireLineBoundary,
     /// Sticky flag: capture exceeded a bound or the decoder was poisoned, so the
     /// partial log is abandoned and the response becomes non-replayable.
     events_over_budget: bool,
@@ -873,12 +914,28 @@ impl ResponseStoreRequestState {
             return;
         }
         for &byte in chunk {
-            if byte == b'\n' && self.pending_wire_bytes > 0 && self.last_wire_byte_was_lf {
-                self.pending_wire_bytes = 0;
-            } else {
-                self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+            if byte == b'\n' && matches!(self.pending_wire_boundary, PendingWireLineBoundary::EndedWithCr) {
+                self.pending_wire_boundary = PendingWireLineBoundary::EndedLine;
+                continue;
             }
-            self.last_wire_byte_was_lf = byte == b'\n';
+            match byte {
+                b'\n' | b'\r' => {
+                    self.pending_wire_bytes = if self.pending_wire_boundary.line_ended() {
+                        0
+                    } else {
+                        self.pending_wire_bytes.saturating_add(1)
+                    };
+                    self.pending_wire_boundary = if byte == b'\r' {
+                        PendingWireLineBoundary::EndedWithCr
+                    } else {
+                        PendingWireLineBoundary::EndedLine
+                    };
+                },
+                _ => {
+                    self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                    self.pending_wire_boundary = PendingWireLineBoundary::Content;
+                },
+            }
         }
     }
 }
@@ -919,6 +976,8 @@ fn charge_store_payload(ctx: &mut HttpFilterContext<'_>, store: &mut ResponseSto
 fn store_stream_budget_fits(
     responses: &ResponsesState,
     stable: Option<StoreStableCache>,
+    response_object_charge: &mut Option<ResponseObjectChargeCache>,
+    tool_calls_charge: &mut Option<CompletedToolCallsChargeCache>,
     removed: usize,
     added: usize,
 ) -> bool {
@@ -934,8 +993,22 @@ fn store_stream_budget_fits(
     let Some(measurement_limit) = remaining.checked_add(removed) else {
         return false;
     };
+    let Some(response_object_bytes) =
+        ResponseObjectChargeCache::measure(response_object_charge, responses, measurement_limit)
+    else {
+        return false;
+    };
+    let Some(tool_calls_bytes) =
+        CompletedToolCallsChargeCache::measure(tool_calls_charge, responses, measurement_limit)
+    else {
+        return false;
+    };
     responses
-        .stream_changing_payload_bytes_bounded_with_cached_output(measurement_limit)
+        .stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+            measurement_limit,
+            Some(response_object_bytes),
+            Some(tool_calls_bytes),
+        )
         .and_then(|current| current.checked_sub(removed))
         .and_then(|current| current.checked_add(added))
         .is_some_and(|next| next <= remaining)
@@ -1192,6 +1265,8 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Resul
     state.input = Some(input);
     state.input_retained_bytes = retained_bytes;
     state.shared_stable_bytes = None;
+    state.response_object_charge = None;
+    state.tool_calls_charge = None;
     let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
     let admitted = charge_store_payload(ctx, &mut state, next);
     ctx.extensions.insert(state);
@@ -1656,6 +1731,8 @@ impl HttpFilter for ResponseStoreFilter {
         // Request re-entry may rewrite cached owners without changing lengths.
         if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
             state.shared_stable_bytes = None;
+            state.response_object_charge = None;
+            state.tool_calls_charge = None;
         }
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
@@ -1696,6 +1773,8 @@ impl HttpFilter for ResponseStoreFilter {
         }
         if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
             state.shared_stable_bytes = None;
+            state.response_object_charge = None;
+            state.tool_calls_charge = None;
         }
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
@@ -3041,6 +3120,120 @@ mod encode_replay_event_tests {
         assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
     }
 
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks shape and revision invalidation for both fixed tool owners"
+    )]
+    fn replay_meter_invalidates_changed_tool_snapshots() {
+        let mut state = ResponsesState::default();
+        let initial = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, initial).unwrap();
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "tool".to_owned()),
+            json!({"schema": "x".repeat(4_096)}),
+        );
+        assert!(
+            !cache.matches(&state),
+            "a newly resolved MCP tool changes the cached shape"
+        );
+
+        let expanded = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, expanded).unwrap();
+        state.client_tool_echo = Some(crate::openai::responses::state::ClientToolEcho {
+            tools: vec![json!({"name": "client-tool"})],
+            tool_choice: json!("auto"),
+        });
+        assert!(!cache.matches(&state), "captured client tools change the cached shape");
+
+        let expanded = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, expanded).unwrap();
+        state
+            .mcp_tool_map
+            .get_mut(&("server".to_owned(), "tool".to_owned()))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("schema".to_owned(), json!("y".repeat(4_096)));
+        state.mark_replay_stable_payload_changed();
+        assert!(
+            !cache.matches(&state),
+            "a same-shape schema rewrite changes the revision"
+        );
+    }
+
+    #[test]
+    fn replay_capture_does_not_retain_complete_crlf_or_cr_comments() {
+        for (label, wire) in [
+            ("LF", &b": heartbeat\n\n"[..]),
+            ("CRLF", &b": heartbeat\r\n\r\n"[..]),
+            ("CR", &b": heartbeat\r\r"[..]),
+        ] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            let mut responses = ResponsesState::default();
+            responses.apply_retained_payload_limit(4_096);
+            ctx.extensions.insert(responses);
+            let filter =
+                ResponseStoreFilter::with_bounds(NonZeroU32::new(1_000).unwrap(), NonZeroU64::new(65_536).unwrap());
+            let chunk = Some(Bytes::copy_from_slice(wire));
+            for _ in 0..128 {
+                assert!(
+                    filter.capture_stream_events(&mut ctx, &chunk, false),
+                    "{label} comment frame"
+                );
+            }
+            assert_eq!(
+                ctx.extensions
+                    .get::<super::ResponseStoreRequestState>()
+                    .unwrap()
+                    .pending_wire_bytes,
+                0,
+                "{label} frame ends at an SSE record boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_pending_wire_tracker_pairs_crlf_across_chunks() {
+        let mut state = super::ResponseStoreRequestState::default();
+        state.track_pending_wire_bytes(b"data: x\r");
+        assert!(state.pending_wire_bytes > 0, "the data line is unfinished");
+        state.track_pending_wire_bytes(b"\n\r");
+        assert_eq!(state.pending_wire_bytes, 0, "a split CRLF and CR finish the record");
+        state.track_pending_wire_bytes(b"\n");
+        assert_eq!(
+            state.pending_wire_bytes, 0,
+            "the paired LF remains outside the next record"
+        );
+    }
+
+    #[test]
+    fn replay_meter_remeasures_same_shape_response_object_edits() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState::default();
+        responses.replace_response_object(json!({"output": [{"text": "small"}]}));
+        responses.apply_retained_payload_limit(8_192);
+        ctx.extensions.insert(responses);
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_000).unwrap(), NonZeroU64::new(65_536).unwrap());
+        let chunk = Some(Bytes::from_static(b": heartbeat\n\n"));
+        assert!(filter.capture_stream_events(&mut ctx, &chunk, false));
+        let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        responses
+            .output_items_mut()
+            .get_mut(0)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("text".to_owned(), json!("x".repeat(8_192)));
+        assert!(
+            !filter.capture_stream_events(&mut ctx, &chunk, false),
+            "a same-shape output-item rewrite must invalidate the exact response charge"
+        );
+    }
+
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -3088,5 +3281,90 @@ mod encode_replay_event_tests {
             !filter.capture_stream_events(&mut ctx, &frame, false),
             "a same-shape request rewrite must be measured before the next replay chunk"
         );
+    }
+
+    #[test]
+    fn store_completed_call_cache_invalidates_same_length_replacement() {
+        let mut state = ResponsesState::default();
+        state
+            .tool_calls
+            .push(json!({"type":"function_call", "arguments":"small"}));
+        state.mark_tool_calls_changed();
+        state.apply_retained_payload_limit(4_096);
+        let stable =
+            super::StoreStableCache::new(&state, state.stream_stable_payload_bytes_bounded(4_096).unwrap()).unwrap();
+        let mut response_charge = None;
+        let mut tool_calls_charge = None;
+        assert!(super::store_stream_budget_fits(
+            &state,
+            Some(stable),
+            &mut response_charge,
+            &mut tool_calls_charge,
+            0,
+            0
+        ));
+
+        state.tool_calls[0]["arguments"] = json!("x".repeat(4_096));
+        state.mark_tool_calls_changed();
+        assert!(
+            !super::store_stream_budget_fits(&state, Some(stable), &mut response_charge, &mut tool_calls_charge, 0, 0),
+            "the same vector length must not reuse a stale completed-call charge"
+        );
+        state.tool_calls[0]["arguments"] = json!("small");
+        state.mark_tool_calls_changed();
+        assert!(super::store_stream_budget_fits(
+            &state,
+            Some(stable),
+            &mut response_charge,
+            &mut tool_calls_charge,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "matched before/after Store budget-meter timing probe"
+    )]
+    fn store_completed_call_budget_checks_reuse_exact_charge() {
+        fn timed_checks(size: usize) -> std::time::Duration {
+            let mut state = ResponsesState::default();
+            state.apply_retained_payload_limit(64 * 1024 * 1024);
+            state
+                .tool_calls
+                .push(json!({"type":"function_call", "arguments":"x".repeat(size)}));
+            state.mark_tool_calls_changed();
+            let stable = super::StoreStableCache::new(
+                &state,
+                state.stream_stable_payload_bytes_bounded(64 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+            let mut response_charge = None;
+            let mut tool_calls_charge = None;
+            assert!(super::store_stream_budget_fits(
+                &state,
+                Some(stable),
+                &mut response_charge,
+                &mut tool_calls_charge,
+                0,
+                100
+            ));
+            let start = std::time::Instant::now();
+            for _ in 0..1_000 {
+                assert!(std::hint::black_box(super::store_stream_budget_fits(
+                    std::hint::black_box(&state),
+                    Some(stable),
+                    &mut response_charge,
+                    &mut tool_calls_charge,
+                    0,
+                    100
+                )));
+            }
+            start.elapsed()
+        }
+        let empty = timed_checks(0);
+        let completed_call = timed_checks(1_000_000);
+        eprintln!("1,000 Store budget checks: empty={empty:?}; 1MiB completed call={completed_call:?}");
     }
 }

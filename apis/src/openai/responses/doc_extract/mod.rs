@@ -60,11 +60,15 @@ use tracing::{debug, trace, warn};
 
 use self::{
     config::{DocExtractConfig, validate_config},
-    extract::{ExtractError, ExtractionBudget, extract_input_file},
+    extract::{ExtractError, ExtractionBudget, extract_input_file, parse_data_uri},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts_mut,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
+    body_limits::reject_rewritten_body_too_large,
+    bound_body_outcome,
+    content_parts::{content_parts, content_parts_mut, infer_mime_from_filename},
+    openai_responses_proxy::serialized_outbound_body_len,
+    state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 
@@ -160,6 +164,10 @@ impl HttpFilter for DocExtractFilter {
             return Ok(FilterAction::Release);
         };
 
+        if !document_parse_fits_budget(ctx, raw) {
+            return Ok(reject_retained_extraction_budget(ctx));
+        }
+
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
             Err(e) => {
@@ -192,7 +200,14 @@ fn extract_and_rewrite(
     body: &mut Option<Bytes>,
     mut parsed: serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
-    let max_bytes = filter.config.max_rewritten_body_bytes;
+    let Some(raw_len) = body.as_ref().map(Bytes::len) else {
+        return Ok(reject_retained_extraction_budget(ctx));
+    };
+    if extraction_budget_active(ctx)
+        && !projected_extraction_peak(ctx, &parsed, raw_len).is_some_and(|bytes| extraction_fits_budget(ctx, bytes))
+    {
+        return Ok(reject_retained_extraction_budget(ctx));
+    }
     let mut budget = ExtractionBudget::new(&filter.config);
 
     let count = match extract_current_input(&mut parsed, &mut budget) {
@@ -201,28 +216,207 @@ fn extract_and_rewrite(
     };
 
     if count == 0 {
-        trace!("no input_file parts to extract");
-        if let Err(e) = extract_state_history(ctx, &mut budget) {
-            return Ok(reject_extract_error(&e));
-        }
-        if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
-            return Ok(rejection);
-        }
-        return Ok(FilterAction::Continue);
+        return finish_history_only(ctx, &mut budget, raw_len, filter.config.max_rewritten_body_bytes);
     }
 
     debug!(count, "extracted input_file parts");
-    if let Some(rejection) = rewrite_body(body, &parsed, max_bytes, filter.name())? {
+    if let Some(rejection) = rewrite_body(body, &parsed, filter.config.max_rewritten_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
         return Ok(reject_extract_error(&e));
     }
-    if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
+    if !extraction_fits_budget(ctx, body.as_ref().map_or(0, Bytes::len)) {
+        return Ok(reject_retained_extraction_budget(ctx));
+    }
+    if let Some(rejection) = reject_oversized_state_body(ctx, filter.config.max_rewritten_body_bytes)? {
         return Ok(rejection);
     }
 
     Ok(FilterAction::Continue)
+}
+
+/// Complete a request whose current input was unchanged but whose rehydrated
+/// history may still contain inline documents.
+fn finish_history_only(
+    ctx: &mut HttpFilterContext<'_>,
+    budget: &mut ExtractionBudget,
+    raw_len: usize,
+    max_rewritten_body_bytes: usize,
+) -> Result<FilterAction, FilterError> {
+    trace!("no input_file parts to extract");
+    if let Err(error) = extract_state_history(ctx, budget) {
+        return Ok(reject_extract_error(&error));
+    }
+    if !extraction_fits_budget(ctx, raw_len) {
+        return Ok(reject_retained_extraction_budget(ctx));
+    }
+    if let Some(rejection) = reject_oversized_state_body(ctx, max_rewritten_body_bytes)? {
+        return Ok(rejection);
+    }
+    Ok(FilterAction::Continue)
+}
+
+/// The framework body and a second parsed tree coexist with shared state.
+fn document_parse_fits_budget(ctx: &mut HttpFilterContext<'_>, raw: &Bytes) -> bool {
+    if let Some(limit) = ctx
+        .extensions
+        .get::<AgenticBudgetPolicy>()
+        .map(|policy| policy.max_retained_bytes())
+        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        state.apply_retained_payload_limit(limit);
+    }
+    if !extraction_budget_active(ctx) {
+        return true;
+    }
+    raw.len()
+        .checked_add(buffered_parsed_json_bytes_upper_bound(raw).unwrap_or(usize::MAX))
+        .is_some_and(|bytes| extraction_fits_budget(ctx, bytes))
+}
+
+/// Shared limit can be published before `ResponsesState` exists on a direct
+/// request, or applied to state by an earlier request-body filter.
+fn extraction_budget_active(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+        .is_some()
+        || ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+}
+
+/// Check a filter-local owner against shared state or the pipeline policy.
+fn extraction_fits_budget(ctx: &HttpFilterContext<'_>, additional_bytes: usize) -> bool {
+    if let Some(state) = ctx.extensions.get::<ResponsesState>()
+        && state.retained_payload_limit().is_some()
+    {
+        return state.can_retain_payload(additional_bytes);
+    }
+    ctx.extensions
+        .get::<AgenticBudgetPolicy>()
+        .is_none_or(|policy| additional_bytes <= policy.max_retained_bytes())
+}
+
+/// Bound the simultaneous raw body, parsed tree, rewritten body, decoded text,
+/// and two independently owned history-tail copies before any file is decoded.
+/// Existing state owners are measured by `extraction_fits_budget` separately.
+fn projected_extraction_peak(ctx: &HttpFilterContext<'_>, parsed: &serde_json::Value, raw_len: usize) -> Option<usize> {
+    let parsed_bytes = retained_json_bytes(parsed)?;
+    let input = parsed.get("input").and_then(serde_json::Value::as_array);
+    let current = input.map_or_else(
+        || Some(ExtractionGrowth::default()),
+        |input| measure_extraction_growth(input),
+    )?;
+    let history = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map_or_else(|| Some(ExtractionGrowth::default()), history_extraction_growth)?;
+    let rewritten_bytes = if current.extractable {
+        parsed_bytes.checked_add(current.json_growth)?
+    } else {
+        0
+    };
+    let tail_copies = if current.extractable && ctx.extensions.get::<ResponsesState>().is_some() {
+        retained_json_values_bytes(input?)?
+            .checked_add(current.json_growth)?
+            .checked_mul(2)?
+    } else {
+        0
+    };
+    raw_len
+        .checked_add(parsed_bytes)?
+        .checked_add(rewritten_bytes)?
+        .checked_add(tail_copies)?
+        .checked_add(history.json_growth)?
+        .checked_add(current.largest_text.max(history.largest_text).checked_mul(2)?)
+}
+
+/// Project extraction only across history prefixes; current tails are replaced.
+fn history_extraction_growth(state: &ResponsesState) -> Option<ExtractionGrowth> {
+    let input_len = state.input.len();
+    let messages_end = state.messages.len().saturating_sub(input_len);
+    let persisted_end = state.persisted_messages.len().saturating_sub(input_len);
+    measure_extraction_growth(state.messages.get(..messages_end)?)?.combine(measure_extraction_growth(
+        state.persisted_messages.get(..persisted_end)?,
+    )?)
+}
+
+/// Growth beyond the already charged encoded part. JSON may escape one decoded
+/// input byte into six wire bytes (for example `\\u0000`).
+#[derive(Clone, Copy, Default)]
+struct ExtractionGrowth {
+    /// Maximum extra compact-JSON bytes after replacing encoded parts.
+    json_growth: usize,
+    /// Largest one-file decoded text, including its optional source label.
+    largest_text: usize,
+    /// Whether at least one text-safe inline file would be converted.
+    extractable: bool,
+}
+
+impl ExtractionGrowth {
+    /// Sum independent owners while retaining the largest transient decode.
+    fn combine(self, other: Self) -> Option<Self> {
+        Some(Self {
+            json_growth: self.json_growth.checked_add(other.json_growth)?,
+            largest_text: self.largest_text.max(other.largest_text),
+            extractable: self.extractable || other.extractable,
+        })
+    }
+}
+
+/// Project compact-JSON growth for text-safe inline files in these items.
+fn measure_extraction_growth(items: &[serde_json::Value]) -> Option<ExtractionGrowth> {
+    let mut growth = ExtractionGrowth::default();
+    for item in items {
+        let Some(parts) = content_parts(item) else {
+            continue;
+        };
+        for part in parts {
+            let Some(text_bound) = extractable_text_bound(part).ok()? else {
+                continue;
+            };
+            let new_part_bound = b"{\"type\":\"input_text\",\"text\":\"\"}"
+                .len()
+                .checked_add(text_bound.checked_mul(6)?)?;
+            let part_growth = new_part_bound.saturating_sub(retained_json_bytes(part)?);
+            growth.json_growth = growth.json_growth.checked_add(part_growth)?;
+            growth.largest_text = growth.largest_text.max(text_bound);
+            growth.extractable = true;
+        }
+    }
+    Some(growth)
+}
+
+/// Base64 decoding never yields more bytes than its encoded input. Include the
+/// optional source label that extraction prefixes to the decoded text.
+fn extractable_text_bound(part: &serde_json::Value) -> Result<Option<usize>, ()> {
+    if part.get("type").and_then(serde_json::Value::as_str) != Some("input_file") {
+        return Ok(None);
+    }
+    let Some(data) = part.get("file_data").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let filename = part.get("filename").and_then(serde_json::Value::as_str);
+    let mime = parse_data_uri(data)
+        .map(|uri| uri.mime)
+        .or_else(|| infer_mime_from_filename(filename))
+        .unwrap_or("application/octet-stream");
+    if !config::is_text_safe_mime(mime) {
+        return Ok(None);
+    }
+    let prefix = filename
+        .filter(|name| !name.is_empty())
+        .map_or(Some(0), |name| name.len().checked_add(11))
+        .ok_or(())?;
+    Ok(Some(data.len().checked_add(prefix).ok_or(())?))
+}
+
+/// Publish one terminal shared-budget error before another dispatch or store.
+fn reject_retained_extraction_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    super::budget_error::reject_request(
+        ctx,
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during document extraction",
+    )
 }
 
 /// Walk the current request input and extract text-safe `input_file` parts.

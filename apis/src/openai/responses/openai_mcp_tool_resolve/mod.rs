@@ -606,7 +606,7 @@ impl McpToolResolveFilter {
             start = end;
         }
 
-        collect_resolutions(entries, &entry_to_task, task_results)
+        collect_resolutions_with_budget(entries, &entry_to_task, task_results, budget)
     }
 
     /// Resolve tools for a single MCP entry independently.
@@ -992,6 +992,72 @@ fn eager_prepared_bytes(results: &[Option<Vec<serde_json::Value>>]) -> Option<us
     bytes
         .checked_mul(DEFERRED_LISTING_OWNER_RESERVATION)?
         .checked_add(tools.checked_mul(EAGER_TOOL_OVERHEAD_RESERVATION_BYTES)?)
+}
+
+/// Reserve entry metadata copied into every dispatch-map tool before building
+/// any of those maps. The fixed per-tool reserve above covers generated fields,
+/// but credentials and other entry values can be much larger than that floor.
+fn eager_dispatch_fanout_bytes(
+    entries: &[serde_json::Value],
+    entry_to_task: &[Option<usize>],
+    results: &[Option<Vec<serde_json::Value>>],
+) -> Result<usize, ResolveError> {
+    entries
+        .iter()
+        .zip(entry_to_task)
+        .try_fold(0_usize, |used, (entry, task)| {
+            let Some(tools) = task.and_then(|index| results.get(index)).and_then(Option::as_ref) else {
+                return Ok(used);
+            };
+            let allowed = extract_allowed_tools(entry)?;
+            let count = tools
+                .iter()
+                .filter(|tool| allowed.matches(tool) && tool.get("name").and_then(serde_json::Value::as_str).is_some())
+                .count();
+            if count == 0 {
+                return Ok(used);
+            }
+            let metadata = eager_entry_dispatch_metadata_bytes(entry).ok_or(ResolveError::RetainedBudget)?;
+            used.checked_add(metadata.checked_mul(count).ok_or(ResolveError::RetainedBudget)?)
+                .ok_or(ResolveError::RetainedBudget)
+        })
+}
+
+/// Dynamic strings and JSON values copied by `insert_tools` for each tool.
+fn eager_entry_dispatch_metadata_bytes(entry: &serde_json::Value) -> Option<usize> {
+    let label = server_label(entry).len();
+    let server_url = entry
+        .get("server_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .len();
+    ["headers", "authorization", "require_approval", "connector_id"]
+        .iter()
+        .try_fold(label.checked_mul(2)?.checked_add(server_url)?, |used, &field| {
+            used.checked_add(entry.get(field).map_or(Some(0), retained_json_bytes)?)
+        })
+}
+
+/// Keep the raw listings and prior request owners live in the same projection
+/// as dispatch metadata before `collect_resolutions` starts cloning entries.
+fn collect_resolutions_with_budget(
+    entries: &[serde_json::Value],
+    entry_to_task: &[Option<usize>],
+    task_results: Vec<Option<Vec<serde_json::Value>>>,
+    budget: Option<EagerListingBudget>,
+) -> Result<Resolution, ResolveError> {
+    if let Some(budget) = budget {
+        let prepared = eager_prepared_bytes(&task_results).ok_or(ResolveError::RetainedBudget)?;
+        let fanout = eager_dispatch_fanout_bytes(entries, entry_to_task, &task_results)?;
+        let peak = budget
+            .baseline
+            .checked_add(prepared)
+            .and_then(|bytes| bytes.checked_add(fanout));
+        if peak.is_none_or(|bytes| bytes > budget.limit) {
+            return Err(ResolveError::RetainedBudget);
+        }
+    }
+    collect_resolutions(entries, entry_to_task, task_results)
 }
 
 /// Admit the independently owned rewritten body, dispatch map, discovery
@@ -1654,7 +1720,7 @@ fn build_list_tools_failure_response(
     // into state here without a clone.
     ctx.extensions
         .get_or_insert_with(ResponsesState::default)
-        .response_object = response;
+        .replace_response_object(response);
 
     // Emit as a header-phase `TerminalResponse`, not a `Reject`. A terminal
     // response preserves downstream keepalive (this is a successful 200 transport
@@ -3445,6 +3511,19 @@ impl AllowedTools {
     fn as_names(&self) -> Option<&[String]> {
         self.names.as_deref()
     }
+
+    /// Apply the same name and read-only checks before and during filtering.
+    fn matches(&self, tool: &serde_json::Value) -> bool {
+        if let Some(names) = self.as_names()
+            && !tool
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| names.iter().any(|allowed| allowed == name))
+        {
+            return false;
+        }
+        self.read_only.is_none_or(|wanted| tool_read_only_hint(tool) == wanted)
+    }
 }
 
 /// Check `previous_tools` for a cached listing matching
@@ -3492,31 +3571,10 @@ fn find_cached_listing(
 
 /// Filter tools by name list and/or read-only annotation.
 fn apply_allowed_tools_filter(tools: Vec<serde_json::Value>, allowed: &AllowedTools) -> Vec<serde_json::Value> {
-    let names = allowed.as_names();
-    let read_only = allowed.read_only;
-
-    if names.is_none() && read_only.is_none() {
+    if allowed.names.is_none() && allowed.read_only.is_none() {
         return tools;
     }
-
-    tools
-        .into_iter()
-        .filter(|t| {
-            if let Some(list) = names {
-                let matches_name = t
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|n| list.iter().any(|a| a == n));
-                if !matches_name {
-                    return false;
-                }
-            }
-            if let Some(want_read_only) = read_only {
-                return tool_read_only_hint(t) == want_read_only;
-            }
-            true
-        })
-        .collect()
+    tools.into_iter().filter(|tool| allowed.matches(tool)).collect()
 }
 
 /// Return whether an MCP tool has `annotations.readOnlyHint`
