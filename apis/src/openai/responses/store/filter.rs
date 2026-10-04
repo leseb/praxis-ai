@@ -1261,9 +1261,10 @@ fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, bytes: &[
 /// Admit a noncanonical JSON body before core commits the upstream headers.
 /// Without the body we cannot inspect number tokens. The scanner above can
 /// add at most 21 bytes for each exponent token, whose shortest spelling is
-/// three bytes (`1e0`); all other JSON bytes have no larger expansion. Thus
-/// eight times a trusted wire length bounds the parsed JSON size. A missing or
-/// ambiguous length cannot establish the persistence peak before commitment.
+/// three bytes (`1e0`). It also reserves up to 24 bytes for `-0`, a two-byte
+/// token. Thus twelve times a trusted wire length bounds the same scanner's
+/// projection. A missing or ambiguous length cannot establish the persistence
+/// peak before commitment.
 fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     let response = ctx.response_header.as_ref()?;
     if response.headers.contains_key(http::header::TRANSFER_ENCODING)
@@ -1277,7 +1278,7 @@ fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usi
     if lengths.next().is_some() || wire_bytes > MAX_JSON_BODY_BYTES {
         return None;
     }
-    let parsed_bytes = wire_bytes.checked_mul(8)?;
+    let parsed_bytes = wire_bytes.checked_mul(12)?;
     // Core's multi-chunk BodyBuffer::freeze copies into a contiguous Bytes
     // while the original chunks are still owned by the buffer.
     let transient_wire_bytes = wire_bytes.checked_mul(2)?;
@@ -1991,10 +1992,18 @@ impl HttpFilter for ResponseStoreFilter {
             .get::<ResponsesState>()
             .and_then(ResponsesState::retained_payload_limit)
             .is_some();
-        let canonical_finalized = budgeted && super::super::buffered_canonical_completed(ctx);
+        let body_finalized = budgeted
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.buffered_canonical_finalized);
+        let canonical_finalized = body_finalized && super::super::buffered_canonical_completed(ctx);
         let canonical_completed = has_conversation(ctx) && canonical_finalized;
         if !is_streaming_request(ctx) && !canonical_completed {
-            let admitted_wire_length = if budgeted && !canonical_finalized {
+            // An IRR step has not committed its headers to the client; its
+            // buffered body can be measured before the outer response starts.
+            let direct_response = ctx.extensions.get::<praxis_filter::IterationState>().is_none();
+            let admitted_wire_length = if budgeted && !body_finalized && direct_response {
                 let Some(length) = buffered_header_persistence_length(ctx) else {
                     return Ok(persistence_budget_failure(ctx, false, &mut None));
                 };
@@ -2002,7 +2011,7 @@ impl HttpFilter for ResponseStoreFilter {
             } else {
                 None
             };
-            let max_bytes = if canonical_finalized {
+            let max_bytes = if body_finalized {
                 // The agentic loop already admitted and serialized this exact
                 // body. A previous-response restore may have selected a 64 MiB
                 // ceiling, but the ceiling itself owns no payload allocation.
@@ -2019,7 +2028,7 @@ impl HttpFilter for ResponseStoreFilter {
                 MAX_JSON_BODY_BYTES
             };
             if budgeted
-                && !canonical_finalized
+                && !body_finalized
                 && let BodyMode::StreamBuffer { max_bytes: existing } = &ctx.response_body_mode
                 && existing.is_none_or(|bytes| bytes > max_bytes)
             {
@@ -3897,6 +3906,41 @@ mod encode_replay_event_tests {
     }
 
     #[tokio::test]
+    async fn incomplete_canonical_body_needs_no_direct_content_length() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "false");
+        let mut state = ResponsesState {
+            response_object: json!({"id":"resp_incomplete", "status":"incomplete", "output":[]}),
+            ..ResponsesState::default()
+        };
+        state.apply_retained_payload_limit(16_384);
+        state.buffered_canonical_finalized = true;
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        let store_filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(100).unwrap(), NonZeroU64::new(1_000_000).unwrap());
+
+        assert!(matches!(
+            store_filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+    }
+
+    #[tokio::test]
     #[expect(
         clippy::too_many_lines,
         reason = "the complete response filter context is needed to test header admission"
@@ -3970,7 +4014,29 @@ mod encode_replay_event_tests {
     fn shortest_exponent_tokens_stay_within_header_json_bound() {
         let wire = format!("[{}]", vec!["1e0"; 4096].join(","));
         let parsed_bound = buffered_parsed_json_bytes_upper_bound(wire.as_bytes()).unwrap();
-        assert!(parsed_bound <= wire.len() * 8);
+        assert!(parsed_bound <= wire.len() * 12);
+    }
+
+    #[test]
+    fn negative_zero_header_bound_covers_body_scanner_before_commit() {
+        let wire = format!("[{}]", vec!["-0"; 4096].join(","));
+        let bytes = wire.as_bytes();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut state = ResponsesState::default();
+        let baseline = state.retained_payload_bytes().unwrap();
+        let eightfold = bytes.len() * 8;
+        let headroom = encoded_column_headroom(eightfold, 0, 0).unwrap();
+        state.apply_retained_payload_limit(baseline + eightfold * 6 + headroom + bytes.len() * 2);
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_LENGTH, bytes.len().to_string().parse().unwrap());
+        ctx.response_header = Some(&mut response);
+
+        assert!(!buffered_persistence_construction_fits(&ctx, bytes));
+        assert_eq!(super::buffered_header_persistence_length(&ctx), None);
     }
 
     #[cfg(feature = "openai-conversations")]

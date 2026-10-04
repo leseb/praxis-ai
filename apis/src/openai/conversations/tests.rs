@@ -4502,6 +4502,11 @@ async fn response_conditions_excluding_store_do_not_suppress_conversation_append
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    // Core-private IterationState is unavailable in this synthetic context;
+    // a bounded provider header keeps this test focused on round participation.
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, "512".parse().unwrap());
     ctx.response_header = Some(&mut response);
 
     // An intermediate IRR response did run Store. Its participation marker
@@ -6708,6 +6713,11 @@ async fn review_final_gate_must_not_revive_a_conversation_hook_skipped_this_roun
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    // Core-private IterationState is unavailable in this synthetic context;
+    // a bounded provider header keeps this test focused on round participation.
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, "512".parse().unwrap());
     ctx.response_header = Some(&mut response);
 
     // An intermediate IRR response did run Store. Its participation marker
