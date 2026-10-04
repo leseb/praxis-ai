@@ -1902,6 +1902,93 @@ async fn budgeted_canonical_restore_accepts_finalized_body_without_content_lengt
     let mut body = None;
     state.finalize_response_body(&mut body).unwrap();
     assert!(state.buffered_canonical_finalized);
+    let canonical_wire_bytes = state.buffered_canonical_wire_bytes.unwrap();
+    ctx.extensions.insert(state);
+    ctx.extensions
+        .insert(setup_registry(MockStore::with_status("resp_prev", "completed")));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        RehydrateFilter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let store_config = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: responses\nconversations_table: conversations\n",
+    )
+    .unwrap();
+    let store_filter = super::super::store::ResponseStoreFilter::from_config(&store_config).unwrap();
+    assert!(matches!(
+        store_filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        store_filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer { max_bytes: Some(max) } if max == canonical_wire_bytes
+    ));
+    assert!(matches!(
+        RehydrateFilter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        store_filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(restored["previous_response_id"], "resp_prev");
+}
+
+#[tokio::test]
+async fn finalized_restore_rejects_near_budget_before_headers() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(1 << 20);
+    state.response_object = json!({
+        "id": "resp_new", "object": "response", "status": "completed",
+        "previous_response_id": null, "output": [{"text": "x".repeat(1024)}],
+    });
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    let retained = state.retained_payload_bytes().unwrap();
+    let wire = state.buffered_canonical_wire_bytes.unwrap();
+    let parsed = state.buffered_canonical_parsed_bound_bytes.unwrap();
+    let header_peak = parsed * 5 + "resp_prev".len() * 12 + 128 + wire * 2;
+    state.apply_retained_payload_limit(retained + header_peak - 1);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    let action = RehydrateFilter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finalized_numeric_restore_header_admission_survives_body_phase() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(1 << 20);
+    state.response_object = json!({
+        "id": "resp_new", "object": "response", "status": "completed",
+        "previous_response_id": null, "output": [],
+        "created_at": 12345678901234567890_u64,
+    });
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    let retained = state.retained_payload_bytes().unwrap();
+    let wire = state.buffered_canonical_wire_bytes.unwrap();
+    let parsed = state.buffered_canonical_parsed_bound_bytes.unwrap();
+    assert!(parsed > wire, "numeric scanner must exceed the canonical wire length");
+    state.apply_retained_payload_limit(retained + parsed * 5 + "resp_prev".len() * 12 + 128 + wire * 2);
     ctx.extensions.insert(state);
     ctx.response_header = Some(&mut response);
 
@@ -1909,12 +1996,55 @@ async fn budgeted_canonical_restore_accepts_finalized_body_without_content_lengt
         RehydrateFilter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
+    assert!(matches_finalized_restore_admission(
+        &ctx,
+        body.as_deref().unwrap(),
+        "resp_prev"
+    ));
+    let mut changed = body.as_deref().unwrap().to_vec();
+    let id_start = changed.windows(8).position(|bytes| bytes == b"resp_new").unwrap();
+    changed[id_start] = b'R';
+    assert_eq!(changed.len(), body.as_ref().unwrap().len());
+    assert!(!matches_finalized_restore_admission(&ctx, &changed, "resp_prev"));
     assert!(matches!(
         RehydrateFilter.on_response_body(&mut ctx, &mut body, true).unwrap(),
         FilterAction::Continue
     ));
     let restored: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(restored["previous_response_id"], "resp_prev");
+}
+
+#[tokio::test]
+async fn finalized_store_rejects_near_budget_before_headers() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(setup_registry(MockStore::with_status("resp_prev", "completed")));
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(1 << 20);
+    state.response_object = json!({
+        "id": "resp_new", "object": "response", "status": "completed",
+        "previous_response_id": null, "output": [{"text": "x".repeat(1024)}],
+    });
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    let retained = state.retained_payload_bytes().unwrap();
+    let wire = state.buffered_canonical_wire_bytes.unwrap();
+    state.apply_retained_payload_limit(retained + wire * 2);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    let store_config = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: responses\nconversations_table: conversations\n",
+    )
+    .unwrap();
+    let store_filter = super::super::store::ResponseStoreFilter::from_config(&store_config).unwrap();
+
+    let action = store_filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]

@@ -613,6 +613,14 @@ pub(crate) struct ResponsesState {
     /// The loop already admitted and serialized this round's buffered body.
     pub(crate) buffered_canonical_finalized: bool,
 
+    /// Exact wire length of the serialized canonical body.
+    pub(crate) buffered_canonical_wire_bytes: Option<usize>,
+
+    /// Lexical upper bound for reparsing that same canonical wire body.
+    pub(crate) buffered_canonical_parsed_bound_bytes: Option<usize>,
+    /// Digest of the exact wire body admitted by the terminal finalizer.
+    pub(crate) buffered_canonical_body_digest: Option<[u8; 32]>,
+
     /// Prior streamed terminal response retained across request-side re-entry.
     ///
     /// `openai_stream_events` invalidates [`Self::response_object`] before the
@@ -956,6 +964,9 @@ impl Default for ResponsesState {
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             buffered_canonical_finalized: false,
+            buffered_canonical_wire_bytes: None,
+            buffered_canonical_parsed_bound_bytes: None,
+            buffered_canonical_body_digest: None,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
             tool_search_calls: Vec::new(),
@@ -1321,6 +1332,9 @@ impl ResponsesState {
         self.request_body = serde_json::json!({ "stream": streaming });
         self.response_object = serde_json::Value::Null;
         self.buffered_canonical_finalized = false;
+        self.buffered_canonical_wire_bytes = None;
+        self.buffered_canonical_parsed_bound_bytes = None;
+        self.buffered_canonical_body_digest = None;
         self.local_completion_response_template = serde_json::Value::Null;
         self.tool_choice = serde_json::Value::Null;
         self.tools.clear();
@@ -1492,6 +1506,10 @@ impl ResponsesState {
         reason = "in-place canonical response finalization with budget preflight"
     )]
     pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
+        self.buffered_canonical_finalized = false;
+        self.buffered_canonical_wire_bytes = None;
+        self.buffered_canonical_parsed_bound_bytes = None;
+        self.buffered_canonical_body_digest = None;
         if !self.response_object.is_object() {
             return Ok(());
         }
@@ -1571,9 +1589,19 @@ impl ResponsesState {
                 return Err(finalize_rejection("failed to encode final response"));
             },
         };
+        // The listener budget can be applied by an outer filter after this
+        // finalizer runs, so keep this evidence even when no local limit is set.
+        let Some(parsed_bound_bytes) = super::agentic_loop::buffered_parsed_json_bytes_upper_bound(&serialized) else {
+            self.discard_payload_for_budget_error();
+            return Err(finalize_rejection("failed to bound final response JSON"));
+        };
+        let body_digest = crate::hash::Sha256::digest(&serialized);
         self.response_object = response;
         *body = Some(Bytes::from(serialized));
         self.buffered_canonical_finalized = true;
+        self.buffered_canonical_wire_bytes = Some(serialized_bytes);
+        self.buffered_canonical_parsed_bound_bytes = Some(parsed_bound_bytes);
+        self.buffered_canonical_body_digest = Some(body_digest);
         Ok(())
     }
 

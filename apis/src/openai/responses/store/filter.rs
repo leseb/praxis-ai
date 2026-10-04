@@ -68,7 +68,7 @@ use super::{
         agentic_loop::AgenticBudgetPolicy,
         bound_body_outcome,
         error::responses_error_rejection,
-        rehydrate::DirectFiniteRestoreFraming,
+        rehydrate::{DirectFiniteRestoreFraming, FinalizedFiniteRestoreAdmission, FinalizedRestoredBodyDigest},
         state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
     },
     config::{ResponseStoreConfig, validate_config},
@@ -279,7 +279,26 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !persistence_construction_fits(ctx, bytes.len()) {
+        let header_admitted = ctx
+            .extensions
+            .get::<FinalizedPersistenceAdmission>()
+            .is_some_and(|admission| {
+                let expected_digest = if admission.rewritten {
+                    ctx.extensions
+                        .get::<FinalizedRestoredBodyDigest>()
+                        .map(|digest| digest.0)
+                } else {
+                    ctx.extensions
+                        .get::<ResponsesState>()
+                        .and_then(|state| state.buffered_canonical_body_digest)
+                };
+                ctx.extensions
+                    .get::<ResponsesState>()
+                    .is_some_and(|state| state.buffered_canonical_finalized)
+                    && bytes.len() <= admission.response_upper_bytes
+                    && expected_digest == Some(crate::hash::Sha256::digest(bytes))
+            });
+        if !header_admitted && !persistence_construction_fits(ctx, bytes.len()) {
             return Ok(persistence_budget_failure(ctx, false, body));
         }
 
@@ -795,6 +814,28 @@ fn persistence_construction_fits_with_wire(
         .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(wire_bytes));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// A canonical response admitted for persistence before client headers commit.
+struct FinalizedPersistenceAdmission {
+    response_upper_bytes: usize,
+    rewritten: bool,
+}
+
+fn finalized_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let wire_bytes = state.buffered_canonical_wire_bytes?;
+    let parsed_bound = state.buffered_canonical_parsed_bound_bytes?;
+    state.buffered_canonical_body_digest?;
+    let response_upper_bytes = ctx
+        .extensions
+        .get::<FinalizedFiniteRestoreAdmission>()
+        .map_or(parsed_bound, |admission| admission.response_upper_bytes);
+    // The canonical framework body can remain live beside the later
+    // StreamBuffer body while constructing the persistence record.
+    let transient_wire_bytes = wire_bytes.checked_mul(2)?.max(response_upper_bytes);
+    persistence_construction_fits_with_wire(ctx, response_upper_bytes, transient_wire_bytes)
+        .then_some(response_upper_bytes)
 }
 
 /// Admit direct finite persistence before headers commit using trusted framing.
@@ -1398,6 +1439,7 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.extensions.remove::<FinalizedPersistenceAdmission>();
         if let Some(limit) = ctx
             .extensions
             .get::<AgenticBudgetPolicy>()
@@ -1428,6 +1470,16 @@ impl HttpFilter for ResponseStoreFilter {
                 .extensions
                 .get::<ResponsesState>()
                 .is_some_and(|state| state.buffered_canonical_finalized);
+            if budgeted && finalized {
+                let Some(response_upper_bytes) = finalized_header_persistence_length(ctx) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                let rewritten = ctx.extensions.get::<FinalizedFiniteRestoreAdmission>().is_some();
+                ctx.extensions.insert(FinalizedPersistenceAdmission {
+                    response_upper_bytes,
+                    rewritten,
+                });
+            }
             let direct = ctx.extensions.get::<praxis_filter::IterationState>().is_none();
             let admitted_wire_length = if budgeted && !finalized && direct {
                 let Some(length) = buffered_header_persistence_length(ctx) else {
@@ -1437,7 +1489,12 @@ impl HttpFilter for ResponseStoreFilter {
             } else {
                 None
             };
-            let max_bytes = if budgeted && !finalized {
+            let max_bytes = if budgeted && finalized {
+                ctx.extensions
+                    .get::<ResponsesState>()
+                    .and_then(|state| state.buffered_canonical_wire_bytes)
+                    .unwrap_or(MAX_JSON_BODY_BYTES)
+            } else if budgeted && !finalized {
                 let Some(state) = ctx.extensions.get::<ResponsesState>() else {
                     return Ok(persistence_budget_failure(ctx, false, &mut None));
                 };

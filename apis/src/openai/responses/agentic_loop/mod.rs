@@ -842,6 +842,9 @@ fn end_stream_with_error(
 /// body pre-read, before request filters and routing inspect the headers.
 fn prepare_iteration(state: &mut ResponsesState) {
     state.buffered_canonical_finalized = false;
+    state.buffered_canonical_wire_bytes = None;
+    state.buffered_canonical_parsed_bound_bytes = None;
+    state.buffered_canonical_body_digest = None;
     state.tool_calls.clear();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();

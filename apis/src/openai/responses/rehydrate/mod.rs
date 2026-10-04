@@ -104,6 +104,18 @@ pub(super) struct DirectFiniteRestoreFraming {
     pub previous_id_bytes: usize,
 }
 
+/// Header admission for a canonical body already finalized by the agentic loop.
+/// The same body and ID are checked again before using this admission at EOS.
+pub(super) struct FinalizedFiniteRestoreAdmission {
+    pub wire_bytes: usize,
+    pub parsed_bound_bytes: usize,
+    pub previous_id_bytes: usize,
+    pub response_upper_bytes: usize,
+}
+
+/// The rewritten body handed to later response-body filters on this exchange.
+pub(super) struct FinalizedRestoredBodyDigest(pub [u8; 32]);
+
 /// Configuration for `openai_responses_rehydrate`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -298,6 +310,8 @@ impl HttpFilter for RehydrateFilter {
     )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         ctx.extensions.remove::<DirectFiniteRestoreFraming>();
+        ctx.extensions.remove::<FinalizedFiniteRestoreAdmission>();
+        ctx.extensions.remove::<FinalizedRestoredBodyDigest>();
         // A listener policy may precede the request-state owner in some
         // pipeline orders. Apply it here too before admitting a direct restore.
         if let Some(limit) = ctx
@@ -316,13 +330,32 @@ impl HttpFilter for RehydrateFilter {
         // The two shapes are mutually exclusive (content-type), so only one path
         // ever arms.
         if let Some(prev_id) = eligible_previous_response_id(ctx) {
+            let finalized_budgeted = ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.retained_payload_limit().is_some() && state.buffered_canonical_finalized);
+            let finalized_admission = if finalized_budgeted {
+                let Some(admission) = finalized_restore_admission(ctx, &prev_id) else {
+                    ctx.set_metadata("responses.skip_persist", "true");
+                    return Ok(FilterAction::Reject(responses_error_rejection(
+                        502,
+                        "server_error",
+                        RETAINED_RESTORE_OVERFLOW,
+                    )));
+                };
+                Some(admission)
+            } else {
+                None
+            };
             // An IRR step's upstream headers are still internal; a direct
             // response needs its finite body admitted before client headers.
             let direct_budgeted =
                 ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
                     state.retained_payload_limit().is_some() && !state.buffered_canonical_finalized
                 }) && ctx.extensions.get::<praxis_filter::IterationState>().is_none();
-            let max_bytes = if direct_budgeted {
+            let max_bytes = if let Some(admission) = &finalized_admission {
+                admission.wire_bytes
+            } else if direct_budgeted {
                 let Some(max_bytes) = finite_restore_header_length(ctx, &prev_id) else {
                     ctx.set_metadata("responses.skip_persist", "true");
                     return Ok(FilterAction::Reject(responses_error_rejection(
@@ -342,6 +375,9 @@ impl HttpFilter for RehydrateFilter {
                     wire_bytes: max_bytes,
                     previous_id_bytes,
                 });
+            }
+            if let Some(admission) = finalized_admission {
+                ctx.extensions.insert(admission);
             }
         } else {
             arm_streaming_restore(ctx);
@@ -430,6 +466,12 @@ impl HttpFilter for RehydrateFilter {
         }
 
         restore_previous_response_id(armed.previous_response_id, body);
+        if ctx.extensions.get::<FinalizedFiniteRestoreAdmission>().is_some()
+            && let Some(bytes) = body.as_ref()
+        {
+            ctx.extensions
+                .insert(FinalizedRestoredBodyDigest(crate::hash::Sha256::digest(bytes)));
+        }
         Ok(FilterAction::Continue)
     }
 }
@@ -448,6 +490,9 @@ fn finite_restore_fits(ctx: &HttpFilterContext<'_>, body: Option<&[u8]>, previou
     if state.retained_payload_limit().is_none() {
         return true;
     }
+    if body.is_some_and(|body| matches_finalized_restore_admission(ctx, body, previous_id)) {
+        return true;
+    }
     let Some(parsed_bytes) = body.and_then(super::agentic_loop::buffered_parsed_json_bytes_upper_bound) else {
         return false;
     };
@@ -459,6 +504,53 @@ fn finite_restore_fits(ctx: &HttpFilterContext<'_>, body: Option<&[u8]>, previou
         .and_then(|bytes| previous_id.len().checked_mul(12)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(128));
     peak.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+fn matches_finalized_restore_admission(ctx: &HttpFilterContext<'_>, body: &[u8], previous_id: &str) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return false;
+    };
+    let Some(admitted) = ctx.extensions.get::<FinalizedFiniteRestoreAdmission>() else {
+        return false;
+    };
+    state.buffered_canonical_finalized
+        && body.len() == admitted.wire_bytes
+        && previous_id.len() == admitted.previous_id_bytes
+        && state.buffered_canonical_body_digest == Some(crate::hash::Sha256::digest(body))
+        && super::agentic_loop::buffered_parsed_json_bytes_upper_bound(body)
+            .is_some_and(|bytes| bytes <= admitted.parsed_bound_bytes)
+}
+
+/// Use the exact finalized wire length and its numeric-normalization bound.
+/// Core can still own two wire buffers at the response hook, so include both.
+fn finalized_restore_admission(
+    ctx: &HttpFilterContext<'_>,
+    previous_id: &str,
+) -> Option<FinalizedFiniteRestoreAdmission> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let wire_bytes = state.buffered_canonical_wire_bytes?;
+    let parsed_bound_bytes = state.buffered_canonical_parsed_bound_bytes?;
+    state.buffered_canonical_body_digest?;
+    let previous_id_bytes = previous_id.len();
+    let response_upper_bytes = parsed_bound_bytes
+        .checked_add(previous_id_bytes.checked_mul(6)?)?
+        .checked_add(32)?;
+    if response_upper_bytes > MAX_JSON_BODY_BYTES {
+        return None;
+    }
+    let peak = parsed_bound_bytes
+        .checked_mul(5)?
+        .checked_add(previous_id_bytes.checked_mul(12)?)?
+        .checked_add(128)?
+        .checked_add(wire_bytes.checked_mul(2)?)?;
+    state
+        .can_retain_payload(peak)
+        .then_some(FinalizedFiniteRestoreAdmission {
+            wire_bytes,
+            parsed_bound_bytes,
+            previous_id_bytes,
+            response_upper_bytes,
+        })
 }
 
 /// Before direct-route headers commit, bound every finite restore owner using
