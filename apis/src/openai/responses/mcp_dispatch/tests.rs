@@ -2685,12 +2685,15 @@ async fn resume_approval_replay_is_rejected() {
     let req2 = make_request(http::Method::POST, "/v1/responses");
     let mut ctx2 = make_owned_filter_context(&req2);
     register_store(&mut ctx2, Arc::clone(&store));
-    ctx2.extensions.insert(ResponsesState {
+    let mut replay_state = ResponsesState {
         mcp_tool_map: approval_tool_map(),
         previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
         messages: vec![approval_response("call_1", true, None)],
         ..ResponsesState::default()
-    });
+    };
+    let baseline = replay_state.retained_payload_bytes().unwrap();
+    replay_state.apply_retained_payload_limit(baseline + 1_000_000);
+    ctx2.extensions.insert(replay_state);
     let mut body2 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx2, &mut body2, true).await.unwrap());
     assert_eq!(rejection.status, 400, "replay is a client error");
@@ -2701,6 +2704,15 @@ async fn resume_approval_replay_is_rejected() {
 
     let state = ctx2.extensions.get::<ResponsesState>().unwrap();
     assert!(state.tool_calls.is_empty(), "replay must not execute the tool again");
+    assert_eq!(
+        state.messages,
+        vec![approval_response("call_1", true, None)],
+        "replay must not remove the original approval control"
+    );
+    assert!(
+        state.persisted_messages.is_empty(),
+        "replay must not persist a decision"
+    );
     assert!(
         state.accumulated_output.is_empty(),
         "replay must produce no second mcp_call"
@@ -2760,6 +2772,11 @@ async fn resume_approval_deny_then_approve_is_rejected() {
     assert!(
         state2.tool_calls.is_empty(),
         "a denied-then-approved replay must not execute the tool"
+    );
+    assert_eq!(
+        state2.messages,
+        vec![approval_response("call_1", true, None)],
+        "a denied-then-approved replay must preserve the original control"
     );
     assert!(
         state2.accumulated_output.is_empty(),

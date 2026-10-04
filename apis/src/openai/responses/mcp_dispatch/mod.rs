@@ -597,25 +597,25 @@ impl McpDispatchFilter {
             return Ok(());
         }
 
-        // Phase 3: apply the decisions to request-scoped state, then preflight
-        // the executable calls before consuming their durable approval. A
-        // successful approval must remain retryable if the result minimum
-        // cannot fit the request-wide budget.
-        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
-            return Ok(());
-        };
-        // Approval responses are proxy-level control items: keep them in the
-        // persisted trace but strip them from backend-bound messages.
-        state.messages.retain(|m| !is_approval_response(m));
-        for decision in &resolved {
-            apply_decision(state, decision);
-        }
-
+        // Phase 3: preflight executable calls before consuming their durable
+        // approval. Stage the decisions only for the admission calculation,
+        // then remove them before the fallible claim. A replay or store error
+        // must leave request-scoped state unchanged.
         if aggregate_budget_armed && resolved.iter().any(|decision| decision.approve) {
-            let executable_fits = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            let executable_fits = ctx.extensions.get_mut::<ResponsesState>().is_some_and(|state| {
+                let original_calls = state.tool_calls.len();
+                let original_messages = state.messages.len();
+                let original_persisted = state.persisted_messages.len();
+                for decision in &resolved {
+                    apply_decision(state, decision);
+                }
                 let tool_index = McpToolIndex::new(&state.mcp_tool_map);
                 let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
-                aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes).is_some()
+                let fits = aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes).is_some();
+                state.tool_calls.truncate(original_calls);
+                state.messages.truncate(original_messages);
+                state.persisted_messages.truncate(original_persisted);
+                fits
             });
             if !executable_fits {
                 record_approval_budget_failure(ctx);
@@ -629,6 +629,15 @@ impl McpDispatchFilter {
         let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
         let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
         consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return Ok(());
+        };
+        // Approval responses are proxy-level control items: keep them in the
+        // persisted trace but strip them from backend-bound messages.
+        state.messages.retain(|m| !is_approval_response(m));
+        for decision in &resolved {
+            apply_decision(state, decision);
+        }
         Ok(())
     }
 }
@@ -649,9 +658,11 @@ fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]
         let owners = if decision.approve { 1 } else { 2 };
         used.checked_add(bytes?.checked_mul(owners)?)
     });
-    removed
-        .zip(added)
-        .is_some_and(|(removed, added)| state.can_replace_retained_payload(removed, added, 0))
+    removed.zip(added).is_some_and(|(removed, added)| {
+        // Admission temporarily stages decisions while the original
+        // approval controls remain live, then rolls back before claiming.
+        state.can_retain_payload(added) && state.can_replace_retained_payload(removed, added, 0)
+    })
 }
 
 /// Raw payload cloned while parsing client approval controls.
