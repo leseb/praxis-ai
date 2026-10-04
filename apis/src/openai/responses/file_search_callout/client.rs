@@ -611,15 +611,7 @@ impl FileSearchClient {
             );
             return batch;
         }
-        let per_response_limit = self.max_response_bytes.min(total_response_limit);
-        // A retained aggregate cap can tighten the total without changing the
-        // configured per-call ceiling. Only a tightened per-call ceiling makes
-        // `ResponseTooLarge` an aggregate-budget failure.
-        let retained_payload_controls_per_response_limit = retained_payload_controls_per_call(
-            self.max_response_bytes,
-            total_response_limit,
-            retained_payload_controls_limit,
-        );
+        let admission_per_response_limit = self.max_response_bytes.min(total_response_limit);
         let execution_timeout = transport
             .identity
             .deadline(execution_started, self.timeout)
@@ -629,24 +621,16 @@ impl FileSearchClient {
         // re-runs the private-IP check (literal targets bypass it), making the
         // `prepare_url_target` validation hook the sole runtime SSRF gate.
         let allow_private = transport.outbound.allow_private_upstreams();
-        // One executor drives the whole fan-out: `run` takes `&self`, so the
-        // concurrent sub-requests share a single transport and downstream
-        // projection. Outbound headers are identical across specs, so they are
-        // built once and cloned only at each owned `SubRequest` boundary.
-        let executor = FilteredSubrequestExecutor::for_callout(
-            self.subrequest_client.clone(),
-            transport.downstream.clone(),
-            0,
-            per_response_limit,
-            execution_timeout,
-        );
+        // Outbound headers are identical across specs, so build them once and
+        // clone only at each owned `SubRequest` boundary. Each chunk gets an
+        // executor whose body cap fits the remaining retained allowance.
         let outbound_headers = self.build_outbound_headers(request_headers);
         let admission = match self
             .acquire_execution_admission(
                 specs.len(),
                 execution_started,
                 execution_timeout,
-                per_response_limit,
+                admission_per_response_limit,
                 total_response_limit,
             )
             .await
@@ -666,8 +650,18 @@ impl FileSearchClient {
                 break;
             }
 
-            let chunk_len =
-                self.reserved_chunk_len(consumed_response_bytes, specs.len() - next_spec, total_response_limit);
+            let remaining_bytes = total_response_limit.saturating_sub(consumed_response_bytes);
+            let per_response_limit = if retained_payload_controls_limit {
+                self.max_response_bytes.min(remaining_bytes)
+            } else {
+                admission_per_response_limit
+            };
+            let chunk_len = self.reserved_chunk_len(
+                consumed_response_bytes,
+                specs.len() - next_spec,
+                total_response_limit,
+                retained_payload_controls_limit,
+            );
             if chunk_len == 0 {
                 if let Some(remaining_specs) = specs.get(next_spec..) {
                     append_budget_failures(
@@ -683,6 +677,21 @@ impl FileSearchClient {
             let Some(chunk) = specs.get(next_spec..next_spec.saturating_add(chunk_len)) else {
                 break;
             };
+            let retained_payload_controls_per_response_limit = retained_payload_controls_per_call(
+                self.max_response_bytes,
+                per_response_limit,
+                retained_payload_controls_limit,
+            );
+            // All callouts in this chunk share one executor and its bounded
+            // response cap. A later retained-budget chunk can use a smaller
+            // cap after earlier successful bodies consume some allowance.
+            let executor = FilteredSubrequestExecutor::for_callout(
+                self.subrequest_client.clone(),
+                transport.downstream.clone(),
+                0,
+                per_response_limit,
+                execution_timeout,
+            );
             let futures = chunk.iter().map(|spec| {
                 self.search_one(
                     spec,
@@ -1028,12 +1037,23 @@ impl FileSearchClient {
     }
 
     /// Calculate a chunk whose worst-case bodies fit the remaining budget.
-    fn reserved_chunk_len(&self, consumed_bytes: usize, remaining_specs: usize, total_limit: usize) -> usize {
+    fn reserved_chunk_len(
+        &self,
+        consumed_bytes: usize,
+        remaining_specs: usize,
+        total_limit: usize,
+        retained_payload_controls_limit: bool,
+    ) -> usize {
         let remaining_bytes = total_limit.saturating_sub(consumed_bytes);
-        if remaining_bytes == 0 {
+        if remaining_bytes == 0 || self.max_response_bytes == 0 {
             return 0;
         }
-        let reserved = if total_limit < self.max_response_bytes {
+        let reserved = if retained_payload_controls_limit {
+            // Once a retained cap controls the aggregate, run another store
+            // sequentially against the unspent bytes rather than failing it
+            // just because the configured per-call ceiling is larger.
+            remaining_bytes / self.max_response_bytes.min(remaining_bytes)
+        } else if total_limit < self.max_response_bytes {
             usize::from(consumed_bytes == 0)
         } else {
             remaining_bytes / self.max_response_bytes
