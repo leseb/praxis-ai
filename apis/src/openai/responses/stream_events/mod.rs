@@ -149,12 +149,17 @@ pub(super) struct StreamEventsState {
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
     stream_failed: bool,
-    /// The immutable request and history charge for this upstream round.
-    /// Initialized on the first response chunk, after all request filters ran.
+    /// Request and history charge cached across ordinary upstream chunks.
+    /// Refreshed at EOS after the loop owner may append the round to history.
     shared_stable_bytes: OnceLock<usize>,
 }
 
 impl StreamEventsState {
+    /// The owner can append history between ordinary chunks and EOS.
+    fn clear_shared_budget_cache(&mut self) {
+        self.shared_stable_bytes = OnceLock::new();
+    }
+
     /// Raw parser, argument, deferred-terminal, and local suppression payload
     /// retained outside [`ResponsesState`].
     fn retained_payload_bytes(&self) -> Option<usize> {
@@ -188,11 +193,19 @@ impl StreamEventsState {
     }
 }
 
-/// Return filter-local retained payload so the agentic loop can include parser
-/// state when admitting an initial request or another inference round.
-pub(crate) fn retained_stream_payload_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    ctx.get_filter_state::<StreamEventsState>()
-        .map_or(Some(0), StreamEventsState::retained_payload_bytes)
+/// Publish this filter's payload through request-shared state. The agentic
+/// filter has another filter ID and cannot read this parser's local slot.
+fn publish_stream_payload(ctx: &mut HttpFilterContext<'_>, parser: &StreamEventsState) -> bool {
+    let Some(bytes) = parser.retained_payload_bytes() else {
+        return false;
+    };
+    if !stream_payload_fits(ctx, parser, 0) {
+        return false;
+    }
+    if let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() {
+        responses.retained_stream_parser_bytes = bytes;
+    }
+    true
 }
 
 /// Composes the current IRR execution into one logical Responses stream.
@@ -307,6 +320,9 @@ impl OpenaiStreamEventsFilter {
             }
             (state.iteration, output_index_offset)
         });
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.retained_stream_parser_bytes = 0;
+        }
         ctx.insert_filter_state(self.new_round_state(iteration, output_index_offset));
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
@@ -551,7 +567,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
             return Ok(FilterAction::Continue);
         }
 
-        process_chunk(ctx, body);
+        process_chunk(ctx, body, end_of_stream);
 
         if end_of_stream {
             record_idle_transport_timeout(ctx);
@@ -630,7 +646,7 @@ fn publish_idle_timeout_if_incomplete(ctx: &mut HttpFilterContext<'_>) {
 }
 
 /// Parse SSE frames, accumulating state and optionally normalizing output.
-fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
     let Some(bytes) = body.as_ref() else {
         return;
     };
@@ -638,6 +654,10 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
     };
+
+    if end_of_stream {
+        state.clear_shared_budget_cache();
+    }
 
     // Aggregate overflow is terminal for the logical stream. Suppress every
     // later upstream frame without reparsing it so the first bounded budget
@@ -661,6 +681,11 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
         state.stream_failed = true;
     }
     handle_parse_result(ctx, body, &state, parsed);
+
+    if !publish_stream_payload(ctx, &state) {
+        *body = None;
+        record_retained_payload_overflow(ctx, &mut state);
+    }
 
     if let Some(deadline) = stream_deadline_at(&state) {
         recap_stream_deadline(ctx, deadline);
@@ -1130,6 +1155,7 @@ fn record_retained_payload_overflow(ctx: &mut HttpFilterContext<'_>, state: &mut
     if let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() {
         responses.discard_payload_for_budget_error();
         responses.deferred_stream_done = false;
+        responses.retained_stream_parser_bytes = 0;
     }
     state.tool_call_args.clear();
     state.rejected_tool_call_args.clear();
@@ -2766,6 +2792,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.provider_streamed_terminal_ids.clear();
     }
+    parser_state.clear_shared_budget_cache();
     if !stream_payload_fits(ctx, &parser_state, output.len()) {
         output.clear();
         record_retained_payload_overflow(ctx, &mut parser_state);
@@ -2791,6 +2818,11 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     let continues = logical_stream_continues(ctx); // re-read AFTER drain + arm-stop: a
     // (b)-site failure or the arm-stop above flips the owner action=done.
     finalize_emit_terminal(ctx, &mut parser_state, &mut output, continues);
+    if !publish_stream_payload(ctx, &parser_state) {
+        output.clear();
+        record_retained_payload_overflow(ctx, &mut parser_state);
+        finalize_emit_terminal(ctx, &mut parser_state, &mut output, false);
+    }
     *body = (!output.is_empty()).then(|| Bytes::from(output));
     ctx.insert_filter_state(parser_state);
 }

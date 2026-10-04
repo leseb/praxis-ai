@@ -83,6 +83,62 @@ fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
     OpenaiStreamEventsFilter::build(&yaml).unwrap()
 }
 
+#[tokio::test]
+async fn parser_payload_is_visible_to_a_different_agentic_filter_id() {
+    let (stream_filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState {
+        request_body: json!({"model": "m", "input": "hello", "stream": true}),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(64 * 1024);
+    ctx.extensions.insert(responses);
+    let mut partial = Some(Bytes::from(format!("data: {}", "x".repeat(5_000))));
+    stream_filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
+    let parser_bytes = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_stream_parser_bytes;
+    assert!(parser_bytes >= 5_000, "unfinished frame must be published");
+
+    ctx.current_filter_id = Some(1);
+    assert!(ctx.get_filter_state::<StreamEventsState>().is_none());
+    let agentic = crate::openai::responses::agentic_loop::AgenticLoopFilter::from_config(
+        &serde_yaml::from_str("max_retained_bytes: 4096").unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        agentic.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(_)
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn eos_remeasures_history_appended_after_first_stream_chunk() {
+    let (filter, mut ctx) = make_armed_context();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + 2_000);
+    ctx.extensions.insert(responses);
+    assert!(super::shared_retained_budget(&ctx, &stream).unwrap().1.is_some());
+    ctx.insert_filter_state(stream);
+
+    let item = json!({"type": "reasoning", "id": "rs_eos", "summary": "x".repeat(3_000)});
+    let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    responses.messages.push(item.clone());
+    responses.persisted_messages.push(item);
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+}
+
 /// Build a context and arm the filter as the IRR runner plus `on_request`
 /// would inside a step.
 ///

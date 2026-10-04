@@ -343,6 +343,11 @@ pub(crate) struct ResponsesState {
     /// The loop owner refreshes this before initial admission.
     pub(crate) retained_external_payload_bytes: usize,
 
+    /// Parser buffers published by `openai_stream_events`. Its filter-local
+    /// slot is invisible to other filters, so the request-wide meter owns this
+    /// charge between stream callbacks.
+    pub(crate) retained_stream_parser_bytes: usize,
+
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
 
@@ -901,6 +906,7 @@ impl Default for ResponsesState {
         Self {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
+            retained_stream_parser_bytes: 0,
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -1031,7 +1037,9 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, false)
+        let remaining = max_bytes.checked_sub(self.retained_stream_parser_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, false)?
+            .checked_add(self.retained_stream_parser_bytes)
     }
 
     /// Request and history owners cannot change while one upstream stream is
@@ -1048,6 +1056,9 @@ impl ResponsesState {
             &self.tools,
         ] {
             meter.json_values(values)?;
+        }
+        for id in &self.provider_compaction_ids {
+            meter.raw(id.len())?;
         }
         Some(meter.used())
     }
@@ -1096,6 +1107,9 @@ impl ResponsesState {
                 &self.tools,
             ] {
                 meter.json_values(values)?;
+            }
+            for id in &self.provider_compaction_ids {
+                meter.raw(id.len())?;
             }
         }
         for value in [
@@ -1301,6 +1315,8 @@ impl ResponsesState {
         self.emitted_output_items.clear();
         self.locally_executed_output_items.clear();
         self.provider_streamed_terminal_ids.clear();
+        self.provider_compaction_ids.clear();
+        self.retained_stream_parser_bytes = 0;
         self.dispatch_failure = None;
     }
 
@@ -1863,6 +1879,28 @@ mod tests {
             bytes * 4,
             "each of the four owned JSON copies contributes its bytes"
         );
+    }
+
+    #[test]
+    fn retained_payload_counts_and_releases_provider_compaction_ids() {
+        let id = "c".repeat(8_192);
+        let mut state = ResponsesState::from_request_body(json!({
+            "input": [{"type": "compaction", "id": &id, "encrypted_content": "opaque"}]
+        }));
+        let with_id = state.retained_payload_bytes().unwrap();
+        let stable_with_id = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        state.provider_compaction_ids.clear();
+        assert_eq!(with_id - state.retained_payload_bytes().unwrap(), id.len());
+        assert_eq!(
+            stable_with_id - state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap(),
+            id.len()
+        );
+
+        state.provider_compaction_ids.insert(id);
+        state.apply_retained_payload_limit(with_id - 1);
+        assert!(!state.can_retain_payload(0));
+        state.discard_payload_for_budget_error();
+        assert!(state.provider_compaction_ids.is_empty());
     }
 
     #[cfg(feature = "store")]
