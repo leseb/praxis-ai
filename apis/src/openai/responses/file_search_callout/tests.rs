@@ -417,6 +417,89 @@ fn aggregate_limit_rejects_before_file_search_formatting() {
 }
 
 #[test]
+fn aggregate_limit_preflights_joined_query_and_bridge_arguments() {
+    let query = "q".repeat(1_024);
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({
+            "type": "file_search_call",
+            "id": "fs-1",
+            "status": "searching",
+            "queries": [query],
+        })],
+    );
+    let assignments = state.drain_file_search_assignments();
+    let plan = build_search_plan(&state, &assignments);
+    let batch = SearchBatch::new(plan.calls.len());
+    let baseline = state.retained_payload_bytes().unwrap()
+        + plan.retained_payload_bytes().unwrap()
+        + batch.staging_bytes().unwrap();
+
+    // The old model-only projection admitted this 2,200-byte remainder,
+    // then allocated the joined query and bridge arguments before checking
+    // whether their serialized form fit the smaller model allowance.
+    state.apply_retained_payload_limit(baseline + 2_200);
+    assert!(reserve_file_search_formatting(&state, &plan, &batch, false).is_err());
+
+    let failure =
+        FileSearchCalloutFilter::apply_batch(&mut state, &assignments, &plan, &batch, 0, usize::MAX).unwrap_err();
+    assert_eq!(failure.status, 502);
+    assert!(state.retained_payload_failed);
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.messages.is_empty());
+}
+
+#[test]
+fn aggregate_limit_admits_joined_query_at_default_budget() {
+    let query = "q".repeat(1_024);
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({
+            "type": "file_search_call",
+            "id": "fs-1",
+            "status": "searching",
+            "queries": [query],
+        })],
+    );
+    let assignments = state.drain_file_search_assignments();
+    let plan = build_search_plan(&state, &assignments);
+    let batch = SearchBatch::new(plan.calls.len());
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+
+    assert!(reserve_file_search_formatting(&state, &plan, &batch, false).is_ok());
+    FileSearchCalloutFilter::apply_batch(&mut state, &assignments, &plan, &batch, 0, usize::MAX).unwrap();
+    assert!(!state.retained_payload_failed);
+}
+
+#[test]
+fn formatter_query_reservation_covers_sixfold_json_escaping() {
+    let query = "\0".repeat(1_024);
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({
+            "type": "file_search_call",
+            "id": "fs-1",
+            "status": "searching",
+            "queries": [query],
+        })],
+    );
+    let assignments = state.drain_file_search_assignments();
+    let plan = build_search_plan(&state, &assignments);
+    let batch = SearchBatch::new(plan.calls.len());
+    let joined_size = joined_query_size(&plan.calls[0].queries).0;
+    let bridge = model_context_messages("fs-1", 0, FNV_OFFSET_BASIS, &query, "");
+    let arguments = bridge[0]["arguments"].as_str().unwrap();
+    assert!(arguments.len() >= joined_size * 6);
+    assert!(joined_size * 8 + QUERY_FORMATTING_FIXED_BYTES >= joined_size * 2 + arguments.len());
+
+    let baseline = state.retained_payload_bytes().unwrap()
+        + plan.retained_payload_bytes().unwrap()
+        + batch.staging_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + joined_size * 8 + QUERY_FORMATTING_FIXED_BYTES - 1);
+    assert!(reserve_file_search_formatting(&state, &plan, &batch, false).is_err());
+}
+
+#[test]
 fn bridge_budget_retains_ascii_context_near_the_execution_cap() {
     let result = SearchResult {
         attributes: None,
@@ -521,6 +604,7 @@ fn model_facing_query_join_is_bounded() {
     assert!(truncated);
     assert_eq!(joined.len(), 40_000);
     assert!(joined.len() <= MAX_QUERY_BYTES);
+    assert_eq!(joined_query_size(&queries), (joined.len(), true));
 }
 
 #[test]
