@@ -1301,13 +1301,20 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
             {
                 4
             },
-            Some("reasoning" | "web_search_call") => 3,
+            Some("reasoning" | "web_search_call" | "compaction") => 3,
             Some("file_search_call") => 2,
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
+        // A provider compaction item also copies its ID into the replay set.
+        let replay_id_bytes = if item.get("type").and_then(Value::as_str) == Some("compaction") {
+            item.get("id").and_then(Value::as_str).map_or(0, str::len)
+        } else {
+            0
+        };
         let Some(total) = bytes
             .checked_mul(copies)
+            .and_then(|bytes| bytes.checked_add(replay_id_bytes))
             .and_then(|bytes| copied_item_bytes.checked_add(bytes))
         else {
             return false;
@@ -1758,12 +1765,21 @@ fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
             return false;
         };
         let copies = match item.get("type").and_then(Value::as_str) {
-            Some("function_call" | "reasoning" | "web_search_call") => 3,
+            Some("function_call" | "reasoning" | "web_search_call" | "compaction") => 3,
             Some("file_search_call") => 2,
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
-        let Some(total) = bytes.checked_mul(copies).and_then(|bytes| added.checked_add(bytes)) else {
+        let replay_id_bytes = if item.get("type").and_then(Value::as_str) == Some("compaction") {
+            item.get("id").and_then(Value::as_str).map_or(0, str::len)
+        } else {
+            0
+        };
+        let Some(total) = bytes
+            .checked_mul(copies)
+            .and_then(|bytes| bytes.checked_add(replay_id_bytes))
+            .and_then(|bytes| added.checked_add(bytes))
+        else {
             return false;
         };
         added = total;

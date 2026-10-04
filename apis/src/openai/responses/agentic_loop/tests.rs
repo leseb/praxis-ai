@@ -2959,6 +2959,74 @@ fn appends_streamed_provider_compaction_to_replay_state() {
     assert_eq!(state.accumulated_output[0]["id"], "cmp_streamed");
 }
 
+fn large_provider_compaction_response() -> Value {
+    json!({
+        "object": "response",
+        "output": [{"type": "compaction", "id": "cmp_1", "encrypted_content": "x".repeat(4_096)}]
+    })
+}
+
+#[test]
+fn buffered_compaction_preflights_all_replay_owners() {
+    let response = large_provider_compaction_response();
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut limited = ResponsesState::default();
+    limited.apply_retained_payload_limit(10_000);
+    assert!(
+        super::extract_tool_calls_from_body(&body, &mut limited).is_err(),
+        "buffered compaction must reject before cloning all replay owners"
+    );
+    assert!(
+        limited.accumulated_output.is_empty(),
+        "rejected output must not enter replay state"
+    );
+
+    let mut admitted = ResponsesState::default();
+    admitted.apply_retained_payload_limit(20_000);
+    super::extract_tool_calls_from_body(&body, &mut admitted).unwrap();
+    assert!(
+        admitted.retained_payload_bytes().unwrap() <= 20_000,
+        "admitted buffered state must fit its limit"
+    );
+    assert!(
+        admitted.provider_compaction_ids.contains("cmp_1"),
+        "compaction ID must remain replayable"
+    );
+}
+
+#[test]
+fn streamed_compaction_preflights_all_replay_owners() {
+    let response = large_provider_compaction_response();
+    let mut limited = ResponsesState {
+        response_object: response.clone(),
+        ..ResponsesState::default()
+    };
+    limited.apply_retained_payload_limit(10_000);
+    assert!(
+        super::collect_streaming_output_items(&mut limited).is_err(),
+        "streamed compaction must reject before cloning all replay owners"
+    );
+    assert!(
+        limited.retained_payload_failed,
+        "over-budget streamed state must fail closed"
+    );
+
+    let mut admitted = ResponsesState {
+        response_object: response,
+        ..ResponsesState::default()
+    };
+    admitted.apply_retained_payload_limit(20_000);
+    super::collect_streaming_output_items(&mut admitted).unwrap();
+    assert!(
+        admitted.retained_payload_bytes().unwrap() <= 20_000,
+        "admitted streamed state must fit its limit"
+    );
+    assert!(
+        admitted.provider_compaction_ids.contains("cmp_1"),
+        "compaction ID must remain replayable"
+    );
+}
+
 /// Regression (#955): the sole owner stamps a stable synthetic id on every
 /// id-less output item before accumulation, so the public response never ships an
 /// item without an id. A private `function_call(name=file_search)` that arrives
