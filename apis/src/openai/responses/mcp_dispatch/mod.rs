@@ -597,14 +597,10 @@ impl McpDispatchFilter {
             return Ok(());
         }
 
-        // Phase 3: atomically claim single-use consumption for the whole batch.
-        // Every id here has a pending row, so a failed transition means the
-        // approval was already consumed (replay) rather than never issued.
-        let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
-        let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
-        consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
-
-        // Phase 4: apply the decisions to request-scoped state.
+        // Phase 3: apply the decisions to request-scoped state, then preflight
+        // the executable calls before consuming their durable approval. A
+        // successful approval must remain retryable if the result minimum
+        // cannot fit the request-wide budget.
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(());
         };
@@ -614,6 +610,25 @@ impl McpDispatchFilter {
         for decision in &resolved {
             apply_decision(state, decision);
         }
+
+        if aggregate_budget_armed && resolved.iter().any(|decision| decision.approve) {
+            let executable_fits = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+                let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+                let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+                aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes).is_some()
+            });
+            if !executable_fits {
+                record_approval_budget_failure(ctx);
+                return Ok(());
+            }
+        }
+
+        // Phase 4: atomically claim single-use consumption for the whole batch.
+        // Every id here has a pending row, so a failed transition means the
+        // approval was already consumed (replay) rather than never issued.
+        let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
+        let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
+        consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
         Ok(())
     }
 }

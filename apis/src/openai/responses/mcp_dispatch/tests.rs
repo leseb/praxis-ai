@@ -3688,3 +3688,53 @@ fn extract_approval_responses_filters_only_responses() {
     assert_eq!(responses.len(), 2);
     assert!(responses.iter().copied().all(is_approval_response));
 }
+
+#[tokio::test]
+async fn execution_budget_failure_keeps_approval_available_for_retry() {
+    let filter = McpDispatchFilter {
+        pool_namespace: super::mcp_client::McpPoolNamespace::new(),
+        user_credential_slot: None,
+        authorization_assertion_slot: None,
+        outbound_pipeline: super::mcp_client::build_bare_outbound_pipeline(false).unwrap(),
+        forward_headers: vec![],
+        timeout: std::time::Duration::from_secs(1),
+        max_calls_per_round: 32,
+        max_parallel_calls: 8,
+        max_result_bytes: TEST_MAX_RESULT_BYTES,
+        max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+    };
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+
+    let mut state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_1", true, None)],
+        request_body: json!({"padding": "x".repeat(4096)}),
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 2000);
+    ctx.extensions.insert(state);
+
+    filter.resume_approvals(&mut ctx).await.unwrap();
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed, "result admission fails before a callout");
+    assert!(
+        state.tool_calls.is_empty(),
+        "failed request cannot execute the approved call"
+    );
+
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    assert_eq!(
+        store
+            .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_1"], 2000)
+            .await
+            .unwrap(),
+        None,
+        "the pending approval remains available to a corrected retry"
+    );
+}
