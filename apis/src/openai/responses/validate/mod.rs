@@ -180,6 +180,12 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
             #[cfg(feature = "openai-mcp-tools")]
             if let Some(pool) = ctx.extensions.remove::<crate::mcp_client::McpSessionPool>() {
                 pool.drain_in_background();
+                if let Some(state) = ctx.extensions.get_mut::<super::state::ResponsesState>() {
+                    // Every parked owner moved into the live closing registry.
+                    // The last response filters must not count both forms.
+                    state.retained_mcp_session_bytes = 0;
+                    state.retained_mcp_closing_pool = Some(pool);
+                }
             }
         }
         Ok(FilterAction::Continue)
@@ -367,10 +373,23 @@ mod tests {
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
         ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
+        let mut state = ResponsesState {
+            retained_mcp_session_bytes: 1_024,
+            ..ResponsesState::default()
+        };
+        state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 16);
+        assert!(!state.can_retain_payload(32));
+        ctx.extensions.insert(state);
 
         let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
 
         assert!(matches!(action, FilterAction::Continue));
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert!(
+            state.can_retain_payload(32),
+            "drained parked sessions must not remain charged twice"
+        );
+        assert!(state.retained_mcp_closing_pool.is_some());
         assert!(
             ctx.extensions.get::<crate::mcp_client::McpSessionPool>().is_none(),
             "the outer response-body EOS hook must not leave live session ownership in request extensions"
