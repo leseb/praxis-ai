@@ -2339,7 +2339,74 @@ async fn direct_stream_restore_error_follows_forwarded_provider_sequences() {
 }
 
 #[tokio::test]
-async fn rejected_chunk_does_not_count_complete_frames_it_never_forwarded() {
+async fn direct_stream_restore_overflow_after_forwarded_terminal_tears_down_transport() {
+    for terminal in [
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+        "response.cancelled",
+        "error",
+    ] {
+        let filter = default_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut response = sse_ok_response();
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.current_filter_id = Some(0);
+        let mut state = rehydrated_state("resp_prev");
+        state.request_body["stream"] = json!(true);
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(baseline + 4_096);
+        ctx.extensions.insert(state);
+        ctx.response_header = Some(&mut response);
+        assert!(matches!(
+            filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+
+        let frame = format!(
+            "event: {terminal}\ndata: {}\n\n",
+            json!({
+                "type": terminal,
+                "sequence_number": 7,
+                "response": {"id": "resp_new", "object": "response", "previous_response_id": null}
+            })
+        );
+        let mut body = Some(Bytes::from(frame));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        let forwarded = parse_sse_frames(body.as_ref().expect("terminal frame is forwarded"));
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].event_type.as_deref(), Some(terminal));
+
+        let admitted_comment = Bytes::from_static(b": keepalive\n\n");
+        let mut body = Some(admitted_comment.clone());
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert_eq!(
+            body,
+            Some(admitted_comment),
+            "{terminal}: a small trailing comment stays on the wire"
+        );
+
+        // A trailing comment is permitted by SSE framing, but this chunk is too
+        // large for the retained payload budget. No second terminal can follow.
+        let mut later = Some(Bytes::from(format!(":{}", "x".repeat(8_000))));
+        assert!(
+            filter.on_response_body(&mut ctx, &mut later, false).is_err(),
+            "{terminal}: overflow after the forwarded terminal must tear down the transport"
+        );
+        assert!(later.is_none(), "{terminal}: no budget error may enter the body");
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    }
+}
+
+#[tokio::test]
+async fn rejected_chunk_does_not_count_terminal_or_sequence_it_never_forwarded() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut response = sse_ok_response();
@@ -2359,7 +2426,7 @@ async fn rejected_chunk_does_not_count_complete_frames_it_never_forwarded() {
     // The first frame is complete, but the second is an oversized partial.
     // Admission rejects the whole chunk, so neither provider frame is sent.
     let chunk = format!(
-        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"delta\":\"Hi\"}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"{}",
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":0}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"{}",
         "x".repeat(8_000)
     );
     let mut body = Some(Bytes::from(chunk));
@@ -2372,6 +2439,15 @@ async fn rejected_chunk_does_not_count_complete_frames_it_never_forwarded() {
     assert_eq!(frames[0].event_type.as_deref(), Some("error"));
     let error: Value = serde_json::from_slice(&frames[0].data).unwrap();
     assert_eq!(error["sequence_number"], 0);
+}
+
+#[test]
+fn terminal_probe_uses_last_sse_event_field() {
+    assert!(frame_sequence_and_terminal(b"event: response.created\nevent: response.completed\ndata: {}\n\n").1);
+    assert!(
+        !frame_sequence_and_terminal(b"event: response.completed\nevent: response.output_text.delta\ndata: {}\n\n").1
+    );
+    assert!(!frame_sequence_and_terminal(b": response.completed\ndata: {}\n\n").1);
 }
 
 #[tokio::test]
@@ -2503,13 +2579,13 @@ fn response_key_probe_skips_comments_and_preserves_escaped_keys() {
 #[test]
 fn forwarded_sequence_probe_reads_only_top_level_integer() {
     assert_eq!(
-        frame_sequence_number(
+        frame_sequence_and_terminal(
             b"data: {\"nested\":{\"sequence_number\":99},\"sequence_numb\\u0065r\":7,\"delta\":\"sequence_number: 100\"}\n\n"
-        ),
+        ).0,
         Some(7)
     );
     assert_eq!(
-        frame_sequence_number(b"data: {\"nested\":{\"sequence_number\":99}}\n\n"),
+        frame_sequence_and_terminal(b"data: {\"nested\":{\"sequence_number\":99}}\n\n").0,
         None
     );
 }
@@ -3774,6 +3850,7 @@ fn armed_stream(max_buffer_bytes: usize, prev_id: &str) -> RestorePreviousRespon
         previous_response_id: prev_id.to_owned(),
         stable_budget: None,
         last_forwarded_sequence: None,
+        forwarded_terminal: false,
     }
 }
 

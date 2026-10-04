@@ -363,6 +363,22 @@ impl HttpFilter for RehydrateFilter {
             let restored =
                 restore_previous_response_id_stream_chunk_with_budget(&mut armed, body, end_of_stream, budget);
             let Ok(keep_armed) = restored else {
+                if armed.forwarded_terminal {
+                    // The client has already received a terminal frame. Returning
+                    // an error tears down the committed stream without appending
+                    // a contradictory local terminal or forwarding this chunk.
+                    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                        state.discard_payload_for_budget_error();
+                    }
+                    #[cfg(feature = "store")]
+                    super::store::discard_retained_request_payload(ctx);
+                    ctx.set_metadata("responses.skip_persist", "true");
+                    super::fs_arm_stream_stop(ctx);
+                    *body = None;
+                    return Err(
+                        "response restoration exceeded retained payload budget after terminal SSE event".into(),
+                    );
+                }
                 fail_streaming_restore_budget(ctx, body, end_of_stream, armed.last_forwarded_sequence);
                 return Ok(FilterAction::Continue);
             };
@@ -570,6 +586,7 @@ fn arm_streaming_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
         previous_response_id: prev_id,
         stable_budget: None,
         last_forwarded_sequence: None,
+        forwarded_terminal: false,
     });
 
     true
@@ -627,6 +644,8 @@ struct RestorePreviousResponseIdStream {
     stable_budget: Option<RestoreStableBudget>,
     /// Highest provider sequence in a complete frame actually forwarded.
     last_forwarded_sequence: Option<u64>,
+    /// A terminal SSE frame was admitted and forwarded in an earlier callback.
+    forwarded_terminal: bool,
 }
 
 /// Stable request/history/output charges and an O(1) invalidation key for streamed restore.
@@ -996,7 +1015,7 @@ fn restore_stream_fresh_chunk(
     let remainder = incoming.len() - scan.cursor;
     if flush_streaming_restore(&scan, remainder, armed.max_buffer_bytes, end_of_stream) {
         *body = finalize_view(scan.out, incoming, scan.run_start, incoming.len());
-        armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
+        note_forwarded_frames(armed, scan.max_forwarded_sequence, scan.forwarded_terminal);
         return Ok(false);
     }
     *body = finalize_view(scan.out, incoming, scan.run_start, scan.cursor);
@@ -1012,7 +1031,7 @@ fn restore_stream_fresh_chunk(
     armed.scan_at_line_start = scan.resume_at_line_start;
     // The just-scanned frames are visible only after every trailing-partial
     // reservation succeeds; an error replaces this entire chunk.
-    armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
+    note_forwarded_frames(armed, scan.max_forwarded_sequence, scan.forwarded_terminal);
     Ok(true)
 }
 
@@ -1086,14 +1105,21 @@ fn restore_stream_buffered_chunk(
     let remainder = armed.pending.len() - scan.cursor;
     if flush_streaming_restore(&scan, remainder, armed.max_buffer_bytes, end_of_stream) {
         *body = flush_pending(scan.out, &mut armed.pending, scan.run_start);
-        armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
+        note_forwarded_frames(armed, scan.max_forwarded_sequence, scan.forwarded_terminal);
         return Ok(false);
     }
     *body = emit_pending_prefix(scan.out, &mut armed.pending, scan.cursor);
     armed.scan_from = scan.resume_from - scan.cursor;
     armed.scan_at_line_start = scan.resume_at_line_start;
-    armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
+    note_forwarded_frames(armed, scan.max_forwarded_sequence, scan.forwarded_terminal);
     Ok(true)
+}
+
+/// Commit scan facts only after the current chunk has passed every admission
+/// check and its complete frames are ready to leave this filter.
+fn note_forwarded_frames(armed: &mut RestorePreviousResponseIdStream, sequence: Option<u64>, terminal: bool) {
+    armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, sequence);
+    armed.forwarded_terminal |= terminal;
 }
 
 /// Decide whether the restore must fail open on this chunk — a complete frame exceeded
@@ -1139,6 +1165,10 @@ fn flush_pending(out: Option<Vec<u8>>, pending: &mut BytesMut, run_start: usize)
 }
 
 /// Result of walking the complete frames at the front of a chunk's buffer.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent overflow, scan-resume, and forwarded-terminal facts"
+)]
 struct FrameScan {
     /// The rewritten output buffer, or `None` while every frame so far is a
     /// zero-copy pass-through (no rewrite has forced a fresh buffer yet).
@@ -1160,6 +1190,8 @@ struct FrameScan {
     resume_at_line_start: bool,
     /// Highest top-level sequence among complete frames in this successful scan.
     max_forwarded_sequence: Option<u64>,
+    /// A terminal SSE frame appeared among the successfully scanned frames.
+    forwarded_terminal: bool,
 }
 
 /// The resume point of a resumable frame-boundary scan.
@@ -1196,6 +1228,7 @@ fn scan_complete_frames(
     let (mut out, mut overflow): (Option<Vec<u8>>, bool) = (None, false);
     let (mut cursor, mut run_start) = (0_usize, 0_usize);
     let mut max_forwarded_sequence = None;
+    let mut forwarded_terminal = false;
     let (mut scan_pos, mut at_line_start) = (resume.from, resume.at_line_start);
     let (resume_from, resume_at_line_start) = loop {
         match scan_frame_end(buf, scan_pos, at_line_start, at_stream_end) {
@@ -1218,10 +1251,9 @@ fn scan_complete_frames(
                     stable_budget,
                 )?;
                 if budget.is_some_and(|state| state.retained_payload_limit().is_some()) {
-                    max_forwarded_sequence = max_sequence(
-                        max_forwarded_sequence,
-                        frame_sequence_number(buf.get(cursor..end).unwrap_or_default()),
-                    );
+                    let (sequence, terminal) = frame_sequence_and_terminal(buf.get(cursor..end).unwrap_or_default());
+                    max_forwarded_sequence = max_sequence(max_forwarded_sequence, sequence);
+                    forwarded_terminal |= terminal;
                 }
                 cursor = end;
                 scan_pos = end;
@@ -1237,6 +1269,7 @@ fn scan_complete_frames(
         resume_from,
         resume_at_line_start,
         max_forwarded_sequence,
+        forwarded_terminal,
     })
 }
 
@@ -1336,20 +1369,28 @@ fn frame_may_have_response_key(frame: &[u8]) -> bool {
     probe.found
 }
 
-/// Read a provider frame's top-level integer sequence without allocating its
-/// data payload. A local terminal error must follow frames already forwarded.
+/// Read a provider frame's top-level sequence and terminal event without
+/// allocating its data payload. `event:` follows SSE's last-field-wins rule;
+/// a local terminal error must follow frames already forwarded.
 #[expect(
     clippy::too_many_lines,
     reason = "joined SSE data and JSON number scan share one state machine"
 )]
-fn frame_sequence_number(frame: &[u8]) -> Option<u64> {
+fn frame_sequence_and_terminal(frame: &[u8]) -> (Option<u64>, bool) {
     let mut probe = ResponseKeyProbe::for_key(b"sequence_number");
     let mut sequence = 0_u64;
     let mut saw_digit = false;
     let mut valid = false;
     let mut done = false;
     let mut had_data = false;
+    let mut terminal = false;
     for_each_sse_line(frame, |line, _| {
+        if let Some(event) = sse_field_value(line, b"event") {
+            terminal = matches!(
+                event,
+                b"response.completed" | b"response.failed" | b"response.incomplete" | b"response.cancelled" | b"error"
+            );
+        }
         if done {
             return;
         }
@@ -1378,7 +1419,7 @@ fn frame_sequence_number(frame: &[u8]) -> Option<u64> {
             }
         }
     });
-    (saw_digit && (valid || !done)).then_some(sequence)
+    ((saw_digit && (valid || !done)).then_some(sequence), terminal)
 }
 
 /// Preserve the largest forwarded sequence when a chunk contains several frames.

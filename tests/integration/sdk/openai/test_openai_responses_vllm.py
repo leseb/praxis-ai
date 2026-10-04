@@ -1961,6 +1961,7 @@ class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
     """Serve fixed native Responses bodies without running the IRR step."""
 
     protocol_version = "HTTP/1.1"
+    terminal_gate: ClassVar[threading.Event | None] = None
 
     def log_message(self, fmt, *args):
         pass
@@ -1969,6 +1970,44 @@ class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         request_body = json.loads(self.rfile.read(length))
         model = request_body["model"]
+        if model == "terminal-stream":
+            response = {
+                "id": "resp_direct_budget_terminal_stream",
+                "object": "response",
+                "created_at": 1780000000,
+                "model": model,
+                "status": "completed",
+                "output": [],
+            }
+            terminal = (
+                "event: response.completed\ndata: "
+                + json.dumps({
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": response,
+                }, separators=(",", ":"))
+                + "\n\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(terminal)
+            self.wfile.flush()
+            gate = type(self).terminal_gate
+            if gate is not None:
+                gate.wait(timeout=10)
+            # This unfinished SSE comment exceeds the direct restore's 64 KiB
+            # retained allowance after the terminal frame is already on wire.
+            try:
+                self.wfile.write(b":" + b"x" * 120_000)
+                self.wfile.flush()
+                time.sleep(0.2)
+                self.wfile.write(b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
+            return
         size = 50 if model == "chunked" else int(model)
         response = {
             "id": f"resp_direct_budget_{model}",
@@ -2120,6 +2159,43 @@ def test_direct_budget_restore_rejects_before_success_headers(direct_budget_clie
         )
     assert failed.value.status_code == 502
     assert failed.value.response.json()["error"]["type"] == "server_error"
+
+
+@pytest.mark.parametrize("direct_budget_client", [65_536], indirect=True)
+def test_direct_budget_stream_overflow_after_completion_has_one_terminal(direct_budget_client):
+    """The direct SSE route closes after a late overflow without an error event."""
+    seed = direct_budget_client.responses.create(model="10", input="seed", store=True)
+    url = f"{str(direct_budget_client.base_url).rstrip('/')}/responses"
+    wire = bytearray()
+    transport_failed = False
+    gate = threading.Event()
+    DirectBudgetBackendHandler.terminal_gate = gate
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            try:
+                with client.stream(
+                    "POST", url,
+                    headers={"Content-Type": "application/json", **TRUSTED_OWNER_HEADERS},
+                    json={
+                        "model": "terminal-stream", "input": "next", "stream": True,
+                        "store": False, "previous_response_id": seed.id,
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    for chunk in response.iter_raw():
+                        wire.extend(chunk)
+                        if b"event: response.completed" in wire and b"\n\n" in wire:
+                            gate.set()  # The provider may now send the oversized tail.
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                transport_failed = True  # The filter aborts the committed transport.
+    finally:
+        gate.set()
+        DirectBudgetBackendHandler.terminal_gate = None
+    assert transport_failed, "the over-budget stream must end with a transport error"
+    assert wire.count(b"event: response.completed") == 1
+    assert b"event: error" not in wire
+    assert b"event: response.failed" not in wire
+    assert b"x" * 128 not in wire, "the rejected comment cannot leak downstream"
 
 
 @pytest.fixture()
