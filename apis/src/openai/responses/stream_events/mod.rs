@@ -3303,12 +3303,35 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
     // The canonical response remains in state while its JSON is written into
-    // the outgoing SSE buffer. Admit that independent wire owner first.
-    let terminal_copy_fits = retained_json_bytes(&state.response_object)
-        .and_then(|bytes| output.len().checked_add(bytes))
-        .and_then(|bytes| bytes.checked_add(128))
-        .is_some_and(|bytes| state.can_retain_payload(bytes));
-    if !terminal_copy_fits {
+    // the outgoing SSE buffer. Reserve the exact final frame before writing:
+    // incremental Vec growth can otherwise retain twice the wire length.
+    let terminal_frame_bytes = retained_json_bytes(&state.response_object)
+        .and_then(|bytes| {
+            bytes.checked_add(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":".len())
+        })
+        .and_then(|bytes| bytes.checked_add(b",\"sequence_number\":".len()))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(&sequence_number)?))
+        .and_then(|bytes| bytes.checked_add(b"}\n\n".len()))
+        .and_then(|bytes| {
+            if deferred_done {
+                bytes.checked_add(b"data: [DONE]\n\n".len())
+            } else {
+                Some(bytes)
+            }
+        });
+    let wire_peak = terminal_frame_bytes
+        .and_then(|frame_bytes| output.len().checked_add(frame_bytes))
+        .and_then(|final_len| {
+            if final_len > output.capacity() {
+                final_len.checked_add(output.capacity())
+            } else {
+                Some(output.capacity())
+            }
+        });
+    if !wire_peak.is_some_and(|bytes| state.can_retain_payload(bytes))
+        || terminal_frame_bytes.is_none_or(|bytes| output.try_reserve_exact(bytes).is_err())
+        || !state.can_retain_payload(output.capacity())
+    {
         drop(output);
         return Some(encode_retained_payload_error(ctx));
     }
@@ -3327,7 +3350,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     if deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
-    if !state.can_replace_retained_payload(0, 0, output.len()) {
+    if !state.can_replace_retained_payload(0, 0, output.capacity()) {
         drop(output);
         return Some(encode_retained_payload_error(ctx));
     }

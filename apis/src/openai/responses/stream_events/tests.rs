@@ -8490,3 +8490,40 @@ async fn chat_budget_failure_replaces_deferred_terminal_with_error() {
     assert!(final_wire.contains("event: error"), "{final_wire}");
     assert!(!final_wire.contains("event: response.completed"), "{final_wire}");
 }
+
+#[test]
+fn local_completion_admits_retained_wire_capacity() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut state = ResponsesState {
+        accumulated_output: vec![
+            json!({"type":"message", "id":"msg_large", "content":[{"type":"output_text", "text":"x".repeat(300 * 1024)}]}),
+        ],
+        local_completion_response_template: json!({"id":"resp_local", "status":"completed", "output":[]}),
+        ..ResponsesState::default()
+    };
+    let cap = 1024 * 1024;
+    state.apply_retained_payload_limit(cap);
+    let baseline = state.retained_payload_bytes().unwrap();
+    assert!(baseline < cap);
+    ctx.extensions.insert(state);
+
+    let result = encode_local_completion(&mut ctx).unwrap();
+    let retained = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    assert!(
+        result
+            .as_ref()
+            .windows(b"event: response.completed".len())
+            .any(|window| window == b"event: response.completed"),
+        "this boundary must admit the completed terminal"
+    );
+    let wire_capacity = result.try_into_mut().unwrap().capacity();
+    assert!(
+        retained + wire_capacity <= cap,
+        "retained response and terminal wire capacity exceed the request limit"
+    );
+}
