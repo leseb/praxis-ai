@@ -673,7 +673,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     state.apply_retained_payload_limit(current + result_id_bytes + 20_000);
     let calls = call_refs(&state.tool_calls);
 
-    let arguments = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap() * 3;
+    let arguments = super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap();
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
         panic!("weather tool must resolve")
@@ -726,7 +726,7 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
         ..ResponsesState::default()
     };
     let current = state.retained_payload_bytes().unwrap();
-    let argument_staging = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap() * 3;
+    let argument_staging = super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap();
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
         panic!("weather tool must resolve")
@@ -736,6 +736,64 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
     let calls = call_refs(&state.tool_calls);
 
     assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+}
+
+#[test]
+fn exponent_arguments_reject_before_dispatch_normalization() {
+    let arguments = format!("{{\"values\":[{}]}}", vec!["1e15"; 10_000].join(","));
+    let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": arguments});
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let (parsed, copied_text) = normalize_arguments(&state.tool_calls[0]["arguments"]).unwrap();
+    let live_peak = state.retained_payload_bytes().unwrap() + retained_json_bytes(&parsed).unwrap() + copied_text.len();
+    state.apply_retained_payload_limit(live_peak - 1);
+    let calls = call_refs(&state.tool_calls);
+    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+}
+
+#[test]
+fn exponent_arguments_reject_before_approval_claim() {
+    let arguments = format!("{{\"values\":[{}]}}", vec!["1e15"; 10_000].join(","));
+    let decision = ResolvedApproval {
+        approval_id: "call_1".to_owned(),
+        approve: true,
+        reason: None,
+        server_label: "weather".to_owned(),
+        tool_name: "get_weather".to_owned(),
+        encoded_name: "weather__get_weather".to_owned(),
+        arguments,
+    };
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    let mut committed = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    super::apply_decision(&mut committed, &decision);
+    let (parsed, copied_text) = normalize_arguments(&committed.tool_calls[0]["arguments"]).unwrap();
+    let live_peak =
+        committed.retained_payload_bytes().unwrap() + retained_json_bytes(&parsed).unwrap() + copied_text.len();
+    state.apply_retained_payload_limit(live_peak - 1);
+    assert!(!super::approval_decisions_fit(&state, &[decision], 8_192));
+}
+
+#[test]
+fn argument_staging_bounds_canonical_numeric_and_string_forms() {
+    for raw in [
+        json!(r#"{"number":1e15,"negative":-0}"#),
+        json!(r#"{"number":1e-15,"text":"1e15","quote":"\\\""}"#),
+        json!({"number": 1.25, "text": "escaped\nvalue"}),
+    ] {
+        let projected = super::mcp_argument_staging_bytes(&raw).unwrap();
+        let (parsed, canonical) = normalize_arguments(&raw).unwrap();
+        let actual = canonical.len() + 3 * retained_json_bytes(&parsed).unwrap();
+        assert!(projected >= actual, "argument staging undercounted {raw}");
+    }
 }
 
 #[test]

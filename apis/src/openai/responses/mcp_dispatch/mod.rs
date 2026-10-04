@@ -726,7 +726,7 @@ fn minimum_approval_dispatch_reserve(
     let mut staging = 0_usize;
     for call in extract_mcp_tool_calls(&state.tool_calls, &tool_index) {
         calls = calls.checked_add(1)?;
-        let arguments = retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?;
+        let arguments = mcp_argument_staging_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?;
         staging = staging.checked_add(mcp_call_dispatch_staging(
             call.get("call_id")
                 .or_else(|| call.get("id"))
@@ -741,7 +741,7 @@ fn minimum_approval_dispatch_reserve(
         calls = calls.checked_add(1)?;
         staging = staging.checked_add(mcp_call_dispatch_staging(
             &decision.approval_id,
-            retained_json_bytes(&decision.arguments)?,
+            mcp_string_argument_staging_bytes(&decision.arguments)?,
             &decision.encoded_name,
             &tool_index,
         )?)?;
@@ -763,7 +763,7 @@ fn minimum_approval_dispatch_reserve(
 /// definition that can coexist with retained state before a result arrives.
 fn mcp_call_dispatch_staging(
     id: &str,
-    arguments_json_bytes: usize,
+    arguments_staging_bytes: usize,
     name: &str,
     tool_index: &McpToolIndex<'_>,
 ) -> Option<usize> {
@@ -771,9 +771,63 @@ fn mcp_call_dispatch_staging(
         Some(McpToolMatch::Unique { entry, .. }) => retained_json_bytes(entry)?,
         _ => 0,
     };
-    id.len()
-        .checked_add(arguments_json_bytes.checked_mul(3)?)?
-        .checked_add(tool_bytes)
+    id.len().checked_add(arguments_staging_bytes)?.checked_add(tool_bytes)
+}
+
+/// Bound each live argument owner without parsing the whole argument tree.
+fn mcp_argument_staging_bytes(raw: &serde_json::Value) -> Option<usize> {
+    match raw {
+        serde_json::Value::String(text) => mcp_string_argument_staging_bytes(text),
+        other => retained_json_bytes(other)?.checked_mul(4),
+    }
+}
+
+/// The copied source text coexists with two rmcp message trees and a wire Vec.
+fn mcp_string_argument_staging_bytes(text: &str) -> Option<usize> {
+    let normalized = text
+        .len()
+        .checked_add(normalized_argument_number_growth(text.as_bytes())?)?;
+    text.len().checked_add(normalized.checked_mul(3)?)
+}
+
+/// Count only numeric growth when `serde_json` normalizes a borrowed JSON string.
+/// Non-numeric syntax and escaped string contents cannot grow on re-encoding.
+fn normalized_argument_number_growth(data: &[u8]) -> Option<usize> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut number_start = None;
+    let mut growth = 0_usize;
+    for offset in 0..=data.len() {
+        let byte = data.get(offset).copied();
+        if in_string {
+            match byte {
+                Some(b'\\') if !escaped => escaped = true,
+                Some(b'"') if !escaped => in_string = false,
+                _ => escaped = false,
+            }
+            continue;
+        }
+        if let Some(start) = number_start {
+            if matches!(byte, Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')) {
+                continue;
+            }
+            let token = data.get(start..offset)?;
+            growth = growth.checked_add(normalized_number_token_growth(token))?;
+            number_start = None;
+        }
+        match byte {
+            Some(b'"') => in_string = true,
+            Some(b'0'..=b'9' | b'-') => number_start = Some(offset),
+            _ => {},
+        }
+    }
+    Some(growth)
+}
+
+/// Measure one number's compact output without retaining the argument tree.
+fn normalized_number_token_growth(token: &[u8]) -> usize {
+    serde_json::from_slice::<serde_json::Number>(token)
+        .map_or(32, |number| number.to_string().len().saturating_sub(token.len()))
 }
 
 /// Raw payload cloned while parsing client approval controls.
@@ -1967,7 +2021,7 @@ fn aggregate_mcp_result_limit(
                 .or_else(|| call.get("id"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown"),
-            retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?,
+            mcp_argument_staging_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?,
             call.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
             &tool_index,
         )?)
