@@ -334,7 +334,7 @@ async fn on_response_selects_bounded_stream_buffer_for_non_streaming_responses()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_caps_buffer_at_shared_budget_headroom() {
+async fn on_response_caps_direct_buffer_at_trusted_length() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -356,6 +356,7 @@ async fn on_response_caps_buffer_at_shared_budget_headroom() {
     let mut resp = crate::test_utils::make_response();
     resp.headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    resp.headers.insert(http::header::CONTENT_LENGTH, "32".parse().unwrap());
     ctx.response_header = Some(&mut resp);
 
     assert!(matches!(
@@ -364,8 +365,8 @@ async fn on_response_caps_buffer_at_shared_budget_headroom() {
     ));
     assert_eq!(
         ctx.response_body_mode,
-        BodyMode::StreamBuffer { max_bytes: Some(8_192) },
-        "the finite store buffer must fit alongside already retained state"
+        BodyMode::StreamBuffer { max_bytes: Some(32) },
+        "the finite store buffer must not exceed its admitted wire length"
     );
 }
 
