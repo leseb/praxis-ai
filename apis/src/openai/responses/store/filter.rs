@@ -768,8 +768,8 @@ struct StoreStableCache {
     revision: u64,
     /// Lengths of every cached collection. Dispatch may append after synthesis
     /// has already advanced the iteration.
-    collection_lengths: [usize; 7],
-    /// Serialized payload charge of the cached request, history, and output.
+    collection_lengths: [usize; 10],
+    /// Serialized payload charge of cached request, history, output, and tools.
     bytes: usize,
 }
 
@@ -792,7 +792,7 @@ impl StoreStableCache {
     }
 
     /// Lengths of the collections covered by the stable charge.
-    fn collection_lengths(state: &ResponsesState) -> [usize; 7] {
+    fn collection_lengths(state: &ResponsesState) -> [usize; 10] {
         [
             state.input.len(),
             state.messages.len(),
@@ -801,6 +801,9 @@ impl StoreStableCache {
             state.tools.len(),
             state.provider_compaction_ids.len(),
             state.accumulated_output.len(),
+            state.mcp_tool_map.len(),
+            usize::from(state.client_tool_echo.is_some()),
+            state.client_tool_echo.as_ref().map_or(0, |echo| echo.tools.len()),
         ]
     }
 }
@@ -2999,6 +3002,48 @@ mod encode_replay_event_tests {
             b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
         ));
         assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks shape and revision invalidation for both fixed tool owners"
+    )]
+    fn replay_meter_invalidates_changed_tool_snapshots() {
+        let mut state = ResponsesState::default();
+        let initial = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, initial).unwrap();
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "tool".to_owned()),
+            json!({"schema": "x".repeat(4_096)}),
+        );
+        assert!(
+            !cache.matches(&state),
+            "a newly resolved MCP tool changes the cached shape"
+        );
+
+        let expanded = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, expanded).unwrap();
+        state.client_tool_echo = Some(crate::openai::responses::state::ClientToolEcho {
+            tools: vec![json!({"name": "client-tool"})],
+            tool_choice: json!("auto"),
+        });
+        assert!(!cache.matches(&state), "captured client tools change the cached shape");
+
+        let expanded = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, expanded).unwrap();
+        state
+            .mcp_tool_map
+            .get_mut(&("server".to_owned(), "tool".to_owned()))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("schema".to_owned(), json!("y".repeat(4_096)));
+        state.mark_replay_stable_payload_changed();
+        assert!(
+            !cache.matches(&state),
+            "a same-shape schema rewrite changes the revision"
+        );
     }
 
     #[tokio::test]

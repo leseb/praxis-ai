@@ -475,7 +475,7 @@ impl StreamConverter {
         self.echo_projection
     }
 
-    /// Cache the stable shared-state charge once per provider stream.
+    /// Cache the request, history, and fixed-tool charge once per provider stream.
     pub(super) fn shared_stable_bytes(&mut self, state: &ResponsesState, limit: usize) -> Option<usize> {
         if self.shared_stable_bytes.is_none() {
             self.shared_stable_bytes = state

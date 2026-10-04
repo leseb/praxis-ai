@@ -2275,6 +2275,30 @@ fn streaming_restore_cache_remeasures_changed_request_and_output() {
     assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
 }
 
+#[test]
+fn streaming_restore_cache_remeasures_changed_tool_snapshots() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "short", "previous_response_id": "resp_prev"}));
+    state.apply_retained_payload_limit(4_096);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "tool".to_owned()),
+        json!({"schema": "x".repeat(4_096)}),
+    );
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+    state.mcp_tool_map.clear();
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state.client_tool_echo = Some(crate::openai::responses::state::ClientToolEcho {
+        tools: vec![json!({"name": "x".repeat(4_096)})],
+        tool_choice: json!("auto"),
+    });
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+    state.client_tool_echo = None;
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+}
+
 /// Re-parse assembled SSE output bytes into frames for assertions.
 fn parse_sse_frames(bytes: &[u8]) -> Vec<SseFrame> {
     SseFrameParser::new(1 << 20)

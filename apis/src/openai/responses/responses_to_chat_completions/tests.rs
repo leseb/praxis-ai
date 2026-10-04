@@ -33,6 +33,41 @@ fn wide_stream_limits() -> super::stream::StreamLimits {
 }
 
 #[test]
+fn chat_stream_meter_includes_fixed_tool_snapshots_once() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hello"}));
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "tool".to_owned()),
+        json!({"schema": "x".repeat(4_096)}),
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"name": "client-tool", "description": "y".repeat(4_096)})],
+        tool_choice: json!("auto"),
+    });
+    let mut converter = StreamConverter::new("resp_tools".to_owned(), 1, wide_stream_limits());
+    let stable = converter.shared_stable_bytes(&state, usize::MAX).unwrap();
+    let changing = state
+        .stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+        .unwrap();
+    assert_eq!(stable + changing, state.retained_payload_bytes().unwrap());
+
+    state.mcp_tool_map.clear();
+    state.client_tool_echo = None;
+    let mut next_stream = StreamConverter::new("resp_next".to_owned(), 2, wide_stream_limits());
+    let next_stable = next_stream.shared_stable_bytes(&state, usize::MAX).unwrap();
+    assert!(
+        next_stable < stable,
+        "the next stream remeasures discarded tool snapshots"
+    );
+    assert_eq!(
+        next_stable
+            + state
+                .stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+                .unwrap(),
+        state.retained_payload_bytes().unwrap()
+    );
+}
+
+#[test]
 fn first_stream_callback_reserves_both_request_echo_lifecycle_frames() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);

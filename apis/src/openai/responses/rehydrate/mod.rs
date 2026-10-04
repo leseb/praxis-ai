@@ -757,7 +757,7 @@ struct RestorePreviousResponseIdStream {
     stable_payload: Option<RestoreStablePayloadCache>,
 }
 
-/// An O(1) invalidation key for the request/history owners cached by Rehydrate.
+/// An O(1) invalidation key for request, history, and tool snapshots cached by Rehydrate.
 #[derive(Clone, Copy)]
 struct RestoreStablePayloadCache {
     /// Limit under which the charge was measured.
@@ -767,7 +767,7 @@ struct RestoreStablePayloadCache {
     /// In-place mutation revision of those owners.
     revision: u64,
     /// Shapes of all stable collections, catching appends without a revision.
-    collection_lengths: [usize; 6],
+    collection_lengths: [usize; 9],
     /// Serialized payload charge of the stable owners.
     bytes: usize,
 }
@@ -793,7 +793,7 @@ impl RestoreStablePayloadCache {
     }
 
     /// Snapshot collection lengths without scanning their JSON payloads.
-    fn collection_lengths(state: &ResponsesState) -> [usize; 6] {
+    fn collection_lengths(state: &ResponsesState) -> [usize; 9] {
         [
             state.input.len(),
             state.messages.len(),
@@ -801,6 +801,9 @@ impl RestoreStablePayloadCache {
             state.previous_tools.len(),
             state.tools.len(),
             state.provider_compaction_ids.len(),
+            state.mcp_tool_map.len(),
+            usize::from(state.client_tool_echo.is_some()),
+            state.client_tool_echo.as_ref().map_or(0, |echo| echo.tools.len()),
         ]
     }
 }

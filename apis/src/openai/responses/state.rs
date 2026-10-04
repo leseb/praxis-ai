@@ -1072,9 +1072,9 @@ impl ResponsesState {
             .checked_add(stream_bytes)
     }
 
-    /// Request and history owners cannot change while one upstream stream is
-    /// being parsed. Measure them once per round; the stream meter measures all
-    /// other owners after each chunk.
+    /// Request, history, and resolved tool snapshots stay fixed during one
+    /// upstream round. Streaming owners cache these while measuring changing
+    /// response state on each callback.
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1090,6 +1090,15 @@ impl ResponsesState {
         for id in &self.provider_compaction_ids {
             meter.raw(id.len())?;
         }
+        for ((server, tool), value) in &self.mcp_tool_map {
+            meter.raw(server.len())?;
+            meter.raw(tool.len())?;
+            meter.json(value)?;
+        }
+        if let Some(echo) = &self.client_tool_echo {
+            meter.json_values(&echo.tools)?;
+            meter.json(&echo.tool_choice)?;
+        }
         Some(meter.used())
     }
 
@@ -1103,26 +1112,27 @@ impl ResponsesState {
     }
 
     /// Count changing owners while a response filter caches request, history,
-    /// and prior output. Include the stream parsers' published charges.
+    /// fixed tool snapshots, and prior output. Include the stream parsers'
+    /// published charges.
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true)?
             .checked_add(stream_bytes)
     }
 
     /// Count owners that may change between Rehydrate SSE callbacks, including
     /// accumulated output and both published stream-parser charges. The stable
-    /// request and history owners are measured once by the Rehydrate stream.
+    /// request, history, and tool snapshots are measured once by Rehydrate.
     #[cfg(feature = "store")]
     pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, true)?
             .checked_add(stream_bytes)
     }
 
@@ -1969,6 +1979,49 @@ mod tests {
             state.retained_payload_bytes().unwrap() - baseline,
             bytes * 4,
             "each of the four owned JSON copies contributes its bytes"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks all four stream meter partitions against the full owner charge"
+    )]
+    fn streaming_meters_charge_fixed_tool_snapshots_once() {
+        let mut state = ResponsesState::from_request_body(json!({"input": "hello"}));
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "tool".to_owned()),
+            json!({"schema": "m".repeat(4_096)}),
+        );
+        state.client_tool_echo = Some(ClientToolEcho {
+            tools: vec![json!({"type": "function", "name": "t", "description": "e".repeat(4_096)})],
+            tool_choice: json!("auto"),
+        });
+        state.response_object = json!({"output": [{"text": "changing"}]});
+
+        let total = state.retained_payload_bytes().unwrap();
+        let stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing = state
+            .stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+            .unwrap();
+        assert_eq!(
+            stable + changing,
+            total,
+            "Store and Chat charge each fixed tool snapshot once"
+        );
+        #[cfg(feature = "store")]
+        assert_eq!(
+            stable
+                + state
+                    .rehydrate_stream_changing_payload_bytes_bounded(usize::MAX)
+                    .unwrap(),
+            total,
+            "Rehydrate charges each fixed tool snapshot once"
+        );
+        assert_eq!(
+            stable + state.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
+            total,
+            "StreamEvents charges each fixed tool snapshot once"
         );
     }
 

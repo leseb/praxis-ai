@@ -994,22 +994,6 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
         responses
             .stream_stable_payload_bytes_bounded(limit)
             .and_then(|bytes| bytes.checked_add(retained_json_values_bytes(&responses.accumulated_output)?))
-            .and_then(|bytes| {
-                responses
-                    .mcp_tool_map
-                    .iter()
-                    .try_fold(bytes, |used, ((server, tool), value)| {
-                        used.checked_add(server.len())?
-                            .checked_add(tool.len())?
-                            .checked_add(retained_json_bytes(value)?)
-                    })
-            })
-            .and_then(|bytes| match &responses.client_tool_echo {
-                None => Some(bytes),
-                Some(echo) => bytes
-                    .checked_add(retained_json_values_bytes(&echo.tools)?)
-                    .and_then(|bytes| bytes.checked_add(retained_json_bytes(&echo.tool_choice)?)),
-            })
             .filter(|bytes| *bytes <= limit)
             .unwrap_or(usize::MAX)
     });
