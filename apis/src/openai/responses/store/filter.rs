@@ -238,10 +238,16 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let response_bytes = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .and_then(|state| retained_json_bytes(&state.response_object));
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            // A native SSE pass-through can use Store without the Responses
+            // accumulator. There is no canonical record to persist in that
+            // case, and the client's terminal chunk must remain untouched.
+            if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
+                return Ok(FilterAction::Continue);
+            }
+            return Ok(persistence_budget_failure(ctx, true, body));
+        };
+        let response_bytes = retained_json_bytes(&state.response_object);
         if !response_bytes.is_some_and(|bytes| persistence_construction_fits(ctx, bytes)) {
             return Ok(persistence_budget_failure(ctx, true, body));
         }
@@ -1212,10 +1218,13 @@ fn persistence_budget_failure(
             "server_error",
             "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during persistence",
         );
-        *body = super::super::stream_events::encode_local_error(
-            ctx,
-            "server_error",
-            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during persistence",
+        *body = Some(
+            super::super::stream_events::encode_local_error(
+                ctx,
+                "server_error",
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during persistence",
+            )
+            .unwrap_or_else(|| super::super::stream_events::encode_retained_payload_error(ctx)),
         );
         return FilterAction::Continue;
     }
@@ -1640,10 +1649,16 @@ fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<B
     // Compact JSON cannot exceed the raw body, so the body length is a safe
     // upper bound for the snapshot captured below.
     let raw_bytes = body.as_ref().map_or(0, Bytes::len);
-    let admitted = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .is_some_and(|state| state.can_retain_payload(raw_bytes));
+    let admitted = if let Some(state) = ctx.extensions.get::<ResponsesState>() {
+        state.can_retain_payload(raw_bytes)
+    } else {
+        // Store may run before validation creates ResponsesState. The
+        // classifier's allocation-free request preflight already reserves the
+        // raw body, parsed JSON, and canonical input copies for this policy.
+        // Repeat it here so the snapshot cannot bypass admission if filter
+        // ordering differs, then charge the snapshot once state appears.
+        super::super::initial_budget_rejection(ctx, body.as_deref().unwrap_or_default()).is_none()
+    };
     if admitted {
         return Ok(());
     }
@@ -2592,11 +2607,59 @@ mod encode_replay_event_tests {
     use serde_json::json;
 
     use super::{
-        CapturedEvent, DirectFiniteRestoreFraming, ResponseEventRecord, ResponseStoreFilter, StateOwner,
-        buffered_header_persistence_length, capture_request_input, encode_replay_event, persistence_budget_failure,
-        persistence_construction_fits,
+        AgenticBudgetPolicy, CapturedEvent, DirectFiniteRestoreFraming, ResponseEventRecord, ResponseStoreFilter,
+        StateOwner, admit_request_input_snapshot, buffered_header_persistence_length, capture_request_input,
+        encode_replay_event, persistence_budget_failure, persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
+
+    #[test]
+    fn budgeted_store_admits_input_before_response_state_exists() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        let config = serde_yaml::from_str("max_retained_bytes: 4096").expect("valid policy config");
+        ctx.extensions
+            .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+
+        let normal = Some(Bytes::from_static(br#"{"input":"hello"}"#));
+        assert!(
+            admit_request_input_snapshot(&mut ctx, &normal).is_ok(),
+            "a small request is admitted before validation creates ResponsesState"
+        );
+        assert!(ctx.extensions.get::<ResponsesState>().is_none());
+
+        let oversized = Some(Bytes::from(format!(r#"{{"input":"{}"}}"#, "x".repeat(513))));
+        assert!(
+            admit_request_input_snapshot(&mut ctx, &oversized).is_err(),
+            "the same pre-state path retains the classifier's fail-closed bound"
+        );
+    }
+
+    #[test]
+    fn streaming_budget_error_without_response_state_still_emits_terminal_event() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let config = serde_yaml::from_str("max_retained_bytes: 4096").expect("valid policy config");
+        ctx.extensions
+            .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+        let mut body = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+        assert!(matches!(
+            persistence_budget_failure(&mut ctx, true, &mut body),
+            FilterAction::Continue
+        ));
+        let bytes = body.expect("budget error must replace the unsafe terminal");
+        assert!(
+            bytes.starts_with(b"event: error\n"),
+            "client receives a terminal SSE error"
+        );
+        assert!(bytes.ends_with(b"\n\n"), "error event is a complete SSE frame");
+        assert!(
+            !bytes
+                .windows(b"response.completed".len())
+                .any(|part| part == b"response.completed")
+        );
+    }
 
     #[test]
     fn budgeted_finite_persistence_requires_trusted_header_or_restore_handoff() {

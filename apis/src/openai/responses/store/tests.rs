@@ -1801,6 +1801,42 @@ async fn on_response_body_continues_when_terminal_body_is_none() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_stream_without_responses_state_preserves_terminal_chunk() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers.insert(
+        http::header::CONTENT_TYPE,
+        "text/event-stream".parse().expect("valid content type"),
+    );
+    ctx.response_header = Some(&mut resp);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.expect("headers accepted"),
+        FilterAction::Continue
+    ));
+
+    let terminal = Bytes::from_static(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n");
+    let mut body = Some(terminal.clone());
+    assert!(matches!(
+        filter
+            .on_response_body(&mut ctx, &mut body, true)
+            .expect("terminal accepted"),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        body,
+        Some(terminal),
+        "Store must forward a native terminal it cannot persist"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_skips_when_body_is_empty() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
