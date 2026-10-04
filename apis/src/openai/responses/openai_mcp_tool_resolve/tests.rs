@@ -5687,6 +5687,44 @@ async fn eager_listing_rejects_exhausted_shared_budget_before_rewrite() {
     assert!(state.accumulated_output.is_empty());
 }
 
+/// The request's credential is one owner, but dispatch copies it once per
+/// discovered tool; that peak must be admitted before building the tool map.
+#[test]
+fn eager_dispatch_rejects_credential_fanout_before_map_construction() {
+    let tools: Vec<serde_json::Value> = (0..1_000)
+        .map(|index| serde_json::json!({"name": format!("tool_{index}")}))
+        .collect();
+    let entry = serde_json::json!({
+        "server_label": "s", "server_url": "https://mcp.example/mcp",
+        "authorization": "secret".repeat(1_000),
+        "headers": {"x-large": "value".repeat(1_000)},
+        "require_approval": {"never": vec!["tool_0"; 10_000]}
+    });
+    let limit = 64 * 1024 * 1024;
+    let baseline = retained_json_bytes(&entry).unwrap() * 3;
+    let budget = EagerListingBudget { limit, baseline };
+    let raw_results = vec![Some(tools.clone())];
+    assert!(
+        baseline + eager_prepared_bytes(&raw_results).unwrap() < limit,
+        "the old raw-listing reserve fits while metadata fanout exceeds the budget"
+    );
+    let rejected = collect_resolutions_with_budget(std::slice::from_ref(&entry), &[Some(0)], raw_results, Some(budget));
+    assert!(
+        matches!(rejected, Err(ResolveError::RetainedBudget)),
+        "reject before dispatch-map allocation"
+    );
+
+    let mut filtered = entry;
+    filtered["allowed_tools"] = serde_json::json!(["tool_0"]);
+    let filtered_budget = EagerListingBudget {
+        limit,
+        baseline: retained_json_bytes(&filtered).unwrap() * 3,
+    };
+    let admitted = collect_resolutions_with_budget(&[filtered], &[Some(0)], vec![Some(tools)], Some(filtered_budget))
+        .expect("one selected tool should fit despite large entry metadata");
+    assert_eq!(admitted.tool_map.len(), 1, "reserve only filtered dispatch entries");
+}
+
 #[tokio::test]
 async fn eager_listing_with_policy_rejects_missing_shared_state() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
