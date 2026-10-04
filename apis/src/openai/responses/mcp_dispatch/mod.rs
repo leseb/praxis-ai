@@ -2249,7 +2249,10 @@ async fn execute_single_call(
         .retain_session
         .then(|| mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry)))
         .flatten();
-    let result = mcp_client::call_tool_with_forwarded_headers(
+    // Aggregate admission reserves three result owners. At most two of those
+    // shares may be live as raw transport bytes plus the parsed rmcp message.
+    let preparse_peak_limit = (!options.retain_session).then(|| options.max_result_bytes.saturating_mul(2));
+    let result = mcp_client::call_tool_with_forwarded_headers_with_budget(
         session_key.as_ref().map(|key| (options.session_pool, key)),
         server_url,
         headers,
@@ -2262,6 +2265,7 @@ async fn execute_single_call(
         options.timeout,
         payload_limit,
         options.max_control_response_bytes,
+        preparse_peak_limit,
         callout,
     )
     .await;

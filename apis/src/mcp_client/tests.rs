@@ -2435,6 +2435,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
         MAX_CONTROL_RESPONSE_BYTES,
+        None,
         callout,
         &parse_display_url(url),
     )
