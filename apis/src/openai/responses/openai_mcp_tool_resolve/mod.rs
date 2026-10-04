@@ -72,7 +72,9 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
-    AgenticBudgetPolicy, bound_body_outcome,
+    AgenticBudgetPolicy,
+    agentic_loop::buffered_parsed_json_bytes_upper_bound,
+    bound_body_outcome,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -831,7 +833,13 @@ fn parse_budgeted_mcp_request(
         .extensions
         .get::<ResponsesState>()
         .or(listener_budget.as_deref())
-        .is_none_or(|state| state.retained_payload_limit().is_none() || state.can_retain_payload(bytes.len()));
+        .is_none_or(|state| {
+            state.retained_payload_limit().is_none_or(|_| {
+                buffered_parsed_json_bytes_upper_bound(bytes)
+                    .and_then(|parsed| parsed.checked_add(bytes.len()))
+                    .is_some_and(|peak| state.can_retain_payload(peak))
+            })
+        });
     if !parse_fits {
         let streaming = is_streaming(ctx);
         return Err(reject_retained_budget(ctx, streaming, bytes));

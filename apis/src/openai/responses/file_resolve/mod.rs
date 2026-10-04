@@ -532,7 +532,10 @@ fn file_parse_admitted_bytes(ctx: &mut HttpFilterContext<'_>, raw: &[u8]) -> Opt
         raw.len()
     };
     if let Some(state) = ctx.extensions.get::<ResponsesState>() {
-        return state.can_retain_payload(parsed_bound).then_some(parsed_bound);
+        return parsed_bound
+            .checked_add(raw.len())
+            .is_some_and(|peak| state.can_retain_payload(peak))
+            .then_some(parsed_bound);
     }
     policy_limit
         .is_none_or(|limit| {

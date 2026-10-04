@@ -1784,24 +1784,33 @@ fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<B
     if should_skip(ctx) {
         return Ok(());
     }
-    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+    let Some(policy_limit) = ctx
+        .extensions
+        .get::<AgenticBudgetPolicy>()
+        .map(|policy| policy.max_retained_bytes())
+    else {
         return Ok(());
     };
-    // Compact JSON cannot exceed the raw body, so the body length is a safe
-    // upper bound for the snapshot captured below.
     let raw_bytes = body.as_ref().map_or(0, Bytes::len);
-    let admitted = if let Some(state) = ctx.extensions.get::<ResponsesState>() {
-        state.can_retain_payload(raw_bytes)
+    // The buffered wire remains live while serde_json builds another owned
+    // tree. Exponent-form numbers can expand in that tree before input is
+    // moved into the store snapshot.
+    let parsed_bound = body.as_deref().map_or(Some(0), buffered_parsed_json_bytes_upper_bound);
+    let admitted = if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.apply_retained_payload_limit(policy_limit);
+        parsed_bound
+            .and_then(|parsed| parsed.checked_add(raw_bytes))
+            .is_some_and(|peak| state.can_retain_payload(peak))
     } else {
         // A valid pipeline may place the store after format classification but
         // before the filter that creates ResponsesState. Apply the same
         // pre-parse headroom as the request filter until that state exists;
         // the creator then transfers this captured snapshot into its meter.
         let existing = retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
-        raw_bytes
-            .checked_mul(super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)
+        parsed_bound
+            .and_then(|parsed| parsed.checked_mul(super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER))
             .and_then(|peak| existing.checked_add(peak))
-            .is_some_and(|peak| peak <= policy.max_retained_bytes())
+            .is_some_and(|peak| peak <= policy_limit)
     };
     if admitted {
         return Ok(());
@@ -2753,9 +2762,10 @@ mod encode_replay_event_tests {
     use serde_json::json;
 
     use super::{
-        CapturedEvent, ResponseEventRecord, ResponseStoreFilter, StateOwner, buffered_parsed_json_bytes_upper_bound,
-        buffered_persistence_construction_fits, capture_request_input, encode_replay_event, encoded_column_headroom,
-        persistence_budget_failure, persistence_construction_fits,
+        AgenticBudgetPolicy, CapturedEvent, ResponseEventRecord, ResponseStoreFilter, StateOwner,
+        admit_request_input_snapshot, buffered_parsed_json_bytes_upper_bound, buffered_persistence_construction_fits,
+        capture_request_input, encode_replay_event, encoded_column_headroom, persistence_budget_failure,
+        persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
 
@@ -3205,6 +3215,40 @@ mod encode_replay_event_tests {
         ctx.extensions.insert(state);
         assert!(persistence_construction_fits(&ctx, wire.len()));
         assert!(!buffered_persistence_construction_fits(&ctx, wire.as_bytes()));
+    }
+
+    #[test]
+    fn request_input_snapshot_preflights_numeric_normalization_with_live_history() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        let raw = Bytes::from(format!(
+            r#"{{"model":"m","input":"hello","numbers":[{}]}}"#,
+            vec!["1e15"; 256].join(",")
+        ));
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let parsed_bytes = super::retained_json_bytes(&parsed).unwrap();
+        assert!(parsed_bytes > raw.len());
+        let mut state = ResponsesState::from_request_body(parsed);
+        state.iteration = 1;
+        state
+            .messages
+            .insert(0, json!({"role":"assistant","content":"x".repeat(65_536)}));
+        let baseline = state.retained_payload_bytes().unwrap();
+        let limit = baseline + raw.len() + 1;
+        state.apply_retained_payload_limit(limit);
+        assert!(state.can_retain_payload(raw.len()));
+        assert!(!state.can_retain_payload(parsed_bytes));
+        ctx.extensions.insert(state);
+        ctx.extensions.insert(
+            AgenticBudgetPolicy::from_config(&serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap())
+                .unwrap(),
+        );
+
+        let result = admit_request_input_snapshot(&mut ctx, &Some(raw));
+
+        assert!(matches!(result, Err(FilterAction::Reject(_))));
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     }
 
     #[test]

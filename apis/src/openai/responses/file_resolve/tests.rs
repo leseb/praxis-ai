@@ -22,6 +22,33 @@ use crate::{
     },
 };
 
+#[tokio::test]
+async fn request_parse_charges_wire_and_parsed_tree_with_live_history() {
+    let filter = make_filter_with_outbound_for_url("http://127.0.0.1:1");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({"model":"m","input":"hello","metadata":{"padding":"y".repeat(1024)}});
+    let raw = serde_json::to_vec(&original).unwrap();
+    let parsed_bytes = super::super::state::retained_json_bytes(&original).unwrap();
+    let mut state = ResponsesState::from_request_body(original);
+    state.iteration = 1;
+    state
+        .messages
+        .insert(0, json!({"role":"assistant","content":"x".repeat(8192)}));
+    let baseline = state.retained_payload_bytes().unwrap();
+    let limit = baseline + parsed_bytes + raw.len() / 2;
+    state.apply_retained_payload_limit(limit);
+    assert!(state.can_retain_payload(parsed_bytes));
+    assert!(baseline + parsed_bytes + raw.len() > limit);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(_)));
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
