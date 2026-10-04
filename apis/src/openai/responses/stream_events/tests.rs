@@ -518,6 +518,52 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
 }
 
 #[test]
+fn numeric_sse_event_is_rejected_before_expanded_value_allocation() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let numbers = std::iter::repeat_n("1e15", 10_000).collect::<Vec<_>>().join(",");
+    let wire = Bytes::from(format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r1\",\"output\":[],\"metadata\":{{\"values\":[{numbers}]}}}}}}\n\n"
+    ));
+    let mut responses = ResponsesState::default();
+    let limit = responses.retained_payload_bytes().unwrap() + wire.len() * 4;
+    responses.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(responses);
+
+    let result = super::parse_and_accumulate(&mut stream, &mut ctx, &wire, std::time::Instant::now()).unwrap();
+    assert!(
+        result.is_none(),
+        "numeric expansion must fail before event construction"
+    );
+    assert_eq!(
+        stream.event_count, 0,
+        "no event may be parsed after the preflight fails"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn ordinary_delta_skips_already_flushed_local_output_bound() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    ctx.extensions.insert(ResponsesState {
+        accumulated_output: vec![json!({"id": "mcp_1", "type": "mcp_call", "output": "x".repeat(1_048_576)})],
+        locally_executed_output_items: ["mcp_1".to_owned()].into(),
+        ..ResponsesState::default()
+    });
+    let chunk = make_sse_chunk("response.output_text.delta", &json!({"delta": "x"}));
+    let mut parser = SseFrameParser::new(65_536);
+    let frames = parser.parse_chunk(&chunk).unwrap();
+    let event = crate::openai::sse::responses::ResponsesEvent::from_frame(&frames[0]).unwrap();
+    let pending = super::logical_output_upper_bound(&ctx, &stream, std::slice::from_ref(&event)).unwrap();
+    assert!(pending > 1_048_576, "the first content event must reserve local output");
+
+    stream.local_items_flushed = true;
+    let flushed = super::logical_output_upper_bound(&ctx, &stream, &[event]).unwrap();
+    assert!(flushed < 1_024, "later deltas only reserve their own wire payload");
+}
+
+#[test]
 fn store_budget_error_drops_later_stream_events() {
     let (filter, mut ctx) = make_armed_context();
     ctx.set_metadata("responses.store_stream_budget_failed", "true");
@@ -2421,7 +2467,8 @@ async fn logical_output_is_admitted_before_allocation() {
     let mut parser = SseFrameParser::new(65_536);
     let frames = parser.parse_chunk(&chunk).unwrap();
     let event = crate::openai::sse::responses::ResponsesEvent::from_frame(&frames[0]).unwrap();
-    let output_upper_bound = super::logical_output_upper_bound(&ctx, &[event]).unwrap();
+    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, stream, &[event]).unwrap();
     ctx.extensions
         .get_mut::<ResponsesState>()
         .unwrap()
@@ -2469,7 +2516,8 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
     let frame_bytes = super::retained_frame_payload_bytes(&frames).unwrap();
     let event_bytes = super::retained_event_payload_bytes(&events[0]).unwrap();
     let projected_state_bytes = super::projected_responses_state_clone_bytes(&ctx, &events);
-    let output_upper_bound = super::logical_output_upper_bound(&ctx, &events).unwrap();
+    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, stream, &events).unwrap();
     let current = ctx
         .extensions
         .get::<ResponsesState>()

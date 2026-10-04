@@ -812,7 +812,10 @@ fn parse_and_accumulate(
             .iter()
             .filter(|frame| frame.data != b"[DONE]")
             .try_fold(0_usize, |used, frame| {
-                used.checked_add(frame.data.len())
+                // Serde may expand exponent-form numbers while constructing
+                // the event Value. Admit that parsed owner before allocation.
+                let parsed_bound = super::agentic_loop::buffered_parsed_json_bytes_upper_bound(&frame.data)?;
+                used.checked_add(parsed_bound)
                     .and_then(|used| used.checked_add(frame.event_type.as_ref().map_or(0, String::len)))
             });
     // `frames` stays live while `ResponsesEvent` owns newly parsed JSON values.
@@ -841,7 +844,7 @@ fn parse_and_accumulate(
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     }
-    let Some(logical_output_upper_bound) = logical_output_upper_bound(ctx, &events) else {
+    let Some(logical_output_upper_bound) = logical_output_upper_bound(ctx, state, &events) else {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
@@ -1096,11 +1099,20 @@ fn local_terminal_output_upper_bound(state: &ResponsesState) -> Option<usize> {
 }
 
 /// Bound all output that `commit_chunk_events` can append for this chunk.
-fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
-    let mut bound = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .map_or(Some(0), local_terminal_output_upper_bound)?;
+fn logical_output_upper_bound(
+    ctx: &HttpFilterContext<'_>,
+    stream: &StreamEventsState,
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    // Local items flush before the first non-creation event, once per round.
+    // Later chunks cannot emit them again and must not rescan prior output.
+    let mut bound = if stream.local_items_flushed || events.iter().all(is_response_lifecycle_creation) {
+        0
+    } else {
+        ctx.extensions
+            .get::<ResponsesState>()
+            .map_or(Some(0), local_terminal_output_upper_bound)?
+    };
     for event in events {
         bound = bound.checked_add(normalized_sse_event_upper_bound(
             ctx,
