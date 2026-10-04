@@ -1026,7 +1026,8 @@ fn parse_and_accumulate(
 /// Reserve both copies made when a `done` event uses previously buffered deltas.
 /// The source string is already charged in `StreamEventsState`; completion moves
 /// it into a local owner, copies it into the output item, then clones that item
-/// into `tool_calls` while the local string remains live.
+/// into `tool_calls` while the local string remains live. Both destinations
+/// serialize the argument string as JSON, which can escape and expand its raw bytes.
 fn projected_argument_fallback_clone_bytes(state: &StreamEventsState, events: &[ResponsesEvent]) -> Option<usize> {
     events.iter().try_fold(0_usize, |total, event| {
         let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
@@ -1041,7 +1042,7 @@ fn projected_argument_fallback_clone_bytes(state: &StreamEventsState, events: &[
         if state.rejected_tool_call_args.contains(&key) {
             return Some(total);
         }
-        let fallback_bytes = state.tool_call_args.get(&key).map_or(0, String::len);
+        let fallback_bytes = state.tool_call_args.get(&key).map_or(Some(0), retained_json_bytes)?;
         total.checked_add(fallback_bytes.checked_mul(2)?)
     })
 }

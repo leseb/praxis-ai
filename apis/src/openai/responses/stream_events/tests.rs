@@ -7819,7 +7819,7 @@ fn budget_rejects_done_fallback_arguments_before_cloning() {
     let done_payload = json!({"item_id": "fc_1", "output_index": 0});
     let done = ResponsesEvent::FunctionCallArgumentsDone(done_payload.clone());
     let fallback_projection = super::projected_argument_fallback_clone_bytes(&stream, &[done]).unwrap();
-    assert_eq!(fallback_projection, 400_000, "both destination copies must be reserved");
+    assert_eq!(fallback_projection, 400_004, "both JSON string copies must be reserved");
     let explicit = ResponsesEvent::FunctionCallArgumentsDone(json!({
         "item_id": "fc_1", "output_index": 0, "arguments": "{}"
     }));
@@ -7841,6 +7841,72 @@ fn budget_rejects_done_fallback_arguments_before_cloning() {
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(responses.retained_payload_failed, "the logical stream must fail closed");
     assert!(responses.tool_calls.is_empty(), "no fallback copy may be committed");
+    assert!(body.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budget_rejects_escaped_done_fallback_before_cloning() {
+    use crate::openai::sse::responses::ResponsesEvent;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    responses.replace_response_object(json!({"output": [{
+        "type": "function_call", "id": "fc_1", "call_id": "call_1",
+        "name": "tool", "arguments": "", "status": "in_progress"
+    }]}));
+    responses.apply_retained_payload_limit(350_000);
+    ctx.extensions.insert(responses);
+    let arguments = serde_json::to_string(&json!({"s": "\\".repeat(50_000)})).unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_ok());
+    for delta in arguments.as_bytes().chunks(1_024) {
+        let mut body = Some(make_sse_chunk(
+            "response.function_call_arguments.delta",
+            &json!({
+                "item_id": "fc_1", "output_index": 0,
+                "delta": std::str::from_utf8(delta).unwrap()
+            }),
+        ));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "the buffered argument source fits before completion"
+        );
+    }
+
+    let done_payload = json!({"item_id": "fc_1", "output_index": 0});
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert_eq!(stream.tool_call_args.get("item:fc_1"), Some(&arguments));
+    let done = ResponsesEvent::FunctionCallArgumentsDone(done_payload.clone());
+    let projection = super::projected_argument_fallback_clone_bytes(&stream, &[done]).unwrap();
+    assert_eq!(
+        projection,
+        serde_json::to_string(&arguments).unwrap().len() * 2,
+        "reserve the exact JSON-escaped form of both destination strings"
+    );
+    assert!(
+        projection > arguments.len() * 2,
+        "backslashes must expand the reservation"
+    );
+    let budget = super::shared_retained_budget(&ctx, &mut stream);
+    assert!(budget.unwrap().1.is_some(), "the buffered source itself fits");
+    assert!(
+        !super::stream_payload_fits_with_budget(&stream, projection, budget),
+        "preflight must reject escaped destination copies before commitment"
+    );
+    ctx.insert_filter_state(stream);
+
+    let mut body = Some(make_sse_chunk("response.function_call_arguments.done", &done_payload));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        responses.retained_payload_failed,
+        "escaped fallback clones exceed the budget"
+    );
+    assert!(
+        responses.tool_calls.is_empty(),
+        "no escaped fallback copy may be committed"
+    );
     assert!(body.is_none(), "the rejected chunk must not be forwarded");
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
