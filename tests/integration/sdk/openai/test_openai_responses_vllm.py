@@ -2101,7 +2101,10 @@ def direct_budget_client(tmp_path, request):
         + anchor,
     )
     config = _patch_store_backend(config, str(tmp_path / "responses.db"))
-    config += f'\nadmin:\n  address: "127.0.0.1:{_free_port()}"\n'
+    admin_port = _free_port()
+    while admin_port == proxy_port:
+        admin_port = _free_port()
+    config += f'\nadmin:\n  address: "127.0.0.1:{admin_port}"\n'
     config_path = _persist_config(config)
     log_path = str(tmp_path / "praxis.log")
     with open(log_path, "w") as log_file:
