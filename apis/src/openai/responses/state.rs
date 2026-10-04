@@ -203,9 +203,13 @@ impl ResponseObjectChargeCache {
 #[cfg(feature = "store")]
 #[derive(Clone, Copy)]
 pub(crate) struct CompletedToolCallsChargeCache {
+    /// Agentic round whose completed calls were measured.
     iteration: u32,
+    /// Explicit call mutation revision; overflow disables reuse.
     revision: u64,
+    /// Completed-call count, guarding against unmarked shape changes.
     length: usize,
+    /// Compact JSON bytes of the completed calls.
     bytes: usize,
 }
 

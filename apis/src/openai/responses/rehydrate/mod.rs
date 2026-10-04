@@ -1052,13 +1052,7 @@ fn streaming_restore_budget(
     let Some(limit) = state.retained_payload_limit() else {
         return Ok(None);
     };
-    let stable = if let Some(cache) = armed.stable_payload.filter(|cache| cache.matches(state, limit)) {
-        cache.bytes
-    } else {
-        let bytes = state.stream_stable_payload_bytes_bounded(limit).ok_or(())?;
-        armed.stable_payload = RestoreStablePayloadCache::new(state, limit, bytes);
-        bytes
-    };
+    let stable = restore_stable_payload_bytes(armed, state, limit)?;
     let measurement_limit = limit.checked_add(state.retained_rehydrate_stream_bytes).ok_or(())?;
     let changing_limit = measurement_limit.checked_sub(stable).ok_or(())?;
     let response_object_bytes =
@@ -1078,6 +1072,20 @@ fn streaming_restore_budget(
         current,
         retained_rehydrate_stream_bytes: state.retained_rehydrate_stream_bytes,
     }))
+}
+
+/// Reuse the unchanged request/history charge for each streamed callback.
+fn restore_stable_payload_bytes(
+    armed: &mut RestorePreviousResponseIdStream,
+    state: &ResponsesState,
+    limit: usize,
+) -> Result<usize, ()> {
+    if let Some(cache) = armed.stable_payload.filter(|cache| cache.matches(state, limit)) {
+        return Ok(cache.bytes);
+    }
+    let bytes = state.stream_stable_payload_bytes_bounded(limit).ok_or(())?;
+    armed.stable_payload = RestoreStablePayloadCache::new(state, limit, bytes);
+    Ok(bytes)
 }
 
 /// Admit one rewrite staging allocation against the current callback snapshot.
