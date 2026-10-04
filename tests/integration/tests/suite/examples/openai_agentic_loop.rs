@@ -24,6 +24,7 @@ use praxis_test_utils::{
     free_port, http_get, http_send, json_post, load_example_config, parse_body, parse_status, patch_yaml,
     start_mcp_mock_server_with_config, start_proxy,
 };
+use sqlx::Row as _;
 
 // -----------------------------------------------------------------------------
 // Pipeline Build
@@ -114,8 +115,8 @@ fn oversized_stored_history_returns_413_before_replay_or_inference() {
     assert_eq!(model.requests().len(), 1, "oversized history must not reach inference");
 }
 
-#[test]
-fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
+#[tokio::test]
+async fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
     let model_response = serde_json::json!({
         "id": "resp_retained_overflow",
         "object": "response",
@@ -165,12 +166,20 @@ fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
         0,
         "overflow must stop before tool execution"
     );
-    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_retained_overflow", None);
-    assert_eq!(status, 404, "failed response must not be stored");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let stored: i64 = sqlx::query("SELECT COUNT(*) AS n FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("count query should run")
+        .get("n");
+    pool.close().await;
+    assert_eq!(stored, 0, "failed response must not be stored under its generated ID");
 }
 
-#[test]
-fn aggregate_mcp_transport_overflow_stops_remaining_calls_and_persistence() {
+#[tokio::test]
+async fn aggregate_mcp_transport_overflow_stops_remaining_calls_and_persistence() {
     let first_response = serde_json::json!({
         "id": "resp_mcp_transport_budget",
         "object": "response",
@@ -229,8 +238,16 @@ fn aggregate_mcp_transport_overflow_stops_remaining_calls_and_persistence() {
     assert_eq!(body["error"]["type"], "server_error");
     assert_eq!(mcp.method_count("tools/call"), 1, "later call must not execute");
     assert_eq!(model.requests().len(), 1, "overflow must not resume inference");
-    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_mcp_transport_budget", None);
-    assert_eq!(status, 404, "overflow must not persist a successful response");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let stored: i64 = sqlx::query("SELECT COUNT(*) AS n FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("count query should run")
+        .get("n");
+    pool.close().await;
+    assert_eq!(stored, 0, "overflow must not persist a response under its generated ID");
 }
 
 #[test]
