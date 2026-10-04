@@ -555,7 +555,7 @@ pub(crate) fn insert_budgeted_responses_state(
             return Err(FilterAction::Reject(error::responses_error_rejection(
                 413,
                 "invalid_request_error",
-                "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+                "initial request state exceeds openai_agentic_loop.max_retained_bytes",
             )));
         }
     }
