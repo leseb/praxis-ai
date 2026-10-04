@@ -1101,7 +1101,41 @@ impl ResponsesState {
             meter.raw(tool.len())?;
             meter.json(value)?;
         }
+        self.meter_deferred_mcp_payload(&mut meter)?;
         Some(meter.used())
+    }
+
+    /// Charge deferred connector definitions in the revision-invalidated stable owner.
+    fn meter_deferred_mcp_payload(&self, meter: &mut PayloadMeter) -> Option<()> {
+        for connector in &self.deferred_mcp {
+            meter.raw(connector.connector_id.len())?;
+            meter.raw(connector.server_label.len())?;
+            meter.raw(connector.server_url.len())?;
+            if let Some(authorization) = &connector.authorization {
+                meter.raw(authorization.len())?;
+            }
+            for value in [
+                connector.allowed_tools.as_ref(),
+                connector.headers.as_ref(),
+                connector.require_approval.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                meter.json(value)?;
+            }
+        }
+        #[cfg(feature = "openai-mcp-tools")]
+        for slot in [
+            self.mcp_connector_context_policy.credential_slot.as_ref(),
+            self.mcp_connector_context_policy.authorization_slot.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.raw(slot.len())?;
+        }
+        Some(())
     }
 
     /// The Chat stream converter caches the current response/template/call
@@ -1215,6 +1249,7 @@ impl ResponsesState {
                 meter.raw(tool.len())?;
                 meter.json(value)?;
             }
+            self.meter_deferred_mcp_payload(&mut meter)?;
         }
         if let Some(bytes) = cached_current_output_bytes {
             meter.raw(bytes)?;
@@ -1248,36 +1283,6 @@ impl ResponsesState {
             meter.raw(lowered.original_name.len())?;
             if let Some(namespace) = &lowered.namespace {
                 meter.raw(namespace.len())?;
-            }
-        }
-        for connector in &self.deferred_mcp {
-            meter.raw(connector.connector_id.len())?;
-            meter.raw(connector.server_label.len())?;
-            meter.raw(connector.server_url.len())?;
-            if let Some(authorization) = &connector.authorization {
-                meter.raw(authorization.len())?;
-            }
-            for value in [
-                connector.allowed_tools.as_ref(),
-                connector.headers.as_ref(),
-                connector.require_approval.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                meter.json(value)?;
-            }
-        }
-        #[cfg(feature = "openai-mcp-tools")]
-        {
-            for slot in [
-                self.mcp_connector_context_policy.credential_slot.as_ref(),
-                self.mcp_connector_context_policy.authorization_slot.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                meter.raw(slot.len())?;
             }
         }
         for (key, value) in &self.citation_files {
@@ -1396,6 +1401,7 @@ impl ResponsesState {
         {
             self.retained_mcp_session_bytes = 0;
             self.retained_mcp_closing_pool = None;
+            self.mcp_connector_context_policy = McpConnectorContextPolicy::default();
         }
         self.messages.clear();
         self.persisted_messages.clear();
@@ -1420,6 +1426,7 @@ impl ResponsesState {
         self.provider_compaction_ids.clear();
         self.retained_rehydrate_stream_bytes = 0;
         self.dispatch_failure = None;
+        self.mark_replay_stable_payload_changed();
     }
 
     /// Create initial state from a parsed request body.
@@ -2099,6 +2106,68 @@ mod tests {
         ] {
             assert_eq!(changing, Some(baseline_changing));
         }
+        assert_eq!(state.retained_payload_bytes().unwrap(), stable + baseline_changing);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks every deferred descriptor owner against all stream meters"
+    )]
+    fn deferred_mcp_payload_is_measured_once_in_stream_stable_charge() {
+        let mut state = ResponsesState::default();
+        let baseline_stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let baseline_changing = state.stream_changing_payload_bytes_bounded_for_parser(1_024).unwrap();
+        let allowed_tools = json!({"names": ["x".repeat(1_048_576)]});
+        let headers = json!({"x-tenant": "team"});
+        let approval = json!({"never": ["lookup"]});
+        let connector_bytes = "id".len()
+            + "label".len()
+            + "https://mcp.example.com".len()
+            + "secret".len()
+            + retained_json_bytes(&allowed_tools).unwrap()
+            + retained_json_bytes(&headers).unwrap()
+            + retained_json_bytes(&approval).unwrap();
+        state.deferred_mcp.push(DeferredMcpConnector {
+            authorization: Some("secret".to_owned()),
+            allowed_tools: Some(allowed_tools),
+            connector_id: "id".to_owned(),
+            headers: Some(headers),
+            max_rewritten_body_bytes: 1_200_000,
+            max_tools: 128,
+            require_approval: Some(approval),
+            server_label: "label".to_owned(),
+            server_url: "https://mcp.example.com".to_owned(),
+            timeout: Duration::from_secs(5),
+        });
+        #[cfg(feature = "openai-mcp-tools")]
+        let policy_bytes = {
+            state.mcp_connector_context_policy =
+                McpConnectorContextPolicy::new(Some("credential-slot"), Some("assertion-slot"));
+            state.mcp_connector_context_policy.retained_payload_bytes().unwrap()
+        };
+        #[cfg(not(feature = "openai-mcp-tools"))]
+        let policy_bytes = 0;
+        state.mark_replay_stable_payload_changed();
+
+        let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
+        assert_eq!(stable, baseline_stable + connector_bytes + policy_bytes);
+        let current_output = current_output_bytes(&state);
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            for changing in [
+                state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+                state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+                #[cfg(feature = "store")]
+                state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+            ] {
+                assert_eq!(changing, Some(baseline_changing));
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deferred descriptors must not be rescanned per chunk"
+        );
         assert_eq!(state.retained_payload_bytes().unwrap(), stable + baseline_changing);
     }
 
