@@ -1927,6 +1927,129 @@ def witness_replay_limited_tool_client(tmp_path_factory, request, search_server)
     )
 
 
+class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
+    """Serve fixed native Responses bodies without running the IRR step."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        request_body = json.loads(self.rfile.read(length))
+        model = request_body["model"]
+        size = 50 if model == "chunked" else int(model)
+        response = {
+            "id": f"resp_direct_budget_{model}",
+            "object": "response",
+            "created_at": 1780000000,
+            "model": model,
+            "status": "completed",
+            "output": [{
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "x" * size}],
+            }],
+        }
+        payload = json.dumps(response, separators=(",", ":")).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        if model == "chunked":
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if model == "chunked":
+            self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n")
+        else:
+            self.wfile.write(payload)
+        self.wfile.flush()
+        self.close_connection = True
+
+
+@pytest.fixture()
+def direct_budget_client(tmp_path, request):
+    """Route a Responses request around IRR while retaining its loop policy."""
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), DirectBudgetBackendHandler)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    proxy_port = _free_port()
+    config = _load_example_config(
+        "examples/configs/openai/responses/agentic-loop-fixture.yaml",
+        proxy_port,
+        backend_endpoint=f"127.0.0.1:{backend.server_port}",
+    )
+    config = config.replace("max_retained_bytes: 67108864", "max_retained_bytes: 16384")
+    anchor = "      - filter: iterative_request_router\n"
+    assert config.count(anchor) == 1
+    config = config.replace(
+        anchor,
+        "      - filter: request_id\n"
+        "        branch_chains:\n"
+        "          - name: direct\n"
+        "            rejoin: terminal\n"
+        "            chains:\n"
+        "              - name: direct-inline\n"
+        "                filters:\n"
+        "                  - filter: router\n"
+        "                    routes:\n"
+        "                      - path_prefix: \"/\"\n"
+        "                        cluster: direct-backend\n"
+        "                  - filter: load_balancer\n"
+        "                    clusters:\n"
+        "                      - name: direct-backend\n"
+        f"                        endpoints: [\"127.0.0.1:{backend.server_port}\"]\n"
+        + anchor,
+    )
+    config = _patch_store_backend(config, str(tmp_path / "responses.db"))
+    config += f'\nadmin:\n  address: "127.0.0.1:{_free_port()}"\n'
+    config_path = _persist_config(config)
+    log_path = str(tmp_path / "praxis.log")
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, log_path)
+            yield _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if request.session.testsfailed > 0:
+                print(_read_log_tail(log_path), file=sys.stderr)
+            backend.shutdown()
+            os.unlink(config_path)
+
+
+def test_direct_budget_store_rejects_before_success_headers(direct_budget_client):
+    """A noncanonical direct branch reports a structured budget failure."""
+    client = direct_budget_client
+    admitted = client.responses.create(model="10", input="hello", store=True)
+    assert admitted.status == "completed"
+    assert admitted.output[0].content[0].text == "x" * 10
+
+    with pytest.raises(APIStatusError) as known:
+        client.responses.create(model="3000", input="hello", store=True)
+    assert known.value.status_code == 502
+    assert known.value.response.json()["error"]["type"] == "server_error"
+
+    with pytest.raises(APIStatusError) as unknown:
+        client.responses.create(model="chunked", input="hello", store=True)
+    assert unknown.value.status_code == 502
+    assert unknown.value.response.json()["error"]["type"] == "server_error"
+
+    passthrough = client.responses.create(model="3000", input="hello", store=False)
+    assert passthrough.status == "completed"
+    assert passthrough.output[0].content[0].text == "x" * 3000
+
+
 @pytest.fixture()
 def provider_compaction_client(tmp_path_factory, request):
     """Function-scoped native Responses backend with a provider compaction."""
