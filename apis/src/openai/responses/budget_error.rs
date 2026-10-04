@@ -15,7 +15,7 @@ use super::{
 /// Reject a request-side admission before dispatching another provider call.
 /// The HTTP status is determined by the logical response, not its `stream` bit:
 /// the first input is a 413, an uncommitted continuation is a 502, and
-/// a committed response requires an in-band error.
+/// committed response headers or SSE bytes require an in-band error.
 pub(crate) fn reject_request(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
     FilterAction::Reject(request_rejection(ctx, message))
 }
@@ -38,6 +38,7 @@ pub(crate) fn response_rejection(ctx: &mut HttpFilterContext<'_>, message: &str)
     rejection(ctx, message, false)
 }
 
+/// Select the wire error from the request phase and actual client commitment.
 fn rejection(ctx: &mut HttpFilterContext<'_>, message: &str, initial: bool) -> Rejection {
     let committed = ctx.extensions.get::<ObservedResponsesSse>().is_some()
         || ctx
@@ -75,6 +76,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers all three wire phases in one stateful context"
+    )]
     fn request_phase_tracks_actual_sse_commitment() {
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_filter_context(&request);
@@ -94,7 +99,7 @@ mod tests {
         ctx.extensions.insert(ObservedResponsesSse);
         let in_band = request_rejection(&mut ctx, "over budget");
         assert_eq!(in_band.status, 200);
-        let body = std::str::from_utf8(in_band.body.as_deref().unwrap()).unwrap();
+        let body = String::from_utf8_lossy(in_band.body.as_deref().unwrap_or_default());
         assert!(body.contains("event: error"));
         assert!(!body.contains("response.completed"));
         assert!(!body.contains("[DONE]"));
@@ -109,10 +114,6 @@ mod tests {
             first_pull.status, 200,
             "headers commit the status before the first body pull"
         );
-        assert!(
-            std::str::from_utf8(first_pull.body.as_deref().unwrap())
-                .unwrap()
-                .contains("event: error")
-        );
+        assert!(String::from_utf8_lossy(first_pull.body.as_deref().unwrap_or_default()).contains("event: error"));
     }
 }

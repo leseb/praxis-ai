@@ -163,6 +163,80 @@ pub(crate) struct ClientToolEcho {
     pub tool_choice: serde_json::Value,
 }
 
+/// Exact response-object charge reused by response filters while the object is unchanged.
+#[cfg(feature = "store")]
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseObjectChargeCache {
+    /// Agentic round whose response object was measured.
+    iteration: u32,
+    /// Explicit mutation revision; an overflow disables reuse.
+    revision: u64,
+    /// Compact JSON bytes of the response object.
+    bytes: usize,
+}
+
+#[cfg(feature = "store")]
+impl ResponseObjectChargeCache {
+    /// Measure once per revision, including after an in-place output-item rewrite.
+    pub(crate) fn measure(cache: &mut Option<Self>, state: &ResponsesState, max_bytes: usize) -> Option<usize> {
+        if let Some(existing) = cache
+            && existing.iteration == state.iteration
+            && Some(existing.revision) == state.response_object_revision
+        {
+            return (existing.bytes <= max_bytes).then_some(existing.bytes);
+        }
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json(&state.response_object)?;
+        let bytes = meter.used();
+        *cache = state.response_object_revision.map(|revision| Self {
+            iteration: state.iteration,
+            revision,
+            bytes,
+        });
+        Some(bytes)
+    }
+}
+
+/// Exact completed-call charge reused by Store and Rehydrate during one SSE
+/// response. Every production write advances the dedicated call revision;
+/// overflow disables reuse rather than admitting a stale size.
+#[cfg(feature = "store")]
+#[derive(Clone, Copy)]
+pub(crate) struct CompletedToolCallsChargeCache {
+    /// Agentic round whose completed calls were measured.
+    iteration: u32,
+    /// Explicit call mutation revision; overflow disables reuse.
+    revision: u64,
+    /// Completed-call count, guarding against unmarked shape changes.
+    length: usize,
+    /// Compact JSON bytes of the completed calls.
+    bytes: usize,
+}
+
+#[cfg(feature = "store")]
+impl CompletedToolCallsChargeCache {
+    /// Measure once per stream mutation revision, respecting a smaller later limit.
+    pub(crate) fn measure(cache: &mut Option<Self>, state: &ResponsesState, max_bytes: usize) -> Option<usize> {
+        if let Some(existing) = cache
+            && existing.iteration == state.iteration
+            && Some(existing.revision) == state.tool_calls_revision
+            && existing.length == state.tool_calls.len()
+        {
+            return (existing.bytes <= max_bytes).then_some(existing.bytes);
+        }
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json_values(&state.tool_calls)?;
+        let bytes = meter.used();
+        *cache = state.tool_calls_revision.map(|revision| Self {
+            iteration: state.iteration,
+            revision,
+            length: state.tool_calls.len(),
+            bytes,
+        });
+        Some(bytes)
+    }
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
@@ -342,20 +416,28 @@ pub(crate) struct ResponsesState {
     /// captured SSE replay rows, and the store decoder's unfinished record).
     /// The loop owner refreshes this before initial admission.
     pub(crate) retained_external_payload_bytes: usize,
-    /// Incomplete SSE frame held by the outer rehydration response rewrite.
-    pub(crate) retained_rehydrate_stream_bytes: usize,
-    /// Semantic and framing payload published by the Chat stream translator.
-    pub(crate) retained_chat_converter_bytes: usize,
-
-    /// Revision of request/history/output owners cached by response-store
-    /// replay admission. In-place changes do not alter collection lengths.
-    /// `None` means the counter overflowed and replay must fail closed.
+    /// Invalidates the store replay cache after in-place request, history, or
+    /// output changes that do not alter collection lengths. Overflow fails closed.
     pub(crate) replay_stable_payload_revision: Option<u64>,
+
+    /// Invalidates response-object byte caches after an owned or in-place edit.
+    /// Overflow disables reuse so a stale charge can never be admitted.
+    pub(crate) response_object_revision: Option<u64>,
+
+    /// Invalidates Store and Rehydrate's completed-call charge after any write.
+    /// Overflow disables cache reuse.
+    pub(crate) tool_calls_revision: Option<u64>,
 
     /// Parser buffers published by `openai_stream_events`. Its filter-local
     /// slot is invisible to other filters, so the request-wide meter owns this
     /// charge between stream callbacks.
     pub(crate) retained_stream_parser_bytes: usize,
+
+    /// An incomplete SSE frame retained by response ID restoration between callbacks.
+    pub(crate) retained_rehydrate_stream_bytes: usize,
+
+    /// Semantic and framing payload published by the Chat stream translator.
+    pub(crate) retained_chat_converter_bytes: usize,
 
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
@@ -615,6 +697,17 @@ pub(crate) struct ResponsesState {
 
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
+
+    /// The loop already admitted and serialized this round's buffered body.
+    pub(crate) buffered_canonical_finalized: bool,
+
+    /// Exact wire length of the serialized canonical body.
+    pub(crate) buffered_canonical_wire_bytes: Option<usize>,
+
+    /// Lexical upper bound for reparsing that same canonical wire body.
+    pub(crate) buffered_canonical_parsed_bound_bytes: Option<usize>,
+    /// Digest of the exact wire body admitted by the terminal finalizer.
+    pub(crate) buffered_canonical_body_digest: Option<[u8; 32]>,
 
     /// Prior streamed terminal response retained across request-side re-entry.
     ///
@@ -879,14 +972,6 @@ impl McpConnectorContextPolicy {
             authorization_slot: authorization_slot.map(str::to_owned),
         }
     }
-
-    /// Bytes owned by the configured slot names in request-scoped state.
-    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
-        self.credential_slot
-            .as_ref()
-            .map_or(0, String::len)
-            .checked_add(self.authorization_slot.as_ref().map_or(0, String::len))
-    }
 }
 
 impl fmt::Debug for DeferredMcpConnector {
@@ -923,10 +1008,12 @@ impl Default for ResponsesState {
         Self {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
+            replay_stable_payload_revision: Some(0),
+            response_object_revision: Some(0),
+            tool_calls_revision: Some(0),
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
-            replay_stable_payload_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -968,6 +1055,10 @@ impl Default for ResponsesState {
             request_body: serde_json::Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
+            buffered_canonical_finalized: false,
+            buffered_canonical_wire_bytes: None,
+            buffered_canonical_parsed_bound_bytes: None,
+            buffered_canonical_body_digest: None,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
             tool_search_calls: Vec::new(),
@@ -1057,12 +1148,17 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false, None, None)?
+            .checked_add(stream_bytes)
     }
 
-    /// Request, history, and the capture-once client-tool echo remain stable
-    /// between upstream chunks. Measure them once per round; streaming filters
-    /// refresh this baseline when a request rewrite or next round changes it.
+    /// Request, history, and resolved tool snapshots stay fixed during one
+    /// upstream round. Streaming owners cache these while measuring changing
+    /// response state on each callback.
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1078,137 +1174,23 @@ impl ResponsesState {
         for id in &self.provider_compaction_ids {
             meter.raw(id.len())?;
         }
-        if let Some(echo) = &self.client_tool_echo {
-            meter.json_values(&echo.tools)?;
-            meter.json(&echo.tool_choice)?;
-        }
-        Some(meter.used())
-    }
-
-    /// Rehydration runs after the stream parser and can see new canonical output
-    /// between chunks; count both while reusing only stable request/history bytes.
-    #[cfg(feature = "store")]
-    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
-    }
-
-    /// The response store caches request/history and prior output while
-    /// capturing replay chunks, but must still count all changing owners,
-    /// including the parser charge published by `openai_stream_events`.
-    #[cfg(feature = "store")]
-    pub(crate) fn store_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
-    }
-
-    /// The translated upstream round cannot append prior output until its
-    /// converter has finished. The converter caches that large owner once;
-    /// this counts all other changing owners, including the stream parser.
-    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
-    }
-
-    /// Stream events separately charges its parser state and cached prior
-    /// output; the capture-once echo belongs to the common stable charge.
-    pub(crate) fn stream_changing_payload_bytes_bounded_for_parser(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, false, true)
-    }
-
-    /// Count payload owned directly by this state, excluding sibling-filter
-    /// owners that participate only in the aggregate agentic budget.
-    ///
-    /// File search's legacy `max_state_bytes` option predates the aggregate
-    /// budget and covers iterative-router plus file-search continuation state;
-    /// response-store snapshots and other sibling-filter owners must not change
-    /// that independent compatibility limit.
-    pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false)
-    }
-
-    /// Shared implementation for aggregate and state-only payload accounting.
-    #[expect(
-        clippy::too_many_lines,
-        clippy::cognitive_complexity,
-        clippy::too_many_arguments,
-        clippy::fn_params_excessive_bools,
-        reason = "exhaustive accounting for the request-scoped state bag"
-    )]
-    fn retained_payload_bytes_bounded_inner(
-        &self,
-        max_bytes: usize,
-        include_external: bool,
-        skip_stream_stable: bool,
-        skip_accumulated_output: bool,
-        include_stream_parser: bool,
-        include_chat_converter: bool,
-    ) -> Option<usize> {
-        let mut meter = PayloadMeter::new(max_bytes);
-        if include_external {
-            meter.raw(self.retained_external_payload_bytes)?;
-            meter.raw(self.retained_rehydrate_stream_bytes)?;
-        }
-        if include_stream_parser {
-            meter.raw(self.retained_stream_parser_bytes)?;
-        }
-        if include_chat_converter {
-            meter.raw(self.retained_chat_converter_bytes)?;
-        }
-
-        if !skip_stream_stable {
-            meter.json(&self.request_body)?;
-            for values in [
-                &self.input,
-                &self.messages,
-                &self.persisted_messages,
-                &self.previous_tools,
-                &self.tools,
-            ] {
-                meter.json_values(values)?;
-            }
-            for id in &self.provider_compaction_ids {
-                meter.raw(id.len())?;
-            }
-            if let Some(echo) = &self.client_tool_echo {
-                meter.json_values(&echo.tools)?;
-                meter.json(&echo.tool_choice)?;
-            }
-        }
-        for value in [
-            &self.response_object,
-            &self.local_completion_response_template,
-            &self.tool_choice,
-            &self.usage,
-        ] {
-            meter.json(value)?;
-        }
-        if !skip_accumulated_output {
-            meter.json_values(&self.accumulated_output)?;
-        }
-        for values in [&self.tool_calls, &self.tool_search_calls, &self.web_search_calls] {
-            meter.json_values(values)?;
-        }
-        for value in [
-            self.context_management.as_ref(),
-            self.conversation.as_ref(),
-            self.original_tool_choice.as_ref(),
-            self.previous_usage.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            meter.json(value)?;
-        }
         for ((server, tool), value) in &self.mcp_tool_map {
             meter.raw(server.len())?;
             meter.raw(tool.len())?;
             meter.json(value)?;
         }
-        for (private_name, lowered) in &self.client_tool_lowering {
-            meter.raw(private_name.len())?;
-            meter.raw(lowered.original_name.len())?;
-            if let Some(namespace) = &lowered.namespace {
-                meter.raw(namespace.len())?;
-            }
+        if let Some(echo) = &self.client_tool_echo {
+            meter.json_values(&echo.tools)?;
+            meter.json(&echo.tool_choice)?;
         }
+        self.meter_deferred_mcp(&mut meter)?;
+        Some(meter.used())
+    }
+
+    /// Charge deferred connector descriptors and their fixed security slots.
+    /// Discovery changes these only between upstream rounds; stream owners
+    /// cache this charge until the next round or stable-payload revision.
+    fn meter_deferred_mcp(&self, meter: &mut PayloadMeter) -> Option<()> {
         for connector in &self.deferred_mcp {
             meter.raw(connector.connector_id.len())?;
             meter.raw(connector.server_label.len())?;
@@ -1228,16 +1210,206 @@ impl ResponsesState {
             }
         }
         #[cfg(feature = "openai-mcp-tools")]
+        for slot in [
+            self.mcp_connector_context_policy.credential_slot.as_ref(),
+            self.mcp_connector_context_policy.authorization_slot.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            for slot in [
-                self.mcp_connector_context_policy.credential_slot.as_ref(),
-                self.mcp_connector_context_policy.authorization_slot.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                meter.raw(slot.len())?;
+            meter.raw(slot.len())?;
+        }
+        Some(())
+    }
+
+    /// Count the owners which may change during a streaming response. The
+    /// stream-local meter adds the cached request/history and prior-round
+    /// output and tool-snapshot charges separately; all are fixed until EOS.
+    #[cfg(test)]
+    pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, None, None)?
+            .checked_add(self.retained_rehydrate_stream_bytes)
+    }
+
+    /// Use the stream parser's exact charges for unchanged output items and
+    /// completed tool calls. Other filters pass `None` and keep measuring their
+    /// own tool-call owners because they do not share the parser's invalidation.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: usize,
+        tool_calls_bytes: Option<usize>,
+    ) -> Option<usize> {
+        let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            true,
+            true,
+            Some(response_object_bytes),
+            tool_calls_bytes,
+        )?
+        .checked_add(self.retained_rehydrate_stream_bytes)
+    }
+
+    /// Count changing owners while a response filter caches request, history,
+    /// fixed tool snapshots, and prior output. Include the stream parsers'
+    /// published charges.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        self.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(max_bytes, None, None)
+    }
+
+    /// The Store and Chat changing meter with an exact cached response-object
+    /// charge when the Store has already measured this revision.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
+    ) -> Option<usize> {
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            true,
+            true,
+            response_object_bytes,
+            tool_calls_bytes,
+        )?
+        .checked_add(stream_bytes)
+    }
+
+    /// Uncached Rehydrate meter retained for parity tests. Production caches
+    /// prior output with request/history and uses the shared changing meter.
+    #[cfg(all(test, feature = "store"))]
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
+    ) -> Option<usize> {
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            false,
+            true,
+            response_object_bytes,
+            tool_calls_bytes,
+        )?
+        .checked_add(stream_bytes)
+    }
+
+    /// Count payload owned directly by this state, excluding sibling-filter
+    /// owners that participate only in the aggregate agentic budget.
+    ///
+    /// File search's legacy `max_state_bytes` option predates the aggregate
+    /// budget and covers iterative-router plus file-search continuation state;
+    /// response-store snapshots and other sibling-filter owners must not change
+    /// that independent compatibility limit.
+    pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, None, None)
+    }
+
+    /// Shared implementation for aggregate and state-only payload accounting.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        clippy::fn_params_excessive_bools,
+        clippy::too_many_arguments,
+        reason = "exhaustive accounting for the request-scoped state bag"
+    )]
+    fn retained_payload_bytes_bounded_inner(
+        &self,
+        max_bytes: usize,
+        include_external: bool,
+        skip_stream_stable: bool,
+        skip_accumulated_output: bool,
+        skip_stream_fixed_tools: bool,
+        response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
+    ) -> Option<usize> {
+        let mut meter = PayloadMeter::new(max_bytes);
+        if include_external {
+            meter.raw(self.retained_external_payload_bytes)?;
+            meter.raw(self.retained_chat_converter_bytes)?;
+        }
+
+        if !skip_stream_stable {
+            meter.json(&self.request_body)?;
+            for values in [
+                &self.input,
+                &self.messages,
+                &self.persisted_messages,
+                &self.previous_tools,
+                &self.tools,
+            ] {
+                meter.json_values(values)?;
             }
+            for id in &self.provider_compaction_ids {
+                meter.raw(id.len())?;
+            }
+        }
+        if let Some(bytes) = response_object_bytes {
+            meter.raw(bytes)?;
+        } else {
+            meter.json(&self.response_object)?;
+        }
+        for value in [&self.local_completion_response_template, &self.tool_choice, &self.usage] {
+            meter.json(value)?;
+        }
+        if !skip_accumulated_output {
+            meter.json_values(&self.accumulated_output)?;
+        }
+        if let Some(bytes) = tool_calls_bytes {
+            meter.raw(bytes)?;
+        } else {
+            meter.json_values(&self.tool_calls)?;
+        }
+        for values in [&self.tool_search_calls, &self.web_search_calls] {
+            meter.json_values(values)?;
+        }
+        for value in [
+            self.context_management.as_ref(),
+            self.conversation.as_ref(),
+            self.original_tool_choice.as_ref(),
+            self.previous_usage.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.json(value)?;
+        }
+        if !skip_stream_fixed_tools {
+            for ((server, tool), value) in &self.mcp_tool_map {
+                meter.raw(server.len())?;
+                meter.raw(tool.len())?;
+                meter.json(value)?;
+            }
+        }
+        for (private_name, lowered) in &self.client_tool_lowering {
+            meter.raw(private_name.len())?;
+            meter.raw(lowered.original_name.len())?;
+            if let Some(namespace) = &lowered.namespace {
+                meter.raw(namespace.len())?;
+            }
+        }
+        if !skip_stream_fixed_tools && let Some(echo) = &self.client_tool_echo {
+            meter.json_values(&echo.tools)?;
+            meter.json(&echo.tool_choice)?;
+        }
+        if !skip_stream_fixed_tools {
+            self.meter_deferred_mcp(&mut meter)?;
         }
         for (key, value) in &self.citation_files {
             meter.raw(key.len())?;
@@ -1323,6 +1495,7 @@ impl ResponsesState {
     pub(crate) fn fail_retained_payload_budget(&mut self) {
         self.retained_payload_failed = true;
         self.tool_calls.clear();
+        self.mark_tool_calls_changed();
         self.tool_search_calls.clear();
         self.web_search_calls.clear();
         self.file_search_assignments.clear();
@@ -1347,6 +1520,10 @@ impl ResponsesState {
         self.logical_stream_response_id = None;
         self.input.clear();
         self.deferred_mcp.clear();
+        #[cfg(feature = "openai-mcp-tools")]
+        {
+            self.mcp_connector_context_policy = McpConnectorContextPolicy::default();
+        }
         self.mcp_tool_map.clear();
         self.client_tool_lowering.clear();
         self.client_tool_echo = None;
@@ -1360,7 +1537,12 @@ impl ResponsesState {
         self.original_tool_choice = None;
         self.response_id = None;
         self.request_body = serde_json::json!({ "stream": streaming });
-        self.response_object = serde_json::Value::Null;
+        self.mark_replay_stable_payload_changed();
+        self.replace_response_object(serde_json::Value::Null);
+        self.buffered_canonical_finalized = false;
+        self.buffered_canonical_wire_bytes = None;
+        self.buffered_canonical_parsed_bound_bytes = None;
+        self.buffered_canonical_body_digest = None;
         self.local_completion_response_template = serde_json::Value::Null;
         self.tool_choice = serde_json::Value::Null;
         self.tools.clear();
@@ -1415,18 +1597,12 @@ impl ResponsesState {
     pub(crate) fn provider_compaction_ids_from_messages(messages: &[serde_json::Value]) -> HashSet<String> {
         messages
             .iter()
-            .filter_map(Self::provider_compaction_id_from_message)
+            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
+            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.starts_with("compact_"))
             .map(ToOwned::to_owned)
             .collect()
-    }
-
-    /// Borrow a provider compaction ID before a collector copies it into state.
-    pub(crate) fn provider_compaction_id_from_message(item: &serde_json::Value) -> Option<&str> {
-        (item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
-            .then_some(item)
-            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
-            .and_then(|item| item.get("id").and_then(serde_json::Value::as_str))
-            .filter(|id| !id.starts_with("compact_"))
     }
 
     /// Record the first security-context failure; later calls are ignored (first wins).
@@ -1442,12 +1618,41 @@ impl ResponsesState {
         self.mark_replay_stable_payload_changed();
     }
 
-    /// Invalidate the store replay meter after an in-place mutation of a
-    /// cached request, history, tool, or accumulated output owner.
+    /// Invalidate the store replay cache after an in-place stable-owner edit.
     pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
         self.replay_stable_payload_revision = self
             .replay_stable_payload_revision
             .and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Invalidate exact response-object charges before an owned or in-place edit.
+    pub(crate) fn mark_response_object_changed(&mut self) {
+        self.response_object_revision = self
+            .response_object_revision
+            .and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Invalidate completed-call byte charges before an append, replacement, or clear.
+    pub(crate) fn mark_tool_calls_changed(&mut self) {
+        self.tool_calls_revision = self.tool_calls_revision.and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Borrow the response object for mutation and invalidate response-filter byte caches.
+    pub(crate) fn response_object_mut(&mut self) -> &mut serde_json::Value {
+        self.mark_response_object_changed();
+        &mut self.response_object
+    }
+
+    /// Replace the response object and invalidate response-filter byte caches.
+    pub(crate) fn replace_response_object(&mut self, response: serde_json::Value) {
+        self.response_object = response;
+        self.mark_response_object_changed();
+    }
+
+    /// Move the response object out and invalidate response-filter byte caches.
+    pub(crate) fn take_response_object(&mut self) -> serde_json::Value {
+        self.mark_response_object_changed();
+        std::mem::take(&mut self.response_object)
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
@@ -1461,6 +1666,7 @@ impl ResponsesState {
 
     /// Mutably borrow public output, creating a valid array when absent.
     pub(crate) fn output_items_mut(&mut self) -> &mut Vec<serde_json::Value> {
+        self.mark_response_object_changed();
         if !self.response_object.is_object() {
             self.response_object = serde_json::Value::Object(serde_json::Map::new());
         }
@@ -1548,6 +1754,10 @@ impl ResponsesState {
         reason = "in-place canonical response finalization with budget preflight"
     )]
     pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
+        self.buffered_canonical_finalized = false;
+        self.buffered_canonical_wire_bytes = None;
+        self.buffered_canonical_parsed_bound_bytes = None;
+        self.buffered_canonical_body_digest = None;
         if !self.response_object.is_object() {
             return Ok(());
         }
@@ -1579,7 +1789,7 @@ impl ResponsesState {
         // the retained-state mutation transactional through annotation and both
         // size admissions; on failure no oversized response or serialization
         // buffer becomes an additional state owner.
-        let mut response = std::mem::take(&mut self.response_object);
+        let mut response = self.take_response_object();
         if let Some(obj) = response.as_object_mut() {
             if !self.accumulated_output.is_empty() {
                 obj.insert(
@@ -1593,11 +1803,11 @@ impl ResponsesState {
         }
         if let Err(error) = annotate_response(&mut response, &self.citation_files) {
             tracing::warn!(%error, "failed to annotate final response");
-            self.response_object = response;
+            self.replace_response_object(response);
             return Err(finalize_rejection("failed to annotate final response"));
         }
         let Some(serialized_bytes) = bounded_json_size(&response, MAX_JSON_BODY_BYTES).ok().flatten() else {
-            self.response_object = response;
+            self.replace_response_object(response);
             return Err(finalize_rejection(
                 "final response exceeds the JSON response byte limit",
             ));
@@ -1623,12 +1833,23 @@ impl ResponsesState {
             Ok(serialized) => serialized,
             Err(error) => {
                 tracing::warn!(%error, "failed to encode final response");
-                self.response_object = response;
+                self.replace_response_object(response);
                 return Err(finalize_rejection("failed to encode final response"));
             },
         };
-        self.response_object = response;
+        // The listener budget can be applied by an outer filter after this
+        // finalizer runs, so keep this evidence even when no local limit is set.
+        let Some(parsed_bound_bytes) = super::agentic_loop::buffered_parsed_json_bytes_upper_bound(&serialized) else {
+            self.discard_payload_for_budget_error();
+            return Err(finalize_rejection("failed to bound final response JSON"));
+        };
+        let body_digest = crate::hash::Sha256::digest(&serialized);
+        self.replace_response_object(response);
         *body = Some(Bytes::from(serialized));
+        self.buffered_canonical_finalized = true;
+        self.buffered_canonical_wire_bytes = Some(serialized_bytes);
+        self.buffered_canonical_parsed_bound_bytes = Some(parsed_bound_bytes);
+        self.buffered_canonical_body_digest = Some(body_digest);
         Ok(())
     }
 
@@ -1813,10 +2034,6 @@ fn current_round_tool_call_admissions_by<'a>(
 /// `max_tool_calls` is exhausted. An omitted limit leaves discovery allowed.
 /// When the current round's output is not yet replayable, remaining prior-round
 /// budget is the admission signal.
-#[cfg_attr(
-    not(feature = "openai-mcp-tools"),
-    expect(dead_code, reason = "MCP resolver is the production caller")
-)]
 pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
     let Some(max) = state.max_tool_calls else {
         return true;
@@ -1957,6 +2174,179 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks all four stream meter partitions against the full owner charge"
+    )]
+    fn streaming_meters_charge_fixed_tool_snapshots_once() {
+        let mut state = ResponsesState::from_request_body(json!({"input": "hello"}));
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "tool".to_owned()),
+            json!({"schema": "m".repeat(4_096)}),
+        );
+        state.client_tool_echo = Some(ClientToolEcho {
+            tools: vec![json!({"type": "function", "name": "t", "description": "e".repeat(4_096)})],
+            tool_choice: json!("auto"),
+        });
+        state.deferred_mcp.push(DeferredMcpConnector {
+            authorization: Some("Bearer secret".to_owned()),
+            allowed_tools: Some(json!(["lookup"])),
+            connector_id: "connector".to_owned(),
+            headers: Some(json!({"X-Header": "h".repeat(4_096)})),
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: Some(json!("never")),
+            server_label: "server".to_owned(),
+            server_url: "https://example.com/mcp".to_owned(),
+            timeout: Duration::from_secs(5),
+        });
+        state.response_object = json!({"output": [{"text": "changing"}]});
+
+        let total = state.retained_payload_bytes().unwrap();
+        let stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing = state
+            .stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+            .unwrap();
+        assert_eq!(
+            stable + changing,
+            total,
+            "Store and Chat charge each fixed tool snapshot once"
+        );
+        #[cfg(feature = "store")]
+        assert_eq!(
+            stable
+                + state
+                    .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None, None)
+                    .unwrap(),
+            total,
+            "Rehydrate charges each fixed tool snapshot once"
+        );
+        assert_eq!(
+            stable + state.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
+            total,
+            "StreamEvents charges each fixed tool snapshot once"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compares 2,000 stream measurements for small and large descriptors"
+    )]
+    fn deferred_connector_charge_is_stable_across_stream_deltas() {
+        fn measure(header_bytes: usize) -> Duration {
+            let mut state = ResponsesState::from_request_body(json!({"input": "hello", "stream": true}));
+            state.deferred_mcp.push(DeferredMcpConnector {
+                authorization: None,
+                allowed_tools: None,
+                connector_id: "connector".to_owned(),
+                headers: Some(json!({"X-Header": "x".repeat(header_bytes)})),
+                max_rewritten_body_bytes: 67_108_864,
+                max_tools: 128,
+                require_approval: None,
+                server_label: "server".to_owned(),
+                server_url: "https://example.com/mcp".to_owned(),
+                timeout: Duration::from_secs(5),
+            });
+            let stable = state.stream_stable_payload_bytes_bounded(64 << 20).unwrap();
+            let changing_limit = (64 << 20) - stable;
+            let started = std::time::Instant::now();
+            for _ in 0..2_000 {
+                std::hint::black_box(
+                    state
+                        .stream_changing_payload_bytes_bounded_with_cached_output(changing_limit)
+                        .unwrap(),
+                );
+            }
+            started.elapsed()
+        }
+
+        let small = measure(1_024);
+        let large = measure(1 << 20);
+        assert!(
+            large <= small.saturating_mul(20) + Duration::from_millis(100),
+            "unchanged 1 MiB deferred headers must not be serialized for every delta: small={small:?}, large={large:?}"
+        );
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn response_object_charge_cache_remeasures_after_revision_overflow() {
+        let mut state = ResponsesState::default();
+        state.replace_response_object(json!({"output": "small"}));
+        let mut cache = None;
+        let first = ResponseObjectChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        state.response_object_revision = Some(u64::MAX);
+        state.replace_response_object(json!({"output": "x".repeat(4_096)}));
+        let next = ResponseObjectChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert!(next > first, "overflowed revisions must remeasure the new object");
+        assert!(cache.is_none(), "an overflowed revision must disable reuse");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn completed_tool_calls_charge_cache_remeasures_after_revision_overflow() {
+        let mut state = ResponsesState::default();
+        state.tool_calls.push(json!({"arguments": "small"}));
+        state.mark_tool_calls_changed();
+        let mut cache = None;
+        let first = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        state.tool_calls_revision = Some(u64::MAX);
+        state.tool_calls[0]["arguments"] = json!("x".repeat(4_096));
+        state.mark_tool_calls_changed();
+        let next = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert!(next > first);
+        assert!(cache.is_none(), "an overflowed revision must disable reuse");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn cached_completed_tool_calls_preserve_store_and_rehydrate_meter_parity() {
+        let mut state = ResponsesState::from_request_body(json!({"input":"hello"}));
+        state
+            .tool_calls
+            .push(json!({"type":"function_call", "arguments":"x".repeat(4_096)}));
+        state.mark_tool_calls_changed();
+        let mut cache = None;
+        let charge = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert_eq!(
+            state.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+                usize::MAX,
+                None,
+                Some(charge)
+            ),
+            state.stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+        );
+        assert_eq!(
+            state.rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+                usize::MAX,
+                None,
+                Some(charge)
+            ),
+            state.rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None, None)
+        );
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn response_object_charge_cache_respects_smaller_measurement_limits() {
+        let mut state = ResponsesState::default();
+        state.replace_response_object(json!({"output": "x".repeat(4_096)}));
+        let mut cache = None;
+        assert!(
+            ResponseObjectChargeCache::measure(&mut cache, &state, 512).is_none(),
+            "the first measurement must stop at the available budget"
+        );
+        assert!(cache.is_none(), "a failed measurement must not be cached");
+        let bytes = ResponseObjectChargeCache::measure(&mut cache, &state, 8_192).unwrap();
+        assert!(bytes > 512, "the exact charge must exceed the smaller limit");
+        assert!(
+            ResponseObjectChargeCache::measure(&mut cache, &state, 512).is_none(),
+            "a cached charge must still honor each callback's limit"
+        );
+    }
+
+    #[test]
     fn retained_payload_counts_and_releases_provider_compaction_ids() {
         let id = "c".repeat(8_192);
         let mut state = ResponsesState::from_request_body(json!({
@@ -1976,43 +2366,6 @@ mod tests {
         assert!(!state.can_retain_payload(0));
         state.discard_payload_for_budget_error();
         assert!(state.provider_compaction_ids.is_empty());
-    }
-
-    #[test]
-    fn client_tool_echo_moves_to_stream_stable_charge_for_every_consumer() {
-        let mut state = ResponsesState::default();
-        let before_capture = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
-        state.client_tool_echo = Some(ClientToolEcho {
-            tools: vec![json!({"type": "function", "name": "large", "description": "x".repeat(1_048_576)})],
-            tool_choice: json!("auto"),
-        });
-        // Client-tool compatibility calls mark_request_body_for_rebuild after
-        // capture, invalidating store and rehydrate stable cache revisions.
-        state.mark_request_body_for_rebuild();
-        assert_eq!(state.replay_stable_payload_revision, Some(1));
-        let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
-        assert!(stable > before_capture + 1_048_576);
-        let full = state.retained_payload_bytes().unwrap();
-
-        let started = std::time::Instant::now();
-        for _ in 0..200 {
-            let changing = [
-                state.stream_changing_payload_bytes_bounded_for_parser(1_024),
-                state.stream_changing_payload_bytes_bounded_with_cached_output(1_024),
-                #[cfg(feature = "store")]
-                state.rehydrate_stream_changing_payload_bytes_bounded(1_024),
-                #[cfg(feature = "store")]
-                state.store_stream_changing_payload_bytes_bounded(1_024),
-            ];
-            for charge in changing {
-                assert_eq!(stable + charge.unwrap(), full);
-            }
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the capture-once echo must not be serialized by changing meters: {:?}",
-            started.elapsed()
-        );
     }
 
     #[cfg(feature = "store")]

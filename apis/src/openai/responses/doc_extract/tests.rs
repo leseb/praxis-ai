@@ -1571,3 +1571,89 @@ async fn rejects_when_state_body_exceeds_max_rewritten_body_bytes() {
         _ => panic!("expected rejection when state body (with large history) exceeds max_rewritten_body_bytes"),
     }
 }
+
+#[tokio::test]
+async fn retained_budget_rejects_document_expansion_before_dispatch_or_persistence() {
+    use super::super::{AgenticBudgetPolicy, state::ResponsesState};
+
+    let request = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap());
+    let input = responses_body(&serde_json::json!([{
+        "role":"user", "content":[{
+            "type":"input_file", "filename":"a.txt", "file_data":text_file_data(&"\0".repeat(3600))
+        }]
+    }]));
+    let original = serde_json::to_vec(&input).unwrap();
+    let mut state = ResponsesState::from_request_body(input);
+    state.apply_retained_payload_limit(65_536);
+    state.store_persist_armed = true;
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("document expansion must fail before inference");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(!state.store_persist_armed);
+    assert_eq!(
+        body.unwrap().as_ref(),
+        original,
+        "rejected request must not publish rewritten wire"
+    );
+}
+
+#[tokio::test]
+async fn retained_budget_admits_small_document_with_wire_copy() {
+    use super::super::{AgenticBudgetPolicy, state::ResponsesState};
+
+    let request = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap());
+    let input = responses_body(&serde_json::json!([{
+        "role":"user", "content":[{
+            "type":"input_file", "filename":"a.txt", "file_data":text_file_data("hello")
+        }]
+    }]));
+    ctx.extensions.insert(ResponsesState::from_request_body(input.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&input).unwrap()));
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_payload_limit(), Some(65_536));
+    assert!(state.can_retain_payload(body.as_ref().unwrap().len()));
+    assert_eq!(state.request_body["input"][0]["content"][0]["type"], "input_text");
+}
+
+#[tokio::test]
+async fn policy_without_state_rejects_document_parse_peak() {
+    use super::super::AgenticBudgetPolicy;
+
+    let request = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let input = responses_body(&serde_json::json!([{
+        "role":"user", "content":[{
+            "type":"input_file", "filename":"a.txt", "file_data":text_file_data(&"x".repeat(3000))
+        }]
+    }]));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&input).unwrap()));
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("pipeline policy must apply before state exists");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}

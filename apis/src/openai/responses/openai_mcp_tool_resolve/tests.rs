@@ -4193,6 +4193,35 @@ async fn discover_deferred_connectors_skips_tools_list_when_budget_exhausted() {
 }
 
 #[tokio::test]
+async fn deferred_discovery_rejects_before_tools_list_when_retained_budget_is_exhausted() {
+    let mut state = ResponsesState {
+        deferred_mcp: vec![deferred_connector("http://127.0.0.1:9/mcp", None, None)],
+        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(
+        state.deferred_mcp.len(),
+        1,
+        "failed discovery must preserve the pending connector"
+    );
+    assert!(state.mcp_tool_map.is_empty());
+}
+
+#[test]
+fn deferred_listing_peak_admits_exact_boundary() {
+    let reserved = mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION;
+    let limit = 100 + 50 + 25 + reserved;
+    assert!(deferred_listing_batch_fits(100, 50, 25, 1, limit));
+    assert!(!deferred_listing_batch_fits(100, 50, 25, 1, limit - 1));
+    assert!(!deferred_listing_batch_fits(100, 50, 25, 2, limit));
+}
+
+#[tokio::test]
 async fn connector_missing_label_rejected_at_filter_level() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         "
@@ -5620,6 +5649,102 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
         state.locally_executed_output_items.contains(id),
         "id recorded as locally executed"
     );
+    assert!(
+        state.can_retain_payload(0),
+        "ordinary cached listing fits the shared budget"
+    );
+}
+
+#[tokio::test]
+async fn eager_listing_rejects_exhausted_shared_budget_before_rewrite() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let body_json = mcp_body("https://mcp.example/mcp");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(body_json.clone()));
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("exhausted budget must reject before tools/list");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default()).contains("retained payload"));
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_slice()),
+        "outbound body must not be rewritten"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert_eq!(state.retained_payload_limit(), Some(4096));
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+}
+
+/// The request's credential is one owner, but dispatch copies it once per
+/// discovered tool; that peak must be admitted before building the tool map.
+#[test]
+fn eager_dispatch_rejects_credential_fanout_before_map_construction() {
+    let tools: Vec<serde_json::Value> = (0..1_000)
+        .map(|index| serde_json::json!({"name": format!("tool_{index}")}))
+        .collect();
+    let entry = serde_json::json!({
+        "server_label": "s", "server_url": "https://mcp.example/mcp",
+        "authorization": "secret".repeat(1_000),
+        "headers": {"x-large": "value".repeat(1_000)},
+        "require_approval": {"never": vec!["tool_0"; 10_000]}
+    });
+    let limit = 64 * 1024 * 1024;
+    let baseline = retained_json_bytes(&entry).unwrap() * 3;
+    let budget = EagerListingBudget { limit, baseline };
+    let raw_results = vec![Some(tools.clone())];
+    assert!(
+        baseline + eager_prepared_bytes(&raw_results).unwrap() < limit,
+        "the old raw-listing reserve fits while metadata fanout exceeds the budget"
+    );
+    let rejected = collect_resolutions_with_budget(std::slice::from_ref(&entry), &[Some(0)], raw_results, Some(budget));
+    assert!(
+        matches!(rejected, Err(ResolveError::RetainedBudget)),
+        "reject before dispatch-map allocation"
+    );
+
+    let mut filtered = entry;
+    filtered["allowed_tools"] = serde_json::json!(["tool_0"]);
+    let filtered_budget = EagerListingBudget {
+        limit,
+        baseline: retained_json_bytes(&filtered).unwrap() * 3,
+    };
+    let admitted = collect_resolutions_with_budget(&[filtered], &[Some(0)], vec![Some(tools)], Some(filtered_budget))
+        .expect("one selected tool should fit despite large entry metadata");
+    assert_eq!(admitted.tool_map.len(), 1, "reserve only filtered dispatch entries");
+}
+
+#[tokio::test]
+async fn eager_listing_with_policy_rejects_missing_shared_state() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let body_json = mcp_body("https://mcp.example/mcp");
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
 }
 
 /// `commit_discovery_items` appends one item per server in request order.

@@ -1539,6 +1539,7 @@ async fn scoped_connector_context_reaches_initialize_and_tools_call_unchanged() 
         serde_json::json!({"message": "hello"}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await
@@ -1991,6 +1992,38 @@ async fn call_tool_timeout() {
 // Session pooling / reuse (#1019)
 // =========================================================================
 
+/// A legal minimum result limit must still reach the tool call after initialize.
+/// This server's tool reply exceeds the separate 2 KiB result parse allowance.
+#[tokio::test]
+async fn budgeted_minimum_result_limit_reaches_tool_after_initialize() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let callout = McpCallout::fabricated(true).unwrap();
+    let result = call_tool_with_forwarded_headers_with_budget(
+        None,
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "ok"}),
+        INTEGRATION_TIMEOUT,
+        1_024,
+        1_024,
+        Some(2_048),
+        &callout,
+    )
+    .await;
+    ct.cancel();
+    assert_eq!(method_count(&methods, "initialize"), 1);
+    assert_eq!(method_count(&methods, "tools/call"), 1);
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
+}
+
 /// Two `tools/call`s for the same identity across consecutive rounds share one
 /// initialized session: exactly one `initialize` handshake, two `tools/call`s.
 #[tokio::test]
@@ -2013,6 +2046,7 @@ async fn pooled_session_reused_across_rounds_runs_single_initialize() {
             serde_json::json!({ "message": message }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2041,6 +2075,48 @@ async fn pooled_session_reused_across_rounds_runs_single_initialize() {
     );
 }
 
+/// Budgeted dispatch passes no pool handle, so a completed tool call releases
+/// its initialized peer metadata before the next agentic round.
+#[tokio::test]
+async fn unpooled_tool_calls_close_peer_metadata_between_rounds() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "budgeted".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    for message in ["round-1", "round-2"] {
+        let result = call_tool_with_forwarded_headers(
+            None,
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "echo",
+            serde_json::json!({ "message": message }),
+            INTEGRATION_TIMEOUT,
+            TEST_MAX_RESULT_BYTES,
+            16_384,
+            &callout,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str()),
+            Some(message)
+        );
+        assert!(pool.checkout(&key, TEST_MAX_RESULT_BYTES).session.is_none());
+    }
+    ct.cancel();
+    assert_eq!(method_count(&methods, "initialize"), 2);
+    assert_eq!(method_count(&methods, "tools/call"), 2);
+}
+
 /// Sessions never cross security contexts: two calls with different identity
 /// keys (same endpoint) each open their own session, so each runs its own
 /// `initialize`.
@@ -2065,6 +2141,7 @@ async fn distinct_identity_keys_never_reuse_a_session() {
             serde_json::json!({ "message": key }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2100,6 +2177,7 @@ async fn empty_fingerprint_never_pools_a_session() {
             serde_json::json!({ "message": "x" }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2144,6 +2222,7 @@ async fn reused_session_failure_evicts_without_retry() {
         serde_json::json!({ "message": "round-1" }),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &callout,
     )
     .await
@@ -2167,6 +2246,7 @@ async fn reused_session_failure_evicts_without_retry() {
         serde_json::json!({ "message": "round-2" }),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &callout,
     )
     .await;
@@ -2215,6 +2295,7 @@ async fn reused_session_transparently_reinitializes_after_server_404() {
             serde_json::json!({ "message": message }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2279,6 +2360,7 @@ async fn payload_limit_change_replaces_session_without_fragmenting_identity_key(
             serde_json::json!({ "message": "ok" }),
             INTEGRATION_TIMEOUT,
             limit,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2314,6 +2396,7 @@ async fn pool_drain_explicitly_closes_idle_server_session() {
         serde_json::json!({ "message": "ok" }),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &callout,
     )
     .await
@@ -2355,6 +2438,7 @@ async fn dispatcher_namespaces_prevent_cross_filter_session_reuse() {
             serde_json::json!({ "message": "ok" }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2382,6 +2466,8 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         None,
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
+        None,
         callout,
         &parse_display_url(url),
     )

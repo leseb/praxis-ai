@@ -34,16 +34,13 @@ fn aggregate_file_parse_admission_respects_existing_state() {
     state.apply_retained_payload_limit(baseline + 96);
     ctx.extensions.insert(state);
 
+    assert!(file_parse_fits_budget(&ctx, 96), "exact remaining allowance should fit");
     assert!(
-        ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(96),
-        "exact remaining allowance should fit"
-    );
-    assert!(
-        !ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(97),
+        !file_parse_fits_budget(&ctx, 97),
         "one byte over the allowance should fail"
     );
-    assert_eq!(aggregate_resolution_headroom(&ctx, 0), Some(96));
-    assert_eq!(aggregate_resolution_headroom(&ctx, 24), Some(0));
+    assert_eq!(aggregate_resolution_headroom(&ctx, 32, 32), Ok(Some(32)));
+    assert_eq!(aggregate_resolution_headroom(&ctx, 64, 64), Err(()));
 }
 
 #[test]

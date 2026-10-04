@@ -302,7 +302,7 @@ fn response_body_mode_defaults_to_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() {
+async fn on_response_selects_bounded_stream_buffer_for_non_streaming_responses() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -315,11 +315,89 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     assert!(matches!(action, FilterAction::Continue), "request should continue");
     assert_eq!(
         ctx.response_body_mode,
+        BodyMode::Stream,
+        "request phase must defer the finite cap"
+    );
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "response should continue");
+    assert_eq!(
+        ctx.response_body_mode,
         BodyMode::StreamBuffer {
             max_bytes: Some(67_108_864)
         },
         "non-streaming Responses requests should remain bounded"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_caps_direct_buffer_at_trusted_length() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut state = ResponsesState {
+        input: vec![json!({"role": "user", "content": "Hello"})],
+        ..ResponsesState::default()
+    };
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 8_192);
+    ctx.extensions.insert(state);
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    resp.headers.insert(http::header::CONTENT_LENGTH, "32".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer { max_bytes: Some(32) },
+        "the finite store buffer must not exceed its admitted wire length"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_rejects_known_body_larger_than_shared_headroom() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut state = ResponsesState::default();
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 1_024);
+    ctx.extensions.insert(state);
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    resp.headers
+        .insert(http::header::CONTENT_LENGTH, "1025".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let FilterAction::Reject(rejection) = filter.on_response(&mut ctx).await.unwrap() else {
+        panic!("known response body above the shared cap must be rejected before commit");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 // -----------------------------------------------------------------------------
