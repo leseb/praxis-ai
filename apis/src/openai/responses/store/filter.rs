@@ -67,6 +67,7 @@ use super::{
         DEFAULT_STORE_NAME,
         agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
         bound_body_outcome,
+        budget_error::reject_retained_payload_budget,
         error::responses_error_rejection,
         state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
     },
@@ -1382,12 +1383,10 @@ fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), Filt
 /// Retain request input alongside the already captured owner.
 fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Result<(), FilterAction> {
     let Some(retained_bytes) = retained_json_bytes(&input) else {
-        ctx.set_metadata("responses.skip_persist", "true");
-        return Err(FilterAction::Reject(responses_error_rejection(
-            413,
-            "invalid_request_error",
+        return Err(reject_retained_payload_budget(
+            ctx,
             "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-        )));
+        ));
     };
     let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
     state.input = Some(input);
@@ -1398,12 +1397,10 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Resul
         .is_some_and(|next| charge_store_payload(ctx, &mut state, next));
     ctx.extensions.insert(state);
     if !admitted {
-        ctx.set_metadata("responses.skip_persist", "true");
-        return Err(FilterAction::Reject(responses_error_rejection(
-            413,
-            "invalid_request_error",
+        return Err(reject_retained_payload_budget(
+            ctx,
             "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-        )));
+        ));
     }
     ctx.set_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA, retained_bytes.to_string());
     Ok(())
@@ -1819,12 +1816,10 @@ fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<B
     if admitted {
         return Ok(());
     }
-    ctx.set_metadata("responses.skip_persist", "true");
-    Err(FilterAction::Reject(responses_error_rejection(
-        413,
-        "invalid_request_error",
+    Err(reject_retained_payload_budget(
+        ctx,
         "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-    )))
+    ))
 }
 
 #[async_trait]
@@ -2771,7 +2766,7 @@ mod encode_replay_event_tests {
         capture_request_input, encode_replay_event, encoded_column_headroom, persistence_budget_failure,
         persistence_construction_fits,
     };
-    use crate::openai::responses::state::ResponsesState;
+    use crate::openai::responses::{ObservedResponsesSse, state::ResponsesState};
 
     #[test]
     fn streaming_persistence_without_response_state_keeps_final_chunk() {
@@ -3253,6 +3248,67 @@ mod encode_replay_event_tests {
 
         assert!(matches!(result, Err(FilterAction::Reject(_))));
         assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+
+    #[test]
+    fn request_input_snapshot_overflow_uses_continuation_wire() {
+        for streaming in [false, true] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.extensions.insert(
+                AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap(),
+            );
+            let mut state = ResponsesState {
+                iteration: 1,
+                request_body: json!({"stream": streaming}),
+                messages: vec![json!("x".repeat(2800))],
+                ..ResponsesState::default()
+            };
+            state.apply_retained_payload_limit(4096);
+            assert!(state.can_retain_payload(0));
+            ctx.extensions.insert(state);
+            if streaming {
+                ctx.extensions.insert(ObservedResponsesSse);
+            }
+            let body = Some(Bytes::from(
+                serde_json::to_vec(&json!({"input":"y".repeat(1000)})).unwrap(),
+            ));
+
+            let action = admit_request_input_snapshot(&mut ctx, &body).unwrap_err();
+            assert!(matches!(action, FilterAction::Reject(_)));
+            if let FilterAction::Reject(rejection) = action {
+                assert_eq!(rejection.status, if streaming { 200 } else { 502 });
+            }
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
+    }
+
+    #[test]
+    fn captured_input_overflow_uses_continuation_wire() {
+        for streaming in [false, true] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            let mut state = ResponsesState {
+                iteration: 1,
+                request_body: json!({"stream": streaming}),
+                messages: vec![json!("x".repeat(2800))],
+                ..ResponsesState::default()
+            };
+            let baseline = state.retained_payload_bytes().unwrap();
+            state.apply_retained_payload_limit(baseline + 64);
+            ctx.extensions.insert(state);
+            if streaming {
+                ctx.extensions.insert(ObservedResponsesSse);
+            }
+
+            let action = capture_request_input(&mut ctx, json!("y".repeat(1000))).unwrap_err();
+            assert!(matches!(action, FilterAction::Reject(_)));
+            if let FilterAction::Reject(rejection) = action {
+                assert_eq!(rejection.status, if streaming { 200 } else { 502 });
+            }
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
     }
 
     #[test]
