@@ -3408,7 +3408,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
                 Ok(unique) => Some(unique.len()),
                 Err(shared) => shared.len().checked_mul(2),
             };
-            if copy_peak.is_some_and(|bytes| stream_payload_fits(ctx, &parser_state, bytes)) {
+            if copy_peak.is_some_and(|bytes| stream_payload_fits(ctx, &mut parser_state, bytes)) {
                 match buffer {
                     Ok(unique) => Vec::from(unique),
                     Err(shared) => shared.to_vec(),
@@ -3437,7 +3437,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
         }?;
         existing.checked_add(bytes)
     });
-    if preflight_staging.is_some_and(|bytes| stream_payload_fits(ctx, &parser_state, bytes)) {
+    if preflight_staging.is_some_and(|bytes| stream_payload_fits(ctx, &mut parser_state, bytes)) {
         // #1046 §4.2: drain file_search synthesis before terminal/error finalization,
         // under the precedence policy. The owner queues each reconciled call by its
         // absolute output index this round, but the request-phase dispatcher only

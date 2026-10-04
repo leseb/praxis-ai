@@ -271,6 +271,9 @@ pub(crate) struct ResolutionBudget {
     references_seen: usize,
     /// Inline bytes still available across current input and state history.
     remaining_resolved_bytes: usize,
+    /// Independently owned resolution values still admitted by the shared
+    /// request budget. Mirror walks do not reset this allowance.
+    aggregate_remaining_bytes: Option<usize>,
     /// Whether the shared request budget is tighter than the resolver's own cap.
     aggregate_constrained: bool,
     /// Bound outbound chain execution for configured Files API
@@ -335,6 +338,7 @@ impl ResolutionBudget {
     /// Each representation still has its own independent resolver limit.
     pub(crate) fn apply_aggregate_headroom(&mut self, headroom: usize) {
         let limit = headroom / 16;
+        self.aggregate_remaining_bytes = Some(limit);
         if limit < self.max_resolved_bytes {
             self.max_resolved_bytes = limit;
             self.remaining_resolved_bytes = limit;
@@ -388,11 +392,24 @@ impl ResolutionBudget {
         }
         let cache_kind = (part_type, source.kind());
         if let Some(cached) = self.cached(part_type, source) {
+            if let (Some(remaining), Ok(resolved)) = (self.aggregate_remaining_bytes, cached)
+                && retained_resolved_bytes(part_type, source, resolved).is_none_or(|bytes| bytes > remaining)
+            {
+                return Err(ResolveError::RetainedBudget);
+            }
             return cached.clone();
         }
 
+        // A new cache entry owns a key even when it came from rehydrated history.
+        self.consume_aggregate_bytes(source.value().len())?;
         self.register_reference()?;
 
+        let max_resolved_bytes = self
+            .aggregate_remaining_bytes
+            .map_or(max_resolved_bytes, |remaining| max_resolved_bytes.min(remaining));
+        let aggregate_remaining_bytes = self.aggregate_remaining_bytes;
+        let aggregate_binding =
+            aggregate_remaining_bytes.is_some_and(|remaining| remaining <= self.remaining_resolved_bytes);
         let outbound = self.outbound.as_ref();
         let resolution = tokio::time::timeout_at(self.deadline, async {
             match source {
@@ -475,6 +492,14 @@ impl ResolutionBudget {
         })?;
         Ok(())
     }
+
+    /// Charge a new cache owner or rewritten content part against headroom.
+    fn consume_aggregate_bytes(&mut self, bytes: usize) -> Result<(), ResolveError> {
+        if let Some(remaining) = self.aggregate_remaining_bytes.as_mut() {
+            *remaining = remaining.checked_sub(bytes).ok_or(ResolveError::RetainedBudget)?;
+        }
+        Ok(())
+    }
 }
 
 /// Build the stable error returned when the request-wide deadline expires.
@@ -519,6 +544,7 @@ impl FilesApiClient {
             max_resolved_bytes: self.max_resolved_bytes,
             references_seen: 0,
             remaining_resolved_bytes: self.max_resolved_bytes,
+            aggregate_remaining_bytes: None,
             aggregate_constrained: false,
             outbound,
         }
@@ -797,10 +823,11 @@ async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolv
     };
     let mut resolved_count = 0_usize;
     for part in parts {
-        if let Some(resolved_len) = resolve_content_part(part, resolver).await? {
+        if let Some((resolved_len, aggregate_bytes)) = resolve_content_part(part, resolver).await? {
             resolver
                 .budget
                 .consume_resolved_bytes(resolved_len, resolver.client.max_resolved_bytes)?;
+            resolver.budget.consume_aggregate_bytes(aggregate_bytes)?;
             resolved_count += 1;
         }
     }
@@ -808,10 +835,14 @@ async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolv
 }
 
 /// Resolve a single content part if it contains a resolvable reference.
+#[expect(
+    clippy::too_many_lines,
+    reason = "aggregate admission stays adjacent to reference resolution"
+)]
 async fn resolve_content_part(
     part: &mut serde_json::Value,
     resolver: &mut ContentResolver<'_>,
-) -> Result<Option<usize>, ResolveError> {
+) -> Result<Option<(usize, usize)>, ResolveError> {
     let Some((part_type, source)) = resolvable_reference(part) else {
         return Ok(None);
     };
@@ -838,6 +869,14 @@ async fn resolve_content_part(
         return Ok(None);
     };
     let len = output_len_for_part(part_type, source, &resolved);
+    let aggregate_bytes = retained_resolved_bytes(part_type, source, &resolved).ok_or(ResolveError::RetainedBudget)?;
+    if resolver
+        .budget
+        .aggregate_remaining_bytes
+        .is_some_and(|remaining| aggregate_bytes > remaining)
+    {
+        return Err(ResolveError::RetainedBudget);
+    }
     if len > max_resolved_bytes {
         return Err(ResolveError::TooLarge {
             reference: source.to_string(),
@@ -846,7 +885,7 @@ async fn resolve_content_part(
     }
     let source_kind = source.kind();
     rewrite_part(part, part_type, source_kind, resolved);
-    Ok(Some(len))
+    Ok(Some((len, aggregate_bytes)))
 }
 
 /// Resolve one reference and apply the configured missing-file policy.
