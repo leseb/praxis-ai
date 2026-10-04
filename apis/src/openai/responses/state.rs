@@ -1674,14 +1674,15 @@ impl ResponsesState {
                 "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during final serialization",
             ));
         }
-        let serialized = match serde_json::to_vec(&response) {
-            Ok(serialized) => serialized,
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode final response");
-                self.response_object = response;
-                return Err(finalize_rejection("failed to encode final response"));
-            },
-        };
+        // The size pass measured this exact serialization. Allocate its one
+        // admitted wire owner up front so Vec growth cannot keep an old buffer
+        // alive alongside its replacement near the request-wide limit.
+        let mut serialized = Vec::with_capacity(serialized_bytes);
+        if let Err(error) = serde_json::to_writer(&mut serialized, &response) {
+            tracing::warn!(%error, "failed to encode final response");
+            self.response_object = response;
+            return Err(finalize_rejection("failed to encode final response"));
+        }
         self.response_object = response;
         *body = Some(Bytes::from(serialized));
         Ok(())
@@ -3004,6 +3005,36 @@ mod tests {
         assert!(
             body.is_none(),
             "failed serialization reservation must not produce a body"
+        );
+    }
+
+    #[test]
+    fn finalize_response_body_serializes_with_one_admitted_wire_allocation() {
+        let mut state = ResponsesState {
+            response_object: json!({
+                "object": "response",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "x".repeat(1_048_576)}]
+                }]
+            }),
+            ..ResponsesState::default()
+        };
+        let serialized_bytes = bounded_json_size(&state.response_object, MAX_JSON_BODY_BYTES)
+            .unwrap()
+            .unwrap();
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(baseline + serialized_bytes);
+
+        let mut body = None;
+        let allocations = allocation_counter::measure(|| {
+            state.finalize_response_body(&mut body).unwrap();
+        });
+        assert_eq!(body.as_ref().map(Bytes::len), Some(serialized_bytes));
+        assert!(!state.retained_payload_failed);
+        assert!(
+            allocations.bytes_max <= u64::try_from(serialized_bytes).unwrap() + 65_536,
+            "one wire-sized buffer is admitted; serializer growth must not keep a second buffer: {allocations:?}"
         );
     }
 
