@@ -540,17 +540,10 @@ fn reactive_compaction_response_limit(
 }
 
 fn reject_compaction_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
-    ctx.set_metadata("responses.skip_persist", "true");
-    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-        state.discard_payload_for_budget_error();
-    }
-    #[cfg(feature = "store")]
-    super::store::discard_retained_request_payload(ctx);
-    FilterAction::Reject(responses_error_rejection(
-        502,
-        "server_error",
+    super::budget_error::reject_request(
+        ctx,
         "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during compaction",
-    ))
+    )
 }
 
 // -----------------------------------------------------------------------------

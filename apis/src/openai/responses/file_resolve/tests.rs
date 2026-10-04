@@ -43,6 +43,25 @@ fn aggregate_file_parse_admission_respects_existing_state() {
     assert_eq!(aggregate_resolution_headroom(&ctx, 64, 64), Err(()));
 }
 
+#[test]
+fn initial_file_resolution_budget_error_is_request_too_large() {
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.extensions.insert(ResponsesState::from_request_body(
+        json!({"model": "gpt-4o", "input": "hello"}),
+    ));
+
+    let FilterAction::Reject(rejection) = reject_retained_resolution_budget(&mut ctx) else {
+        panic!("resolution budget exhaustion must reject");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
 #[tokio::test]
 async fn aggregate_file_exhaustion_cannot_fail_open() {
     let client = make_client();

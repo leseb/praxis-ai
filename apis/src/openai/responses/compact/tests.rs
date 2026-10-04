@@ -807,7 +807,7 @@ async fn reactive_budget_rejects_before_summarization_even_with_fail_open() {
     let FilterAction::Reject(rejection) = action else {
         panic!("aggregate exhaustion must reject before the callout");
     };
-    assert_eq!(rejection.status, 502);
+    assert_eq!(rejection.status, 413);
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
