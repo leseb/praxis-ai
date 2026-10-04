@@ -547,9 +547,10 @@ impl FileSearchClient {
         }
     }
 
-    /// Search with a request-scoped ceiling for decoded result payload.
-    /// The collected body and decoded values coexist, so half of the available
-    /// bytes are reserved for each owner before a callout is scheduled.
+    /// Search with a request-scoped ceiling for callout request and result payload.
+    /// Request bodies remain owned while the concurrent callouts run. Reserve
+    /// half the available bytes for those bodies before dividing the other half
+    /// between collected responses and decoded results.
     #[expect(
         clippy::too_many_lines,
         clippy::too_many_arguments,
@@ -568,8 +569,9 @@ impl FileSearchClient {
         let mut deadline_recorded = false;
         let mut next_spec = 0_usize;
         let execution_started = Instant::now();
+        let (response_allowance, request_allowance) = search_execution_allowances(max_decoded_bytes);
         let (total_response_limit, retained_payload_controls_limit) =
-            retained_response_body_limit(self.max_total_response_bytes, max_decoded_bytes);
+            retained_response_body_limit(self.max_total_response_bytes, response_allowance);
         if total_response_limit == 0 {
             append_budget_failures(
                 &mut batch.failures,
@@ -651,6 +653,9 @@ impl FileSearchClient {
             let Some(chunk) = specs.get(next_spec..next_spec.saturating_add(chunk_len)) else {
                 break;
             };
+            // Every body in this chunk can be live at once. The bounded writer
+            // enforces this per-call share before extending its owned Vec.
+            let request_body_limit = MAX_SEARCH_REQUEST_BYTES.min(request_allowance / chunk.len());
             let futures = chunk.iter().map(|spec| {
                 self.search_one(
                     spec,
@@ -664,6 +669,7 @@ impl FileSearchClient {
                     allow_private,
                     per_response_limit,
                     retained_payload_controls_per_response_limit,
+                    request_body_limit,
                 )
             });
             let chunk_results = futures::future::join_all(futures).await;
@@ -716,9 +722,10 @@ impl FileSearchClient {
         allow_private: bool,
         per_response_limit: usize,
         retained_payload_controls_per_response_limit: bool,
+        request_body_limit: usize,
     ) -> Result<SearchResponse, FileSearchError> {
         deadline_remaining(execution_timeout, execution_started, spec.store_id)?;
-        let request = self.build_request(spec, execution_started, execution_timeout)?;
+        let request = self.build_request(spec, execution_started, execution_timeout, request_body_limit)?;
         deadline_remaining(execution_timeout, execution_started, spec.store_id)?;
         let body = self
             .execute_request(
@@ -786,6 +793,7 @@ impl FileSearchClient {
         spec: &SearchSpec<'_>,
         execution_started: Instant,
         execution_timeout: Duration,
+        request_body_limit: usize,
     ) -> Result<PreparedSearchRequest, FileSearchError> {
         let url = self.search_url(spec.store_id)?;
         if spec.query.len() > MAX_QUERY_BYTES {
@@ -798,7 +806,13 @@ impl FileSearchClient {
         let request_body =
             VectorStoreSearchRequest::new(spec.filters, spec.max_num_results, spec.query, spec.ranking_options)
                 .map_err(|message| request_error(spec.store_id, message))?;
-        let body = serialize_bounded_request(&request_body, spec.store_id, execution_started, execution_timeout)?;
+        let body = serialize_bounded_request(
+            &request_body,
+            spec.store_id,
+            execution_started,
+            execution_timeout,
+            request_body_limit,
+        )?;
 
         Ok(PreparedSearchRequest { body, url })
     }
@@ -1804,6 +1818,9 @@ struct BoundedRequestWriter {
     /// Serialized bytes retained so far.
     body: Vec<u8>,
 
+    /// Maximum bytes this request may own while its concurrent chunk runs.
+    max_bytes: usize,
+
     /// Whether serialization attempted to cross the limit.
     exceeded: bool,
 
@@ -1819,9 +1836,10 @@ struct BoundedRequestWriter {
 
 impl BoundedRequestWriter {
     /// Create an empty bounded request buffer.
-    fn new(execution_started: Instant, timeout: Duration) -> Self {
+    fn new(execution_started: Instant, timeout: Duration, max_bytes: usize) -> Self {
         Self {
             body: Vec::new(),
+            max_bytes,
             exceeded: false,
             deadline_elapsed: false,
             execution_started,
@@ -1839,7 +1857,7 @@ impl io::Write for BoundedRequestWriter {
                 "search request deadline exceeded",
             ));
         }
-        let remaining = MAX_SEARCH_REQUEST_BYTES.saturating_sub(self.body.len());
+        let remaining = self.max_bytes.saturating_sub(self.body.len());
         if buf.len() > remaining {
             self.exceeded = true;
             return Err(io::Error::other("search request body limit exceeded"));
@@ -1973,13 +1991,17 @@ fn serialize_bounded_request(
     store_id: &str,
     execution_started: Instant,
     timeout: Duration,
+    request_body_limit: usize,
 ) -> Result<Vec<u8>, FileSearchError> {
-    let mut writer = BoundedRequestWriter::new(execution_started, timeout);
+    let mut writer = BoundedRequestWriter::new(execution_started, timeout, request_body_limit);
     let serialized = serde_json::to_writer(&mut writer, request);
     if writer.deadline_elapsed {
         return Err(execution_deadline_error(store_id));
     }
     if writer.exceeded {
+        if request_body_limit < MAX_SEARCH_REQUEST_BYTES {
+            return Err(aggregate_limit_error(store_id, request_body_limit, true));
+        }
         return Err(request_error(
             store_id,
             format!("search request exceeds {MAX_SEARCH_REQUEST_BYTES} byte limit"),
@@ -2282,6 +2304,16 @@ fn aggregate_limit_error(store_id: &str, limit: usize, retained_payload: bool) -
     }
 }
 
+/// Reserve simultaneous outgoing request bodies before response admission.
+/// An absent request-wide budget keeps the independent file-search ceilings.
+fn search_execution_allowances(available_bytes: usize) -> (usize, usize) {
+    if available_bytes == usize::MAX {
+        return (usize::MAX, usize::MAX);
+    }
+    let request_allowance = available_bytes / 2;
+    (available_bytes - request_allowance, request_allowance)
+}
+
 /// Intersect the configured response ceiling with the request-wide allowance.
 fn retained_response_body_limit(configured_limit: usize, available_bytes: usize) -> (usize, bool) {
     if available_bytes == usize::MAX {
@@ -2344,17 +2376,17 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use serde_json::{Value, json};
 
     use super::{
-        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_BODY_BUDGET_UNIT_BYTES,
+        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, MAX_SEARCH_REQUEST_BYTES, RESPONSE_BODY_BUDGET_UNIT_BYTES,
         RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchFailure, SearchResult, SearchSpec,
         VectorStoreSearchRequest, append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results,
         parse_response_body, response_admission_units, retained_payload_controls_per_call,
-        retained_response_body_limit,
+        retained_response_body_limit, search_execution_allowances, serialize_bounded_request,
     };
 
     const MINIMAL_RESULT: &[u8] = br#"{"content":[],"file_id":"","filename":"","score":0}"#;
@@ -2425,6 +2457,67 @@ mod tests {
         assert!(!retained_payload_controls_per_call(512, 1_024, true));
         assert!(retained_payload_controls_per_call(2_048, 1_024, true));
         assert!(!retained_payload_controls_per_call(2_048, 1_024, false));
+    }
+
+    #[test]
+    fn retained_budget_rejects_search_request_body_before_it_is_allocated() {
+        let query = "q".repeat(60 * 1_024);
+        let request = VectorStoreSearchRequest::new(None, None, &query, None).expect("valid search request");
+        let (response_allowance, request_allowance) = search_execution_allowances(6_000);
+        assert_eq!(
+            response_allowance + request_allowance,
+            6_000,
+            "all shared headroom must be partitioned"
+        );
+        let request_body_limit = MAX_SEARCH_REQUEST_BYTES.min(request_allowance);
+        let failure = serialize_bounded_request(
+            &request,
+            "vs-test",
+            Instant::now(),
+            Duration::from_secs(1),
+            request_body_limit,
+        )
+        .expect_err("a 60 KiB query cannot allocate its body under 6 KiB of shared headroom");
+        assert!(
+            matches!(
+                failure,
+                FileSearchError::AggregateLimit {
+                    retained_payload: true,
+                    ..
+                }
+            ),
+            "the pre-dial failure must reach the shared retained-budget path"
+        );
+    }
+
+    #[test]
+    fn retained_budget_preserves_ordinary_concurrent_search_requests() {
+        let query = "q".repeat(60 * 1_024);
+        let request = VectorStoreSearchRequest::new(None, None, &query, None).expect("valid search request");
+        let (_, normal_request_allowance) = search_execution_allowances(64 * 1_024 * 1_024);
+        let ordinary_body = serialize_bounded_request(
+            &request,
+            "vs-test",
+            Instant::now(),
+            Duration::from_secs(1),
+            MAX_SEARCH_REQUEST_BYTES.min(normal_request_allowance / 8),
+        )
+        .expect("the same query must fit alongside eight normal budgeted callouts");
+        assert!(
+            ordinary_body.len() > 6_000,
+            "the regression body must exceed the tight request budget"
+        );
+        assert!(
+            ordinary_body.len() <= MAX_SEARCH_REQUEST_BYTES,
+            "the independent request ceiling still applies"
+        );
+
+        let (_, tight_request_allowance) = search_execution_allowances(6_000);
+        let concurrent_cap = MAX_SEARCH_REQUEST_BYTES.min(tight_request_allowance / 8);
+        assert!(
+            concurrent_cap * 8 <= tight_request_allowance,
+            "all eight live request bodies must fit together"
+        );
     }
 
     #[test]
