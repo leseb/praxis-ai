@@ -126,6 +126,8 @@ mod config;
 )]
 mod tests;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
@@ -199,7 +201,7 @@ use super::{
     },
     state::{
         DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
-        current_round_file_search_admissions, tool_search_discovery_is_within_budget,
+        current_round_file_search_admissions, current_round_tool_call_admissions,
     },
     stream_events::{encode_local_completion, encode_local_error},
     usage::merge_usage,
@@ -209,7 +211,7 @@ use super::{
 use super::{
     mcp_classify::{McpDisposition, classify_mcp},
     mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    openai_mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
+    openai_mcp_tool_resolve::{MAX_FUNCTION_NAME_LEN, McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
 
@@ -441,6 +443,11 @@ impl HttpFilter for AgenticLoopFilter {
             return finish_incomplete_round(ctx, state, body);
         }
 
+        // Ownership classification builds a reverse MCP name index. Reserve
+        // its owned keys and encoder scratch before either classification pass.
+        if !mcp_tool_index_fits(&state) {
+            return finish_response_failure(ctx, state, &retained_payload_failure(), true);
+        }
         if has_mixed_function_call_ownership(&state) {
             return reject_mixed_ownership_round(ctx, state);
         }
@@ -450,7 +457,7 @@ impl HttpFilter for AgenticLoopFilter {
             return finish_response_failure(ctx, state, &failure, retained_budget_failure);
         }
 
-        if !state.can_retain_payload(0) {
+        if !state.can_retain_payload(0) || !mcp_tool_index_fits(&state) {
             if request_is_streaming(&state) {
                 state.discard_payload_for_budget_error();
             }
@@ -978,6 +985,37 @@ fn has_dispatchable_calls(state: &ResponsesState) -> bool {
     !state.web_search_calls.is_empty() || !state.file_search_assignments.is_empty() || has_dispatchable_mcp_work(state)
 }
 
+/// Both agentic ownership predicates build a temporary reverse MCP name index.
+/// Admission must be rechecked after dispatcher preparation can grow the state.
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_tool_index_fits(state: &ResponsesState) -> bool {
+    (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty())
+        || mcp_tool_index_charge(state).is_some_and(|charge| state.can_retain_payload(charge))
+}
+
+/// Account for the index's owned encoded names and its largest in-flight raw
+/// and sanitized encoder strings without allocating them first.
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_tool_index_charge(state: &ResponsesState) -> Option<usize> {
+    if state.retained_payload_limit().is_none() {
+        return Some(0);
+    }
+    let (names, largest_raw) =
+        state
+            .mcp_tool_map
+            .keys()
+            .try_fold((0_usize, 0_usize), |(names, largest_raw), (server, tool)| {
+                let raw = server.len().checked_add(2)?.checked_add(tool.len())?;
+                Some((names.checked_add(raw.min(MAX_FUNCTION_NAME_LEN))?, largest_raw.max(raw)))
+            })?;
+    names.checked_add(largest_raw.checked_mul(2)?)
+}
+
+#[cfg(not(feature = "openai-mcp-tools"))]
+const fn mcp_tool_index_fits(_state: &ResponsesState) -> bool {
+    true
+}
+
 /// Whether deferred MCP discovery is pending or a recorded call resolves to a
 /// configured MCP tool (auto or approval-required).
 #[cfg(feature = "openai-mcp-tools")]
@@ -1057,36 +1095,86 @@ fn evaluate_loop_decision(
 
 /// Rewrite queued hosted searches to `incomplete` when they cannot consume
 /// remaining `max_tool_calls` budget, and drop them from dispatch.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass reconciles queue, public output, and persisted history"
+)]
 fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
-    if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
+    if state.tool_search_calls.is_empty() {
         return;
     }
-    let queued_ids: Vec<String> = state
-        .tool_search_calls
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
-        .collect();
-    let mark_unidentified = queued_ids.is_empty();
-    let mark = |item: &mut Value| {
-        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
-            return;
-        }
-        let matches = match item.get("id").and_then(Value::as_str) {
-            Some(id) => queued_ids.iter().any(|queued| queued == id),
-            None => mark_unidentified,
+    let admissions = current_round_tool_call_admissions(state, &state.tool_search_calls);
+    let mut search_from = state.current_round_output_start.unwrap_or(0);
+    let mut admitted = Vec::with_capacity(state.tool_search_calls.len());
+    let mut denied = Vec::new();
+    // The call queue owns copies of the canonical output. Match them in model
+    // order so repeated provider IDs do not rewrite an admitted earlier call.
+    for (ordinal, call) in std::mem::take(&mut state.tool_search_calls).into_iter().enumerate() {
+        let output_index = state
+            .accumulated_output
+            .get(search_from..)
+            .and_then(|output| output.iter().position(|item| item == &call))
+            .and_then(|offset| search_from.checked_add(offset));
+        let Some(output_index) = output_index else {
+            continue;
         };
-        if matches && let Some(obj) = item.as_object_mut() {
-            obj.insert("status".to_owned(), json!("incomplete"));
+        search_from = output_index.saturating_add(1);
+        if admissions.get(ordinal) == Some(&true) {
+            admitted.push(call);
+        } else {
+            denied.push((output_index, call));
         }
-    };
-    for item in &mut state.accumulated_output {
-        mark(item);
     }
-    for item in &mut state.persisted_messages {
-        mark(item);
+    state.tool_search_calls = admitted;
+    if denied.is_empty() {
+        return;
+    }
+    for (output_index, _) in &denied {
+        if let Some(object) = state
+            .accumulated_output
+            .get_mut(*output_index)
+            .and_then(Value::as_object_mut)
+        {
+            object.insert("status".to_owned(), json!("incomplete"));
+        }
+    }
+    // A provider may reuse an ID across rounds. Update only the newest stored
+    // occurrence for each denied current-round call.
+    let mut pending = HashMap::<&str, usize>::new();
+    for (_, call) in &denied {
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            *pending.entry(id).or_default() += 1;
+        }
+    }
+    let mut remaining: usize = pending.values().sum();
+    for item in state.persisted_messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(count) = pending.get_mut(id)
+            && *count > 0
+        {
+            if let Some(object) = item.as_object_mut() {
+                object.insert("status".to_owned(), json!("incomplete"));
+            }
+            *count -= 1;
+            remaining -= 1;
+        }
+    }
+    for (_, call) in denied.iter().filter(|(_, call)| call.get("id").is_none()) {
+        if let Some(item) = state.persisted_messages.iter_mut().rfind(|item| **item == *call)
+            && let Some(object) = item.as_object_mut()
+        {
+            object.insert("status".to_owned(), json!("incomplete"));
+        }
     }
     state.mark_replay_stable_payload_changed();
-    state.tool_search_calls.clear();
 }
 
 /// Remove representation metadata after replacing a buffered response body.
@@ -1462,7 +1550,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
         return;
     };
     state.current_round_output_start = Some(state.accumulated_output.len());
-    let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
+    let mut pending_file_search: Vec<(usize, usize, SynthesisKind)> = Vec::new();
     for (round_index, item) in output.iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         state.accumulated_output.push(item.clone());
@@ -1515,6 +1603,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // `FileSearchAssignment`; openai_file_search_callout drains those
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
+                let persisted_index = state.persisted_messages.len();
                 state.persisted_messages.push(item.clone());
                 if is_pending_file_search_call(item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
@@ -1522,7 +1611,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                     } else {
                         SynthesisKind::Native
                     };
-                    pending_file_search.push((absolute_index, synthesis));
+                    pending_file_search.push((absolute_index, persisted_index, synthesis));
                 }
             },
             _ => {},
@@ -1553,36 +1642,45 @@ fn mark_provider_history(state: &mut ResponsesState) {
 /// call is terminalized to `incomplete` in place and no assignment is recorded —
 /// leaving `has_dispatchable_calls` free to exit the loop. The dispatcher applies
 /// only its independent per-continuation server cap to the recorded assignments.
-fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usize, SynthesisKind)>) {
+fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usize, usize, SynthesisKind)>) {
     if pending.is_empty() {
         return;
     }
     let candidates = pending
-        .into_iter()
-        .map(|(output_index, synthesis)| FileSearchAssignment {
-            output_index,
-            synthesis,
+        .iter()
+        .map(|(output_index, _, synthesis)| FileSearchAssignment {
+            output_index: *output_index,
+            synthesis: *synthesis,
         })
         .collect::<Vec<_>>();
     let admissions = current_round_file_search_admissions(state, &candidates);
-    for (index, assignment) in candidates.into_iter().enumerate() {
+    for (index, (assignment, (_, persisted_index, _))) in candidates.into_iter().zip(pending).enumerate() {
         let admitted = admissions.get(index).copied().unwrap_or(false);
         if admitted {
             state.file_search_assignments.push(assignment);
         } else {
-            terminalize_file_search_item(state, assignment.output_index);
+            terminalize_file_search_item(state, assignment.output_index, persisted_index);
         }
     }
 }
 
-/// Mark the `file_search_call` at `index` in `accumulated_output` `incomplete`,
-/// dropping any partial results, when it cannot be dispatched.
-fn terminalize_file_search_item(state: &mut ResponsesState, index: usize) {
-    if let Some(item) = state.accumulated_output.get_mut(index)
-        && let Some(object) = item.as_object_mut()
+/// Mark both independently retained copies of a rejected file search incomplete.
+fn terminalize_file_search_item(state: &mut ResponsesState, output_index: usize, persisted_index: usize) {
+    let mut changed = false;
+    for item in [
+        state.accumulated_output.get_mut(output_index),
+        state.persisted_messages.get_mut(persisted_index),
+    ]
+    .into_iter()
+    .flatten()
     {
-        object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
-        object.remove("results");
+        if let Some(object) = item.as_object_mut() {
+            object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
+            object.remove("results");
+            changed = true;
+        }
+    }
+    if changed {
         state.mark_replay_stable_payload_changed();
     }
 }
@@ -1639,7 +1737,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
     // Move the round out (leaving a valid `[]`), so each item is routed to its
     // last consumer by move; only earlier consumers of a shared item clone.
     let round = std::mem::take(state.output_items_mut());
-    let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
+    let mut pending_file_search: Vec<(usize, usize, SynthesisKind)> = Vec::new();
     for (round_index, item) in round.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
@@ -1690,7 +1788,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
                     state.pending_local_tool_synthesis.push((absolute_index, synthesis));
                 }
                 if is_pending_file_search_call(&item) {
-                    pending_file_search.push((absolute_index, synthesis));
+                    pending_file_search.push((absolute_index, state.persisted_messages.len(), synthesis));
                 }
                 state.persisted_messages.push(item.clone());
                 state.accumulated_output.push(item);

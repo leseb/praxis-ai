@@ -14,8 +14,8 @@ use super::{
 
 /// Reject a request-side admission before dispatching another provider call.
 /// The HTTP status is determined by the logical response, not its `stream` bit:
-/// the first input is a 413, an uncommitted continuation is a 502, and only
-/// bytes already sent as SSE permit an in-band error.
+/// the first input is a 413, an uncommitted continuation is a 502, and
+/// a committed response requires an in-band error.
 pub(crate) fn reject_request(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
     FilterAction::Reject(request_rejection(ctx, message))
 }

@@ -1824,7 +1824,7 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels, None)
         .expect("rewrite must not error")
         .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
@@ -1884,7 +1884,7 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels, None)
         .expect("rewrite must not error")
         .expect("mixed request must be rewritten");
 
@@ -1935,7 +1935,7 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels, None)
         .expect("rewrite must not error")
         .expect("resolved-empty entry must trigger a rewrite");
 
@@ -3875,9 +3875,11 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
         tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
         ..ResponsesState::default()
     };
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
 
     discover_deferred_connectors(&mut state).await.unwrap();
     ct.cancel();
+    assert!(state.retained_payload_bytes().unwrap() <= 64 * 1024 * 1024);
 
     assert!(
         state.deferred_mcp.is_empty(),
@@ -5588,6 +5590,7 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![cached_weather_listing(server_url)];
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
     ctx.extensions.insert(state);
 
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -5595,6 +5598,7 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     assert!(matches!(action, FilterAction::Continue), "cache hit should continue");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert!(state.retained_payload_bytes().unwrap() <= 64 * 1024 * 1024);
     let items = list_tools_items(state);
     assert_eq!(items.len(), 1, "one discovery item for the resolved server");
     let item = items[0];
@@ -5870,4 +5874,142 @@ async fn malformed_allowed_tools_string_rejects_before_rewrite() {
         state.is_none() || state.unwrap().mcp_tool_map.is_empty(),
         "mcp_tool_map must not be populated on validation failure"
     );
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_cached_mcp_listing_before_commit() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let body_json = mcp_body(server_url);
+    let mut listing = cached_weather_listing(server_url);
+    listing["tools"][0]["description"] = serde_json::json!("x".repeat(4_096));
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![listing];
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + 1_024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_fresh_mcp_listing_before_callout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let body_json = mcp_body(&server_url);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json);
+    state.apply_retained_payload_limit(8_192);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "tools/list must not start without enough room for its bounded response"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_deferred_mcp_listing_before_callout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mut state = ResponsesState {
+        deferred_mcp: vec![deferred_connector(&server_url, None, None)],
+        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(state.deferred_mcp.len(), 1);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "deferred tools/list must not start without enough room for its bounded response"
+    );
+}
+
+#[test]
+fn aggregate_budget_rejects_repeated_mcp_selectors_before_expansion() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let names: Vec<String> = (0..128).map(|i| format!("t{i:03}_{}", "x".repeat(60))).collect();
+    let listed_tools: Vec<_> = names
+        .iter()
+        .map(|name| serde_json::json!({"name": name, "inputSchema": {"type": "object"}}))
+        .collect();
+    let selectors = vec![serde_json::json!({"type": "mcp", "server_label": "weather"}); 4_000];
+    let body_json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "tools": [{
+            "type": "mcp", "server_label": "weather", "server_url": server_url,
+            "allowed_tools": names,
+        }],
+        "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": selectors},
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url, "tools": listed_tools,
+    })];
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut action = None;
+    let allocation = allocation_counter::measure(|| {
+        action = Some(
+            runtime
+                .block_on(filter.on_request_body(&mut ctx, &mut body, true))
+                .unwrap(),
+        );
+    });
+
+    assert!(matches!(&action, Some(FilterAction::Reject(rejection)) if rejection.status == 502));
+    assert!(
+        allocation.bytes_max < 16 * 1024 * 1024,
+        "expanded selectors must be projected before building JSON or wire owners: {allocation:?}"
+    );
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
 }

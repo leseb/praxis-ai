@@ -5354,13 +5354,44 @@ class RetainedToolSearchBackendHandler(BaseHTTPRequestHandler):
         pass
 
 
+class RetainedFileMetadataHandler(BaseHTTPRequestHandler):
+    """Report an oversized file without serving its content."""
+
+    metadata_requests: ClassVar[int] = 0
+    content_requests: ClassVar[int] = 0
+
+    def do_GET(self):
+        if self.path.endswith("/content"):
+            type(self).content_requests += 1
+            self.send_response(500)
+            self.end_headers()
+            return
+        type(self).metadata_requests += 1
+        payload = json.dumps(
+            {"id": "file-budget", "filename": "budget.txt", "content_type": "text/plain", "bytes": 49_152}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 @pytest.fixture()
 def retained_tool_search_client(tmp_path, request):
     """OpenAI SDK client backed by a fixed, oversized hosted search result."""
     RetainedToolSearchBackendHandler.requests = 0
+    RetainedFileMetadataHandler.metadata_requests = 0
+    RetainedFileMetadataHandler.content_requests = 0
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), RetainedToolSearchBackendHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    files_port = _free_port()
+    files_server = HTTPServer(("127.0.0.1", files_port), RetainedFileMetadataHandler)
+    threading.Thread(target=files_server.serve_forever, daemon=True).start()
 
     proxy_port = _free_port()
     with open("examples/configs/openai/responses/agentic-loop-overflow-fixture.yaml") as f:
@@ -5404,6 +5435,28 @@ def retained_tool_search_client(tmp_path, request):
     if store_filters not in config:
         raise RuntimeError("retained overflow fixture's store filters changed")
     config = config.replace(store_filters, "", 1)
+    config = config.replace(
+        "      - filter: openai_mcp_tool_resolve\n",
+        "      - filter: openai_file_resolve\n"
+        f'        files_api_url: "http://127.0.0.1:{files_port}"\n'
+        "        allow_pre_security_callout: true\n\n"
+        "      - filter: openai_mcp_tool_resolve\n",
+        1,
+    )
+    if getattr(request, "param", None) == "doc_extract":
+        config = config.replace(
+            "      - filter: openai_mcp_tool_resolve\n",
+            "      - filter: openai_doc_extract\n"
+            "        allow_pre_security_callout: true\n\n"
+            "      - filter: openai_mcp_tool_resolve\n",
+            1,
+        )
+    config = config.replace(
+        "  allow_private_endpoints: true # example proxies to local backends",
+        "  allow_private_endpoints: true # example proxies to local backends\n"
+        "  allow_private_upstreams: true # stubbed Files API callouts",
+        1,
+    )
     config_path = _persist_config(config)
     log_path = str(tmp_path / "praxis.log")
     log_file = open(log_path, "w")
@@ -5432,9 +5485,232 @@ def retained_tool_search_client(tmp_path, request):
         log_file.close()
         server.shutdown()
         server.server_close()
+        files_server.shutdown()
+        files_server.server_close()
         if not started or request.session.testsfailed > 0:
             print(f"\n=== Retained tool search Praxis logs ===\n{_read_log_tail(log_path)}", file=sys.stderr)
         os.unlink(config_path)
+
+
+@pytest.mark.parametrize(
+    "scenario", ["direct", "buffered_middle", "empty_stream", "buffered_sse", "translated"]
+)
+def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
+    tmp_path, scenario
+):
+    """Only an actually streamed IRR response changes the later error wire format."""
+
+    class StubHandler(BaseHTTPRequestHandler):
+        paths: ClassVar[list[str]] = []
+        empty_stream: ClassVar[bool] = scenario == "empty_stream"
+
+        def do_GET(self):
+            self.paths.append(self.path)
+            if self.path != "/v1/files/file-budget":
+                self.send_error(500, "unexpected content fetch")
+                return
+            payload = json.dumps(
+                {"filename": "a.txt", "content_type": "text/plain", "bytes": 49152}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            self.paths.append("POST " + self.path)
+            self.rfile.read(int(self.headers["Content-Length"]))
+            if scenario == "translated":
+                payload = (
+                    b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
+                    b'"created":1,"model":"m","choices":[{"index":0,'
+                    b'"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
+                    b'"created":1,"model":"m","choices":[{"index":0,'
+                    b'"delta":{},"finish_reason":"stop"}]}\n\n'
+                    b'data: [DONE]\n\n'
+                )
+            else:
+                payload = (
+                    b'event: response.created\ndata: {"type":"response.created",'
+                    b'"response":{"id":"resp_file_budget","object":"response",'
+                    b'"status":"in_progress","output":[]}}\n\n'
+                )
+            if self.empty_stream:
+                payload = b""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    stub = ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+    thread = threading.Thread(target=stub.serve_forever, daemon=True)
+    thread.start()
+    proxy_port = _free_port()
+    config = f"""
+listeners:
+  - name: file-budget-stream
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [file-budget-stream]
+filter_chains:
+  - name: file-budget-stream
+    filters:
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: first
+        max_iterations: 2
+        steps:
+          - name: first
+            filters:
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{stub.server_port}"]
+            on_result:
+              - default: true
+                next: resolve
+          - name: resolve
+            filters:
+              - filter: openai_responses_format
+              - filter: openai_file_resolve
+                files_api_url: "http://127.0.0.1:{stub.server_port}"
+                allow_pre_security_callout: true
+              - filter: openai_stream_events
+              - filter: openai_agentic_loop
+                max_infer_iters: 1
+                max_retained_bytes: 4096
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{stub.server_port}"]
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true
+"""
+    if scenario == "translated":
+        config = config.replace(
+            "              - filter: openai_responses_proxy\n",
+            "              - filter: openai_stream_events\n"
+            "              - filter: responses_to_chat_completions\n",
+            1,
+        )
+        config = config.replace("max_retained_bytes: 4096", "max_retained_bytes: 65536")
+    if scenario in {"buffered_middle", "empty_stream"}:
+        config = config.replace("max_iterations: 2", "max_iterations: 3", 1)
+        config = config.replace("next: resolve", "next: middle", 1)
+        config = config.replace(
+            "          - name: resolve\n",
+            """          - name: middle
+            filters:
+              - filter: static_response
+                status: 200
+                body: '{}'
+                headers:
+                  - name: Content-Type
+                    value: application/json
+            on_result:
+              - default: true
+                next: resolve
+          - name: resolve
+""",
+            1,
+        )
+    if scenario == "buffered_sse":
+        first = config.index("          - name: first\n")
+        filters_start = config.index("            filters:\n", first)
+        filters_end = config.index("            on_result:\n", filters_start)
+        config = (
+            config[:filters_start]
+            + """            filters:
+              - filter: static_response
+                status: 200
+                body: 'ignored'
+                headers:
+                  - name: Content-Type
+                    value: text/event-stream
+"""
+            + config[filters_end:]
+        )
+    config_path = _persist_config(config)
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, str(log_path))
+            response = httpx.post(
+                f"http://127.0.0.1:{proxy_port}/v1/responses",
+                json={
+                    "model": "m",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_file", "file_id": "file-budget"}],
+                        }
+                    ],
+                    "store": False,
+                    "stream": scenario != "buffered_sse",
+                },
+                timeout=20,
+            )
+            if scenario == "buffered_sse":
+                assert response.status_code == 502, response.text
+                assert response.headers["content-type"].startswith("application/json")
+                assert response.json()["error"]["type"] == "server_error"
+            else:
+                assert response.status_code == 200, response.text
+                assert response.headers["content-type"].startswith("text/event-stream")
+                frames = [frame for frame in response.text.split("\n\n") if frame]
+                event_names = [frame.split("\n", 1)[0] for frame in frames]
+                if scenario == "translated":
+                    assert "event: response.created" in event_names, response.text
+                    assert event_names[-1] == "event: error", response.text
+                else:
+                    expected = [] if scenario == "empty_stream" else ["event: response.created"]
+                    assert event_names == [*expected, "event: error"], response.text
+                error = json.loads(frames[-1].split("data: ", 1)[1])
+                assert error["type"] == "error"
+                assert error["code"] == "server_error"
+                assert "agentic retained payload exceeded" in error["message"]
+                assert "{\"error\":" not in response.text
+            assert StubHandler.paths.count("POST /v1/responses") == (
+                0 if scenario == "buffered_sse" else 1
+            )
+            assert StubHandler.paths.count("/v1/files/file-budget") == 1
+            assert "/v1/files/file-budget/content" not in StubHandler.paths
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stub.shutdown()
+            stub.server_close()
+            os.unlink(config_path)
+            if proc.returncode not in (0, -2):
+                print(_read_log_tail(str(log_path)), file=sys.stderr)
 
 
 class TestAgenticLoopVLLM:
@@ -5493,6 +5769,56 @@ class TestAgenticLoopVLLM:
         assert exc_info.value.status_code == 502
         assert "agentic retained payload exceeded" in exc_info.value.response.text
         assert RetainedToolSearchBackendHandler.requests == 1
+
+    def test_initial_file_resolution_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A declared oversized file is rejected before content or inference."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file-budget"}],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedFileMetadataHandler.metadata_requests == 1
+        assert RetainedFileMetadataHandler.content_requests == 0
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    @pytest.mark.parametrize("retained_tool_search_client", ["doc_extract"], indirect=True)
+    def test_document_extraction_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """Escaped extracted text cannot multiply beyond the shared budget."""
+        file_data = "data:text/plain;base64," + base64.b64encode(b"\x01" * 256).decode()
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "filename": "controls.txt",
+                                "file_data": file_data,
+                            }
+                        ],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "during document extraction" in exc_info.value.response.text
+        assert RetainedToolSearchBackendHandler.requests == 0
 
     def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
         """The example's explicit 64 MiB aggregate budget admits an ordinary response."""
