@@ -68,7 +68,7 @@ use super::{
         agentic_loop::AgenticBudgetPolicy,
         bound_body_outcome,
         error::responses_error_rejection,
-        state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
+        state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
     },
     config::{ResponseStoreConfig, validate_config},
 };
@@ -317,12 +317,49 @@ impl ResponseStoreFilter {
         clippy::too_many_lines,
         reason = "preflights and accounts for replay capture alongside shared state"
     )]
-    fn capture_stream_events(&self, ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) -> bool {
+    fn capture_stream_events(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+        end_of_stream: bool,
+    ) -> bool {
         let Some(chunk) = body.as_ref().filter(|b| !b.is_empty()) else {
             return true;
         };
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
         let previously_retained = state.retained_payload_bytes();
+        let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
+        if let Some(responses) = ctx.extensions.get::<ResponsesState>()
+            && let Some(limit) = responses.retained_payload_limit()
+            && (terminal_ready
+                || state
+                    .shared_stable_bytes
+                    .as_ref()
+                    .is_none_or(|cache| !cache.matches(responses)))
+        {
+            let Some(stable) = responses.stream_stable_payload_bytes_bounded(limit) else {
+                ctx.extensions.insert(state);
+                return false;
+            };
+            let Some(remaining) = limit.checked_sub(stable) else {
+                ctx.extensions.insert(state);
+                return false;
+            };
+            let mut output_meter = PayloadMeter::new(remaining);
+            if output_meter.json_values(&responses.accumulated_output).is_none() {
+                ctx.extensions.insert(state);
+                return false;
+            }
+            let Some(stable) = stable.checked_add(output_meter.used()) else {
+                ctx.extensions.insert(state);
+                return false;
+            };
+            let Some(cache) = StoreStableCache::new(responses, stable) else {
+                ctx.extensions.insert(state);
+                return false;
+            };
+            state.shared_stable_bytes = Some(cache);
+        }
         // The decoder can simultaneously hold an unfinished record, completed
         // records, and a newly captured replay row. Reserve their peak before
         // feeding the chunk or making another owned payload copy.
@@ -341,7 +378,7 @@ impl ResponseStoreFilter {
                 .is_some_and(|peak| {
                     ctx.extensions
                         .get::<ResponsesState>()
-                        .is_none_or(|responses| responses.can_retain_payload(peak))
+                        .is_none_or(|responses| store_stream_budget_fits(responses, state.shared_stable_bytes, 0, peak))
                 });
         if !admitted {
             ctx.extensions.insert(state);
@@ -353,9 +390,17 @@ impl ResponseStoreFilter {
         }
         state.track_pending_wire_bytes(chunk);
         let retained = state.retained_payload_bytes();
-        let admitted = previously_retained
-            .zip(retained)
-            .is_some_and(|(_, next)| charge_store_payload(ctx, &mut state, next));
+        let admitted = previously_retained.zip(retained).is_some_and(|(_, next)| {
+            let budget_fits = ctx.extensions.get::<ResponsesState>().is_none_or(|responses| {
+                store_stream_budget_fits(
+                    responses,
+                    state.shared_stable_bytes,
+                    state.charged_retained_bytes.unwrap_or(0),
+                    next,
+                )
+            });
+            budget_fits && charge_store_stream_payload(ctx, &mut state, next)
+        });
         ctx.extensions.insert(state);
         admitted
     }
@@ -642,6 +687,62 @@ impl SseErrorEventDetector {
     }
 }
 
+/// Store request validation can complete before shared response state exists.
+#[derive(Default)]
+enum PersistenceArm {
+    /// The store has not armed this request for persistence.
+    #[default]
+    Pending,
+    /// The store has armed persistence for this request.
+    Armed,
+}
+
+/// Cached stable payload charge and its O(1) invalidation key.
+#[derive(Clone, Copy)]
+struct StoreStableCache {
+    /// Logical loop round when the charge was measured.
+    iteration: u32,
+    /// In-place mutation revision of the cached owners.
+    revision: u64,
+    /// Lengths of every cached collection. Dispatch may append after synthesis
+    /// has already advanced the iteration.
+    collection_lengths: [usize; 7],
+    /// Serialized payload charge of the cached request, history, and output.
+    bytes: usize,
+}
+
+impl StoreStableCache {
+    /// Capture the measured charge and the current O(1) collection shape.
+    fn new(state: &ResponsesState, bytes: usize) -> Option<Self> {
+        Some(Self {
+            iteration: state.iteration,
+            revision: state.replay_stable_payload_revision?,
+            collection_lengths: Self::collection_lengths(state),
+            bytes,
+        })
+    }
+
+    /// Whether the cached charge still describes the current round and shape.
+    fn matches(&self, state: &ResponsesState) -> bool {
+        self.iteration == state.iteration
+            && Some(self.revision) == state.replay_stable_payload_revision
+            && self.collection_lengths == Self::collection_lengths(state)
+    }
+
+    /// Lengths of the collections covered by the stable charge.
+    fn collection_lengths(state: &ResponsesState) -> [usize; 7] {
+        [
+            state.input.len(),
+            state.messages.len(),
+            state.persisted_messages.len(),
+            state.previous_tools.len(),
+            state.tools.len(),
+            state.provider_compaction_ids.len(),
+            state.accumulated_output.len(),
+        ]
+    }
+}
+
 /// Request-phase data needed when persisting the response.
 #[derive(Default)]
 struct ResponseStoreRequestState {
@@ -654,6 +755,15 @@ struct ResponseStoreRequestState {
     /// Store bytes already charged to `ResponsesState`. The store can run
     /// before another filter creates that state.
     charged_retained_bytes: Option<usize>,
+    /// Request, history, and prior output normally stay stable while a
+    /// streamed round is delivered. Recheck their O(1) shape on each chunk:
+    /// synthesis can advance the iteration before request-side dispatch adds
+    /// history in that same iteration. Request-phase re-entry invalidates the
+    /// cache for same-length rewrites of the request body and history.
+    shared_stable_bytes: Option<StoreStableCache>,
+    /// Store request-body validation completed before a later filter created
+    /// `ResponsesState`; transfer its approval-persistence signal with the charge.
+    persistence_arm: PersistenceArm,
     /// Owner captured before inference begins.
     owner: Option<StateOwner>,
     /// Incremental SSE decoder over the outbound stream, lazily created on the
@@ -736,12 +846,69 @@ fn charge_store_payload(ctx: &mut HttpFilterContext<'_>, store: &mut ResponseSto
     admitted
 }
 
+/// Check a replay transition using the per-round request/history charge. The
+/// changing meter still includes the store's currently published charge, so a
+/// replacement subtracts only that owner's prior bytes.
+fn store_stream_budget_fits(
+    responses: &ResponsesState,
+    stable: Option<StoreStableCache>,
+    removed: usize,
+    added: usize,
+) -> bool {
+    let Some(limit) = responses.retained_payload_limit() else {
+        return true;
+    };
+    let Some(cache) = stable.filter(|cache| cache.matches(responses)) else {
+        return false;
+    };
+    let Some(remaining) = limit.checked_sub(cache.bytes) else {
+        return false;
+    };
+    let Some(measurement_limit) = remaining.checked_add(removed) else {
+        return false;
+    };
+    responses
+        .store_stream_changing_payload_bytes_bounded(measurement_limit)
+        .and_then(|current| current.checked_sub(removed))
+        .and_then(|current| current.checked_add(added))
+        .is_some_and(|next| next <= remaining)
+}
+
+/// The caller has already admitted the replay transition with the cached
+/// meter; only transfer its independently owned bytes into shared accounting.
+fn charge_store_stream_payload(
+    ctx: &mut HttpFilterContext<'_>,
+    store: &mut ResponseStoreRequestState,
+    next: usize,
+) -> bool {
+    let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() else {
+        store.charged_retained_bytes = None;
+        return true;
+    };
+    let admitted = if let Some(charged) = store.charged_retained_bytes {
+        responses.replace_retained_external_payload_bytes(charged, next)
+    } else {
+        responses.retain_external_payload_bytes(next)
+    };
+    if admitted {
+        store.charged_retained_bytes = Some(next);
+    }
+    admitted
+}
+
 /// Record a store charge seeded while admitting the agentic budget or
 /// installing rehydrated state.
 pub(crate) fn mark_retained_request_payload_charged(ctx: &mut HttpFilterContext<'_>) {
     if let Some(store) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
         store.charged_retained_bytes = store.retained_payload_bytes();
     }
+}
+
+/// Whether an earlier store filter completed request-phase persistence arming.
+pub(crate) fn request_persistence_armed(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponseStoreRequestState>()
+        .is_some_and(|state| matches!(state.persistence_arm, PersistenceArm::Armed))
 }
 
 /// Release all store-owned request payload after a terminal budget failure.
@@ -833,12 +1000,21 @@ fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), Filt
 
 /// Retain request input alongside the already captured owner.
 fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Result<(), FilterAction> {
-    let retained_bytes = retained_json_bytes(&input).unwrap_or(usize::MAX);
+    let Some(retained_bytes) = retained_json_bytes(&input) else {
+        ctx.set_metadata("responses.skip_persist", "true");
+        return Err(FilterAction::Reject(responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+        )));
+    };
     let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
     state.input = Some(input);
     state.input_retained_bytes = retained_bytes;
-    let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
-    let admitted = charge_store_payload(ctx, &mut state, next);
+    state.shared_stable_bytes = None;
+    let admitted = state
+        .retained_payload_bytes()
+        .is_some_and(|next| charge_store_payload(ctx, &mut state, next));
     ctx.extensions.insert(state);
     if !admitted {
         ctx.set_metadata("responses.skip_persist", "true");
@@ -892,15 +1068,17 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 /// store filter that is absent, request-conditioned out, or ordered after
 /// dispatch.
 ///
-/// It is written from `on_request_body` because `openai_responses_validate`
-/// creates `ResponsesState` in its own `on_request_body`, which runs earlier in
-/// the same body phase, so `ResponsesState` is not yet present during
-/// `on_request`.
+/// It is written from `on_request_body` because the state creator also runs
+/// in that phase. If the store runs first, its local marker is transferred
+/// when `ResponsesState` is created later in the filter chain.
 fn arm_persistence_if_persisting(ctx: &mut HttpFilterContext<'_>) {
-    if request_will_persist_response(ctx)
-        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
-    {
-        state.store_persist_armed = true;
+    if request_will_persist_response(ctx) {
+        if let Some(store) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
+            store.persistence_arm = PersistenceArm::Armed;
+        }
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.store_persist_armed = true;
+        }
     }
 }
 
@@ -1210,16 +1388,28 @@ fn pending_approvals_from_ctx(ctx: &HttpFilterContext<'_>) -> Vec<PendingApprova
 
 /// Reserve the original input snapshot before parsing another owned JSON tree.
 fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<(), FilterAction> {
-    if should_skip(ctx) || ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
+    if should_skip(ctx) {
         return Ok(());
     }
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(());
+    };
     // Compact JSON cannot exceed the raw body, so the body length is a safe
     // upper bound for the snapshot captured below.
     let raw_bytes = body.as_ref().map_or(0, Bytes::len);
-    let admitted = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .is_some_and(|state| state.can_retain_payload(raw_bytes));
+    let admitted = if let Some(state) = ctx.extensions.get::<ResponsesState>() {
+        state.can_retain_payload(raw_bytes)
+    } else {
+        // A valid pipeline may place the store after format classification but
+        // before the filter that creates ResponsesState. Apply the same
+        // pre-parse headroom as the request filter until that state exists;
+        // the creator then transfers this captured snapshot into its meter.
+        let existing = retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
+        raw_bytes
+            .checked_mul(super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)
+            .and_then(|peak| existing.checked_add(peak))
+            .is_some_and(|peak| peak <= policy.max_retained_bytes())
+    };
     if admitted {
         return Ok(());
     }
@@ -1269,6 +1459,12 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The preceding round may have cached its terminal after the agentic
+        // loop advanced `iteration`; request-side filters can now rewrite
+        // stable fields without changing that counter or vector lengths.
+        if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
+            state.shared_stable_bytes = None;
+        }
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
         }
@@ -1311,6 +1507,9 @@ impl HttpFilter for ResponseStoreFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
+        }
+        if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
+            state.shared_stable_bytes = None;
         }
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
@@ -1397,7 +1596,7 @@ impl HttpFilter for ResponseStoreFilter {
             // Capture this chunk's SSE events into request-scoped state before
             // any persist seam below drains that state. Parse-only; the
             // client-visible bytes are never withheld or altered.
-            if !self.capture_stream_events(ctx, body) {
+            if !self.capture_stream_events(ctx, body, end_of_stream) {
                 return Ok(persistence_budget_failure(ctx, true, body));
             }
 
@@ -2061,7 +2260,7 @@ mod encode_replay_event_tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use bytes::Bytes;
-    use praxis_filter::{HttpFilter as _, sse::SseDecoder};
+    use praxis_filter::{FilterAction, HttpFilter as _, sse::SseDecoder};
     use serde_json::json;
 
     use super::{
@@ -2138,7 +2337,7 @@ mod encode_replay_event_tests {
             let frame = Bytes::from(format!(
                 "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":{sequence},\"delta\":\"x\"}}\n\n"
             ));
-            if !filter.capture_stream_events(&mut ctx, &Some(frame)) {
+            if !filter.capture_stream_events(&mut ctx, &Some(frame), false) {
                 break;
             }
             accepted += 1;
@@ -2177,7 +2376,7 @@ mod encode_replay_event_tests {
         let frame = Bytes::from_static(
             b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
         );
-        assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+        assert!(filter.capture_stream_events(&mut ctx, &Some(frame), false));
         let retained = super::retained_request_payload_bytes(&ctx).unwrap();
         assert!(retained > input_bytes);
         assert_eq!(
@@ -2211,7 +2410,7 @@ mod encode_replay_event_tests {
         let frame = Bytes::from_static(
             b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":1}\n\n",
         );
-        assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+        assert!(filter.capture_stream_events(&mut ctx, &Some(frame), false));
         assert_eq!(
             ctx.extensions
                 .get::<ResponsesState>()
@@ -2237,7 +2436,7 @@ mod encode_replay_event_tests {
         let frame = Bytes::from_static(
             b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":1}\n\n",
         );
-        assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+        assert!(filter.capture_stream_events(&mut ctx, &Some(frame), false));
         assert_eq!(
             ctx.extensions
                 .get::<ResponsesState>()
@@ -2282,9 +2481,256 @@ mod encode_replay_event_tests {
             let frame = Bytes::from(format!(
                 "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":{sequence},\"delta\":\"x\"}}\n\n"
             ));
-            assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+            assert!(filter.capture_stream_events(&mut ctx, &Some(frame), false));
         }
-        assert!(filter.capture_stream_events(&mut ctx, &Some(Bytes::from(vec![b'x'; 3_000]))));
+        assert!(filter.capture_stream_events(&mut ctx, &Some(Bytes::from(vec![b'x'; 3_000])), false));
         assert_eq!(super::retained_request_payload_bytes(&ctx), Some(0));
+    }
+
+    #[test]
+    fn replay_meter_refreshes_large_request_charge_at_end_of_stream() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState::from_request_body(json!({"input": "x".repeat(1_048_576)}));
+        responses.apply_retained_payload_limit(8_388_608);
+        ctx.extensions.insert(responses);
+
+        for sequence in 0..32 {
+            let frame = Bytes::from(format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":{sequence},\"delta\":\"x\"}}\n\n"
+            ));
+            assert!(filter.capture_stream_events(&mut ctx, &Some(frame), false));
+        }
+        assert!(
+            ctx.extensions
+                .get::<super::ResponseStoreRequestState>()
+                .unwrap()
+                .shared_stable_bytes
+                .is_some()
+        );
+
+        // The agentic loop may append history before this filter sees EOS.
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .messages
+            .push(json!("y".repeat(7 * 1_048_576)));
+        let terminal = Some(Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":32}\n\n",
+        ));
+        assert!(!filter.capture_stream_events(&mut ctx, &terminal, true));
+    }
+
+    #[test]
+    fn replay_meter_includes_published_stream_parser_charge() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let frame = Some(Bytes::from_static(
+            b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
+        ));
+        let mut responses = ResponsesState::default();
+        let baseline = responses.retained_payload_bytes().unwrap();
+        let peak = frame.as_ref().unwrap().len() * 4;
+        responses.apply_retained_payload_limit(baseline + peak);
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.extensions.insert(responses);
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+
+        let mut responses = ResponsesState {
+            retained_stream_parser_bytes: 1,
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(baseline + peak);
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.extensions.insert(responses);
+        assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[test]
+    fn replay_meter_refreshes_accumulated_output_at_terminal_chunk() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let frame = Some(Bytes::from_static(
+            b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
+        ));
+        for terminal_is_eos in [false, true] {
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            let mut responses = ResponsesState::default();
+            responses
+                .accumulated_output
+                .push(json!({"type": "message", "content": "prior".repeat(100_000)}));
+            responses.apply_retained_payload_limit(1_048_576);
+            ctx.extensions.insert(responses);
+            assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+
+            let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+            responses
+                .accumulated_output
+                .push(json!({"type": "message", "content": "x".repeat(700_000)}));
+            responses.logical_stream_terminal_emitted = !terminal_is_eos;
+            assert!(!filter.capture_stream_events(&mut ctx, &frame, terminal_is_eos));
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reproduces a near-limit dispatch after a cached round completion"
+    )]
+    fn replay_meter_refreshes_history_added_after_next_iteration_was_cached() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState {
+            iteration: 2,
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(32_768);
+        ctx.extensions.insert(responses);
+
+        // A continuing round can emit its synthesized completion after the
+        // loop has already incremented iteration, before dispatch of the next
+        // round adds history under that same iteration number.
+        let frame = Some(Bytes::from_static(
+            b"event: response.file_search_call.completed\ndata: {\"type\":\"response.file_search_call.completed\",\"sequence_number\":0}\n\n",
+        ));
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        let published = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .messages
+            .push(json!({
+                "type": "function_call_output",
+                "output": "x".repeat(32_768 - published - 60),
+            }));
+        let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert!(responses.can_retain_payload(0), "dispatch itself fits the budget");
+        assert!(!responses.can_retain_payload(frame.as_ref().unwrap().len() * 4));
+        assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "measures an in-place hosted output update at the replay boundary"
+    )]
+    fn replay_meter_refreshes_in_place_hosted_output_update() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState {
+            accumulated_output: vec![json!({"type": "file_search_call", "id": "fs_1", "status": "searching"})],
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(32_768);
+        ctx.extensions.insert(responses);
+        let frame = Some(Bytes::from_static(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"x\"}\n\n",
+        ));
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        let published = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        responses
+            .accumulated_output
+            .get_mut(0)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "results".to_owned(),
+                json!([{"text": "x".repeat(32_768 - published - 80)}]),
+            );
+        responses.mark_replay_stable_payload_changed();
+        assert_eq!(responses.accumulated_output.len(), 1);
+        assert!(responses.messages.is_empty());
+        assert!(responses.can_retain_payload(0));
+        assert!(!responses.can_retain_payload(frame.as_ref().unwrap().len() * 4));
+        assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[test]
+    fn replay_meter_fails_closed_when_revision_overflows() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState {
+            replay_stable_payload_revision: Some(u64::MAX),
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(8_192);
+        responses.mark_replay_stable_payload_changed();
+        assert_eq!(responses.replay_stable_payload_revision, None);
+        ctx.extensions.insert(responses);
+        let frame = Some(Bytes::from_static(
+            b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
+        ));
+        assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks request re-entry invalidation and a same-shape rewrite"
+    )]
+    async fn replay_meter_invalidates_same_length_request_rewrites_on_reentry() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState::from_request_body(json!({"input": "x".repeat(1_024)}));
+        responses.apply_retained_payload_limit(8_192);
+        ctx.extensions.insert(responses);
+        let frame = Some(Bytes::from_static(
+            b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
+        ));
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        assert!(
+            ctx.extensions
+                .get::<super::ResponseStoreRequestState>()
+                .unwrap()
+                .shared_stable_bytes
+                .is_some()
+        );
+
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(
+            ctx.extensions
+                .get::<super::ResponseStoreRequestState>()
+                .unwrap()
+                .shared_stable_bytes
+                .is_none(),
+            "the next request phase may replace payloads without changing their vector lengths"
+        );
+        *ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .request_body
+            .get_mut("input")
+            .unwrap() = json!("y".repeat(8_192));
+        assert!(
+            !filter.capture_stream_events(&mut ctx, &frame, false),
+            "a same-shape request rewrite must be measured before the next replay chunk"
+        );
     }
 }

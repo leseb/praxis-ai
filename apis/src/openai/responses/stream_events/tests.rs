@@ -83,37 +83,6 @@ fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
     OpenaiStreamEventsFilter::build(&yaml).unwrap()
 }
 
-#[tokio::test]
-async fn parser_payload_is_visible_to_a_different_agentic_filter_id() {
-    let (stream_filter, mut ctx) = make_armed_context();
-    let mut responses = ResponsesState {
-        request_body: json!({"model": "m", "input": "hello", "stream": true}),
-        ..ResponsesState::default()
-    };
-    responses.apply_retained_payload_limit(64 * 1024);
-    ctx.extensions.insert(responses);
-    let mut partial = Some(Bytes::from(format!("data: {}", "x".repeat(5_000))));
-    stream_filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
-    let parser_bytes = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .unwrap()
-        .retained_stream_parser_bytes;
-    assert!(parser_bytes >= 5_000, "unfinished frame must be published");
-
-    ctx.current_filter_id = Some(1);
-    assert!(ctx.get_filter_state::<StreamEventsState>().is_none());
-    let agentic = crate::openai::responses::agentic_loop::AgenticLoopFilter::from_config(
-        &serde_yaml::from_str("max_retained_bytes: 4096").unwrap(),
-    )
-    .unwrap();
-    assert!(matches!(
-        agentic.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
-}
-
 #[test]
 fn eos_remeasures_history_appended_after_first_stream_chunk() {
     let (filter, mut ctx) = make_armed_context();
@@ -151,6 +120,37 @@ fn eos_remeasures_history_appended_after_first_stream_chunk() {
 /// `IterationState` is covered by the functional integration tests.
 fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     make_armed_context_with_filter(make_filter())
+}
+
+#[tokio::test]
+async fn parser_payload_is_visible_to_a_different_agentic_filter_id() {
+    let (stream_filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState {
+        request_body: json!({"model": "m", "input": "hello", "stream": true}),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(64 * 1024);
+    ctx.extensions.insert(responses);
+    let mut partial = Some(Bytes::from(format!("data: {}", "x".repeat(5_000))));
+    stream_filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
+    let parser_bytes = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_stream_parser_bytes;
+    assert!(parser_bytes >= 5_000, "unfinished frame must be published");
+
+    // Praxis's filter state is keyed by current_filter_id. The loop callback
+    // cannot read the parser's slot, but its shared budget must still reject it.
+    ctx.current_filter_id = Some(1);
+    assert!(ctx.get_filter_state::<StreamEventsState>().is_none());
+    let agentic = crate::openai::responses::agentic_loop::AgenticLoopFilter::from_config(
+        &serde_yaml::from_str("max_retained_bytes: 4096").unwrap(),
+    )
+    .unwrap();
+    let action = agentic.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(_)));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[test]
@@ -342,6 +342,40 @@ fn local_completion_preflights_synthesized_sse_output() {
 }
 
 #[test]
+fn deferred_terminal_replaces_published_parser_charge_once() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    parser_state
+        .tool_call_args
+        .insert("item:large".to_owned(), "x".repeat(5_000));
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({
+            "type": "response.completed",
+            "response": {"id": "resp_budget", "object": "response", "status": "completed", "output": []}
+        }),
+    };
+    let mut state = ResponsesState {
+        response_object: json!({"id": "resp_budget", "object": "response", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let local_bytes = parser_state.retained_payload_bytes().unwrap();
+    state.retained_stream_parser_bytes = local_bytes + terminal.retained_payload_bytes().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    let canonical_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    state.apply_retained_payload_limit(
+        baseline + canonical_staging + terminal.retained_payload_bytes().unwrap() + 2_000,
+    );
+    ctx.extensions.insert(state);
+
+    let mut output = Vec::new();
+    super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output)
+        .expect("the published parser owner must only be charged once");
+    assert!(String::from_utf8_lossy(&output).contains("event: response.completed"));
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
 fn deferred_terminal_preflights_canonical_output_owners() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -444,6 +478,76 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .unwrap()
     );
     assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+}
+
+#[test]
+fn eos_remeasures_history_appended_after_the_first_stream_chunk() {
+    let (filter, mut ctx) = make_armed_context();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + 2_000);
+    ctx.extensions.insert(responses);
+    assert!(super::shared_retained_budget(&ctx, &stream).unwrap().1.is_some());
+    ctx.insert_filter_state(stream);
+
+    // Agentic collection runs before the stream-events EOS callback and copies
+    // the round's reasoning/tool item into both history owners.
+    let item = json!({"type": "reasoning", "id": "rs_eos", "summary": "x".repeat(3_000)});
+    let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    responses.messages.push(item.clone());
+    responses.persisted_messages.push(item);
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+}
+
+#[test]
+fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
+    use super::client_tools::{ClientToolPhase, ClientToolStreamItem};
+    use crate::openai::responses::state::ClientToolRestore;
+
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    stream.client_tool_items.push(ClientToolStreamItem {
+        key: "item:call_done".to_owned(),
+        private_name: "private_tool".repeat(100),
+        restore: ClientToolRestore::Custom,
+        phase: ClientToolPhase::Done,
+        output_index: 0,
+        item_id: Some("call_done".to_owned()),
+    });
+    let parser_bytes = stream.retained_payload_bytes().unwrap();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + parser_bytes + 128);
+    ctx.extensions.insert(responses);
+    assert!(super::publish_stream_payload(&mut ctx, &stream));
+    ctx.insert_filter_state(stream);
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "loop");
+
+    let mut output = None;
+    super::finalize_logical_stream(&mut ctx, &mut output);
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .retained_payload_bytes(),
+        Some(0)
+    );
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(responses.retained_stream_parser_bytes, 0);
+    assert!(
+        responses.can_retain_payload(parser_bytes + 128),
+        "the next IRR step must have room for payload that the old parser released"
+    );
 }
 
 #[test]

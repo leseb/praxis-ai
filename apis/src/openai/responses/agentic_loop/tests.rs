@@ -3484,6 +3484,38 @@ fn streamed_tool_search_preflight_charges_every_retained_copy() {
 }
 
 #[test]
+fn compaction_collection_preflights_history_copies_and_provenance_id() {
+    let id = format!("cmp_{}", "x".repeat(4_096));
+    let response = json!({
+        "object": "response",
+        "output": [{"type": "compaction", "id": id, "encrypted_content": "opaque"}]
+    });
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let output_bytes = super::super::state::retained_json_bytes(&response["output"]).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let id_bytes = response["output"][0]["id"].as_str().unwrap().len();
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let buffered_peak = baseline + response_bytes + 3 * item_bytes + id_bytes;
+    let mut buffered = ResponsesState::default();
+    buffered.apply_retained_payload_limit(buffered_peak - 1);
+    assert!(super::extract_tool_calls_from_body(&body, &mut buffered).is_err());
+    assert!(buffered.accumulated_output.is_empty());
+    assert!(buffered.provider_compaction_ids.is_empty());
+
+    let mut streamed = ResponsesState {
+        response_object: response,
+        ..ResponsesState::default()
+    };
+    let streamed_retained = baseline - 4 + response_bytes - output_bytes + 2 + 3 * item_bytes + id_bytes;
+    streamed.apply_retained_payload_limit(streamed_retained - 1);
+    assert!(!super::streaming_collection_retention_fits(&streamed));
+    assert!(streamed.provider_compaction_ids.is_empty());
+    assert_eq!(streamed.response_object["output"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
     let response = json!({
         "id": "resp_exact",
@@ -3507,6 +3539,118 @@ fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
     super::extract_tool_calls_from_body(&body, &mut state).unwrap();
 
     assert!(state.retained_payload_bytes().unwrap() <= exact_peak);
+}
+
+#[test]
+fn buffered_numeric_projection_counts_normalization_only_outside_strings() {
+    let ordinary = br#"{"quoted":"1e15","escaped":"\\\"1e15","numbers":[1,2,3,1.0]}"#;
+    assert_eq!(
+        super::buffered_parsed_json_bytes_upper_bound(ordinary),
+        Some(ordinary.len())
+    );
+
+    let scientific = br#"{"object":"response","output":[],"numbers":[1e15,-0,18446744073709551616]}"#;
+    let parsed: Value = serde_json::from_slice(scientific).unwrap();
+    let exact = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let bound = super::buffered_parsed_json_bytes_upper_bound(scientific).unwrap();
+    assert!(
+        bound >= exact,
+        "numeric normalization must fit the pre-parse reservation"
+    );
+    assert!(
+        bound > scientific.len(),
+        "scientific notation expands in the parsed owner"
+    );
+}
+
+#[test]
+fn buffered_numeric_expansion_rejects_before_parsed_tree_allocation() {
+    let numbers = vec!["1e15"; 1_024].join(",");
+    let body = Bytes::from(format!(r#"{{"object":"response","output":[],"numbers":[{numbers}]}}"#));
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let parsed_bytes = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+    let limit = baseline + body.len() + 1;
+    assert!(parsed_bytes > body.len() + 1);
+
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(body.len()),
+        "the old raw-length guard would admit parsing"
+    );
+    let mut rejected = false;
+    let allocation = allocation_counter::measure(|| {
+        rejected = super::extract_tool_calls_from_body(&body, &mut state).is_err();
+    });
+    assert!(rejected);
+    assert!(
+        allocation.bytes_total < 1_024,
+        "numeric-heavy Value must be rejected before it is allocated: {allocation:?}"
+    );
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
+fn buffered_usage_projection_rejects_before_copying_large_usage() {
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "object": "response",
+            "output": [],
+            "usage": {"detail": "x".repeat(2_000_000)}
+        }))
+        .unwrap(),
+    );
+    let limit = 3_000_000;
+    assert!(body.len() < limit, "the initial parsed response fits");
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(limit);
+
+    let mut rejected = false;
+    let allocation = allocation_counter::measure(|| {
+        rejected = super::extract_tool_calls_from_body(&body, &mut state).is_err();
+    });
+
+    assert!(rejected, "the duplicate usage owner exceeds the budget");
+    assert!(
+        allocation.bytes_max < 3_000_000,
+        "reject before the second large usage allocation: {allocation:?}"
+    );
+    assert!(state.response_object.is_null());
+    assert!(state.usage.is_null());
+}
+
+#[test]
+fn buffered_usage_replacement_charges_commit_peak_with_copied_output() {
+    let old_usage = json!({"detail": "a".repeat(1_000_000)});
+    let response = json!({
+        "object": "response",
+        "output": [{"type": "message", "id": "msg_1", "content": "x".repeat(2_000_000)}],
+        "usage": {"detail": "b".repeat(1_500_000)}
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut state = ResponsesState {
+        usage: old_usage,
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let old_usage_bytes = super::super::state::retained_json_bytes(&state.usage).unwrap();
+    let incoming_usage_bytes = super::super::state::retained_json_bytes(&response["usage"]).unwrap();
+    let usage_growth = incoming_usage_bytes - old_usage_bytes;
+    let limit = baseline + response_bytes + item_bytes + usage_growth + 64_000;
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(response_bytes + old_usage_bytes + incoming_usage_bytes),
+        "the usage projection alone fits; copied output makes commit unsafe"
+    );
+
+    assert!(super::extract_tool_calls_from_body(&body, &mut state).is_err());
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.response_object.is_null());
+    assert_eq!(state.usage["detail"].as_str().unwrap().len(), 1_000_000);
 }
 
 #[test]

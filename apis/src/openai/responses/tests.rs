@@ -263,12 +263,26 @@ async fn agentic_budget_rejects_raw_body_before_classification() {
     let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(
         error["error"]["message"],
-        "raw request body exceeds the 512-byte limit derived from openai_agentic_loop.max_retained_bytes"
+        "request body exceeds the 512-byte admission limit derived from openai_agentic_loop.max_retained_bytes"
     );
     assert!(
         ctx.get_metadata("openai_responses_format.format").is_none(),
         "classification must not parse or publish the oversized body"
     );
+}
+
+#[test]
+fn history_selector_probe_handles_escaped_keys_without_allocating_payload() {
+    assert!(may_rehydrate_history(br#"{"prev\u0069ous_response_id":"resp_x"}"#));
+    assert!(may_rehydrate_history(br#"{"conversation":{"id":"conv_x"}}"#));
+    assert!(!may_rehydrate_history(br#"{"convers\u0061tion":null}"#));
+    assert!(!may_rehydrate_history(br#"{"input":{"conversation":"nested"}}"#));
+
+    let escaped_unknown_key = "\\u0061".repeat(20_000);
+    let without_history = format!(r#"{{"{escaped_unknown_key}":"x"}}"#);
+    assert!(!may_rehydrate_history(without_history.as_bytes()));
+    let with_history = format!(r#"{{"{escaped_unknown_key}":"x","previous_response_id":"resp_x"}}"#);
+    assert!(may_rehydrate_history(with_history.as_bytes()));
 }
 
 // -----------------------------------------------------------------------------

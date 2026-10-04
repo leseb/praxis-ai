@@ -87,7 +87,7 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    agentic_loop::AgenticBudgetPolicy,
+    agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
     body_limits::reject_rewritten_body_too_large,
     bound_body_outcome,
     openai_responses_proxy::serialized_outbound_body_len,
@@ -384,23 +384,9 @@ impl HttpFilter for FileResolveFilter {
             return Ok(FilterAction::Release);
         };
 
-        let configured_limit = ctx
-            .extensions
-            .get::<AgenticBudgetPolicy>()
-            .map(|policy| policy.max_retained_bytes());
-        if let (Some(limit), Some(state)) = (configured_limit, ctx.extensions.get_mut::<ResponsesState>()) {
-            state.apply_retained_payload_limit(limit);
-        }
-
-        // This filter creates another owned JSON tree while the wire body and
-        // shared request state remain live. Reserve before parsing it.
-        let raw_len = raw.len();
-        let Some(parse_reserve) = raw_len.checked_mul(8) else {
+        let Some(parsed_bound) = file_parse_admitted_bytes(ctx, raw) else {
             return Ok(reject_retained_resolution_budget(ctx));
         };
-        if !file_parse_fits_budget(ctx, parse_reserve) {
-            return Ok(reject_retained_resolution_budget(ctx));
-        }
 
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
@@ -410,7 +396,7 @@ impl HttpFilter for FileResolveFilter {
             },
         };
 
-        resolve_and_rewrite(self, ctx, body, parsed, raw_len).await
+        resolve_and_rewrite(self, ctx, body, parsed, parsed_bound).await
     }
 
     async fn on_bound_upstream_request_body(
@@ -463,16 +449,9 @@ async fn resolve_and_rewrite(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     mut parsed: serde_json::Value,
-    raw_len: usize,
+    parsed_bound: usize,
 ) -> Result<FilterAction, FilterError> {
     let max_bytes = filter.config.max_rewritten_body_bytes;
-    let Some(parsed_bytes) = retained_json_bytes(&parsed) else {
-        return Ok(reject_retained_resolution_budget(ctx));
-    };
-    let headroom = match aggregate_resolution_headroom(ctx, raw_len, parsed_bytes) {
-        Ok(headroom) => headroom,
-        Err(()) => return Ok(reject_retained_resolution_budget(ctx)),
-    };
     let needs_files_api = body_has_file_id_reference(&parsed)
         || ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
             items_have_file_id_reference(&state.messages) || items_have_file_id_reference(&state.persisted_messages)
@@ -490,7 +469,7 @@ async fn resolve_and_rewrite(
     let mut budget = filter
         .client
         .resolution_budget(identity.and_then(|identity| build_outbound_execution(filter, ctx, identity)));
-    if let Some(headroom) = headroom {
+    if let Some(headroom) = aggregate_resolution_headroom(ctx, parsed_bound) {
         budget.apply_aggregate_headroom(headroom);
     }
     // Body pre-read mutations have not reached `ctx.request` yet. Materialize
@@ -535,25 +514,40 @@ async fn resolve_and_rewrite(
     Ok(FilterAction::Continue)
 }
 
-/// An eightfold raw-body reserve includes this second parse and its transient
-/// staging, while ordinary requests without an agentic budget are unchanged.
-fn file_parse_fits_budget(ctx: &HttpFilterContext<'_>, reserve: usize) -> bool {
-    if let Some(state) = ctx.extensions.get::<ResponsesState>() {
-        return state.can_retain_payload(reserve);
-    }
-    ctx.extensions
+/// The parsed body is another owner until resolution and state synchronization finish.
+fn file_parse_admitted_bytes(ctx: &mut HttpFilterContext<'_>, raw: &[u8]) -> Option<usize> {
+    let policy_limit = ctx
+        .extensions
         .get::<AgenticBudgetPolicy>()
-        .is_none_or(|policy| reserve <= policy.max_retained_bytes())
+        .map(|policy| policy.max_retained_bytes());
+    if let (Some(limit), Some(state)) = (policy_limit, ctx.extensions.get_mut::<ResponsesState>()) {
+        state.apply_retained_payload_limit(limit);
+    }
+    let active_budget = policy_limit.is_some()
+        || ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_limit().is_some());
+    let parsed_bound = if active_budget {
+        buffered_parsed_json_bytes_upper_bound(raw)?
+    } else {
+        raw.len()
+    };
+    if let Some(state) = ctx.extensions.get::<ResponsesState>() {
+        return state.can_retain_payload(parsed_bound).then_some(parsed_bound);
+    }
+    policy_limit
+        .is_none_or(|limit| {
+            parsed_bound
+                .checked_mul(super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)
+                .is_some_and(|bytes| bytes <= limit)
+        })
+        .then_some(parsed_bound)
 }
 
-/// The resolver may retain content in its cache and independently inline it
-/// into the outbound body and two history owners. Its cap is a fraction of the
-/// remaining shared budget rather than a second independent allowance.
-fn aggregate_resolution_headroom(
-    ctx: &HttpFilterContext<'_>,
-    raw_len: usize,
-    parsed_bytes: usize,
-) -> Result<Option<usize>, ()> {
+/// Leave room for the parsed body, encoded wire body, resolution cache, and
+/// independently owned request/history mirrors before a Files API read.
+fn aggregate_resolution_headroom(ctx: &HttpFilterContext<'_>, parsed_bound: usize) -> Option<usize> {
     let limit = ctx
         .extensions
         .get::<ResponsesState>()
@@ -562,38 +556,39 @@ fn aggregate_resolution_headroom(
             ctx.extensions
                 .get::<AgenticBudgetPolicy>()
                 .map(|policy| policy.max_retained_bytes())
-        });
-    let Some(limit) = limit else {
-        return Ok(None);
+        })?;
+    let baseline = match ctx.extensions.get::<ResponsesState>() {
+        Some(state) => state.retained_payload_bytes_bounded(limit).unwrap_or(limit),
+        None => 0,
     };
-    let current = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .map_or(Some(0), |state| state.retained_payload_bytes_bounded(limit))
-        .ok_or(())?;
-    current
-        .checked_add(raw_len)
-        .and_then(|used| used.checked_add(parsed_bytes))
-        .and_then(|used| limit.checked_sub(used))
-        .map(Some)
-        .ok_or(())
+    // Parsing and state synchronization may briefly retain the original body,
+    // its parsed form, and both current-input mirrors before replacement.
+    let parse_reserve = parsed_bound.checked_mul(4).unwrap_or(limit);
+    Some(limit.checked_sub(baseline)?.saturating_sub(parse_reserve))
 }
 
-/// Reserve the serialized replacement while the parsed tree and original
-/// request are still live. This also handles resolution without shared state.
-fn file_rewrite_fits_budget(ctx: &HttpFilterContext<'_>, parsed: &serde_json::Value) -> bool {
-    let Some(bytes) = retained_json_bytes(parsed).and_then(|bytes| bytes.checked_mul(2)) else {
-        return false;
-    };
-    file_parse_fits_budget(ctx, bytes)
-}
-
+/// Verify a state synchronization did not exceed its active aggregate budget.
 fn file_state_fits_budget(ctx: &HttpFilterContext<'_>, body_bytes: usize) -> bool {
     ctx.extensions
         .get::<ResponsesState>()
         .is_none_or(|state| state.can_retain_payload(body_bytes))
 }
 
+/// Reserve the serialized replacement while the parsed tree and original
+/// request are still live.
+fn file_rewrite_fits_budget(ctx: &HttpFilterContext<'_>, parsed: &serde_json::Value) -> bool {
+    let Some(bytes) = retained_json_bytes(parsed).and_then(|bytes| bytes.checked_mul(2)) else {
+        return false;
+    };
+    if let Some(state) = ctx.extensions.get::<ResponsesState>() {
+        return state.can_retain_payload(bytes);
+    }
+    ctx.extensions
+        .get::<AgenticBudgetPolicy>()
+        .is_none_or(|policy| bytes <= policy.max_retained_bytes())
+}
+
+/// Clear payload and disable successful persistence on aggregate exhaustion.
 fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
     super::budget_error::reject_request(
         ctx,
@@ -601,6 +596,7 @@ fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterA
     )
 }
 
+/// Map aggregate failures through request cleanup before returning a rejection.
 fn reject_resolution_failure(ctx: &mut HttpFilterContext<'_>, error: &ResolveError) -> FilterAction {
     if matches!(error, ResolveError::RetainedBudget) {
         reject_retained_resolution_budget(ctx)
@@ -753,6 +749,7 @@ async fn sync_state_with_budget(
     };
 
     state.request_body = resolved_body;
+    state.mark_replay_stable_payload_changed();
 
     let input_len = state.input.len();
     let ResponsesState {

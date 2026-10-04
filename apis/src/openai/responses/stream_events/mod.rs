@@ -56,7 +56,7 @@ use crate::{
 };
 
 /// Client-visible terminal message for an exhausted agentic payload budget.
-const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
+pub(crate) const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes";
 
 /// A per-turn terminal event held until the agentic transition is known.
@@ -1164,6 +1164,9 @@ fn record_retained_payload_overflow(ctx: &mut HttpFilterContext<'_>, state: &mut
     state.deferred_done = false;
     state.local_tool_items.clear();
     state.client_tool_items.clear();
+    if let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() {
+        responses.retained_stream_parser_bytes = 0;
+    }
     state.stream_failed = true;
     state.completion_state = CompletionState::Error;
     state.completed_at.get_or_insert_with(Instant::now);
@@ -2762,6 +2765,10 @@ pub(crate) fn encode_retained_payload_error(ctx: &mut HttpFilterContext<'_>) -> 
 }
 
 /// Emit the held terminal event only when the current IRR step is terminal.
+#[expect(
+    clippy::too_many_lines,
+    reason = "deferred terminal finalization and published charge update"
+)]
 fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
@@ -2824,6 +2831,24 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
         finalize_emit_terminal(ctx, &mut parser_state, &mut output, false);
     }
     *body = (!output.is_empty()).then(|| Bytes::from(output));
+    // This upstream round is finished. IRR carries ResponsesState into the
+    // next step but drops filter-local state; leaving its published charge
+    // behind would make the next agentic admission see a ghost parser owner.
+    // Keep only lifecycle metadata for downstream inspection of this step.
+    parser_state.frame_parser.clear();
+    parser_state.tool_call_args.clear();
+    parser_state.rejected_tool_call_args.clear();
+    parser_state.deferred_terminal = None;
+    parser_state.local_tool_items.clear();
+    parser_state.client_tool_items.clear();
+    debug_assert_eq!(
+        parser_state.retained_payload_bytes(),
+        Some(0),
+        "all parser payload owners must be released before the shared charge is cleared"
+    );
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.retained_stream_parser_bytes = 0;
+    }
     ctx.insert_filter_state(parser_state);
 }
 
@@ -2882,9 +2907,15 @@ fn emit_deferred_terminal(
     // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
     let preflight = canonicalization_staging_bytes(state, output.len())
-        .and_then(|staging| terminal.retained_payload_bytes()?.checked_add(staging))
-        .and_then(|staging| parser_state.retained_payload_bytes()?.checked_add(staging));
-    if !preflight.is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging)) {
+        .and_then(|staging| terminal.retained_payload_bytes()?.checked_add(staging));
+    // The parser owner is already published in ResponsesState for cross-filter
+    // admission. Replace that published charge with the current local size;
+    // only the terminal-construction copy above is additional staging.
+    if !preflight.is_some_and(|staging| {
+        parser_state.retained_payload_bytes().is_some_and(|parser_bytes| {
+            state.can_replace_retained_payload(state.retained_stream_parser_bytes, parser_bytes, staging)
+        })
+    }) {
         output.clear();
         record_retained_payload_overflow(ctx, parser_state);
         return Err(SseParseError::StreamPoisoned);

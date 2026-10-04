@@ -1149,6 +1149,7 @@ fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     state.persisted_messages.clear();
     state.persisted_messages.push(persisted_compaction_item);
     state.persisted_messages.extend(persisted_tail);
+    state.mark_replay_stable_payload_changed();
 }
 
 /// Move the current-turn tail off `items`, leaving history behind to drop.

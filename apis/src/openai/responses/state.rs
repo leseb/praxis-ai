@@ -342,6 +342,15 @@ pub(crate) struct ResponsesState {
     /// captured SSE replay rows, and the store decoder's unfinished record).
     /// The loop owner refreshes this before initial admission.
     pub(crate) retained_external_payload_bytes: usize,
+    /// Incomplete SSE frame held by the outer rehydration response rewrite.
+    pub(crate) retained_rehydrate_stream_bytes: usize,
+    /// Semantic and framing payload published by the Chat stream translator.
+    pub(crate) retained_chat_converter_bytes: usize,
+
+    /// Revision of request/history/output owners cached by response-store
+    /// replay admission. In-place changes do not alter collection lengths.
+    /// `None` means the counter overflowed and replay must fail closed.
+    pub(crate) replay_stable_payload_revision: Option<u64>,
 
     /// Parser buffers published by `openai_stream_events`. Its filter-local
     /// slot is invisible to other filters, so the request-wide meter owns this
@@ -907,6 +916,9 @@ impl Default for ResponsesState {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
             retained_stream_parser_bytes: 0,
+            retained_rehydrate_stream_bytes: 0,
+            retained_chat_converter_bytes: 0,
+            replay_stable_payload_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -1037,14 +1049,12 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        let remaining = max_bytes.checked_sub(self.retained_stream_parser_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, false)?
-            .checked_add(self.retained_stream_parser_bytes)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
     }
 
-    /// Request and history owners cannot change while one upstream stream is
-    /// being parsed. Measure them once per round; the stream meter measures all
-    /// other owners after each chunk.
+    /// Request and history owners remain stable between upstream chunks.
+    /// Measure them once per round; `stream_events` refreshes this baseline at
+    /// EOS after the agentic owner may append the finished round to history.
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1066,7 +1076,29 @@ impl ResponsesState {
     /// Count the owners which may change during a streaming response. The
     /// stream-local meter adds the cached request/history charge separately.
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
+    }
+
+    /// Rehydration runs after the stream parser and can see new canonical output
+    /// between chunks; count both while reusing only stable request/history bytes.
+    #[cfg(feature = "store")]
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
+    }
+
+    /// The response store caches request/history and prior output while
+    /// capturing replay chunks, but must still count all changing owners,
+    /// including the parser charge published by `openai_stream_events`.
+    #[cfg(feature = "store")]
+    pub(crate) fn store_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+    }
+
+    /// The translated upstream round cannot append prior output until its
+    /// converter has finished. The converter caches that large owner once;
+    /// this counts all other changing owners, including the stream parser.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1077,13 +1109,15 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
     #[expect(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
         reason = "exhaustive accounting for the request-scoped state bag"
     )]
     fn retained_payload_bytes_bounded_inner(
@@ -1091,10 +1125,20 @@ impl ResponsesState {
         max_bytes: usize,
         include_external: bool,
         skip_stream_stable: bool,
+        skip_accumulated_output: bool,
+        include_stream_parser: bool,
+        include_chat_converter: bool,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
             meter.raw(self.retained_external_payload_bytes)?;
+            meter.raw(self.retained_rehydrate_stream_bytes)?;
+        }
+        if include_stream_parser {
+            meter.raw(self.retained_stream_parser_bytes)?;
+        }
+        if include_chat_converter {
+            meter.raw(self.retained_chat_converter_bytes)?;
         }
 
         if !skip_stream_stable {
@@ -1120,12 +1164,10 @@ impl ResponsesState {
         ] {
             meter.json(value)?;
         }
-        for values in [
-            &self.accumulated_output,
-            &self.tool_calls,
-            &self.tool_search_calls,
-            &self.web_search_calls,
-        ] {
+        if !skip_accumulated_output {
+            meter.json_values(&self.accumulated_output)?;
+        }
+        for values in [&self.tool_calls, &self.tool_search_calls, &self.web_search_calls] {
             meter.json_values(values)?;
         }
         for value in [
@@ -1317,6 +1359,8 @@ impl ResponsesState {
         self.provider_streamed_terminal_ids.clear();
         self.provider_compaction_ids.clear();
         self.retained_stream_parser_bytes = 0;
+        self.retained_rehydrate_stream_bytes = 0;
+        self.retained_chat_converter_bytes = 0;
         self.dispatch_failure = None;
     }
 
@@ -1359,12 +1403,18 @@ impl ResponsesState {
     pub(crate) fn provider_compaction_ids_from_messages(messages: &[serde_json::Value]) -> HashSet<String> {
         messages
             .iter()
-            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
-            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
-            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
-            .filter(|id| !id.starts_with("compact_"))
+            .filter_map(Self::provider_compaction_id_from_message)
             .map(ToOwned::to_owned)
             .collect()
+    }
+
+    /// Borrow a provider compaction ID before a collector copies it into state.
+    pub(crate) fn provider_compaction_id_from_message(item: &serde_json::Value) -> Option<&str> {
+        (item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+            .then_some(item)
+            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
+            .and_then(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.starts_with("compact_"))
     }
 
     /// Record the first security-context failure; later calls are ignored (first wins).
@@ -1377,6 +1427,15 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+        self.mark_replay_stable_payload_changed();
+    }
+
+    /// Invalidate the store replay meter after an in-place mutation of a
+    /// cached request, history, tool, or accumulated output owner.
+    pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
+        self.replay_stable_payload_revision = self
+            .replay_stable_payload_revision
+            .and_then(|revision| revision.checked_add(1));
     }
 
     /// Borrow the public output owned by [`Self::response_object`].

@@ -1085,6 +1085,7 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     for item in &mut state.persisted_messages {
         mark(item);
     }
+    state.mark_replay_stable_payload_changed();
     state.tool_search_calls.clear();
 }
 
@@ -1126,6 +1127,62 @@ fn end_at_iteration_limit(
 // Body Parsing
 // -----------------------------------------------------------------------------
 
+/// Upper bound on compact JSON bytes after parsing a request or response.
+///
+/// `serde_json` can expand exponent-form numbers while serializing its parsed
+/// `Value` (for example, `1e15` becomes `1000000000000000.0`). Its current
+/// finite-float formatter has a 24-byte buffer. Scan number tokens outside
+/// strings without allocating so the parsed tree is admitted before creation.
+/// Integers below 20 bytes and decimal forms without an exponent already have
+/// a shortest round-trip spelling no longer than their input; `-0` is special.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass lexical bound must skip quoted number-like text"
+)]
+pub(super) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+    const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
+    let mut extra = 0_usize;
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(&byte) = body.get(index) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte != b'-' && !byte.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut has_exponent = false;
+        while let Some(&number_byte) = body.get(index) {
+            if !matches!(number_byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+                break;
+            }
+            has_exponent |= matches!(number_byte, b'e' | b'E');
+            index += 1;
+        }
+        let token = body.get(start..index)?;
+        if has_exponent || token.len() >= 20 || token == b"-0" {
+            extra = extra.checked_add(MAX_FORMATTED_NUMBER_BYTES.saturating_sub(token.len()))?;
+        }
+    }
+    body.len().checked_add(extra)
+}
+
 /// Extract completed function-call items from a non-streaming response body
 /// and populate `state.tool_calls` and `state.messages`.
 #[expect(
@@ -1135,11 +1192,15 @@ fn end_at_iteration_limit(
 fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     // The framework owns and separately bounds the raw response body. Only the
     // parsed response and the copies retained by agentic-loop state belong in
-    // this aggregate budget. The body length is an allocation-free upper bound
-    // for the parsed value's compact JSON payload, so reserve that projection
-    // before serde allocates it. The exact retained-owner accounting below runs
-    // after normalization and ID insertion without charging the framework body.
-    if !state.can_retain_payload(body.len()) {
+    // this aggregate budget. Numeric normalization can expand the compact JSON
+    // payload beyond the wire length, so reserve its checked upper bound before
+    // serde allocates. Exact owner accounting follows normalization and IDs.
+    let parsed_bound = if state.retained_payload_limit().is_some() {
+        buffered_parsed_json_bytes_upper_bound(body).ok_or_else(retained_payload_failure)?
+    } else {
+        body.len()
+    };
+    if !state.can_retain_payload(parsed_bound) {
         return Err(retained_payload_failure());
     }
     let response = serde_json::from_slice::<Value>(body)
@@ -1152,8 +1213,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
     };
     let normalization_staging = output_normalization_staging_bytes(&response, has_file_search_tool(state))
         .ok_or_else(retained_payload_failure)?;
-    if !body
-        .len()
+    if !parsed_bound
         .checked_add(normalization_staging)
         .is_some_and(|bytes| state.can_retain_payload(bytes))
     {
@@ -1198,11 +1258,21 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
     let Some(old_usage_bytes) = super::state::retained_json_bytes(&state.usage) else {
         return false;
     };
+    let Some(incoming_usage_bytes) = response
+        .get("usage")
+        .filter(|usage| !usage.is_null())
+        .map_or(Some(0), super::state::retained_json_bytes)
+    else {
+        return false;
+    };
 
     // The parsed response and this helper's usage projection coexist with all
-    // prior-round state. Admit that construction peak before cloning usage.
+    // prior-round state. Merging can clone every incoming usage value into the
+    // projection, so reserve both the old tree and incoming values before the
+    // first allocation. The exact merged size is checked below.
     if !response_bytes
         .checked_add(old_usage_bytes)
+        .and_then(|bytes| bytes.checked_add(incoming_usage_bytes))
         .is_some_and(|bytes| state.can_retain_payload(bytes))
     {
         return false;
@@ -1216,11 +1286,15 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
         return false;
     };
     let usage_growth = new_usage_bytes.saturating_sub(old_usage_bytes);
+    // The later commit merges into state.usage while the old value and copied
+    // output items are live. Replacing an existing usage value can temporarily
+    // own the whole incoming value even when final usage barely grows.
+    let usage_commit_staging = usage_growth.max(incoming_usage_bytes);
     let mut copied_item_bytes = 0_usize;
 
     let Some(output) = response.get("output").and_then(Value::as_array) else {
         return response_bytes
-            .checked_add(usage_growth)
+            .checked_add(usage_commit_staging)
             .zip(old_response_bytes.checked_add(old_usage_bytes))
             .zip(response_bytes.checked_add(new_usage_bytes))
             .is_some_and(|((peak_added, final_removed), final_added)| {
@@ -1243,13 +1317,17 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
             {
                 4
             },
-            Some("reasoning" | "web_search_call") => 3,
+            Some("reasoning" | "web_search_call" | "compaction") => 3,
             Some("file_search_call") => 2,
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
+        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
+            .filter(|id| !state.provider_compaction_ids.contains(*id))
+            .map_or(0, str::len);
         let Some(total) = bytes
             .checked_mul(copies)
+            .and_then(|bytes| bytes.checked_add(id_bytes))
             .and_then(|bytes| copied_item_bytes.checked_add(bytes))
         else {
             return false;
@@ -1262,7 +1340,7 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
     // final replacement must fit independently.
     response_bytes
         .checked_add(copied_item_bytes)
-        .and_then(|bytes| bytes.checked_add(usage_growth))
+        .and_then(|bytes| bytes.checked_add(usage_commit_staging))
         .zip(old_response_bytes.checked_add(old_usage_bytes))
         .zip(
             response_bytes
@@ -1505,6 +1583,7 @@ fn terminalize_file_search_item(state: &mut ResponsesState, index: usize) {
     {
         object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
         object.remove("results");
+        state.mark_replay_stable_payload_changed();
     }
 }
 
@@ -1699,12 +1778,19 @@ fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
             return false;
         };
         let copies = match item.get("type").and_then(Value::as_str) {
-            Some("function_call" | "reasoning" | "web_search_call") => 3,
+            Some("function_call" | "reasoning" | "web_search_call" | "compaction") => 3,
             Some("file_search_call") => 2,
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
-        let Some(total) = bytes.checked_mul(copies).and_then(|bytes| added.checked_add(bytes)) else {
+        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
+            .filter(|id| !state.provider_compaction_ids.contains(*id))
+            .map_or(0, str::len);
+        let Some(total) = bytes
+            .checked_mul(copies)
+            .and_then(|bytes| bytes.checked_add(id_bytes))
+            .and_then(|bytes| added.checked_add(bytes))
+        else {
             return false;
         };
         added = total;
