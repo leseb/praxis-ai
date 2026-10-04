@@ -56,7 +56,7 @@ use crate::{
 };
 
 /// Client-visible terminal message for an exhausted agentic payload budget.
-const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
+pub(crate) const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes";
 
 /// A per-turn terminal event held until the agentic transition is known.

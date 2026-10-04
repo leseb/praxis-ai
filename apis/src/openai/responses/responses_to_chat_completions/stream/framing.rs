@@ -79,7 +79,7 @@ impl Framing {
         self.parser.has_incomplete_frame()
     }
 
-    /// Bytes still owned by the frame parser between callbacks.
+    /// Bytes retained by an unfinished provider frame.
     pub(super) fn retained_bytes(&self) -> usize {
         self.parser.retained_bytes()
     }

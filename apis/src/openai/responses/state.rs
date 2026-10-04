@@ -354,6 +354,9 @@ pub(crate) struct ResponsesState {
     /// An incomplete SSE frame retained by response ID restoration between callbacks.
     pub(crate) retained_rehydrate_stream_bytes: usize,
 
+    /// Semantic and framing payload published by the Chat stream translator.
+    pub(crate) retained_chat_converter_bytes: usize,
+
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
 
@@ -926,6 +929,7 @@ impl Default for ResponsesState {
             replay_stable_payload_revision: Some(0),
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
+            retained_chat_converter_bytes: 0,
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -1135,6 +1139,7 @@ impl ResponsesState {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
             meter.raw(self.retained_external_payload_bytes)?;
+            meter.raw(self.retained_chat_converter_bytes)?;
         }
 
         if !skip_stream_stable {
@@ -1360,6 +1365,7 @@ impl ResponsesState {
         self.provider_compaction_ids.clear();
         self.retained_stream_parser_bytes = 0;
         self.retained_rehydrate_stream_bytes = 0;
+        self.retained_chat_converter_bytes = 0;
         self.dispatch_failure = None;
     }
 
