@@ -387,10 +387,10 @@ impl ResponsesToChatCompletionsFilter {
             }
             return Ok(FilterAction::Continue);
         }
+        let completed_terminal_already_emitted = converter.successful_terminal_emitted();
         let incoming_bytes = body.as_ref().map_or(0, Bytes::len);
         if !converter_construction_fits(ctx, &mut converter, incoming_bytes) {
-            record_converter_budget_failure(ctx, body);
-            return Ok(FilterAction::Continue);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
         }
         let now = ctx.time_source.now().as_secs();
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -411,15 +411,13 @@ impl ResponsesToChatCompletionsFilter {
         if let Some(chunk) = body.take() {
             converter.push_into(&chunk, &inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                record_converter_budget_failure(ctx, body);
-                return Ok(FilterAction::Continue);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
             }
         }
         if end_of_stream {
             converter.finish_into(&inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                record_converter_budget_failure(ctx, body);
-                return Ok(FilterAction::Continue);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
             }
         }
 
@@ -433,8 +431,7 @@ impl ResponsesToChatCompletionsFilter {
             })
         });
         if !admitted {
-            record_converter_budget_failure(ctx, body);
-            return Ok(FilterAction::Continue);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
         }
 
         if ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true") {
@@ -451,6 +448,24 @@ impl ResponsesToChatCompletionsFilter {
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Once a successful terminal was delivered, an oversized later callback can
+/// only fail the transport. Emitting an SSE error would create a second terminal.
+fn stream_converter_budget_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    completed_terminal_already_emitted: bool,
+) -> Result<FilterAction, FilterError> {
+    if completed_terminal_already_emitted {
+        *body = None;
+        return Err(
+            "responses_to_chat_completions: provider bytes after a terminal exceeded the retained payload budget"
+                .into(),
+        );
+    }
+    record_converter_budget_failure(ctx, body);
+    Ok(FilterAction::Continue)
 }
 
 /// Reserve independently retained converter state and the peak produced by a

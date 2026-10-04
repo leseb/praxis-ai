@@ -598,6 +598,11 @@ impl StreamConverter {
         matches!(self.phase, Phase::Failed)
     }
 
+    /// A successful terminal already went to the client in an earlier callback.
+    pub(super) const fn successful_terminal_emitted(&self) -> bool {
+        matches!(self.phase, Phase::EmittedTerminal)
+    }
+
     /// Create a converter for a streaming response.
     #[expect(
         clippy::too_many_lines,
