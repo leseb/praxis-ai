@@ -270,6 +270,14 @@ fn document_parse_fits_budget(ctx: &mut HttpFilterContext<'_>, raw: &Bytes) -> b
     if !extraction_budget_active(ctx) {
         return true;
     }
+    // This filter may precede the Responses request classifier. Apply its
+    // allocation-free structural admission before constructing a JSON Value;
+    // compact arrays can own far more nodes than their wire length suggests.
+    if super::initial_budget_rejection(ctx, raw).is_some()
+        || !super::initial_json_parse_peak_bytes(raw).is_some_and(|bytes| extraction_fits_budget(ctx, bytes))
+    {
+        return false;
+    }
     raw.len()
         .checked_add(buffered_parsed_json_bytes_upper_bound(raw).unwrap_or(usize::MAX))
         .is_some_and(|bytes| extraction_fits_budget(ctx, bytes))

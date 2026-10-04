@@ -959,7 +959,7 @@ async fn aggregate_budget_preflights_extraction_before_state_initialization() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     set_responses_metadata(&mut ctx);
-    let config = serde_yaml::from_str("max_retained_bytes: 131072").unwrap();
+    let config = serde_yaml::from_str("max_retained_bytes: 100000").unwrap();
     let policy = AgenticBudgetPolicy::from_config(&config).unwrap();
     ctx.extensions.insert(policy);
     let body_json = responses_body(&serde_json::json!([
@@ -968,6 +968,10 @@ async fn aggregate_budget_preflights_extraction_before_state_initialization() {
         ]}
     ]));
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let raw = body.as_ref().unwrap();
+    assert!(super::super::initial_json_parse_peak_bytes(raw).unwrap() <= 100_000);
+    assert!(projected_extraction_peak(&ctx, &body_json, raw.len()).unwrap() > 100_000);
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
