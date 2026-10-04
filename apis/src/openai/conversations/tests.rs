@@ -4805,6 +4805,77 @@ async fn append_budget_failure_removes_only_response_persisted_by_this_exchange(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_error_still_terminalizes_conversation_budget_failure() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::None,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    for streaming in [false, true] {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = conv_ctx(&store, &req);
+        ctx.extensions
+            .get_mut::<ResponseStoreRegistry>()
+            .unwrap()
+            .register(
+                &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                Arc::clone(&store),
+            )
+            .unwrap();
+        ctx.current_filter_id = Some(0);
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        ctx.set_metadata("responses.conversation_id", "conv_rollback_failure");
+        if streaming {
+            ctx.set_metadata("openai_responses_format.stream", "true");
+        }
+        let mut state = ResponsesState::default();
+        state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 128);
+        ctx.extensions.insert(state);
+        capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+        let mut response = make_response();
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            (if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            })
+            .parse()
+            .unwrap(),
+        );
+        ctx.response_header = Some(&mut response);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.extensions
+            .insert(crate::openai::responses::store::PersistedResponseForConversation(
+                "resp_rollback_failure".to_owned(),
+            ));
+        let mut body = Some(Bytes::from(if streaming {
+            format!(
+                "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"text\":\"{}\"}}]}}}}\n\n",
+                "x".repeat(1024)
+            )
+            .into_bytes()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "status":"completed", "output":[{"type":"message","content":"x".repeat(1024)}]
+            }))
+            .unwrap()
+        }));
+        let action = filter.on_response_body(&mut ctx, &mut body, true);
+        if streaming {
+            assert!(matches!(action, Ok(FilterAction::Continue)));
+            let wire = String::from_utf8_lossy(body.as_ref().unwrap());
+            assert!(wire.contains("event: error"), "{wire}");
+            assert!(!wire.contains("event: response.completed"), "{wire}");
+        } else {
+            assert!(matches!(action, Ok(FilterAction::Reject(rejection)) if rejection.status == 502));
+        }
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_insert_if_absent_collision_preserves_prior_response_events_and_approvals() {
     let (_, store) = sqlite_harness().await;
     let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
@@ -5672,7 +5743,7 @@ impl ConversationItemStore for FailingItemStore {
 // The registry hands the filter a combined backend, so the double must also be a
 // ResponseStore. Only get_conversation is reachable (the facade routes the
 // conversation existence check through the ResponseStore half); it mirrors the
-// ConversationItemStore result. The response methods are never invoked.
+// ConversationItemStore result. The rollback regression injects a delete error.
 #[async_trait::async_trait]
 impl ResponseStore for FailingItemStore {
     async fn get_conversation(
@@ -5701,7 +5772,7 @@ impl ResponseStore for FailingItemStore {
     }
 
     async fn delete_response(&self, _owner: &crate::StateOwner, _id: &str) -> Result<bool, StoreError> {
-        unreachable!("FailingItemStore is a conversations-only test double")
+        Err(StoreError::Unavailable("injected response rollback failure".to_owned()))
     }
 
     async fn record_pending_approvals(

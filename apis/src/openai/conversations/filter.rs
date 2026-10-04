@@ -693,7 +693,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                                 .and_then(|state| retained_json_bytes(&state.response_object))
                                 .ok_or_else(|| FilterError::from("openai_conversations: response size overflow"))?;
                             if !append_extraction_fits(ctx, &no_body, true) {
-                                return conversation_budget_failure(ctx, false, &mut no_body);
+                                return Ok(conversation_budget_failure(ctx, false, &mut no_body));
                             }
                             let append_owner = ctx
                                 .extensions
@@ -703,7 +703,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                             let items = extract_streaming_append_back_items(ctx, append_owner)
                                 .ok_or_else(|| FilterError::from("openai_conversations: append items missing"))?;
                             if !append_record_construction_fits(ctx, &items.all_items) {
-                                return conversation_budget_failure(ctx, false, &mut no_body);
+                                return Ok(conversation_budget_failure(ctx, false, &mut no_body));
                             }
                             let store = resolve_store(ctx, &items.owner).ok_or_else(|| {
                                 FilterError::from("openai_conversations: store unavailable for append-back")
@@ -712,7 +712,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                             {
                                 Ok(()) => {},
                                 Err(AppendError::Budget) => {
-                                    return conversation_budget_failure(ctx, false, &mut no_body);
+                                    return Ok(conversation_budget_failure(ctx, false, &mut no_body));
                                 },
                                 Err(AppendError::Store(error)) => return Err(error),
                             }
@@ -727,13 +727,13 @@ impl HttpFilter for OpenaiConversationsFilter {
                         // of append items. Bound the shared framework buffer
                         // to the remaining headroom before its first chunk.
                         let Some(max_bytes) = buffered_response_headroom(ctx) else {
-                            return conversation_budget_failure(ctx, false, &mut None);
+                            return Ok(conversation_budget_failure(ctx, false, &mut None));
                         };
                         if existing_response_buffer_exceeds(ctx, max_bytes) {
                             // Core ratchets to the larger StreamBuffer cap. A
                             // prior filter's buffer cannot be narrowed here,
                             // so reject before it can retain unadmitted bytes.
-                            return conversation_budget_failure(ctx, false, &mut None);
+                            return Ok(conversation_budget_failure(ctx, false, &mut None));
                         }
                         ctx.set_response_body_mode(BodyMode::StreamBuffer {
                             max_bytes: Some(max_bytes),
@@ -813,7 +813,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         }
 
         if !append_extraction_fits(ctx, body, streaming) {
-            return conversation_budget_failure(ctx, streaming, body);
+            return Ok(conversation_budget_failure(ctx, streaming, body));
         }
         let items = if streaming {
             extract_streaming_append_back_items(ctx, append_owner)
@@ -824,7 +824,7 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
         if !append_record_construction_fits(ctx, &items.all_items) {
-            return conversation_budget_failure(ctx, streaming, body);
+            return Ok(conversation_budget_failure(ctx, streaming, body));
         }
 
         let conv_id = items.conversation_id;
@@ -846,7 +846,7 @@ impl HttpFilter for OpenaiConversationsFilter {
             body.as_ref().map_or(0, Bytes::len),
         ) {
             Ok(()) => {},
-            Err(AppendError::Budget) => return conversation_budget_failure(ctx, streaming, body),
+            Err(AppendError::Budget) => return Ok(conversation_budget_failure(ctx, streaming, body)),
             Err(AppendError::Store(error)) => {
                 warn!(error = %error, conversation_id = %conv_id, "conversation append-back failed");
                 return Err(error);
@@ -1012,20 +1012,28 @@ fn conversation_budget_failure(
     ctx: &mut HttpFilterContext<'_>,
     streaming: bool,
     body: &mut Option<Bytes>,
-) -> Result<FilterAction, FilterError> {
+) -> FilterAction {
     if let Some(marker) = ctx.extensions.remove::<PersistedResponseForConversation>() {
-        let owner = ctx
-            .extensions
-            .get::<CapturedAppendOwner>()
-            .ok_or_else(|| FilterError::from("openai_conversations: append owner missing for rollback"))?;
-        let store = ctx
-            .extensions
-            .get::<ResponseStoreRegistry>()
-            .and_then(|registry| registry.get_scoped(crate::openai::responses::DEFAULT_STORE_NAME, &owner.0))
-            .ok_or_else(|| FilterError::from("openai_conversations: response store missing for rollback"))?;
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| handle.block_on(store.delete_response(&marker.0)))
-            .map_err(|error| -> FilterError { Box::new(error) })?;
+        let rollback = (|| -> Result<(), FilterError> {
+            let owner = ctx
+                .extensions
+                .get::<CapturedAppendOwner>()
+                .ok_or_else(|| FilterError::from("openai_conversations: append owner missing for rollback"))?;
+            let store = ctx
+                .extensions
+                .get::<ResponseStoreRegistry>()
+                .and_then(|registry| registry.get_scoped(crate::openai::responses::DEFAULT_STORE_NAME, &owner.0))
+                .ok_or_else(|| FilterError::from("openai_conversations: response store missing for rollback"))?;
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| handle.block_on(store.delete_response(&marker.0)))
+                .map_err(|error| -> FilterError { Box::new(error) })?;
+            Ok(())
+        })();
+        if let Err(error) = rollback {
+            // Cleanup is best effort: a failed delete cannot turn an admitted
+            // budget failure back into a client-visible completed response.
+            warn!(%error, "response rollback failed after conversation budget denial");
+        }
     }
     if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
         state.append_attempted = true;
@@ -1037,13 +1045,9 @@ fn conversation_budget_failure(
     if streaming {
         crate::openai::responses::fs_end_stream_with_error_ctx(ctx, "server_error", APPEND_BUDGET_MESSAGE);
         *body = crate::openai::responses::stream_events::encode_local_error(ctx, "server_error", APPEND_BUDGET_MESSAGE);
-        return Ok(FilterAction::Continue);
+        return FilterAction::Continue;
     }
-    Ok(FilterAction::Reject(responses_error_rejection(
-        502,
-        "server_error",
-        APPEND_BUDGET_MESSAGE,
-    )))
+    FilterAction::Reject(responses_error_rejection(502, "server_error", APPEND_BUDGET_MESSAGE))
 }
 
 // -----------------------------------------------------------------------------
