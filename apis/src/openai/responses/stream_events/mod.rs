@@ -1063,6 +1063,20 @@ fn projected_client_tool_restore_bytes(
     if responses.client_tool_lowering.is_empty() {
         return Some(0);
     }
+    // The plan clones its tracked item list even if this chunk has no snapshot.
+    let tracked = stream.client_tool_items.iter().try_fold(0_usize, |used, item| {
+        used.checked_add(item.key.len())?
+            .checked_add(item.private_name.len())?
+            .checked_add(item.item_id.as_ref().map_or(0, String::len))
+    })?;
+    let mut projected = tracked.checked_mul(2)?;
+    if !events
+        .iter()
+        .any(|event| !event.is_terminal() && event.payload().get("response").is_some())
+    {
+        // Ordinary deltas and heartbeats cannot clone the echoed tools.
+        return Some(projected);
+    }
     let echo_bytes = responses.client_tool_echo.as_ref().map_or(Some(0), |echo| {
         retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)
     })?;
@@ -1077,13 +1091,6 @@ fn projected_client_tool_restore_bytes(
                 .checked_add(64)?;
             Some(largest.max(bytes))
         })?;
-    // The plan clones its tracked item list even if this chunk has no snapshot.
-    let tracked = stream.client_tool_items.iter().try_fold(0_usize, |used, item| {
-        used.checked_add(item.key.len())?
-            .checked_add(item.private_name.len())?
-            .checked_add(item.item_id.as_ref().map_or(0, String::len))
-    })?;
-    let mut projected = tracked.checked_mul(2)?;
     for event in events {
         if event.is_terminal() {
             continue;
@@ -1609,7 +1616,12 @@ fn commit_chunk_events(
             .extensions
             .get::<ResponsesState>()
             .is_some_and(|responses| !responses.client_tool_lowering.is_empty());
-        if has_restoration_plan {
+        if has_restoration_plan
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|responses| responses.retained_payload_limit().is_some())
+        {
             let post_commit_staging = staging
                 .frame_payload_bytes
                 .and_then(|frame_bytes| {
