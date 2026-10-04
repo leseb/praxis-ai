@@ -626,7 +626,7 @@ impl RestoreStableBudget {
         Some(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "store-sqlite"))]
     fn matches(self, state: &ResponsesState) -> bool {
         self.stable_matches(state) && state.current_output_revision == Some(self.current_output_revision)
     }
