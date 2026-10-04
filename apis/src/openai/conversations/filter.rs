@@ -674,13 +674,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                     .get::<ResponsesState>()
                     .is_some_and(|state| state.retained_payload_limit().is_some())
                 {
-                    let status = ctx
-                        .extensions
-                        .get::<ResponsesState>()
-                        .and_then(|state| state.response_object.get("status"))
-                        .and_then(Value::as_str);
                     let completed = crate::openai::responses::buffered_canonical_completed(ctx);
-                    let explicitly_unsuccessful = matches!(status, Some("incomplete" | "failed"));
                     if completed {
                         if awaiting_response_store(ctx) {
                             return Ok(FilterAction::Continue);
@@ -721,28 +715,12 @@ impl HttpFilter for OpenaiConversationsFilter {
                             state.append_attempted = true;
                         }
                     } else {
-                        // A selected branch may skip the agentic loop while
-                        // retaining its request-wide budget policy. In that
-                        // case the completed upstream body is the only source
-                        // of append items. Bound the shared framework buffer
-                        // to the remaining headroom before its first chunk.
-                        let Some(max_bytes) = buffered_response_headroom(ctx) else {
-                            return Ok(conversation_budget_failure(ctx, false, &mut None));
-                        };
-                        if existing_response_buffer_exceeds(ctx, max_bytes) {
-                            // Core ratchets to the larger StreamBuffer cap. A
-                            // prior filter's buffer cannot be narrowed here,
-                            // so reject before it can retain unadmitted bytes.
-                            return Ok(conversation_budget_failure(ctx, false, &mut None));
-                        }
-                        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                            max_bytes: Some(max_bytes),
-                        });
-                        if explicitly_unsuccessful
-                            && let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>()
-                        {
-                            state.append_attempted = true;
-                        }
+                        // A conditional branch may skip canonical agentic
+                        // completion. The buffered body, parsed append items,
+                        // and conversation cache rebuild are unknown here.
+                        // Reject before the 200 JSON header can be committed;
+                        // a body-phase rejection would truncate that response.
+                        return Ok(conversation_budget_failure(ctx, false, &mut None));
                     }
                 } else {
                     ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -888,22 +866,6 @@ fn canonical_append_is_empty(ctx: &HttpFilterContext<'_>) -> bool {
                     .and_then(Value::as_array)
                     .is_some_and(Vec::is_empty)
         })
-}
-
-/// Bound a conditional noncanonical JSON buffer by unused request allowance.
-fn buffered_response_headroom(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    let state = ctx.extensions.get::<ResponsesState>()?;
-    let limit = state.retained_payload_limit()?;
-    let current = state.retained_payload_bytes_bounded(limit)?;
-    limit.checked_sub(current).map(|bytes| bytes.min(MAX_JSON_BODY_BYTES))
-}
-
-/// Detect a prior filter buffer that core's ratchet cannot narrow.
-fn existing_response_buffer_exceeds(ctx: &HttpFilterContext<'_>, cap: usize) -> bool {
-    match &ctx.response_body_mode {
-        BodyMode::StreamBuffer { max_bytes } => max_bytes.is_none_or(|existing| existing > cap),
-        _ => false,
-    }
 }
 
 /// Check the canonical local-completion frame delivered as one IRR chunk. The

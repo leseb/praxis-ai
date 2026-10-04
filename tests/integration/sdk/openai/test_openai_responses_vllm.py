@@ -290,6 +290,7 @@ def _write_full_flow_config(
     max_event_bytes: int | None = None,
     compact_callout_port: int | None = None,
     retained_limit: int | None = None,
+    skip_agentic_response: bool = False,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     config = _load_example_config(
@@ -340,6 +341,17 @@ def _write_full_flow_config(
         anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
         assert config.count(anchor) == 1
         config = config.replace(anchor, anchor + f"                max_retained_bytes: {retained_limit}\n")
+    if skip_agentic_response:
+        anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
+        assert config.count(anchor) == 1
+        config = config.replace(
+            anchor,
+            anchor
+            + "                response_conditions:\n"
+            + "                  - when:\n"
+            + "                      headers:\n"
+            + "                        x-test-run-agentic: \"true\"\n",
+        )
     if compression:
         config = _enable_response_store_compression(config)
 
@@ -1831,7 +1843,8 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
 
 
 def _witness_proxy_session(
-    tmp_path_factory, request, search_port=None, max_event_bytes=None, retained_limit=None
+    tmp_path_factory, request, search_port=None, max_event_bytes=None, retained_limit=None,
+    skip_agentic_response=False,
 ):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
@@ -1859,6 +1872,7 @@ def _witness_proxy_session(
         search_port=search_port,
         max_event_bytes=max_event_bytes,
         retained_limit=retained_limit,
+        skip_agentic_response=skip_agentic_response,
     )
     binary = _find_binary()
 
@@ -1905,6 +1919,17 @@ def witness_backend_client(tmp_path_factory, request):
 def witness_budgeted_conversation_client(tmp_path_factory, request):
     """Full-flow SQLite witness with room for the response but not append staging."""
     yield from _witness_proxy_session(tmp_path_factory, request, retained_limit=8_192)
+
+
+@pytest.fixture()
+def witness_noncanonical_budgeted_conversation_client(tmp_path_factory, request):
+    """A selected inference response skips agentic canonicalization under a budget."""
+    yield from _witness_proxy_session(
+        tmp_path_factory,
+        request,
+        retained_limit=67_108_864,
+        skip_agentic_response=True,
+    )
 
 
 @pytest.fixture()
@@ -2730,6 +2755,31 @@ class TestOpenAIResponsesVLLM:
                 "assistant",
             ]
             assert "BUFFERED-STORE-FALSE-410" in items.data[0].content[0].text
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_budgeted_noncanonical_conversation_rejects_before_success_headers(
+        self, witness_noncanonical_budgeted_conversation_client
+    ):
+        """A skipped agentic response has unknown append cost at the 200 header.
+
+        The safe policy rejects even a small body when the aggregate budget is
+        armed, because SQL/cache staging cannot be proven before commitment.
+        """
+        client, forwarded = witness_noncanonical_budgeted_conversation_client
+        conversation = client.conversations.create()
+        try:
+            with pytest.raises(APIStatusError) as exc_info:
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="NONCANONICAL-APPEND-HEADER-410",
+                    conversation=conversation.id,
+                    store=False,
+                )
+            assert exc_info.value.status_code == 502
+            assert exc_info.value.response.json()["error"]["type"] == "server_error"
+            assert forwarded, "the backend response must reach the header hook"
+            assert client.conversations.items.list(conversation.id).data == []
         finally:
             client.conversations.delete(conversation.id)
 
