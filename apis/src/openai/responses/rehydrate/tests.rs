@@ -2340,12 +2340,13 @@ async fn direct_stream_restore_error_follows_forwarded_provider_sequences() {
 
 #[tokio::test]
 async fn direct_stream_restore_overflow_after_forwarded_terminal_tears_down_transport() {
-    for terminal in [
-        "response.completed",
-        "response.incomplete",
-        "response.failed",
-        "response.cancelled",
-        "error",
+    for (terminal, event_header) in [
+        ("response.completed", true),
+        ("response.incomplete", true),
+        ("response.failed", true),
+        ("response.cancelled", true),
+        ("error", true),
+        ("response.completed", false),
     ] {
         let filter = default_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -2363,8 +2364,13 @@ async fn direct_stream_restore_overflow_after_forwarded_terminal_tears_down_tran
             FilterAction::Continue
         ));
 
+        let event = if event_header {
+            format!("event: {terminal}\n")
+        } else {
+            String::new()
+        };
         let frame = format!(
-            "event: {terminal}\ndata: {}\n\n",
+            "{event}data: {}\n\n",
             json!({
                 "type": terminal,
                 "sequence_number": 7,
@@ -2378,7 +2384,7 @@ async fn direct_stream_restore_overflow_after_forwarded_terminal_tears_down_tran
         ));
         let forwarded = parse_sse_frames(body.as_ref().expect("terminal frame is forwarded"));
         assert_eq!(forwarded.len(), 1);
-        assert_eq!(forwarded[0].event_type.as_deref(), Some(terminal));
+        assert_eq!(forwarded[0].event_type.as_deref(), event_header.then_some(terminal));
 
         let admitted_comment = Bytes::from_static(b": keepalive\n\n");
         let mut body = Some(admitted_comment.clone());
@@ -2448,6 +2454,15 @@ fn terminal_probe_uses_last_sse_event_field() {
         !frame_sequence_and_terminal(b"event: response.completed\nevent: response.output_text.delta\ndata: {}\n\n").1
     );
     assert!(!frame_sequence_and_terminal(b": response.completed\ndata: {}\n\n").1);
+    assert!(frame_sequence_and_terminal(b"data: {\"type\":\"response.completed\"}\n\n").1);
+    assert!(frame_sequence_and_terminal(b"data: {\"ty\\u0070e\":\"response.comple\\u0074ed\"}\n\n").1);
+    assert!(frame_sequence_and_terminal(b"data: {\"type\":\ndata: \"response.completed\"}\n\n").1);
+    assert!(
+        !frame_sequence_and_terminal(
+            b"data: {\"nested\":{\"type\":\"response.completed\"},\"type\":\"response.output_text.delta\"}\n\n"
+        )
+        .1
+    );
     assert!(
         !frame_sequence_and_terminal(b"event: response.completed\n\n").1,
         "an event-only SSE frame is not dispatched to the client"
@@ -2483,6 +2498,63 @@ async fn streaming_restore_reserves_exponent_normalization_before_rewrite() {
     let frames = parse_sse_frames(body.as_ref().unwrap());
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+}
+
+#[test]
+fn sse_normalization_bound_excludes_comment_quotes() {
+    let numbers = vec!["1e15"; 1_000].join(",");
+    let frame = format!(
+        ": \"\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"object\":\"response\",\"output\":[{numbers}]}}}}\n\n"
+    );
+    let joined = join_sse_data_payload(frame.as_bytes()).unwrap();
+    let parsed: Value = serde_json::from_slice(&joined).unwrap();
+    let normalized = serde_json::to_vec(&parsed).unwrap();
+    assert!(
+        joined_sse_json_bytes_upper_bound(frame.as_bytes()).unwrap() >= normalized.len(),
+        "an arbitrary quote in an SSE comment cannot hide JSON number expansion"
+    );
+
+    let multiline = b"data: {\"output\":[1e15,\ndata: 2e15]}\n\n";
+    let joined = join_sse_data_payload(multiline).unwrap();
+    let parsed: Value = serde_json::from_slice(&joined).unwrap();
+    let normalized = serde_json::to_vec(&parsed).unwrap();
+    assert!(
+        joined_sse_json_bytes_upper_bound(multiline).unwrap() >= normalized.len(),
+        "the inserted newline between data fields remains in the bound"
+    );
+}
+
+#[tokio::test]
+async fn streaming_restore_rejects_comment_masked_number_expansion_before_rewrite() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let numbers = vec!["1e15"; 10_000].join(",");
+    let frame = format!(
+        ": \"\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":7,\"response\":{{\"id\":\"resp_new\",\"object\":\"response\",\"previous_response_id\":null,\"output\":[{numbers}]}}}}\n\n"
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + frame.len() * 10);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::from(frame));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let frames = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]

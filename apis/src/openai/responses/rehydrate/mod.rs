@@ -1318,7 +1318,7 @@ fn accumulate_frame(
                 // non-JSON fields are raw owners. At most two normalized
                 // owners coexist: parsed tree + serialized JSON, or JSON +
                 // rebuilt frame after the parse has returned.
-                let normalized = super::buffered_parsed_json_bytes_upper_bound(frame)?;
+                let normalized = joined_sse_json_bytes_upper_bound(frame)?;
                 frame
                     .len()
                     .checked_mul(3)?
@@ -1341,6 +1341,27 @@ fn accumulate_frame(
         *run_start = end;
     }
     Ok(())
+}
+
+/// Upper bound for the normalized JSON carried by an SSE frame's `data:` lines.
+/// Scan each field value independently so quotes in comments, `event:`, and
+/// other SSE fields cannot change the JSON lexical state. A valid JSON number
+/// cannot cross the newline inserted between two `data:` fields. No payload
+/// join is allocated at this preflight boundary.
+fn joined_sse_json_bytes_upper_bound(frame: &[u8]) -> Option<usize> {
+    let mut bound = Some(0_usize);
+    let mut had_data = false;
+    for_each_sse_line(frame, |line, _| {
+        if let Some(data) = sse_field_value(line, b"data") {
+            bound = bound.and_then(|bytes| {
+                bytes
+                    .checked_add(usize::from(had_data))?
+                    .checked_add(super::buffered_parsed_json_bytes_upper_bound(data)?)
+            });
+            had_data = true;
+        }
+    });
+    had_data.then_some(bound).flatten()
 }
 
 /// Find a top-level JSON `response` key without joining or parsing SSE data.
@@ -1383,9 +1404,11 @@ fn frame_sequence_and_terminal(frame: &[u8]) -> (Option<u64>, bool) {
     let mut valid = false;
     let mut done = false;
     let mut had_data = false;
+    let mut had_event = false;
     let mut terminal = false;
     for_each_sse_line(frame, |line, _| {
         if let Some(event) = sse_field_value(line, b"event") {
+            had_event = true;
             terminal = matches!(
                 event,
                 b"response.completed" | b"response.failed" | b"response.incomplete" | b"response.cancelled" | b"error"
@@ -1419,12 +1442,145 @@ fn frame_sequence_and_terminal(frame: &[u8]) -> (Option<u64>, bool) {
             }
         }
     });
+    if had_data && !had_event {
+        // The shared Responses parser accepts data.type when the SSE event
+        // field is absent. Read that discriminator without joining the body.
+        terminal = payload_terminal_type(frame);
+    }
     // Event-only frames are not dispatched by the shared SSE parser, so they
     // have not delivered a terminal event to the client.
     (
         (saw_digit && (valid || !done)).then_some(sequence),
         terminal && had_data,
     )
+}
+
+/// Read a top-level JSON `type` string from joined SSE data fields without
+/// allocating the joined body. `ResponseKeyProbe` skips nested and quoted keys.
+fn payload_terminal_type(frame: &[u8]) -> bool {
+    let mut key = ResponseKeyProbe::for_key(b"type");
+    let mut value = TerminalTypeValue::default();
+    let mut had_data = false;
+    for_each_sse_line(frame, |line, _| {
+        let Some(data) = sse_field_value(line, b"data") else {
+            return;
+        };
+        if had_data {
+            feed_terminal_type_byte(&mut key, &mut value, b'\n');
+        }
+        had_data = true;
+        for &byte in data {
+            feed_terminal_type_byte(&mut key, &mut value, byte);
+        }
+    });
+    had_data && value.terminal
+}
+
+/// Feed one joined SSE data byte to the key or its selected value decoder.
+fn feed_terminal_type_byte(key: &mut ResponseKeyProbe, value: &mut TerminalTypeValue, byte: u8) {
+    if key.found {
+        value.feed(byte);
+    } else {
+        key.feed(byte);
+    }
+}
+
+/// A fixed-size decoder for the event discriminator; the longest recognized
+/// terminal type fits without retaining any provider payload bytes.
+#[derive(Default)]
+struct TerminalTypeValue {
+    /// Decoded ASCII event type; no terminal discriminator exceeds 24 bytes.
+    bytes: [u8; 24],
+    /// Number of decoded bytes in `bytes`.
+    len: usize,
+    /// 0 awaits the value, 1 decodes a JSON string, 2 has finished.
+    stage: u8,
+    /// The previous byte introduced a JSON string escape.
+    escaped: bool,
+    /// Hex digits remaining in the current `\u` escape.
+    unicode_digits: u8,
+    /// Code unit accumulated from the current `\u` escape.
+    unicode_value: u16,
+    /// Decoded value names a terminal Responses event.
+    terminal: bool,
+}
+
+impl TerminalTypeValue {
+    /// Append one decoded byte, declining overlong values without allocation.
+    fn push(&mut self, byte: u8) {
+        if let Some(slot) = self.bytes.get_mut(self.len) {
+            *slot = byte;
+            self.len += 1;
+        } else {
+            self.stage = 2;
+        }
+    }
+
+    /// Consume one raw JSON value byte, including string escapes.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "decodes one fixed-size JSON string without allocation"
+    )]
+    fn feed(&mut self, byte: u8) {
+        if self.stage == 0 {
+            if byte.is_ascii_whitespace() {
+                return;
+            }
+            self.stage = if byte == b'"' { 1 } else { 2 };
+            return;
+        }
+        if self.stage != 1 {
+            return;
+        }
+        if self.unicode_digits > 0 {
+            let Some(digit) = json_hex_digit(byte) else {
+                self.stage = 2;
+                return;
+            };
+            self.unicode_value = (self.unicode_value << 4) | u16::from(digit);
+            self.unicode_digits -= 1;
+            if self.unicode_digits == 0 {
+                if let Ok(decoded) = u8::try_from(self.unicode_value) {
+                    self.push(decoded);
+                } else {
+                    self.stage = 2;
+                }
+            }
+            return;
+        }
+        if self.escaped {
+            self.escaped = false;
+            match byte {
+                b'"' | b'\\' | b'/' => self.push(byte),
+                b'b' => self.push(8),
+                b'f' => self.push(12),
+                b'n' => self.push(b'\n'),
+                b'r' => self.push(b'\r'),
+                b't' => self.push(b'\t'),
+                b'u' => {
+                    self.unicode_digits = 4;
+                    self.unicode_value = 0;
+                },
+                _ => self.stage = 2,
+            }
+            return;
+        }
+        match byte {
+            b'\\' => self.escaped = true,
+            b'"' => {
+                self.stage = 2;
+                self.terminal = matches!(
+                    self.bytes.get(..self.len).unwrap_or_default(),
+                    b"response.completed"
+                        | b"response.failed"
+                        | b"response.incomplete"
+                        | b"response.cancelled"
+                        | b"error"
+                );
+            },
+            _ => self.push(byte),
+        }
+    }
 }
 
 /// Preserve the largest forwarded sequence when a chunk contains several frames.

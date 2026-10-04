@@ -1970,7 +1970,7 @@ class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         request_body = json.loads(self.rfile.read(length))
         model = request_body["model"]
-        if model == "terminal-stream":
+        if model in {"terminal-stream", "terminal-stream-no-event"}:
             response = {
                 "id": "resp_direct_budget_terminal_stream",
                 "object": "response",
@@ -1979,8 +1979,9 @@ class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
                 "status": "completed",
                 "output": [],
             }
+            event_prefix = "event: response.completed\n" if model == "terminal-stream" else ""
             terminal = (
-                "event: response.completed\ndata: "
+                event_prefix + "data: "
                 + json.dumps({
                     "type": "response.completed",
                     "sequence_number": 1,
@@ -2162,12 +2163,14 @@ def test_direct_budget_restore_rejects_before_success_headers(direct_budget_clie
 
 
 @pytest.mark.parametrize("direct_budget_client", [65_536], indirect=True)
-def test_direct_budget_stream_overflow_after_completion_has_one_terminal(direct_budget_client):
+@pytest.mark.parametrize("model", ["terminal-stream", "terminal-stream-no-event"])
+def test_direct_budget_stream_overflow_after_completion_has_one_terminal(direct_budget_client, model):
     """The direct SSE route closes after a late overflow without an error event."""
     seed = direct_budget_client.responses.create(model="10", input="seed", store=True)
     url = f"{str(direct_budget_client.base_url).rstrip('/')}/responses"
     wire = bytearray()
     transport_failed = False
+    terminal_marker = b"event: response.completed" if model == "terminal-stream" else b'"type":"response.completed"'
     gate = threading.Event()
     DirectBudgetBackendHandler.terminal_gate = gate
     try:
@@ -2177,14 +2180,14 @@ def test_direct_budget_stream_overflow_after_completion_has_one_terminal(direct_
                     "POST", url,
                     headers={"Content-Type": "application/json", **TRUSTED_OWNER_HEADERS},
                     json={
-                        "model": "terminal-stream", "input": "next", "stream": True,
+                        "model": model, "input": "next", "stream": True,
                         "store": False, "previous_response_id": seed.id,
                     },
                 ) as response:
                     assert response.status_code == 200
                     for chunk in response.iter_raw():
                         wire.extend(chunk)
-                        if b"event: response.completed" in wire and b"\n\n" in wire:
+                        if terminal_marker in wire and b"\n\n" in wire:
                             gate.set()  # The provider may now send the oversized tail.
             except (httpx.RemoteProtocolError, httpx.ReadError):
                 transport_failed = True  # The filter aborts the committed transport.
@@ -2192,7 +2195,7 @@ def test_direct_budget_stream_overflow_after_completion_has_one_terminal(direct_
         gate.set()
         DirectBudgetBackendHandler.terminal_gate = None
     assert transport_failed, "the over-budget stream must end with a transport error"
-    assert wire.count(b"event: response.completed") == 1
+    assert wire.count(terminal_marker) == 1
     assert b"event: error" not in wire
     assert b"event: response.failed" not in wire
     assert b"x" * 128 not in wire, "the rejected comment cannot leak downstream"
