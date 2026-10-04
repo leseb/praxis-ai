@@ -1571,3 +1571,39 @@ async fn rejects_when_state_body_exceeds_max_rewritten_body_bytes() {
         _ => panic!("expected rejection when state body (with large history) exceeds max_rewritten_body_bytes"),
     }
 }
+
+#[tokio::test]
+async fn rejects_document_free_parse_when_history_exhausts_retained_budget() {
+    let filter = make_filter();
+    let request = make_request(Method::POST, "/v1/responses");
+    for state_limit_installed in [false, true] {
+        let mut ctx = make_filter_context(&request);
+        set_responses_metadata(&mut ctx);
+
+        let original = serde_json::json!({"model":"m", "input":[{"role":"user","content":"x".repeat(4096)}]});
+        let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+        let parsed_bytes = retained_json_bytes(&original).unwrap();
+        let mut state = ResponsesState::from_request_body(original);
+        state.iteration = 1;
+        state
+            .messages
+            .insert(0, serde_json::json!({"role":"assistant", "content":"y".repeat(65536)}));
+        let baseline = state.retained_payload_bytes().unwrap();
+        let limit = baseline + parsed_bytes - 1;
+        if state_limit_installed {
+            state.apply_retained_payload_limit(limit);
+            assert!(state.can_retain_payload(0));
+            assert!(!state.can_retain_payload(parsed_bytes));
+        }
+        let config = serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap();
+        ctx.extensions
+            .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+        ctx.extensions.insert(state);
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "parse must reject before allocating a new JSON tree, state limit installed: {state_limit_installed}"
+        );
+    }
+}

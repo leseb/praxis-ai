@@ -16,8 +16,8 @@
 //!   provisioned. `GET` and `DELETE` endpoints owned by the store also reject rather than falling through to the
 //!   upstream.
 //!
-//! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
-//!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
+//! - **`on_response`**: re-checks skip conditions, then inspects the response status and headers. Non-2xx responses,
+//!   content-encoded bodies, or content types other than JSON or event-stream set `responses.skip_persist` and bail
 //!   early.
 //!
 //! - **`on_response_body`**: at the terminal chunk for streams or at end-of-stream for buffered responses, extracts the
@@ -67,7 +67,9 @@ use super::{
         DEFAULT_STORE_NAME,
         agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
         bound_body_outcome,
+        budget_error::reject_retained_payload_budget,
         error::responses_error_rejection,
+        rehydrate::DirectFiniteRestoreFraming,
         state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
     },
     config::{ResponseStoreConfig, validate_config},
@@ -326,7 +328,7 @@ impl ResponseStoreFilter {
         };
         let response_bytes = retained_json_bytes(&state.response_object);
         if !response_bytes.is_some_and(|bytes| persistence_construction_fits(ctx, bytes)) {
-            return Ok(persistence_budget_failure(ctx, true, body));
+            return streaming_persistence_budget_failure(ctx, body);
         }
 
         // Capture the proxy-issued pending approvals before taking the context.
@@ -351,11 +353,11 @@ impl ResponseStoreFilter {
         if budgeted_conversation {
             let inserted = match persist_response_if_absent_blocking(&persist.store, &record, &pending_approvals) {
                 Ok(inserted) => inserted,
-                Err(StoreError::PayloadTooLarge) => return Ok(persistence_budget_failure(ctx, true, body)),
+                Err(StoreError::PayloadTooLarge) => return streaming_persistence_budget_failure(ctx, body),
                 Err(error) => return Err(Box::new(error)),
             };
             if !inserted {
-                return Ok(persistence_budget_failure(ctx, true, body));
+                return streaming_persistence_budget_failure(ctx, body);
             }
         } else {
             persist_response_blocking(&persist.store, &record, &pending_approvals)?;
@@ -480,6 +482,9 @@ impl ResponseStoreFilter {
             return true;
         };
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+        state.terminal_in_chunk = false;
+        state.max_sequence_in_chunk = None;
+        state.unclassified_in_chunk = false;
         let previously_retained = state.retained_payload_bytes();
         let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
         if let Some(responses) = ctx.extensions.get::<ResponsesState>()
@@ -562,9 +567,19 @@ impl ResponseStoreFilter {
             ctx.extensions.insert(state);
             return false;
         }
+        let track_direct_metadata = ctx.extensions.get::<praxis_filter::IterationState>().is_none()
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
         state.error_event_detector.push(chunk);
-        if !state.events_over_budget {
-            self.accumulate_events(&mut state, chunk);
+        if state.events_over_budget {
+            if track_direct_metadata {
+                Self::observe_abandoned_replay(ctx, &mut state, chunk);
+            }
+        } else {
+            self.accumulate_events(&mut state, chunk, track_direct_metadata);
         }
         state.track_pending_wire_bytes(chunk);
         let retained = state.retained_payload_bytes();
@@ -585,7 +600,11 @@ impl ResponseStoreFilter {
 
     /// Decode `chunk` and append each contained SSE event, stopping and marking
     /// the log non-replayable on a bound overrun or decoder poison.
-    fn accumulate_events(&self, state: &mut ResponseStoreRequestState, chunk: &Bytes) {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps replay capture and the decoder's failure cleanup together"
+    )]
+    fn accumulate_events(&self, state: &mut ResponseStoreRequestState, chunk: &Bytes, track_direct_metadata: bool) {
         let max_event_bytes = self.max_event_bytes.get();
         let decoder = state.event_decoder.get_or_insert_with(|| {
             // Allow a single event whose JSON `data` payload fills the whole byte
@@ -605,9 +624,19 @@ impl ResponseStoreFilter {
         });
         let batch = decoder.push(chunk);
         for record in &batch.records {
+            if track_direct_metadata {
+                observe_forwarded_record(state, record);
+            } else {
+                state.terminal_in_chunk |= is_forwarded_terminal_record(record, &record.data());
+            }
+        }
+        for record in &batch.records {
             if !self.capture_one(state, record) {
                 // The replay log is abandoned, but the separate header scanner
                 // still checks later chunks for a client-visible error.
+                if !track_direct_metadata {
+                    state.event_decoder = None;
+                }
                 return;
             }
         }
@@ -619,6 +648,52 @@ impl ResponseStoreFilter {
             state.event_bytes = 0;
             state.event_name_bytes = 0;
             state.event_decoder = None;
+            state.unclassified_in_chunk = true;
+        }
+    }
+
+    /// Keep observing provider wire metadata after the replay log has reached
+    /// its independent cap. The existing decoder is reused only when its
+    /// transient scratch fits the aggregate budget; otherwise the released
+    /// frame is marked unclassified and a later failure must abort the wire.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the decoder peak check and metadata observation in one admission boundary"
+    )]
+    fn observe_abandoned_replay(ctx: &HttpFilterContext<'_>, state: &mut ResponseStoreRequestState, chunk: &Bytes) {
+        let peak = state
+            .pending_wire_bytes
+            .checked_add(chunk.len())
+            .and_then(|bytes| bytes.checked_mul(4))
+            .and_then(|bytes| state.retained_payload_bytes()?.checked_add(bytes));
+        let fits = state.event_decoder.is_some()
+            && peak.is_some_and(|peak| {
+                ctx.extensions.get::<ResponsesState>().is_none_or(|responses| {
+                    store_stream_budget_fits(
+                        responses,
+                        state.shared_stable_bytes,
+                        state.charged_retained_bytes.unwrap_or(0),
+                        peak,
+                    )
+                })
+            });
+        if !fits {
+            state.event_decoder = None;
+            state.pending_wire_bytes = 0;
+            state.unclassified_in_chunk = true;
+            return;
+        }
+        let Some(decoder) = state.event_decoder.as_mut() else {
+            return;
+        };
+        let batch = decoder.push(chunk);
+        for record in &batch.records {
+            observe_forwarded_record(state, record);
+        }
+        if batch.error.is_some() {
+            state.event_decoder = None;
+            state.pending_wire_bytes = 0;
+            state.unclassified_in_chunk = true;
         }
     }
 
@@ -682,6 +757,64 @@ fn decode_replay_row(record: &SseRecord) -> Option<(u64, CapturedEvent)> {
             terminal,
         },
     ))
+}
+
+/// Classify a completed SSE frame from the wire, even when it cannot be
+/// indexed in the replay log (for example, a direct provider omitted a
+/// sequence number). `SseDecoder` emits only frames with a `data:` field, so
+/// a data-less `event:` line cannot falsely mark the stream complete.
+fn is_forwarded_terminal_record(record: &SseRecord, data: &[u8]) -> bool {
+    if !record.is_event() || data == b"[DONE]" {
+        return false;
+    }
+    if let Some(event) = record.event().and_then(|value| std::str::from_utf8(value).ok()) {
+        return is_terminal_event_type(event);
+    }
+    serde_json::from_slice::<EventType<'_>>(data)
+        .ok()
+        .and_then(|event| event.ty)
+        .is_some_and(|event| is_terminal_event_type(&event))
+}
+
+/// Inspect provider wire metadata without retaining another event payload.
+fn observe_forwarded_record(state: &mut ResponseStoreRequestState, record: &SseRecord) {
+    if !record.is_event() {
+        return;
+    }
+    let data = record.data();
+    if data.as_ref() == b"[DONE]" {
+        return;
+    }
+    state.terminal_in_chunk |= is_forwarded_terminal_record(record, &data);
+    match serde_json::from_slice::<WireSequenceHead>(&data) {
+        Ok(WireSequenceHead {
+            sequence_number: Some(sequence),
+        }) => {
+            state.max_sequence_in_chunk = Some(
+                state
+                    .max_sequence_in_chunk
+                    .map_or(sequence, |previous| previous.max(sequence)),
+            );
+        },
+        Ok(_) => {},
+        Err(_) => state.unclassified_in_chunk = true,
+    }
+}
+
+/// Minimal borrowing parse of the public provider sequence.
+#[derive(serde::Deserialize)]
+struct WireSequenceHead {
+    /// Sequence to follow if Store later emits a local budget error.
+    sequence_number: Option<u64>,
+}
+
+/// Borrow the `type` field for a data-only SSE terminal without materializing
+/// the provider's full response JSON.
+#[derive(serde::Deserialize)]
+struct EventType<'a> {
+    /// Borrowed logical event name, when a data-only frame carries one.
+    #[serde(borrow, default, rename = "type")]
+    ty: Option<Cow<'a, str>>,
 }
 
 /// The only fields read from a captured SSE event's JSON `data` payload: the
@@ -949,8 +1082,24 @@ impl StoreStableCache {
     }
 }
 
+/// Last logical line ending seen while tracking unfinished SSE wire bytes.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum WireLineEnding {
+    /// The last byte belonged to a field line.
+    #[default]
+    None,
+    /// The last byte ended a line with CR; a following LF is paired with it.
+    Cr,
+    /// The last byte ended a line with LF.
+    Lf,
+}
+
 /// Request-phase data needed when persisting the response.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "stream replay status and per-chunk wire classification are independent"
+)]
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
     input: Option<Value>,
@@ -981,19 +1130,34 @@ struct ResponseStoreRequestState {
     event_bytes: u64,
     /// Raw bytes in independently owned captured event names.
     event_name_bytes: usize,
-    /// Upper bound on raw bytes after the last complete LF-delimited record.
+    /// Upper bound on raw bytes after the last complete SSE record.
     /// The retained meter charges this twice because the decoder may keep a
-    /// field value and the current line independently. CR-delimited records
-    /// are deliberately overcounted.
+    /// field value and the current line independently.
     pending_wire_bytes: usize,
-    /// Whether the previous wire byte was LF, including across chunk edges.
-    last_wire_byte_was_lf: bool,
+    /// Last wire line ending, including across chunk edges. A following LF
+    /// after CR belongs to the same line ending.
+    last_wire_line_ending: WireLineEnding,
     /// Sticky flag: capture exceeded a bound or the decoder was poisoned, so the
     /// partial log is abandoned and the response becomes non-replayable.
     events_over_budget: bool,
     /// A client-visible SSE error superseded any completed upstream snapshot.
     error_event_detector: SseErrorEventDetector,
+    /// A logical terminal decoded from the current admitted wire chunk.
+    terminal_in_chunk: bool,
+    /// Largest provider sequence decoded in the current admitted chunk.
+    max_sequence_in_chunk: Option<u64>,
+    /// A released frame could not be classified safely after replay stopped.
+    unclassified_in_chunk: bool,
 }
+
+/// A logical SSE terminal from a chunk that this filter already released in
+/// this loop round. Kept outside capture state because persistence may consume
+/// that state; a later IRR round must not inherit the prior round's marker.
+struct StoreForwardedTerminal(u32);
+
+/// A released frame could not be classified after replay capture stopped.
+/// A later budget error must abort instead of guessing its terminal/sequence.
+struct StoreForwardedUnclassified(u32);
 
 impl ResponseStoreRequestState {
     /// Count the sibling-owned input, replay rows, and unfinished decoder data.
@@ -1006,19 +1170,81 @@ impl ResponseStoreRequestState {
 
     /// Track a safe upper bound for the decoder's unfinished record.
     fn track_pending_wire_bytes(&mut self, chunk: &[u8]) {
-        if self.events_over_budget {
+        if self.events_over_budget && self.event_decoder.is_none() {
             self.pending_wire_bytes = 0;
-            self.event_decoder = None;
             return;
         }
         for &byte in chunk {
-            if byte == b'\n' && self.pending_wire_bytes > 0 && self.last_wire_byte_was_lf {
-                self.pending_wire_bytes = 0;
-            } else {
-                self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+            match byte {
+                b'\n' if self.last_wire_line_ending == WireLineEnding::Cr => {
+                    // CRLF is one line ending. Its LF belongs to the still-open
+                    // record only if the preceding CR did not finish that record.
+                    if self.pending_wire_bytes > 0 {
+                        self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                    }
+                },
+                b'\r' | b'\n' if self.last_wire_line_ending == WireLineEnding::None => {
+                    self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                },
+                b'\r' | b'\n' => self.pending_wire_bytes = 0,
+                _ => {
+                    self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                },
             }
-            self.last_wire_byte_was_lf = byte == b'\n';
+            self.last_wire_line_ending = match byte {
+                b'\r' => WireLineEnding::Cr,
+                b'\n' => WireLineEnding::Lf,
+                _ => WireLineEnding::None,
+            };
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_wire_tests {
+    use bytes::Bytes;
+    use praxis_filter::sse::SseDecoder;
+
+    use super::ResponseStoreRequestState;
+
+    #[test]
+    fn completed_crlf_sse_records_release_pending_wire_charge_across_chunks() {
+        for frame in [
+            b"event: response.output_text.delta\ndata: {}\n\n".as_slice(),
+            b"event: response.output_text.delta\r\ndata: {}\r\n\r\n",
+            b"event: response.output_text.delta\rdata: {}\r\r",
+            b"event: response.output_text.delta\ndata: {}\r\n\n",
+        ] {
+            for split in 0..=frame.len() {
+                let mut capture = ResponseStoreRequestState::default();
+                let mut decoder = SseDecoder::new();
+                let mut completed = 0;
+                for chunk in [
+                    frame.get(..split).unwrap_or_default(),
+                    frame.get(split..).unwrap_or_default(),
+                ] {
+                    capture.track_pending_wire_bytes(chunk);
+                    let batch = decoder.push(&Bytes::copy_from_slice(chunk));
+                    assert!(batch.error.is_none());
+                    completed += batch.records.len();
+                }
+                assert_eq!(completed, 1, "frame={frame:?}, split={split}");
+                assert_eq!(capture.pending_wire_bytes, 0, "frame={frame:?}, split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_crlf_line_ending_stays_charged_until_blank_line() {
+        let mut capture = ResponseStoreRequestState::default();
+        capture.track_pending_wire_bytes(b"data: {}\r");
+        let before_lf = capture.pending_wire_bytes;
+        capture.track_pending_wire_bytes(b"\n");
+        assert_eq!(capture.pending_wire_bytes, before_lf + 1);
+        capture.track_pending_wire_bytes(b"\r");
+        assert_eq!(capture.pending_wire_bytes, 0);
+        capture.track_pending_wire_bytes(b"\n");
+        assert_eq!(capture.pending_wire_bytes, 0);
     }
 }
 
@@ -1179,7 +1405,69 @@ fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, bytes: &[
     } else {
         Some(bytes.len())
     };
-    projected.is_some_and(|response_bytes| persistence_construction_fits(ctx, response_bytes))
+    projected.is_some_and(|response_bytes| persistence_construction_fits_with_wire(ctx, response_bytes, bytes.len()))
+}
+
+/// Admit a noncanonical JSON body before core commits the upstream headers.
+/// Without the body we cannot inspect number tokens. Twelve times a trusted
+/// wire length bounds the scanner's normalized JSON projection. A prior
+/// Rehydrate filter can remove `Content-Length` after validating it; its typed
+/// framing handoff also reserves the escaped replacement ID and any new key.
+/// Missing or ambiguous framing cannot establish the persistence peak before
+/// commitment.
+fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let (wire_bytes, replacement_id_bytes) = trusted_persistence_framing(ctx)?;
+    if wire_bytes > MAX_JSON_BODY_BYTES {
+        return None;
+    }
+    let mut parsed_bytes = wire_bytes.checked_mul(12)?;
+    if let Some(previous_id_bytes) = replacement_id_bytes {
+        // JSON control-byte escapes can use six bytes per input byte. Allow
+        // for adding the key when the upstream object omitted it entirely.
+        parsed_bytes = parsed_bytes
+            .checked_add(previous_id_bytes.checked_mul(6)?)?
+            .checked_add(32)?;
+    }
+    // Core's multi-chunk freeze can hold two original wire copies. After
+    // Rehydrate rewrites the body, Store instead holds the replacement wire,
+    // which can be longer than both originals when the ID requires escaping.
+    let transient_wire_bytes = wire_bytes.checked_mul(2)?;
+    let transient_wire_bytes = if replacement_id_bytes.is_some() {
+        transient_wire_bytes.max(parsed_bytes)
+    } else {
+        transient_wire_bytes
+    };
+    persistence_construction_fits_with_wire(ctx, parsed_bytes, transient_wire_bytes).then_some(wire_bytes)
+}
+
+/// Recover trusted upstream framing from the header or Rehydrate's bounded handoff.
+fn trusted_persistence_framing(ctx: &HttpFilterContext<'_>) -> Option<(usize, Option<usize>)> {
+    let response = ctx.response_header.as_ref()?;
+    if response.headers.contains_key(http::header::TRANSFER_ENCODING)
+        || response.headers.contains_key(http::header::CONTENT_ENCODING)
+    {
+        return None;
+    }
+    match &ctx.response_body_mode {
+        BodyMode::Stream => {
+            let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
+            let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
+            if lengths.next().is_some() {
+                return None;
+            }
+            Some((wire_bytes, None))
+        },
+        BodyMode::StreamBuffer {
+            max_bytes: Some(max_bytes),
+        } => {
+            let framing = ctx.extensions.get::<DirectFiniteRestoreFraming>()?;
+            if response.headers.contains_key(http::header::CONTENT_LENGTH) || *max_bytes != framing.wire_bytes {
+                return None;
+            }
+            Some((framing.wire_bytes, Some(framing.previous_id_bytes)))
+        },
+        _ => None,
+    }
 }
 
 /// The response, messages, and input columns may each be zstd-compressed and
@@ -1291,6 +1579,69 @@ fn persistence_budget_failure(
     ))
 }
 
+/// An error frame is valid only while no logical terminal has reached the
+/// client. Once Store released one, a later budget failure must stop the
+/// transport rather than append a contradictory second terminal.
+fn streaming_persistence_budget_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+) -> Result<FilterAction, FilterError> {
+    let terminal_forwarded_this_round = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+        ctx.extensions
+            .get::<StoreForwardedTerminal>()
+            .is_some_and(|marker| state.iteration == marker.0)
+            || ctx
+                .extensions
+                .get::<StoreForwardedUnclassified>()
+                .is_some_and(|marker| state.iteration == marker.0)
+    });
+    if !terminal_forwarded_this_round {
+        return Ok(persistence_budget_failure(ctx, true, body));
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.set_metadata("responses.store_stream_budget_failed", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    discard_retained_request_payload(ctx);
+    crate::openai::responses::fs_arm_stream_stop(ctx);
+    *body = None;
+    Err("response store retained budget exceeded after a forwarded SSE terminal".into())
+}
+
+/// Publish wire metadata only after Store has admitted and released the chunk.
+/// A terminal or sequence in a rejected chunk must not affect local error
+/// framing, and the round marker must not survive into a later IRR iteration.
+fn mark_released_stream_chunk(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    terminal: bool,
+    max_sequence: Option<u64>,
+    unclassified: bool,
+) {
+    if body.is_none() {
+        return;
+    }
+    let Some(iteration) = ctx.extensions.get::<ResponsesState>().map(|state| state.iteration) else {
+        return;
+    };
+    if terminal {
+        ctx.extensions.insert(StoreForwardedTerminal(iteration));
+    }
+    if unclassified {
+        ctx.extensions.insert(StoreForwardedUnclassified(iteration));
+    }
+    if let Some(sequence) = max_sequence {
+        if let Some(next) = sequence.checked_add(1) {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.logical_stream_sequence = state.logical_stream_sequence.max(next);
+            }
+        } else {
+            ctx.extensions.insert(StoreForwardedUnclassified(iteration));
+        }
+    }
+}
+
 /// Capture the immutable owner once, before inference or a body-first consumer.
 fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
     if !request_will_persist_response(ctx) {
@@ -1307,12 +1658,10 @@ fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), Filt
 /// Retain request input alongside the already captured owner.
 fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Result<(), FilterAction> {
     let Some(retained_bytes) = retained_json_bytes(&input) else {
-        ctx.set_metadata("responses.skip_persist", "true");
-        return Err(FilterAction::Reject(responses_error_rejection(
-            413,
-            "invalid_request_error",
+        return Err(reject_retained_payload_budget(
+            ctx,
             "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-        )));
+        ));
     };
     let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
     state.input = Some(input);
@@ -1323,12 +1672,10 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Resul
         .is_some_and(|next| charge_store_payload(ctx, &mut state, next));
     ctx.extensions.insert(state);
     if !admitted {
-        ctx.set_metadata("responses.skip_persist", "true");
-        return Err(FilterAction::Reject(responses_error_rejection(
-            413,
-            "invalid_request_error",
+        return Err(reject_retained_payload_budget(
+            ctx,
             "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-        )));
+        ));
     }
     ctx.set_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA, retained_bytes.to_string());
     Ok(())
@@ -1561,6 +1908,14 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
         return false;
     }
 
+    // An encoded representation is opaque here. Rehydrate also declines it,
+    // and Store cannot safely parse or preflight its decoded JSON size.
+    if resp.headers.contains_key(http::header::CONTENT_ENCODING) {
+        trace!("skipping persistence for content-encoded response");
+        ctx.set_metadata("responses.skip_persist", "true");
+        return false;
+    }
+
     let content_type = resp
         .headers
         .get(http::header::CONTENT_TYPE)
@@ -1705,38 +2060,49 @@ fn pending_approvals_from_ctx(ctx: &HttpFilterContext<'_>) -> Vec<PendingApprova
 // -----------------------------------------------------------------------------
 
 /// Reserve the original input snapshot before parsing another owned JSON tree.
+#[expect(
+    clippy::too_many_lines,
+    reason = "both Store placements must reserve the live wire and parsed tree"
+)]
 fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<(), FilterAction> {
     if should_skip(ctx) {
         return Ok(());
     }
-    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+    let Some(policy_limit) = ctx
+        .extensions
+        .get::<AgenticBudgetPolicy>()
+        .map(|policy| policy.max_retained_bytes())
+    else {
         return Ok(());
     };
-    // Compact JSON cannot exceed the raw body, so the body length is a safe
-    // upper bound for the snapshot captured below.
     let raw_bytes = body.as_ref().map_or(0, Bytes::len);
-    let admitted = if let Some(state) = ctx.extensions.get::<ResponsesState>() {
-        state.can_retain_payload(raw_bytes)
+    // The buffered wire remains live while serde_json builds another owned
+    // tree. Exponent-form numbers can expand in that tree before input is
+    // moved into the store snapshot.
+    let parsed_bound = body.as_deref().map_or(Some(0), buffered_parsed_json_bytes_upper_bound);
+    let admitted = if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.apply_retained_payload_limit(policy_limit);
+        parsed_bound
+            .and_then(|parsed| parsed.checked_add(raw_bytes))
+            .is_some_and(|peak| state.can_retain_payload(peak))
     } else {
         // A valid pipeline may place the store after format classification but
         // before the filter that creates ResponsesState. Apply the same
         // pre-parse headroom as the request filter until that state exists;
         // the creator then transfers this captured snapshot into its meter.
         let existing = retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
-        raw_bytes
-            .checked_mul(super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)
+        parsed_bound
+            .and_then(|parsed| parsed.checked_mul(super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER))
             .and_then(|peak| existing.checked_add(peak))
-            .is_some_and(|peak| peak <= policy.max_retained_bytes())
+            .is_some_and(|peak| peak <= policy_limit)
     };
     if admitted {
         return Ok(());
     }
-    ctx.set_metadata("responses.skip_persist", "true");
-    Err(FilterAction::Reject(responses_error_rejection(
-        413,
-        "invalid_request_error",
+    Err(reject_retained_payload_budget(
+        ctx,
         "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-    )))
+    ))
 }
 
 #[async_trait]
@@ -1882,9 +2248,25 @@ impl HttpFilter for ResponseStoreFilter {
             .get::<ResponsesState>()
             .and_then(ResponsesState::retained_payload_limit)
             .is_some();
-        let canonical_finalized = budgeted && super::super::buffered_canonical_completed(ctx);
+        let body_finalized = budgeted
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.buffered_canonical_finalized);
+        let canonical_finalized = body_finalized && super::super::buffered_canonical_completed(ctx);
         let canonical_completed = has_conversation(ctx) && canonical_finalized;
         if !is_streaming_request(ctx) && !canonical_completed {
+            // An IRR step has not committed its headers to the client; its
+            // buffered body can be measured before the outer response starts.
+            let direct_response = ctx.extensions.get::<praxis_filter::IterationState>().is_none();
+            let admitted_wire_length = if budgeted && !body_finalized && direct_response {
+                let Some(length) = buffered_header_persistence_length(ctx) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                Some(length)
+            } else {
+                None
+            };
             let max_bytes = if canonical_finalized {
                 // The agentic loop already admitted and serialized this exact
                 // body. A previous-response restore may have selected a 64 MiB
@@ -1902,7 +2284,7 @@ impl HttpFilter for ResponseStoreFilter {
                 MAX_JSON_BODY_BYTES
             };
             if budgeted
-                && !canonical_finalized
+                && !body_finalized
                 && let BodyMode::StreamBuffer { max_bytes: existing } = &ctx.response_body_mode
                 && existing.is_none_or(|bytes| bytes > max_bytes)
             {
@@ -1912,7 +2294,7 @@ impl HttpFilter for ResponseStoreFilter {
                 return Ok(persistence_budget_failure(ctx, false, &mut None));
             }
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(max_bytes),
+                max_bytes: Some(admitted_wire_length.map_or(max_bytes, |length| length.min(max_bytes))),
             });
         }
 
@@ -2011,9 +2393,25 @@ impl HttpFilter for ResponseStoreFilter {
             // any persist seam below drains that state. Parse-only; the
             // client-visible bytes are never withheld or altered.
             if !self.capture_stream_events(ctx, body, end_of_stream) {
-                return Ok(persistence_budget_failure(ctx, true, body));
+                return streaming_persistence_budget_failure(ctx, body);
             }
 
+            // This signal is only promoted after the whole chunk passes
+            // admission. A terminal in a rejected chunk was never forwarded.
+            let terminal_in_chunk = ctx
+                .extensions
+                .get_mut::<ResponseStoreRequestState>()
+                .is_some_and(|state| std::mem::take(&mut state.terminal_in_chunk));
+            let (max_sequence_in_chunk, unclassified_in_chunk) = ctx
+                .extensions
+                .get_mut::<ResponseStoreRequestState>()
+                .map(|state| {
+                    (
+                        state.max_sequence_in_chunk.take(),
+                        std::mem::take(&mut state.unclassified_in_chunk),
+                    )
+                })
+                .unwrap_or_default();
             if !end_of_stream {
                 // Deferred and locally encoded terminals can both reach this
                 // pre-IRR filter before EOS. Once either marker is set,
@@ -2035,6 +2433,13 @@ impl HttpFilter for ResponseStoreFilter {
                         action => return Ok(action),
                     }
                 }
+                mark_released_stream_chunk(
+                    ctx,
+                    body,
+                    terminal_in_chunk,
+                    max_sequence_in_chunk,
+                    unclassified_in_chunk,
+                );
                 return Ok(FilterAction::Release);
             }
             // Skip after an earlier chunk consumed persistence state. This
@@ -2044,7 +2449,17 @@ impl HttpFilter for ResponseStoreFilter {
             if ctx.extensions.get::<StreamingResponsePersistenceAttempted>().is_some() {
                 return Ok(FilterAction::Continue);
             }
-            return Self::persist_from_streaming_state(ctx, body);
+            let action = Self::persist_from_streaming_state(ctx, body)?;
+            if matches!(action, FilterAction::Continue | FilterAction::Release) {
+                mark_released_stream_chunk(
+                    ctx,
+                    body,
+                    terminal_in_chunk,
+                    max_sequence_in_chunk,
+                    unclassified_in_chunk,
+                );
+            }
+            return Ok(action);
         }
 
         if !end_of_stream {
@@ -2678,11 +3093,36 @@ mod encode_replay_event_tests {
     use serde_json::json;
 
     use super::{
-        CapturedEvent, ResponseEventRecord, ResponseStoreFilter, StateOwner, buffered_parsed_json_bytes_upper_bound,
-        buffered_persistence_construction_fits, capture_request_input, encode_replay_event, encoded_column_headroom,
-        persistence_budget_failure, persistence_construction_fits,
+        AgenticBudgetPolicy, CapturedEvent, ResponseEventRecord, ResponseStoreFilter, StateOwner,
+        admit_request_input_snapshot, buffered_parsed_json_bytes_upper_bound, buffered_persistence_construction_fits,
+        capture_request_input, encode_replay_event, encoded_column_headroom, persistence_budget_failure,
+        persistence_construction_fits,
     };
-    use crate::openai::responses::state::ResponsesState;
+    use crate::openai::responses::{ObservedResponsesSse, state::ResponsesState};
+
+    #[test]
+    fn encoded_responses_are_not_persistable() {
+        for (content_type, streaming) in [("application/json", "false"), ("text/event-stream", "true")] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.stream", streaming);
+            let mut response = crate::test_utils::make_response();
+            response
+                .headers
+                .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static(content_type));
+            response
+                .headers
+                .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+            ctx.response_header = Some(&mut response);
+
+            assert!(!super::response_is_persistable(&mut ctx), "{content_type}");
+            assert_eq!(
+                ctx.get_metadata("responses.skip_persist"),
+                Some("true"),
+                "{content_type}"
+            );
+        }
+    }
 
     #[test]
     fn streaming_persistence_without_response_state_keeps_final_chunk() {
@@ -3133,6 +3573,101 @@ mod encode_replay_event_tests {
     }
 
     #[test]
+    fn request_input_snapshot_preflights_numeric_normalization_with_live_history() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        let raw = Bytes::from(format!(
+            r#"{{"model":"m","input":"hello","numbers":[{}]}}"#,
+            vec!["1e15"; 256].join(",")
+        ));
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let parsed_bytes = super::retained_json_bytes(&parsed).unwrap();
+        assert!(parsed_bytes > raw.len());
+        let mut state = ResponsesState::from_request_body(parsed);
+        state.iteration = 1;
+        state
+            .messages
+            .insert(0, json!({"role":"assistant","content":"x".repeat(65_536)}));
+        let baseline = state.retained_payload_bytes().unwrap();
+        let limit = baseline + raw.len() + 1;
+        state.apply_retained_payload_limit(limit);
+        assert!(state.can_retain_payload(raw.len()));
+        assert!(!state.can_retain_payload(parsed_bytes));
+        ctx.extensions.insert(state);
+        ctx.extensions.insert(
+            AgenticBudgetPolicy::from_config(&serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap())
+                .unwrap(),
+        );
+
+        let result = admit_request_input_snapshot(&mut ctx, &Some(raw));
+
+        assert!(matches!(result, Err(FilterAction::Reject(_))));
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+
+    #[test]
+    fn request_input_snapshot_overflow_uses_continuation_wire() {
+        for streaming in [false, true] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.extensions.insert(
+                AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap(),
+            );
+            let mut state = ResponsesState {
+                iteration: 1,
+                request_body: json!({"stream": streaming}),
+                messages: vec![json!("x".repeat(2800))],
+                ..ResponsesState::default()
+            };
+            state.apply_retained_payload_limit(4096);
+            assert!(state.can_retain_payload(0));
+            ctx.extensions.insert(state);
+            if streaming {
+                ctx.extensions.insert(ObservedResponsesSse);
+            }
+            let body = Some(Bytes::from(
+                serde_json::to_vec(&json!({"input":"y".repeat(1000)})).unwrap(),
+            ));
+
+            let action = admit_request_input_snapshot(&mut ctx, &body).unwrap_err();
+            assert!(matches!(action, FilterAction::Reject(_)));
+            if let FilterAction::Reject(rejection) = action {
+                assert_eq!(rejection.status, if streaming { 200 } else { 502 });
+            }
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
+    }
+
+    #[test]
+    fn captured_input_overflow_uses_continuation_wire() {
+        for streaming in [false, true] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            let mut state = ResponsesState {
+                iteration: 1,
+                request_body: json!({"stream": streaming}),
+                messages: vec![json!("x".repeat(2800))],
+                ..ResponsesState::default()
+            };
+            let baseline = state.retained_payload_bytes().unwrap();
+            state.apply_retained_payload_limit(baseline + 64);
+            ctx.extensions.insert(state);
+            if streaming {
+                ctx.extensions.insert(ObservedResponsesSse);
+            }
+
+            let action = capture_request_input(&mut ctx, json!("y".repeat(1000))).unwrap_err();
+            assert!(matches!(action, FilterAction::Reject(_)));
+            if let FilterAction::Reject(rejection) = action {
+                assert_eq!(rejection.status, if streaming { 200 } else { 502 });
+            }
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
+    }
+
+    #[test]
     #[expect(clippy::too_many_lines, reason = "checks input, replay, and replacement charges")]
     fn ordinary_stream_store_charges_input_before_replay_rows() {
         let filter =
@@ -3242,6 +3777,243 @@ mod encode_replay_event_tests {
         let mut later = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
         drop(filter.on_response_body(&mut ctx, &mut later, true).unwrap());
         assert!(later.is_none(), "a provider terminal after the error must be withheld");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks admitted, rejected, and payload-only SSE frames"
+    )]
+    fn direct_store_overflow_after_forwarded_completion_aborts_transport() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        for terminal in [
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":0}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"sequence_number\":0}\n\n".as_slice(),
+            b"event: response.completed\ndata: {}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\"}\n\n".as_slice(),
+        ] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.set_metadata("openai_responses_format.stream", "true");
+            let registry = crate::store::ResponseStoreRegistry::new();
+            registry
+                .register(
+                    &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                    std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+                )
+                .unwrap();
+            ctx.extensions.insert(registry);
+            let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":"x","stream":true}));
+            responses.apply_retained_payload_limit(4_096);
+            ctx.extensions.insert(responses);
+
+            let mut completed = Some(Bytes::copy_from_slice(terminal));
+            assert!(matches!(
+                filter.on_response_body(&mut ctx, &mut completed, false).unwrap(),
+                FilterAction::Release
+            ));
+            assert_eq!(completed.as_deref(), Some(terminal));
+
+            let trailing = b": keepalive\n\n";
+            let mut admitted_tail = Some(Bytes::from_static(trailing));
+            assert!(matches!(
+                filter.on_response_body(&mut ctx, &mut admitted_tail, false).unwrap(),
+                FilterAction::Release
+            ));
+            assert_eq!(admitted_tail.as_deref(), Some(trailing.as_slice()));
+
+            let mut overflow = Some(Bytes::from(vec![b'x'; 2_048]));
+            assert!(
+                filter.on_response_body(&mut ctx, &mut overflow, false).is_err(),
+                "a completed stream cannot receive a second terminal error"
+            );
+            assert!(overflow.is_none(), "the rejected chunk must not reach the client");
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks that a rejected terminal does not change the wire state"
+    )]
+    fn terminal_in_rejected_chunk_is_not_marked_as_forwarded() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":"x","stream":true}));
+        responses.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(responses);
+
+        let mut chunk =
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":0}\n\n".to_vec();
+        chunk.extend_from_slice(&vec![b'x'; 2_048]);
+        let mut rejected = Some(Bytes::from(chunk));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut rejected, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(
+            rejected
+                .as_ref()
+                .is_some_and(|bytes| bytes.starts_with(b"event: error")),
+            "the only terminal should be the replacement error"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks data-less SSE framing across separate chunks"
+    )]
+    fn data_less_terminal_header_does_not_mark_a_forwarded_terminal() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":"x","stream":true}));
+        responses.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(responses);
+
+        let mut header = Some(Bytes::from_static(b"event: response.completed\n\n"));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut header, false).unwrap(),
+            FilterAction::Release
+        ));
+        let mut overflow = Some(Bytes::from(vec![b'x'; 2_048]));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut overflow, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(
+            overflow
+                .as_ref()
+                .is_some_and(|bytes| bytes.starts_with(b"event: error"))
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reproduces an EOS overflow after replay capture was abandoned"
+    )]
+    fn abandoned_replay_still_tracks_a_forwarded_terminal_before_eos() {
+        let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        let input = "x".repeat(400);
+        let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":input,"stream":true}));
+        responses.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(responses);
+        capture_request_input(&mut ctx, json!(input)).unwrap();
+
+        let mut first = Some(Bytes::from_static(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n",
+        ));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut first, false).unwrap(),
+            FilterAction::Release
+        ));
+        assert!(
+            ctx.extensions
+                .get::<super::ResponseStoreRequestState>()
+                .unwrap()
+                .events_over_budget
+        );
+
+        let terminal = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1}\n\n";
+        let mut completed = Some(Bytes::copy_from_slice(terminal));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut completed, false).unwrap(),
+            FilterAction::Release
+        ));
+        assert_eq!(completed.as_deref(), Some(terminal.as_slice()));
+
+        let mut eos = None;
+        assert!(filter.on_response_body(&mut ctx, &mut eos, true).is_err());
+        assert!(eos.is_none(), "a second terminal must not follow the completed frame");
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks admitted provider sequences with and without replay capture"
+    )]
+    fn direct_store_budget_error_follows_admitted_provider_sequence() {
+        for max_event_bytes in [1, 1_048_576] {
+            let filter = ResponseStoreFilter::with_bounds(
+                NonZeroU32::new(1_024).unwrap(),
+                NonZeroU64::new(max_event_bytes).unwrap(),
+            );
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.set_metadata("openai_responses_format.stream", "true");
+            let registry = crate::store::ResponseStoreRegistry::new();
+            registry
+                .register(
+                    &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                    std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+                )
+                .unwrap();
+            ctx.extensions.insert(registry);
+            let input = "x".repeat(400);
+            let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":input,"stream":true}));
+            responses.apply_retained_payload_limit(4_096);
+            ctx.extensions.insert(responses);
+            capture_request_input(&mut ctx, json!(input)).unwrap();
+
+            let first =
+                b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":7}\n\n";
+            let mut frame = Some(Bytes::copy_from_slice(first));
+            assert!(matches!(
+                filter.on_response_body(&mut ctx, &mut frame, false).unwrap(),
+                FilterAction::Release
+            ));
+            assert_eq!(frame.as_deref(), Some(first.as_slice()));
+
+            let mut eos = None;
+            let action = filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+            assert!(matches!(action, FilterAction::Continue));
+            let (_, payload) = decode_single(eos.as_deref().unwrap());
+            let error: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(error.get("sequence_number"), Some(&json!(8)));
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
     }
 
     /// Once replay is abandoned at its independent cap, later wire chunks do
@@ -3681,6 +4453,202 @@ mod encode_replay_event_tests {
             store_filter.on_response(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the direct response crosses both rehydrate and store header filters"
+    )]
+    async fn budgeted_direct_stored_restore_uses_validated_framing() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "false");
+        let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"next","store":true}));
+        state.history_rehydrated = true;
+        state.previous_response_id = Some("resp_previous".to_owned());
+        state.apply_retained_payload_limit(65_536);
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        response
+            .headers
+            .insert(http::header::CONTENT_LENGTH, "300".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        let rehydrate = crate::openai::RehydrateFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+        assert!(matches!(
+            rehydrate.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(
+            ctx.response_header
+                .as_ref()
+                .unwrap()
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .is_none()
+        );
+        let store_filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(100).unwrap(), NonZeroU64::new(1_000_000).unwrap());
+        assert!(matches!(
+            store_filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert_eq!(
+            ctx.response_body_mode,
+            praxis_filter::body::BodyMode::StreamBuffer { max_bytes: Some(300) }
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the final response guard needs a complete store context"
+    )]
+    async fn incomplete_canonical_body_needs_no_direct_content_length() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "false");
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        let mut state = ResponsesState {
+            response_object: json!({"id":"resp_incomplete", "status":"incomplete", "output":[]}),
+            ..ResponsesState::default()
+        };
+        state.apply_retained_payload_limit(16_384);
+        state.buffered_canonical_finalized = true;
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        let store_filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(100).unwrap(), NonZeroU64::new(1_000_000).unwrap());
+
+        assert!(matches!(
+            store_filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(crate::openai::responses::final_conversation_buffer_budget_rejection(&ctx).is_none());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the complete response filter context is needed to test header admission"
+    )]
+    async fn noncanonical_budgeted_store_rejects_oversized_known_body_before_headers() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "false");
+        let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":true}));
+        state.apply_retained_payload_limit(16_384);
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        response
+            .headers
+            .insert(http::header::CONTENT_LENGTH, "3232".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        let store_filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(100).unwrap(), NonZeroU64::new(1_000_000).unwrap());
+
+        let rejection = match store_filter.on_response(&mut ctx).await.unwrap() {
+            FilterAction::Reject(rejection) => Some(rejection),
+            _ => None,
+        }
+        .expect("store staging must reject before core commits the upstream success header");
+        assert_eq!(rejection.status, 502);
+        let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            error.pointer("/error/type").and_then(serde_json::Value::as_str),
+            Some("server_error")
+        );
+    }
+
+    #[test]
+    fn noncanonical_header_reserves_multichunk_freeze_owner() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let wire_bytes = 100;
+        let parsed_bytes = wire_bytes * 8;
+        let mut state = ResponsesState::default();
+        let baseline = state.retained_payload_bytes().unwrap();
+        let headroom = encoded_column_headroom(parsed_bytes, 0, 0).unwrap();
+        state.apply_retained_payload_limit(baseline + parsed_bytes * 6 + headroom + wire_bytes + wire_bytes / 2);
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_LENGTH, wire_bytes.to_string().parse().unwrap());
+        ctx.response_header = Some(&mut response);
+
+        assert!(super::persistence_construction_fits_with_wire(
+            &ctx,
+            parsed_bytes,
+            wire_bytes
+        ));
+        assert_eq!(super::buffered_header_persistence_length(&ctx), None);
+    }
+
+    #[test]
+    fn shortest_exponent_tokens_stay_within_header_json_bound() {
+        let wire = format!("[{}]", vec!["1e0"; 4096].join(","));
+        let parsed_bound = buffered_parsed_json_bytes_upper_bound(wire.as_bytes()).unwrap();
+        assert!(parsed_bound <= wire.len() * 12);
+    }
+
+    #[test]
+    fn negative_zero_header_bound_covers_body_scanner_before_commit() {
+        let wire = format!("[{}]", vec!["-0"; 4096].join(","));
+        let bytes = wire.as_bytes();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut state = ResponsesState::default();
+        let baseline = state.retained_payload_bytes().unwrap();
+        let eightfold = bytes.len() * 8;
+        let headroom = encoded_column_headroom(eightfold, 0, 0).unwrap();
+        state.apply_retained_payload_limit(baseline + eightfold * 6 + headroom + bytes.len() * 2);
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_LENGTH, bytes.len().to_string().parse().unwrap());
+        ctx.response_header = Some(&mut response);
+
+        assert!(!buffered_persistence_construction_fits(&ctx, bytes));
+        assert_eq!(super::buffered_header_persistence_length(&ctx), None);
     }
 
     #[cfg(feature = "openai-conversations")]

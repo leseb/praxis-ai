@@ -1970,7 +1970,8 @@ fn result_payload_limit(retained_result_limit: usize) -> usize {
 /// its streaming executor can temporarily hold twice that wire ceiling while
 /// the adapter classifies an overflowing chunk. A session-ID server can also
 /// leave a standalone GET parser and rmcp messages live after each call. Its
-/// buffered DELETE response remains reserved while parked and closing.
+/// buffered DELETE response and a serialized automatic control reply remain
+/// reserved while parked and closing.
 /// Charge every call in the batch because their futures may run concurrently.
 fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<usize> {
     if call_count == 0 {
@@ -1981,11 +1982,13 @@ fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<
     let wire = mcp_client::tool_result_wire_cap(payload);
     let stream = mcp_client::tool_stream_retained_reserve(payload, payload)?;
     let delete = mcp_client::tool_delete_retained_reserve(payload)?;
+    let control = mcp_client::tool_control_retained_reserve(payload)?;
     admitted_results
         .checked_mul(RESULT_PAYLOAD_OWNER_COUNT)?
         .checked_add(wire.checked_mul(2)?.checked_mul(call_count)?)
         .and_then(|peak| peak.checked_add(stream.checked_mul(call_count)?))
         .and_then(|peak| peak.checked_add(delete.checked_mul(call_count)?))
+        .and_then(|peak| peak.checked_add(control.checked_mul(call_count)?))
 }
 
 /// Find the largest batch allowance whose complete wire and decoded peak
@@ -2166,7 +2169,7 @@ fn aggregate_transport_ceiling_lowered(
     configured_payload: usize,
 ) -> bool {
     let (admitted, configured) = match kind {
-        mcp_client::McpResponseLimitKind::Initialize => (
+        mcp_client::McpResponseLimitKind::Initialize | mcp_client::McpResponseLimitKind::Control => (
             admitted_payload.clamp(
                 mcp_client::MIN_TOOL_INITIALIZE_BYTES,
                 mcp_client::MAX_CONTROL_RESPONSE_BYTES,
@@ -2190,7 +2193,6 @@ fn aggregate_transport_ceiling_lowered(
                 configured_payload,
             ),
         ),
-        mcp_client::McpResponseLimitKind::Control => return false,
     };
     lowered_exchange_ceiling(limit, admitted, configured)
 }

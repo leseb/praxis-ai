@@ -464,6 +464,13 @@ fn stream_converter_budget_failure(
 ) -> Result<FilterAction, FilterError> {
     if completed_terminal_already_delivered {
         *body = None;
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.discard_payload_for_budget_error();
+            state.retained_chat_converter_bytes = 0;
+        }
+        #[cfg(feature = "store")]
+        super::store::discard_retained_request_payload(ctx);
+        ctx.set_metadata("responses.skip_persist", "true");
         return Err(
             "responses_to_chat_completions: provider bytes after a terminal exceeded the retained payload budget"
                 .into(),

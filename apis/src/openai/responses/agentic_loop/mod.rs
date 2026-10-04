@@ -1226,12 +1226,12 @@ fn end_at_iteration_limit(
 
 /// Upper bound on compact JSON bytes after parsing a request or response.
 ///
-/// `serde_json` can expand exponent-form numbers while serializing its parsed
-/// `Value` (for example, `1e15` becomes `1000000000000000.0`). Its current
+/// `serde_json` can expand exponent or decimal-form numbers while serializing
+/// its parsed `Value` (for example, `1e15` becomes `1000000000000000.0`, and
+/// rounding can turn a plain decimal into a longer exponent form). Its current
 /// finite-float formatter has a 24-byte buffer. Scan number tokens outside
 /// strings without allocating so the parsed tree is admitted before creation.
-/// Integers below 20 bytes and decimal forms without an exponent already have
-/// a shortest round-trip spelling no longer than their input; `-0` is special.
+/// Integers below 20 bytes retain their spelling length; `-0` is special.
 #[expect(
     clippy::too_many_lines,
     reason = "single-pass lexical bound must skip quoted number-like text"
@@ -1264,16 +1264,16 @@ pub(crate) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usiz
             continue;
         }
         let start = index;
-        let mut has_exponent = false;
+        let mut may_normalize = false;
         while let Some(&number_byte) = body.get(index) {
             if !matches!(number_byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
                 break;
             }
-            has_exponent |= matches!(number_byte, b'e' | b'E');
+            may_normalize |= matches!(number_byte, b'e' | b'E' | b'.');
             index += 1;
         }
         let token = body.get(start..index)?;
-        if has_exponent || token.len() >= 20 || token == b"-0" {
+        if may_normalize || token.len() >= 20 || token == b"-0" {
             extra = extra.checked_add(MAX_FORMATTED_NUMBER_BYTES.saturating_sub(token.len()))?;
         }
     }

@@ -689,7 +689,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
 }
 
 #[test]
-fn aggregate_mcp_peak_reserves_budgeted_delete_response() {
+fn aggregate_mcp_peak_reserves_budgeted_control_and_delete_responses() {
     let admitted = 1_024;
     let payload = admitted / 4;
     let wire = crate::mcp_client::tool_result_wire_cap(payload);
@@ -697,8 +697,8 @@ fn aggregate_mcp_peak_reserves_budgeted_delete_response() {
     let delete = crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES;
     assert_eq!(
         super::mcp_callout_peak_bytes(admitted, 1),
-        Some(admitted * 4 + wire * 2 + stream + delete * 2),
-        "call admission must reserve the buffered DELETE peak before opening the session"
+        Some(admitted * 4 + wire * 2 + stream + delete * 5),
+        "call admission must reserve one automatic control POST and DELETE before opening the session"
     );
 }
 
@@ -1466,16 +1466,16 @@ fn configured_streaming_backstops_remain_recoverable() {
 }
 
 #[test]
-fn fixed_control_cap_does_not_alias_aggregate_initialize_backstop() {
+fn admitted_control_cap_is_a_request_wide_limit() {
     let mut options = execution_options(false, std::time::Duration::from_secs(1));
     options.max_result_bytes = 2 * 1_048_576;
     options.configured_max_result_bytes = 4 * 1_048_576;
     options.aggregate_result_policy = super::McpAggregateResultPolicy::PerCallConstrained;
     let limit = crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES;
     assert_eq!(result_payload_limit(options.max_result_bytes) * 2, limit);
-    for (kind, terminal) in [
-        (crate::mcp_client::McpResponseLimitKind::Control, false),
-        (crate::mcp_client::McpResponseLimitKind::Initialize, true),
+    for kind in [
+        crate::mcp_client::McpResponseLimitKind::Control,
+        crate::mcp_client::McpResponseLimitKind::Initialize,
     ] {
         let error = crate::mcp_client::McpClientError::ResponseTooLarge {
             url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
@@ -1483,7 +1483,7 @@ fn fixed_control_cap_does_not_alias_aggregate_initialize_backstop() {
             kind,
         };
         let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, options.max_result_bytes);
-        assert_eq!(super::aggregate_result_limit_exceeded(&result, &options), terminal);
+        assert!(super::aggregate_result_limit_exceeded(&result, &options));
     }
 }
 

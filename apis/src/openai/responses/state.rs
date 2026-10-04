@@ -1085,6 +1085,7 @@ impl ResponsesState {
     /// client-tool echo remain stable between upstream chunks. Measure them
     /// once per round; streaming filters refresh this baseline when discovery,
     /// binding, a request rewrite, or the next round changes it.
+    #[expect(clippy::too_many_lines, reason = "all stable request owners share one revision")]
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1114,6 +1115,16 @@ impl ResponsesState {
             meter.json(value)?;
         }
         self.meter_deferred_mcp_payload(&mut meter)?;
+        for value in [
+            self.context_management.as_ref(),
+            self.conversation.as_ref(),
+            self.previous_usage.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.json(value)?;
+        }
         Some(meter.used())
     }
 
@@ -1266,6 +1277,16 @@ impl ResponsesState {
                 meter.json(value)?;
             }
             self.meter_deferred_mcp_payload(&mut meter)?;
+            for value in [
+                self.context_management.as_ref(),
+                self.conversation.as_ref(),
+                self.previous_usage.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                meter.json(value)?;
+            }
         }
         if let Some(bytes) = cached_current_output_bytes {
             meter.raw(bytes)?;
@@ -1280,16 +1301,6 @@ impl ResponsesState {
         }
         for values in [&self.tool_search_calls, &self.web_search_calls] {
             meter.json_values(values)?;
-        }
-        for value in [
-            self.context_management.as_ref(),
-            self.conversation.as_ref(),
-            self.previous_usage.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            meter.json(value)?;
         }
         for (private_name, lowered) in &self.client_tool_lowering {
             meter.raw(private_name.len())?;
@@ -2090,6 +2101,48 @@ mod tests {
         );
         assert_eq!(state.retained_payload_bytes().unwrap(), stable + changing);
         assert_eq!(state.replay_stable_payload_revision, Some(1));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks every streaming consumer of the stable context"
+    )]
+    fn unchanged_context_fields_use_the_stream_stable_charge() {
+        let mut state = ResponsesState::default();
+        let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing_before = state
+            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
+            .unwrap();
+        state.context_management = Some(json!({"context": "c".repeat(1_048_576)}));
+        state.conversation = Some(json!({"id": "v".repeat(4_096)}));
+        state.previous_usage = Some(json!({"note": "p".repeat(4_096)}));
+        state.mark_replay_stable_payload_changed();
+
+        let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
+        let current_output = current_output_bytes(&state);
+        assert!(stable > stable_before + 1_048_576);
+        assert_eq!(
+            state.stream_changing_payload_bytes_bounded_for_parser(usize::MAX),
+            Some(changing_before)
+        );
+        assert_eq!(state.retained_payload_bytes().unwrap(), stable + changing_before);
+
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            for changing in [
+                state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+                state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+                #[cfg(feature = "store")]
+                state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+            ] {
+                assert_eq!(changing, Some(changing_before));
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stable context must not be serialized per chunk"
+        );
     }
 
     #[test]

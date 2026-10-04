@@ -4183,7 +4183,7 @@ async fn empty_completed_conversation_turn_skips_append_budget_staging() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn budgeted_stale_completed_state_without_loop_uses_body() {
+async fn budgeted_stale_completed_state_without_loop_rejects_before_header() {
     let (filter, store) = sqlite_harness().await;
     let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
     let req = make_request(Method::POST, "/v1/responses");
@@ -4204,19 +4204,8 @@ async fn budgeted_stale_completed_state_without_loop_uses_body() {
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
     ctx.response_header = Some(&mut response);
-    assert!(matches!(
-        filter.on_response(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let original = Bytes::from_static(
-        b"{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"fallback answer\"}]}",
-    );
-    let mut body = Some(original.clone());
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
-        FilterAction::Continue
-    ));
-    assert_eq!(body, Some(original));
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
     let items = store
         .list_conversation_items(
             &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
@@ -4227,9 +4216,51 @@ async fn budgeted_stale_completed_state_without_loop_uses_body() {
         )
         .await
         .unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].item_data["role"], "assistant");
-    assert!(items[0].item_data.to_string().contains("fallback answer"));
+    assert!(items.is_empty(), "stale completion must not append unverified output");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_canonical_incomplete_conversation_preserves_partial_response() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        response_object: serde_json::json!({"status":"incomplete","output":[]}),
+        buffered_canonical_finalized: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from_static(b"{\"status\":\"incomplete\",\"output\":[]}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+    assert!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4471,6 +4502,11 @@ async fn response_conditions_excluding_store_do_not_suppress_conversation_append
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    // Core-private IterationState is unavailable in this synthetic context;
+    // a bounded provider header keeps this test focused on round participation.
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, "512".parse().unwrap());
     ctx.response_header = Some(&mut response);
 
     // An intermediate IRR response did run Store. Its participation marker
@@ -4740,6 +4776,42 @@ async fn store_false_append_rejects_sql_message_cache_rebuild_without_new_items(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_noncanonical_conversation_rejects_before_json_header() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    let FilterAction::Reject(rejection) = filter.on_response(&mut ctx).await.unwrap() else {
+        panic!("unknown buffered append cost must reject before a 200 header");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "server_error");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_budget_failure_removes_only_response_persisted_by_this_exchange() {
     let (filter, store) = sqlite_harness().await;
     let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
@@ -4770,9 +4842,9 @@ async fn append_budget_failure_removes_only_response_persisted_by_this_exchange(
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
     ctx.response_header = Some(&mut response);
-    drop(filter.on_response(&mut ctx).await.unwrap());
-    // Exercise the compatibility body seam for a noncanonical response;
-    // full-flow canonical turns append in the header hook.
+    // The response was persisted by another response-header filter in this
+    // exchange. A noncanonical append must reject and roll it back before
+    // the 200 JSON header is committed.
     store
         .persist_response_with_pending_approvals_if_absent(
             &ResponseRecord {
@@ -4792,14 +4864,7 @@ async fn append_budget_failure_removes_only_response_persisted_by_this_exchange(
         .insert(crate::openai::responses::store::PersistedResponseForConversation(
             response_id.to_owned(),
         ));
-    let mut body = Some(Bytes::from(
-        serde_json::to_vec(&serde_json::json!({
-            "id":response_id,"status":"completed",
-            "output":[{"type":"message","role":"assistant","content":"x".repeat(1024)}]
-        }))
-        .unwrap(),
-    ));
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
     assert!(store.get_response(&owner, response_id).await.unwrap().is_none());
 }
@@ -4844,11 +4909,18 @@ async fn rollback_error_still_terminalizes_conversation_budget_failure() {
             .unwrap(),
         );
         ctx.response_header = Some(&mut response);
-        drop(filter.on_response(&mut ctx).await.unwrap());
         ctx.extensions
             .insert(crate::openai::responses::store::PersistedResponseForConversation(
                 "resp_rollback_failure".to_owned(),
             ));
+        let header_action = filter.on_response(&mut ctx).await.unwrap();
+        if !streaming {
+            assert!(matches!(header_action, FilterAction::Reject(rejection) if rejection.status == 502));
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+            assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+            continue;
+        }
+        assert!(matches!(header_action, FilterAction::Continue));
         let mut body = Some(Bytes::from(if streaming {
             format!(
                 "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"text\":\"{}\"}}]}}}}\n\n",
@@ -4867,8 +4939,6 @@ async fn rollback_error_still_terminalizes_conversation_budget_failure() {
             let wire = String::from_utf8_lossy(body.as_ref().unwrap());
             assert!(wire.contains("event: error"), "{wire}");
             assert!(!wire.contains("event: response.completed"), "{wire}");
-        } else {
-            assert!(matches!(action, Ok(FilterAction::Reject(rejection)) if rejection.status == 502));
         }
         assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
         assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
@@ -6643,6 +6713,11 @@ async fn review_final_gate_must_not_revive_a_conversation_hook_skipped_this_roun
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    // Core-private IterationState is unavailable in this synthetic context;
+    // a bounded provider header keeps this test focused on round participation.
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, "512".parse().unwrap());
     ctx.response_header = Some(&mut response);
 
     // An intermediate IRR response did run Store. Its participation marker

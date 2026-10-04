@@ -1220,6 +1220,15 @@ async fn full_flow_encoded_response_passes_through_untouched() {
         ENCODED_RESPONSE_BODY,
         "an encoded body must pass through byte-for-byte with no rewrite attempt"
     );
+    let pool = sqlx::SqlitePool::connect(db.url()).await.expect("store should open");
+    let stored_responses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("stored response count should load");
+    assert_eq!(
+        stored_responses, 1,
+        "the opaque encoded second response must not be persisted"
+    );
 
     drop(proxy2);
 }

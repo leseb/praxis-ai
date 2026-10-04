@@ -2219,9 +2219,11 @@ async fn parked_session_reserves_partial_get_sse_parser() {
         .await
         .expect("standalone GET must receive a partial SSE event");
     let stream_reserve = tool_stream_retained_reserve(2_048, 2_048).unwrap();
+    let control_reserve = tool_control_retained_reserve(2_048).unwrap();
+    let delete_reserve = tool_delete_retained_reserve(2_048).unwrap();
     assert!(
-        pool.retained_payload_bytes().unwrap() >= stream_reserve,
-        "the parked session must reserve its still-live partial SSE parser"
+        pool.retained_payload_bytes().unwrap() >= stream_reserve + control_reserve + delete_reserve,
+        "the parked session must reserve its partial GET parser, automatic control reply, and cleanup"
     );
     pool.drain().await;
     ct.cancel();
@@ -2768,7 +2770,10 @@ async fn budgeted_background_delete_charges_its_buffered_response_while_in_fligh
     let session = checkout.session.expect("warm session must be reusable");
     let peer_bytes =
         crate::openai::responses::state::retained_json_bytes(session.service().peer_info().unwrap().as_ref()).unwrap();
-    let expected = peer_bytes + tool_stream_retained_reserve(256, 1_024).unwrap() + 2 * 1_024;
+    let expected = peer_bytes
+        + tool_stream_retained_reserve(256, 1_024).unwrap()
+        + tool_delete_retained_reserve(1_024).unwrap()
+        + tool_control_retained_reserve(1_024).unwrap();
     pool.close_sessions_in_background(vec![session]);
     tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
         .await

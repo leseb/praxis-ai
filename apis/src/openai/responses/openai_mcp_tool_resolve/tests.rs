@@ -5,6 +5,34 @@
 
 use super::*;
 
+#[test]
+fn request_parse_preflights_numeric_normalization_with_live_history() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    let raw = Bytes::from(format!(
+        r#"{{"model":"m","input":"hello","numbers":[{}]}}"#,
+        vec!["1e15"; 256].join(",")
+    ));
+    let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let parsed_bytes = retained_json_bytes(&parsed).unwrap();
+    assert!(parsed_bytes > raw.len());
+    let mut state = ResponsesState::from_request_body(parsed);
+    state.iteration = 1;
+    state
+        .messages
+        .insert(0, serde_json::json!({"role":"assistant","content":"x".repeat(65_536)}));
+    let baseline = state.retained_payload_bytes().unwrap();
+    let limit = baseline + raw.len() + 1;
+    state.apply_retained_payload_limit(limit);
+    assert!(state.can_retain_payload(raw.len()));
+    assert!(!state.can_retain_payload(parsed_bytes));
+    ctx.extensions.insert(state);
+
+    let result = parse_budgeted_mcp_request(&mut ctx, &raw, None);
+
+    assert!(matches!(result, Err(FilterAction::Reject(_))));
+}
+
 // =========================================================================
 // Config Parsing
 // =========================================================================
