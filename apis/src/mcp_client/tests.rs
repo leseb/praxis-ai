@@ -2219,9 +2219,11 @@ async fn parked_session_reserves_partial_get_sse_parser() {
         .await
         .expect("standalone GET must receive a partial SSE event");
     let stream_reserve = tool_stream_retained_reserve(2_048, 2_048).unwrap();
+    let control_reserve = tool_control_retained_reserve(2_048).unwrap();
+    let delete_reserve = tool_delete_retained_reserve(2_048).unwrap();
     assert!(
-        pool.retained_payload_bytes().unwrap() >= stream_reserve,
-        "the parked session must reserve its still-live partial SSE parser"
+        pool.retained_payload_bytes().unwrap() >= stream_reserve + control_reserve + delete_reserve,
+        "the parked session must reserve its partial GET parser, automatic control reply, and cleanup"
     );
     pool.drain().await;
     ct.cancel();
