@@ -78,9 +78,6 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
-/// Maximum Pingora H1 body read or default H2 flow-window chunk before the
-/// core buffered client applies its response-length check.
-const MAX_TRANSPORT_CHUNK_BYTES: usize = 65_536;
 /// Conservative live-owner reserve for the pinned tiktoken fallback. Its
 /// large-piece BPE path holds 32-byte states, a growable merge heap, token
 /// vectors, and regex workspace alongside both formatted conversation strings.
@@ -321,11 +318,8 @@ impl CompactFilter {
             // during growth. Pingora may first read a full 64 KiB chunk into
             // its own buffer and copy that chunk before enforcing the requested
             // response limit. Reserve both transport owners before dispatch.
-            let transport_staging = MAX_TRANSPORT_CHUNK_BYTES
-                .checked_mul(2)
-                .ok_or(ReactiveCompactionError::RetainedBudget)?;
             let aggregate_read_limit = available
-                .checked_sub(transport_staging)
+                .checked_sub(subrequest::MAX_TRANSPORT_STAGING_BYTES)
                 .ok_or(ReactiveCompactionError::RetainedBudget)?
                 / 3;
             if aggregate_read_limit == 0 {

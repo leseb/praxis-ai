@@ -2358,12 +2358,24 @@ fn web_search_response_limit_is_derived_before_dispatch() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
     let current = state.retained_payload_bytes().unwrap();
-    state.apply_retained_payload_limit(current + 32_768);
+    state.apply_retained_payload_limit(current + crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 32_768);
     ctx.extensions.insert(state);
 
     let limit = web_search_response_limit(&ctx, "query", &[]).unwrap();
     assert!(limit < MAX_SEARCH_RESPONSE_BYTES);
     assert!(limit <= (32_768 - 4_096 - "query".len() * 8) / 32);
+}
+
+#[test]
+fn web_search_rejects_before_dispatch_without_transport_staging_headroom() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + crate::subrequest::MAX_TRANSPORT_STAGING_BYTES - 1);
+    ctx.extensions.insert(state);
+
+    assert_eq!(web_search_response_limit(&ctx, "query", &[]), None);
 }
 
 #[test]
