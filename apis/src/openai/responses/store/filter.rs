@@ -1002,13 +1002,30 @@ fn persistence_construction_fits_with_wire(
             .checked_add(record.arguments.len())?
             .checked_add(record.target_fingerprint.len())
     });
+    let replay_id_bytes = replay_identity_stamp_bytes(ctx, state);
     let additional = response_bytes
         .checked_mul(5)
         .and_then(|bytes| history_bytes.checked_mul(3)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(input_bytes))
         .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(replay_id_bytes?))
         .and_then(|bytes| bytes.checked_add(wire_bytes));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Reserve the response ID copied into each durable replay row. Owner clones
+/// share their `Arc<str>` payloads and do not add per-row owner bytes.
+fn replay_identity_stamp_bytes(ctx: &HttpFilterContext<'_>, state: &ResponsesState) -> Option<usize> {
+    let Some(capture) = ctx.extensions.get::<ResponseStoreRequestState>() else {
+        return Some(0);
+    };
+    if capture.events_over_budget {
+        return Some(0);
+    }
+    let Some(id) = state.response_object.get("id").and_then(Value::as_str) else {
+        return Some(0);
+    };
+    id.len().checked_mul(capture.events.len())
 }
 
 /// A canonical response admitted for persistence before client headers commit.
@@ -2481,8 +2498,9 @@ mod encode_replay_event_tests {
     use serde_json::json;
 
     use super::{
-        DirectFiniteRestoreFraming, ResponseEventRecord, ResponseStoreFilter, StateOwner,
+        CapturedEvent, DirectFiniteRestoreFraming, ResponseEventRecord, ResponseStoreFilter, StateOwner,
         buffered_header_persistence_length, capture_request_input, encode_replay_event, persistence_budget_failure,
+        persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
 
@@ -2603,6 +2621,43 @@ mod encode_replay_event_tests {
             128 + store_bytes,
             "replay accounting must preserve other sibling-filter charges"
         );
+    }
+
+    /// Replay rows each own a response ID after the parent record is persisted.
+    /// Admit those clones before persistence, even when each captured event is tiny.
+    #[test]
+    fn replay_persistence_reserves_response_id_for_each_event() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState {
+            response_object: json!({"id": "r".repeat(10_000), "created_at": 1, "model": "test", "output": []}),
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(1_048_576);
+        let response_bytes = super::retained_json_bytes(&responses.response_object).unwrap();
+        let events = (0..1_000)
+            .map(|sequence_number| CapturedEvent {
+                sequence_number,
+                event_type: "response.output_text.delta".to_owned(),
+                payload: b"{}".to_vec(),
+                terminal: false,
+            })
+            .collect::<Vec<_>>();
+        let capture = super::ResponseStoreRequestState {
+            event_bytes: events.iter().map(|event| event.payload.len() as u64).sum(),
+            event_name_bytes: events.iter().map(|event| event.event_type.len()).sum(),
+            events,
+            ..super::ResponseStoreRequestState::default()
+        };
+        responses.set_retained_external_payload_bytes(capture.retained_payload_bytes().unwrap());
+        ctx.extensions.insert(responses);
+        ctx.extensions.insert(capture);
+
+        assert!(!persistence_construction_fits(&ctx, response_bytes));
+        let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        *responses.response_object.get_mut("id").unwrap() = json!("r");
+        let short_response_bytes = super::retained_json_bytes(&responses.response_object).unwrap();
+        assert!(persistence_construction_fits(&ctx, short_response_bytes));
     }
 
     #[test]
