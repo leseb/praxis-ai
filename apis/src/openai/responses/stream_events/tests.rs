@@ -7587,3 +7587,74 @@ fn make_armed_context_with_filter(
     filter.arm(&mut ctx);
     (filter, ctx)
 }
+
+#[test]
+fn budget_rejects_lossy_expansion_of_prior_partial_event_line() {
+    let filter = make_filter();
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true}));
+    responses.apply_retained_payload_limit(4_096);
+    ctx.extensions.insert(responses);
+    filter.arm(&mut ctx);
+
+    let mut partial = b"event: ".to_vec();
+    partial.extend(std::iter::repeat_n(0xFF, 3_000));
+    for fragment in partial.chunks(100) {
+        let mut body = Some(Bytes::copy_from_slice(fragment));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "an unfinished line remains within the budget"
+        );
+    }
+    let mut terminator = Some(Bytes::from_static(b"\n"));
+    filter.on_response_body(&mut ctx, &mut terminator, false).unwrap();
+    assert!(
+        ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+        "the old line's lossy UTF-8 expansion must be rejected before parsing"
+    );
+    assert!(terminator.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budget_rejects_same_chunk_function_call_clone_fanout() {
+    let filter = make_filter();
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true}));
+    responses.apply_retained_payload_limit(102_232);
+    ctx.extensions.insert(responses);
+    filter.arm(&mut ctx);
+
+    let mut wire = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "x".repeat(10_000), "arguments": ""}
+        }),
+    )
+    .to_vec();
+    let done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "arguments": "{}"}),
+    );
+    for _ in 0..32 {
+        wire.extend_from_slice(&done);
+    }
+    let mut body = Some(Bytes::from(wire));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        responses.retained_payload_failed,
+        "fanout must fail before any item clone is committed"
+    );
+    assert!(responses.tool_calls.is_empty(), "no tool-call copies may be retained");
+    assert!(body.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}

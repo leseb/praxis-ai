@@ -917,10 +917,13 @@ fn parse_and_accumulate(
     // The incoming chunk is framework-owned, but parsing can temporarily own
     // both the current line and the copied data/event field before the line is
     // cleared. An invalid UTF-8 event field can expand each input byte to the
-    // three-byte replacement character, so four times the chunk length bounds
-    // the line plus its decoded field. Existing parser scratch is already
-    // included by `stream_payload_fits`.
-    let Some(parser_projection_bytes) = bytes.len().checked_mul(4) else {
+    // three-byte replacement character. Bound this chunk and any earlier
+    // unfinished line that it terminates while the raw line remains live.
+    let Some(parser_projection_bytes) = bytes
+        .len()
+        .checked_mul(4)
+        .and_then(|chunk| chunk.checked_add(state.frame_parser.pending_line_transition_bytes(bytes)?))
+    else {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
@@ -978,8 +981,19 @@ fn parse_and_accumulate(
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
+    let projected_item_scratch_bytes = projected_output_item_scratch_capacity(ctx, &events)
+        .and_then(|slots| slots.checked_mul(std::mem::size_of::<&Value>()));
+    if !construction_bytes
+        .zip(projected_item_scratch_bytes)
+        .and_then(|(construction, scratch)| construction.checked_add(scratch))
+        .is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget))
+    {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    }
     let projected_state_clone_bytes = projected_responses_state_clone_bytes(ctx, &events);
     if !construction_bytes
+        .and_then(|staging| staging.checked_add(projected_item_scratch_bytes?))
         .and_then(|staging| staging.checked_add(projected_state_clone_bytes?))
         .and_then(|staging| staging.checked_add(logical_output_upper_bound.checked_mul(2)?))
         .is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget))
@@ -1018,6 +1032,82 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
     }
 }
 
+/// Number of borrowed item slots needed to project same-chunk item mutations.
+/// The caller reserves these pointer slots before constructing the scratch vec.
+fn projected_output_item_scratch_capacity(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
+    let has_done = events
+        .iter()
+        .any(|event| matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_)));
+    let has_item_mutation = events.iter().any(|event| {
+        matches!(
+            event,
+            ResponsesEvent::OutputItemAdded(_) | ResponsesEvent::OutputItemDone(_)
+        )
+    });
+    if !has_done || !has_item_mutation {
+        return Some(0);
+    }
+    let existing = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map_or(0, |state| state.output_items().len());
+    events.iter().try_fold(existing, |slots, event| {
+        if matches!(
+            event,
+            ResponsesEvent::OutputItemAdded(_) | ResponsesEvent::OutputItemDone(_)
+        ) {
+            slots.checked_add(1)
+        } else {
+            Some(slots)
+        }
+    })
+}
+
+/// Mirror the accumulator's append/replace rules without cloning item payloads.
+fn project_output_item<'a>(items: &mut Vec<&'a Value>, event: &ResponsesEvent, payload: &'a Value) {
+    let Some(item) = payload.get("item") else {
+        return;
+    };
+    if matches!(event, ResponsesEvent::OutputItemAdded(_)) {
+        items.push(item);
+        return;
+    }
+    if let Some(index) = payload
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        && let Some(slot) = items.get_mut(index)
+    {
+        *slot = item;
+        return;
+    }
+    if let Some(id) = item.get("id").and_then(Value::as_str)
+        && let Some(slot) = items
+            .iter_mut()
+            .find(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+    {
+        *slot = item;
+        return;
+    }
+    items.push(item);
+}
+
+/// Match `find_output_item` against borrowed items added earlier in this chunk.
+fn find_projected_output_item<'a>(items: &[&'a Value], payload: &Value) -> Option<&'a Value> {
+    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str)
+        && let Some(item) = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
+    {
+        return Some(item);
+    }
+    let index = payload
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())?;
+    items.get(index).copied()
+}
+
 /// Count payloads that accumulation may clone into [`ResponsesState`] while
 /// the parsed event vector is still live.
 ///
@@ -1032,6 +1122,16 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
 )]
 fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>();
+    let scratch_capacity = projected_output_item_scratch_capacity(ctx, events)?;
+    let mut projected_items = if scratch_capacity == 0 {
+        None
+    } else {
+        let mut items = Vec::with_capacity(scratch_capacity);
+        if let Some(state) = state {
+            items.extend(state.output_items());
+        }
+        Some(items)
+    };
     events.iter().try_fold(0_usize, |used, event| {
         let event_bytes = retained_event_payload_bytes(event)?;
         let additional = match event {
@@ -1049,6 +1149,9 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
             },
             ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
                 let item_bytes = payload.get("item").map_or(Some(0), retained_json_bytes)?;
+                if let Some(items) = projected_items.as_mut() {
+                    project_output_item(items, event, payload);
+                }
                 // Besides the canonical output item, logical-stream
                 // reconciliation can retain item ids, local-tool keys, and a
                 // normalized payload while the parsed event is still live.
@@ -1060,20 +1163,10 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
                 key_bytes.checked_add(delta_bytes)?.checked_add(event_bytes)?
             },
             ResponsesEvent::FunctionCallArgumentsDone(payload) => {
-                let matched_item = state.and_then(|state| {
-                    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str) {
-                        state
-                            .output_items()
-                            .iter()
-                            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
-                    } else {
-                        payload
-                            .get("output_index")
-                            .and_then(Value::as_u64)
-                            .and_then(|index| usize::try_from(index).ok())
-                            .and_then(|index| state.output_items().get(index))
-                    }
-                });
+                let matched_item = projected_items.as_ref().map_or_else(
+                    || state.and_then(|state| find_output_item(state.output_items(), payload)),
+                    |items| find_projected_output_item(items, payload),
+                );
                 // Completion may own an extracted argument string, grow the
                 // canonical item, and clone that completed item into
                 // `tool_calls` before the event is consumed.
