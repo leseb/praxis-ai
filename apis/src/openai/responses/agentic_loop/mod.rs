@@ -542,22 +542,6 @@ fn admit_retained_payload_budget(
     ctx: &mut HttpFilterContext<'_>,
     configured_limit: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
-    // Conversation append-back builds independent input/output records and a
-    // store message cache after the agentic response. Until that owner has a
-    // pre-allocation admission hook, reject this budgeted route before the
-    // first provider/tool side effect rather than let it evade the shared cap.
-    #[cfg(feature = "openai-conversations")]
-    if ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
-        && ctx.get_metadata("responses.conversation_id").is_some()
-        && ctx.get_metadata("openai_responses_format.background") != Some("true")
-    {
-        set_action(ctx, ACTION_DONE)?;
-        return Ok(Some(super::budget_error::reject_request(
-            ctx,
-            "conversation append exceeds the current openai_agentic_loop.max_retained_bytes admission policy",
-        )));
-    }
-
     #[cfg(feature = "store")]
     let store_payload_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
     #[cfg(not(feature = "store"))]
