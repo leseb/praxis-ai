@@ -714,6 +714,20 @@ impl HttpFilter for OpenaiConversationsFilter {
                         if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
                             state.append_attempted = true;
                         }
+                    } else if ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+                        state.buffered_canonical_finalized
+                            && matches!(
+                                state.response_object.get("status").and_then(Value::as_str),
+                                Some("incomplete" | "failed")
+                            )
+                    }) {
+                        // The agentic loop finalized this turn, but it cannot
+                        // contribute a successful assistant item to the
+                        // conversation. Preserve the admitted partial/error
+                        // response without running append-back.
+                        if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
+                            state.append_attempted = true;
+                        }
                     } else {
                         // A conditional branch may skip canonical agentic
                         // completion. The buffered body, parsed append items,

@@ -4220,6 +4220,50 @@ async fn budgeted_stale_completed_state_without_loop_rejects_before_header() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_canonical_incomplete_conversation_preserves_partial_response() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        response_object: serde_json::json!({"status":"incomplete","output":[]}),
+        buffered_canonical_finalized: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from_static(b"{\"status\":\"incomplete\",\"output\":[]}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+    assert!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reversed_response_filter_order_persists_before_budgeted_conversation_append() {
     let (conversations, store) = sqlite_harness().await;
     let response_store_config: serde_yaml::Value = serde_yaml::from_str(

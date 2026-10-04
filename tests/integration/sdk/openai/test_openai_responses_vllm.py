@@ -1065,6 +1065,11 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                 ]
             ),
         }
+        if "BUDGET-CANONICAL-INCOMPLETE-410" in request_input:
+            response["status"] = "incomplete"
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+            response["output"][0]["status"] = "incomplete"
+            response["output"][0]["content"][0]["text"] = "partial answer"
         if web_call_limit:
             # The full-flow example allows 32 web calls per round. A completed
             # upstream snapshot with 33 calls makes IRR emit an SSE error in
@@ -2779,6 +2784,26 @@ class TestOpenAIResponsesVLLM:
             assert exc_info.value.status_code == 502
             assert exc_info.value.response.json()["error"]["type"] == "server_error"
             assert forwarded, "the backend response must reach the header hook"
+            assert client.conversations.items.list(conversation.id).data == []
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_budgeted_canonical_incomplete_conversation_keeps_partial_response(
+        self, witness_budgeted_continuation_client
+    ):
+        """A finalized incomplete response needs no append and keeps its 200 wire."""
+        client, _ = witness_budgeted_continuation_client
+        conversation = client.conversations.create()
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="BUDGET-CANONICAL-INCOMPLETE-410",
+                conversation=conversation.id,
+                store=False,
+                max_output_tokens=1,
+            )
+            assert response.status == "incomplete"
+            assert response.output_text == "partial answer"
             assert client.conversations.items.list(conversation.id).data == []
         finally:
             client.conversations.delete(conversation.id)
