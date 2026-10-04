@@ -809,6 +809,33 @@ fn append_rebuild_allowance(
     Ok(Some(remaining))
 }
 
+/// Remove only the response this exchange inserted before append-back failed.
+fn rollback_persisted_response(ctx: &mut HttpFilterContext<'_>) {
+    let Some(marker) = ctx.extensions.remove::<PersistedResponseForConversation>() else {
+        return;
+    };
+    let rollback = (|| -> Result<(), FilterError> {
+        let owner = ctx
+            .extensions
+            .get::<CapturedAppendOwner>()
+            .ok_or_else(|| FilterError::from("openai_conversations: append owner missing for rollback"))?;
+        let store = ctx
+            .extensions
+            .get::<ResponseStoreRegistry>()
+            .and_then(|registry| registry.get_scoped(crate::openai::responses::DEFAULT_STORE_NAME, &owner.0))
+            .ok_or_else(|| FilterError::from("openai_conversations: response store missing for rollback"))?;
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| handle.block_on(store.delete_response(&marker.0)))
+            .map_err(|error| -> FilterError { Box::new(error) })?;
+        Ok(())
+    })();
+    if let Err(error) = rollback {
+        // Cleanup is best effort: a failed delete cannot turn an admitted
+        // budget failure back into a client-visible completed response.
+        warn!(%error, "response rollback failed after conversation budget denial");
+    }
+}
+
 /// Suppress success after an append admission failure. Streaming clients get
 /// a terminal SSE error because their response headers are already committed.
 fn conversation_budget_failure(
@@ -816,26 +843,7 @@ fn conversation_budget_failure(
     streaming: bool,
     body: &mut Option<Bytes>,
 ) -> FilterAction {
-    if let Some(marker) = ctx.extensions.remove::<PersistedResponseForConversation>() {
-        let rollback = (|| -> Result<(), FilterError> {
-            let owner = ctx
-                .extensions
-                .get::<CapturedAppendOwner>()
-                .ok_or_else(|| FilterError::from("openai_conversations: append owner missing for rollback"))?;
-            let store = ctx
-                .extensions
-                .get::<ResponseStoreRegistry>()
-                .and_then(|registry| registry.get_scoped(crate::openai::responses::DEFAULT_STORE_NAME, &owner.0))
-                .ok_or_else(|| FilterError::from("openai_conversations: response store missing for rollback"))?;
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::block_in_place(|| handle.block_on(store.delete_response(&marker.0)))
-                .map_err(|error| -> FilterError { Box::new(error) })?;
-            Ok(())
-        })();
-        if let Err(error) = rollback {
-            warn!(%error, "response rollback failed after conversation budget denial");
-        }
-    }
+    rollback_persisted_response(ctx);
     if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
         state.append_attempted = true;
     }

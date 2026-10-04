@@ -379,6 +379,10 @@ async fn persist_pairs_response_and_approvals(backend: &dyn PersistedStateBacken
 
 /// A rollback candidate must never replace a preexisting response or its
 /// approvals, including when a provider reuses an ID for the same owner.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks same-owner and cross-owner collisions with approvals"
+)]
 async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateBackend) {
     let first_owner = owner("insert-first");
     let second_owner = owner("insert-second");
@@ -395,7 +399,8 @@ async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateB
         backend
             .persist_response_with_pending_approvals_if_absent(&original, &[approval("pa_old")])
             .await
-            .expect("first insert")
+            .expect("first insert"),
+        "new response must insert"
     );
     let replacement = ResponseRecord {
         model: "new".to_owned(),
@@ -406,7 +411,8 @@ async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateB
         !backend
             .persist_response_with_pending_approvals_if_absent(&replacement, &[approval("pa_new")])
             .await
-            .expect("same-owner collision")
+            .expect("same-owner collision"),
+        "same-owner collision must not replace the existing response"
     );
     assert!(
         !backend
@@ -418,20 +424,26 @@ async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateB
                 &[approval("pa_other")],
             )
             .await
-            .expect("cross-owner collision")
+            .expect("cross-owner collision"),
+        "cross-owner collision must not replace the existing response"
     );
     let stored = backend
         .get_response(&first_owner, &original.id)
         .await
         .expect("get original")
         .expect("original retained");
-    assert_eq!(stored.response_object["marker"], "old");
+    assert_eq!(
+        stored.response_object.get("marker"),
+        Some(&serde_json::json!("old")),
+        "same-owner collision changed the original response"
+    );
     assert!(
         backend
             .get_response(&second_owner, &original.id)
             .await
             .expect("get other")
-            .is_none()
+            .is_none(),
+        "cross-owner collision leaked the original response"
     );
     assert_eq!(
         backend
