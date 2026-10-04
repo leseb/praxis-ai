@@ -42,12 +42,13 @@ use rmcp::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
+use self::session_pool::PooledSession;
 pub use self::streaming_selector::McpStreamingSelectorFilter;
-use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPONSE_BYTES};
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
-        McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+        MAX_CONTROL_RESPONSE_BYTES, McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline,
+        transport_signal_error, validate_mcp_target,
     },
 };
 use crate::StateOwner;
@@ -459,6 +460,7 @@ pub(crate) async fn call_tool(
         arguments,
         timeout,
         max_result_bytes,
+        MAX_CONTROL_RESPONSE_BYTES,
         callout,
     )
     .await
@@ -487,6 +489,7 @@ async fn open_tool_session(
     connector_context: Option<&McpConnectorContext<'_>>,
     timeout: Duration,
     max_result_bytes: usize,
+    max_control_response_bytes: usize,
     callout: &McpCallout,
     display_url: &McpDisplayUrl,
 ) -> Result<PooledSession, McpClientError> {
@@ -494,6 +497,7 @@ async fn open_tool_session(
         callout.clone(),
         timeout,
         max_result_bytes,
+        max_control_response_bytes,
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();
@@ -591,6 +595,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     arguments: serde_json::Value,
     timeout: Duration,
     max_result_bytes: usize,
+    max_control_response_bytes: usize,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let display_url = parse_display_url(server_url);
@@ -648,6 +653,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
             connector_context,
             timeout,
             max_result_bytes,
+            max_control_response_bytes,
             callout,
             &display_url,
         )

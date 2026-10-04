@@ -359,7 +359,6 @@ impl McpSessionPool {
     }
 
     /// Remove every idle session from the pool and close them concurrently.
-    #[cfg(test)]
     pub(crate) async fn drain(&self) {
         let sessions = self.take_all();
         close_sessions(sessions).await;

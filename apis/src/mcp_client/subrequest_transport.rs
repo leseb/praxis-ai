@@ -61,7 +61,7 @@ use crate::{StateOwner, callout_target::AddressPolicy};
 /// from the previous reqwest-layer `bounded_http` client; this is now the single
 /// home for the MCP response tiers, since the dial runs through the executor.
 /// `mod.rs` derives its cumulative `tools/list` budget from this value.
-pub(super) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
 
 /// JSON-RPC envelope allowance added on top of the configured `tools/call`
 /// result cap, covering the surrounding result object beyond the raw payload.
@@ -546,10 +546,12 @@ pub(crate) struct McpSubrequestClient {
     callout: McpCallout,
     /// Wire byte ceiling applied to a `tools/call` response on this client.
     ///
-    /// Control-plane exchanges (`initialize`, `tools/list`, ...) are always
-    /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`]; only `tools/call` responses use
-    /// this configured, JSON-expansion-adjusted ceiling (see [`Self::response_limit`]).
+    /// `tools/call` responses use this configured, JSON-expansion-adjusted
+    /// ceiling (see [`Self::response_limit`]).
     tool_result_bytes: usize,
+    /// Per-exchange cap for initialize and other control responses. Budgeted
+    /// tool calls lower this before dialing a fresh session.
+    control_response_bytes: usize,
     /// Cumulative wire-byte ceiling for a server-initiated GET SSE stream.
     ///
     /// An intentionally coarse raw-wire `DoS` backstop, not decoded parity: for a
@@ -586,6 +588,7 @@ impl McpSubrequestClient {
             callout,
             step_timeout,
             MAX_CONTROL_RESPONSE_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
             owner,
         )
@@ -593,9 +596,8 @@ impl McpSubrequestClient {
 
     /// Build a client for
     /// [`call_tool_with_forwarded_headers`](super::call_tool_with_forwarded_headers):
-    /// `initialize` uses the control ceiling and the `tools/call` response is
-    /// bounded to the configured `max_result_bytes` cap, expanded for worst-case
-    /// JSON string escaping.
+    /// `initialize` uses the supplied control ceiling and the `tools/call`
+    /// response uses `max_result_bytes`, expanded for JSON string escaping.
     ///
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
@@ -604,6 +606,7 @@ impl McpSubrequestClient {
         callout: McpCallout,
         step_timeout: Duration,
         max_result_bytes: usize,
+        max_control_response_bytes: usize,
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
@@ -611,23 +614,30 @@ impl McpSubrequestClient {
             callout,
             step_timeout,
             wire,
-            wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            max_control_response_bytes,
+            wire.saturating_add(max_control_response_bytes),
             owner,
         )
     }
 
     /// Shared constructor: move in the callout and pin the `tools/call` wire
     /// ceiling.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "tool and control wire caps are independent transport bounds"
+    )]
     fn with_wire_cap(
         callout: McpCallout,
         step_timeout: Duration,
         tool_result_bytes: usize,
+        control_response_bytes: usize,
         stream_cumulative_cap: usize,
         owner: Option<StateOwner>,
     ) -> Self {
         Self {
             callout,
             tool_result_bytes,
+            control_response_bytes,
             step_timeout,
             stream_cumulative_cap,
             owner,
@@ -674,7 +684,7 @@ impl McpSubrequestClient {
             ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)) => {
                 self.tool_result_bytes
             },
-            _ => MAX_CONTROL_RESPONSE_BYTES,
+            _ => self.control_response_bytes,
         }
     }
 
@@ -1879,6 +1889,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
+            1_024,
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -1890,7 +1901,7 @@ mod tests {
         let list: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
                 .expect("deserialize tools/list");
-        assert_eq!(client.response_limit(&list), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(client.response_limit(&list), 1_024);
     }
 
     #[test]
@@ -2177,6 +2188,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
             max_result_bytes,
+            MAX_CONTROL_RESPONSE_BYTES,
             None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
@@ -2206,6 +2218,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             1024,
+            MAX_CONTROL_RESPONSE_BYTES,
             None,
         )
     }
