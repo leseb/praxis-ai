@@ -262,6 +262,11 @@ const META_STATUS: &str = "responses.status";
 /// `Content-Length` above that allowance is rejected with HTTP 502 before the
 /// body is read. Without an accurate length, the body buffer still enforces
 /// the cap as chunks arrive; a post-header overflow closes the response.
+/// When client-tool restoration is armed, its finite response buffer reserves
+/// a conservative 256-times raw-body allowance plus echoed-tool overhead
+/// before headers commit. An unframed response may therefore reach its buffer
+/// cap well before the aggregate retained-payload limit; a response larger
+/// than that cap closes after headers rather than exposing lowered tool names.
 ///
 /// # YAML
 ///
