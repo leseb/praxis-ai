@@ -755,29 +755,10 @@ fips-scanner: | require-go
 # -------------------------------------------------------------------
 
 patch-praxis:
-	@if [ ! -d "../praxis" ]; then \
-		echo "ERROR: ../praxis not found — clone praxis core as a sibling directory first"; \
-		exit 1; \
-	fi
-	@if grep -q '\[patch\.crates-io\]' Cargo.toml; then \
-		echo "Already patched — run 'make unpatch-praxis' first"; \
-		exit 1; \
-	fi
-	@printf '\n[patch.crates-io]\n\
-	praxis-proxy-core = { path = "../praxis/core" }\n\
-	praxis-proxy-filter = { path = "../praxis/filter" }\n\
-	praxis-proxy-protocol = { path = "../praxis/protocol" }\n\
-	praxis-proxy-tls = { path = "../praxis/tls" }\n\
-	praxis-proxy = { path = "../praxis/server" }\n' >> Cargo.toml
-	@echo "Patched Cargo.toml to use ../praxis path dependencies"
+	@sh scripts/patch-praxis.sh patch
 
 unpatch-praxis:
-	@if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then \
-		echo "Nothing to unpatch"; \
-		exit 0; \
-	fi
-	@sed -i.bak '/^\[patch\.crates-io\]/,$$d' Cargo.toml && rm -f Cargo.toml.bak
-	@echo "Removed [patch.crates-io] from Cargo.toml"
+	@sh scripts/patch-praxis.sh unpatch
 
 # -------------------------------------------------------------------
 # Dev Setup
