@@ -72,11 +72,11 @@ use self::{
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
 use super::{
-    DEFAULT_STORE_NAME,
+    DEFAULT_STORE_NAME, budget_error,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
+        McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
@@ -597,14 +597,38 @@ impl McpDispatchFilter {
             return Ok(());
         }
 
-        // Phase 3: atomically claim single-use consumption for the whole batch.
+        // Phase 3: preflight executable calls before consuming their durable
+        // approval. Stage the decisions only for the admission calculation,
+        // then remove them before the fallible claim. A replay or store error
+        // must leave request-scoped state unchanged.
+        if aggregate_budget_armed && resolved.iter().any(|decision| decision.approve) {
+            let executable_fits = ctx.extensions.get_mut::<ResponsesState>().is_some_and(|state| {
+                let original_calls = state.tool_calls.len();
+                let original_messages = state.messages.len();
+                let original_persisted = state.persisted_messages.len();
+                for decision in &resolved {
+                    apply_decision(state, decision);
+                }
+                let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+                let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+                let fits = aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes).is_some();
+                state.tool_calls.truncate(original_calls);
+                state.messages.truncate(original_messages);
+                state.persisted_messages.truncate(original_persisted);
+                fits
+            });
+            if !executable_fits {
+                record_approval_budget_failure(ctx);
+                return Ok(());
+            }
+        }
+
+        // Phase 4: atomically claim single-use consumption for the whole batch.
         // Every id here has a pending row, so a failed transition means the
         // approval was already consumed (replay) rather than never issued.
         let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
         let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
         consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
-
-        // Phase 4: apply the decisions to request-scoped state.
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(());
         };
@@ -634,9 +658,11 @@ fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]
         let owners = if decision.approve { 1 } else { 2 };
         used.checked_add(bytes?.checked_mul(owners)?)
     });
-    removed
-        .zip(added)
-        .is_some_and(|(removed, added)| state.can_replace_retained_payload(removed, added, 0))
+    removed.zip(added).is_some_and(|(removed, added)| {
+        // Admission temporarily stages decisions while the original
+        // approval controls remain live, then rolls back before claiming.
+        state.can_retain_payload(added) && state.can_replace_retained_payload(removed, added, 0)
+    })
 }
 
 /// Raw payload cloned while parsing client approval controls.
@@ -1316,6 +1342,9 @@ async fn discover_pending_connectors(
     {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
+            if matches!(err, ResolveError::RetainedBudget) {
+                return Ok(budget_error::reject_request(ctx, &err.to_string()));
+            }
             let streaming = ctx
                 .get_metadata("openai_responses_format.stream")
                 .is_some_and(|v| v == "true");
@@ -1735,8 +1764,7 @@ fn aggregate_mcp_result_limit(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .len();
-        let arguments =
-            retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?.checked_mul(3)?;
+        let arguments = mcp_argument_staging_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?;
         let tool_bytes =
             call.get("name")
                 .and_then(serde_json::Value::as_str)
@@ -1752,6 +1780,20 @@ fn aggregate_mcp_result_limit(
     let admitted = configured_limit.min(available / 3);
     let minimum = mcp_calls.len().checked_mul(MIN_RETAINED_RESULT_BYTES)?;
     (admitted >= minimum).then_some((admitted, admitted < configured_limit))
+}
+
+/// Bound the parsed argument value, canonical string, and transport owner.
+/// A JSON string can contain compact exponent numbers that expand when serde
+/// parses them; the original encoded argument remains live throughout.
+fn mcp_argument_staging_bytes(raw: &serde_json::Value) -> Option<usize> {
+    let raw_bytes = retained_json_bytes(raw)?;
+    let parsed_bound = match raw {
+        serde_json::Value::String(value) => {
+            super::agentic_loop::buffered_parsed_json_bytes_upper_bound(value.as_bytes())?
+        },
+        _ => raw_bytes,
+    };
+    raw_bytes.checked_add(parsed_bound.checked_mul(2)?)
 }
 
 /// The result vector remains live while messages are cloned into two distinct

@@ -342,20 +342,20 @@ pub(crate) struct ResponsesState {
     /// captured SSE replay rows, and the store decoder's unfinished record).
     /// The loop owner refreshes this before initial admission.
     pub(crate) retained_external_payload_bytes: usize,
-    /// Incomplete SSE frame held by the outer rehydration response rewrite.
-    pub(crate) retained_rehydrate_stream_bytes: usize,
-    /// Semantic and framing payload published by the Chat stream translator.
-    pub(crate) retained_chat_converter_bytes: usize,
-
-    /// Revision of request/history/output owners cached by response-store
-    /// replay admission. In-place changes do not alter collection lengths.
-    /// `None` means the counter overflowed and replay must fail closed.
+    /// Invalidates the store replay cache after in-place request, history, or
+    /// output changes that do not alter collection lengths. Overflow fails closed.
     pub(crate) replay_stable_payload_revision: Option<u64>,
 
     /// Parser buffers published by `openai_stream_events`. Its filter-local
     /// slot is invisible to other filters, so the request-wide meter owns this
     /// charge between stream callbacks.
     pub(crate) retained_stream_parser_bytes: usize,
+
+    /// An incomplete SSE frame retained by response ID restoration between callbacks.
+    pub(crate) retained_rehydrate_stream_bytes: usize,
+
+    /// Semantic and framing payload published by the Chat stream translator.
+    pub(crate) retained_chat_converter_bytes: usize,
 
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
@@ -615,6 +615,17 @@ pub(crate) struct ResponsesState {
 
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
+
+    /// The loop already admitted and serialized this round's buffered body.
+    pub(crate) buffered_canonical_finalized: bool,
+
+    /// Exact wire length of the serialized canonical body.
+    pub(crate) buffered_canonical_wire_bytes: Option<usize>,
+
+    /// Lexical upper bound for reparsing that same canonical wire body.
+    pub(crate) buffered_canonical_parsed_bound_bytes: Option<usize>,
+    /// Digest of the exact wire body admitted by the terminal finalizer.
+    pub(crate) buffered_canonical_body_digest: Option<[u8; 32]>,
 
     /// Prior streamed terminal response retained across request-side re-entry.
     ///
@@ -915,10 +926,10 @@ impl Default for ResponsesState {
         Self {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
+            replay_stable_payload_revision: Some(0),
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
-            replay_stable_payload_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -960,6 +971,10 @@ impl Default for ResponsesState {
             request_body: serde_json::Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
+            buffered_canonical_finalized: false,
+            buffered_canonical_wire_bytes: None,
+            buffered_canonical_parsed_bound_bytes: None,
+            buffered_canonical_body_digest: None,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
             tool_search_calls: Vec::new(),
@@ -1049,12 +1064,17 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false)?
+            .checked_add(stream_bytes)
     }
 
-    /// Request and history owners remain stable between upstream chunks.
-    /// Measure them once per round; `stream_events` refreshes this baseline at
-    /// EOS after the agentic owner may append the finished round to history.
+    /// Request and history owners cannot change while one upstream stream is
+    /// being parsed. Measure them once per round; the stream meter measures all
+    /// other owners after each chunk.
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1074,31 +1094,36 @@ impl ResponsesState {
     }
 
     /// Count the owners which may change during a streaming response. The
-    /// stream-local meter adds the cached request/history charge separately.
+    /// stream-local meter adds the cached request/history and prior-round
+    /// output and tool-snapshot charges separately; all are fixed until EOS.
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
+        let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true)?
+            .checked_add(self.retained_rehydrate_stream_bytes)
     }
 
-    /// Rehydration runs after the stream parser and can see new canonical output
-    /// between chunks; count both while reusing only stable request/history bytes.
+    /// Count changing owners while a response filter caches request, history,
+    /// and prior output. Include the stream parsers' published charges.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, false)?
+            .checked_add(stream_bytes)
+    }
+
+    /// Count owners that may change between Rehydrate SSE callbacks, including
+    /// accumulated output and both published stream-parser charges. The stable
+    /// request and history owners are measured once by the Rehydrate stream.
     #[cfg(feature = "store")]
     pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
-    }
-
-    /// The response store caches request/history and prior output while
-    /// capturing replay chunks, but must still count all changing owners,
-    /// including the parser charge published by `openai_stream_events`.
-    #[cfg(feature = "store")]
-    pub(crate) fn store_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
-    }
-
-    /// The translated upstream round cannot append prior output until its
-    /// converter has finished. The converter caches that large owner once;
-    /// this counts all other changing owners, including the stream parser.
-    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, false)?
+            .checked_add(stream_bytes)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1109,15 +1134,15 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
     #[expect(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
-        clippy::too_many_arguments,
         clippy::fn_params_excessive_bools,
+        clippy::too_many_arguments,
         reason = "exhaustive accounting for the request-scoped state bag"
     )]
     fn retained_payload_bytes_bounded_inner(
@@ -1126,18 +1151,11 @@ impl ResponsesState {
         include_external: bool,
         skip_stream_stable: bool,
         skip_accumulated_output: bool,
-        include_stream_parser: bool,
-        include_chat_converter: bool,
+        skip_stream_fixed_tools: bool,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
             meter.raw(self.retained_external_payload_bytes)?;
-            meter.raw(self.retained_rehydrate_stream_bytes)?;
-        }
-        if include_stream_parser {
-            meter.raw(self.retained_stream_parser_bytes)?;
-        }
-        if include_chat_converter {
             meter.raw(self.retained_chat_converter_bytes)?;
         }
 
@@ -1181,10 +1199,12 @@ impl ResponsesState {
         {
             meter.json(value)?;
         }
-        for ((server, tool), value) in &self.mcp_tool_map {
-            meter.raw(server.len())?;
-            meter.raw(tool.len())?;
-            meter.json(value)?;
+        if !skip_stream_fixed_tools {
+            for ((server, tool), value) in &self.mcp_tool_map {
+                meter.raw(server.len())?;
+                meter.raw(tool.len())?;
+                meter.json(value)?;
+            }
         }
         for (private_name, lowered) in &self.client_tool_lowering {
             meter.raw(private_name.len())?;
@@ -1193,7 +1213,7 @@ impl ResponsesState {
                 meter.raw(namespace.len())?;
             }
         }
-        if let Some(echo) = &self.client_tool_echo {
+        if !skip_stream_fixed_tools && let Some(echo) = &self.client_tool_echo {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
         }
@@ -1349,6 +1369,10 @@ impl ResponsesState {
         self.response_id = None;
         self.request_body = serde_json::json!({ "stream": streaming });
         self.response_object = serde_json::Value::Null;
+        self.buffered_canonical_finalized = false;
+        self.buffered_canonical_wire_bytes = None;
+        self.buffered_canonical_parsed_bound_bytes = None;
+        self.buffered_canonical_body_digest = None;
         self.local_completion_response_template = serde_json::Value::Null;
         self.tool_choice = serde_json::Value::Null;
         self.tools.clear();
@@ -1403,18 +1427,12 @@ impl ResponsesState {
     pub(crate) fn provider_compaction_ids_from_messages(messages: &[serde_json::Value]) -> HashSet<String> {
         messages
             .iter()
-            .filter_map(Self::provider_compaction_id_from_message)
+            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
+            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.starts_with("compact_"))
             .map(ToOwned::to_owned)
             .collect()
-    }
-
-    /// Borrow a provider compaction ID before a collector copies it into state.
-    pub(crate) fn provider_compaction_id_from_message(item: &serde_json::Value) -> Option<&str> {
-        (item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
-            .then_some(item)
-            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
-            .and_then(|item| item.get("id").and_then(serde_json::Value::as_str))
-            .filter(|id| !id.starts_with("compact_"))
     }
 
     /// Record the first security-context failure; later calls are ignored (first wins).
@@ -1430,8 +1448,7 @@ impl ResponsesState {
         self.mark_replay_stable_payload_changed();
     }
 
-    /// Invalidate the store replay meter after an in-place mutation of a
-    /// cached request, history, tool, or accumulated output owner.
+    /// Invalidate the store replay cache after an in-place stable-owner edit.
     pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
         self.replay_stable_payload_revision = self
             .replay_stable_payload_revision
@@ -1536,6 +1553,10 @@ impl ResponsesState {
         reason = "in-place canonical response finalization with budget preflight"
     )]
     pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
+        self.buffered_canonical_finalized = false;
+        self.buffered_canonical_wire_bytes = None;
+        self.buffered_canonical_parsed_bound_bytes = None;
+        self.buffered_canonical_body_digest = None;
         if !self.response_object.is_object() {
             return Ok(());
         }
@@ -1615,8 +1636,19 @@ impl ResponsesState {
                 return Err(finalize_rejection("failed to encode final response"));
             },
         };
+        // The listener budget can be applied by an outer filter after this
+        // finalizer runs, so keep this evidence even when no local limit is set.
+        let Some(parsed_bound_bytes) = super::agentic_loop::buffered_parsed_json_bytes_upper_bound(&serialized) else {
+            self.discard_payload_for_budget_error();
+            return Err(finalize_rejection("failed to bound final response JSON"));
+        };
+        let body_digest = crate::hash::Sha256::digest(&serialized);
         self.response_object = response;
         *body = Some(Bytes::from(serialized));
+        self.buffered_canonical_finalized = true;
+        self.buffered_canonical_wire_bytes = Some(serialized_bytes);
+        self.buffered_canonical_parsed_bound_bytes = Some(parsed_bound_bytes);
+        self.buffered_canonical_body_digest = Some(body_digest);
         Ok(())
     }
 

@@ -649,6 +649,41 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
 }
 
 #[test]
+fn aggregate_mcp_limit_rejects_expanding_numeric_arguments_before_execution() {
+    let numbers = std::iter::repeat_n("1e15", 10_000).collect::<Vec<_>>().join(",");
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "call_1",
+            "arguments": format!("{{\"values\":[{numbers}]}}")
+        })],
+        ..ResponsesState::default()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    let raw = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap();
+    let expanded = super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap();
+    assert!(
+        expanded > raw * 3,
+        "serde numeric normalization must increase the argument reserve"
+    );
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
+        panic!("weather tool must resolve")
+    };
+    let tool_bytes = retained_json_bytes(entry).unwrap();
+    // This limit passed the previous raw-byte projection. It cannot hold the
+    // parsed Value, canonical string, and transport owner together.
+    state.apply_retained_payload_limit(
+        current + "call_1".len() + raw * 3 + tool_bytes + 3 * super::MIN_RETAINED_RESULT_BYTES,
+    );
+    assert!(
+        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        "expanding numeric arguments must be rejected before the MCP call"
+    );
+}
+
+#[test]
 fn approval_resume_peak_charges_stored_arguments_before_resolved_clone() {
     let input = ApprovalResponseInput {
         approval_id: "approval_1".to_owned(),
@@ -2685,12 +2720,15 @@ async fn resume_approval_replay_is_rejected() {
     let req2 = make_request(http::Method::POST, "/v1/responses");
     let mut ctx2 = make_owned_filter_context(&req2);
     register_store(&mut ctx2, Arc::clone(&store));
-    ctx2.extensions.insert(ResponsesState {
+    let mut replay_state = ResponsesState {
         mcp_tool_map: approval_tool_map(),
         previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
         messages: vec![approval_response("call_1", true, None)],
         ..ResponsesState::default()
-    });
+    };
+    let baseline = replay_state.retained_payload_bytes().unwrap();
+    replay_state.apply_retained_payload_limit(baseline + 1_000_000);
+    ctx2.extensions.insert(replay_state);
     let mut body2 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx2, &mut body2, true).await.unwrap());
     assert_eq!(rejection.status, 400, "replay is a client error");
@@ -2701,6 +2739,15 @@ async fn resume_approval_replay_is_rejected() {
 
     let state = ctx2.extensions.get::<ResponsesState>().unwrap();
     assert!(state.tool_calls.is_empty(), "replay must not execute the tool again");
+    assert_eq!(
+        state.messages,
+        vec![approval_response("call_1", true, None)],
+        "replay must not remove the original approval control"
+    );
+    assert!(
+        state.persisted_messages.is_empty(),
+        "replay must not persist a decision"
+    );
     assert!(
         state.accumulated_output.is_empty(),
         "replay must produce no second mcp_call"
@@ -2760,6 +2807,11 @@ async fn resume_approval_deny_then_approve_is_rejected() {
     assert!(
         state2.tool_calls.is_empty(),
         "a denied-then-approved replay must not execute the tool"
+    );
+    assert_eq!(
+        state2.messages,
+        vec![approval_response("call_1", true, None)],
+        "a denied-then-approved replay must preserve the original control"
     );
     assert!(
         state2.accumulated_output.is_empty(),
@@ -3687,4 +3739,54 @@ fn extract_approval_responses_filters_only_responses() {
     let responses = extract_approval_responses(&messages);
     assert_eq!(responses.len(), 2);
     assert!(responses.iter().copied().all(is_approval_response));
+}
+
+#[tokio::test]
+async fn execution_budget_failure_keeps_approval_available_for_retry() {
+    let filter = McpDispatchFilter {
+        pool_namespace: super::mcp_client::McpPoolNamespace::new(),
+        user_credential_slot: None,
+        authorization_assertion_slot: None,
+        outbound_pipeline: super::mcp_client::build_bare_outbound_pipeline(false).unwrap(),
+        forward_headers: vec![],
+        timeout: std::time::Duration::from_secs(1),
+        max_calls_per_round: 32,
+        max_parallel_calls: 8,
+        max_result_bytes: TEST_MAX_RESULT_BYTES,
+        max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+    };
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+
+    let mut state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_1", true, None)],
+        request_body: json!({"padding": "x".repeat(4096)}),
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 2000);
+    ctx.extensions.insert(state);
+
+    filter.resume_approvals(&mut ctx).await.unwrap();
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed, "result admission fails before a callout");
+    assert!(
+        state.tool_calls.is_empty(),
+        "failed request cannot execute the approved call"
+    );
+
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    assert_eq!(
+        store
+            .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_1"], 2000)
+            .await
+            .unwrap(),
+        None,
+        "the pending approval remains available to a corrected retry"
+    );
 }

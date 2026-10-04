@@ -2959,6 +2959,74 @@ fn appends_streamed_provider_compaction_to_replay_state() {
     assert_eq!(state.accumulated_output[0]["id"], "cmp_streamed");
 }
 
+fn large_provider_compaction_response() -> Value {
+    json!({
+        "object": "response",
+        "output": [{"type": "compaction", "id": "cmp_1", "encrypted_content": "x".repeat(4_096)}]
+    })
+}
+
+#[test]
+fn buffered_compaction_preflights_all_replay_owners() {
+    let response = large_provider_compaction_response();
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut limited = ResponsesState::default();
+    limited.apply_retained_payload_limit(10_000);
+    assert!(
+        super::extract_tool_calls_from_body(&body, &mut limited).is_err(),
+        "buffered compaction must reject before cloning all replay owners"
+    );
+    assert!(
+        limited.accumulated_output.is_empty(),
+        "rejected output must not enter replay state"
+    );
+
+    let mut admitted = ResponsesState::default();
+    admitted.apply_retained_payload_limit(20_000);
+    super::extract_tool_calls_from_body(&body, &mut admitted).unwrap();
+    assert!(
+        admitted.retained_payload_bytes().unwrap() <= 20_000,
+        "admitted buffered state must fit its limit"
+    );
+    assert!(
+        admitted.provider_compaction_ids.contains("cmp_1"),
+        "compaction ID must remain replayable"
+    );
+}
+
+#[test]
+fn streamed_compaction_preflights_all_replay_owners() {
+    let response = large_provider_compaction_response();
+    let mut limited = ResponsesState {
+        response_object: response.clone(),
+        ..ResponsesState::default()
+    };
+    limited.apply_retained_payload_limit(10_000);
+    assert!(
+        super::collect_streaming_output_items(&mut limited).is_err(),
+        "streamed compaction must reject before cloning all replay owners"
+    );
+    assert!(
+        limited.retained_payload_failed,
+        "over-budget streamed state must fail closed"
+    );
+
+    let mut admitted = ResponsesState {
+        response_object: response,
+        ..ResponsesState::default()
+    };
+    admitted.apply_retained_payload_limit(20_000);
+    super::collect_streaming_output_items(&mut admitted).unwrap();
+    assert!(
+        admitted.retained_payload_bytes().unwrap() <= 20_000,
+        "admitted streamed state must fit its limit"
+    );
+    assert!(
+        admitted.provider_compaction_ids.contains("cmp_1"),
+        "compaction ID must remain replayable"
+    );
+}
+
 /// Regression (#955): the sole owner stamps a stable synthetic id on every
 /// id-less output item before accumulation, so the public response never ships an
 /// item without an id. A private `function_call(name=file_search)` that arrives
@@ -3128,6 +3196,29 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     );
 }
 
+/// An approval admission failure on the first request has not committed SSE
+/// headers, even when the client asked for a stream.
+#[tokio::test]
+async fn initial_retained_dispatch_failure_uses_http_413() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "test", "stream": true}));
+    state.fail_retained_payload_budget();
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "approval exceeds retained budget".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let FilterAction::Reject(response) = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap() else {
+        panic!("budget failure must reject before inference");
+    };
+    assert_eq!(response.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
 /// A locally-detected security-context failure preempts a generic dispatch failure:
 /// the loop owner converts `security_failure` BEFORE `dispatch_failure`, so the client
 /// sees the 401 security terminal, never the 502 dispatch terminal.
@@ -3268,8 +3359,8 @@ async fn on_request_rejects_oversized_initial_state_with_413() {
 
 #[tokio::test]
 #[cfg(feature = "openai-conversations")]
-async fn conversation_append_is_rejected_before_budgeted_dispatch() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 65536").unwrap();
+async fn conversation_append_is_admitted_with_room_for_bounded_append() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 67108864").unwrap();
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -3283,13 +3374,11 @@ async fn conversation_append_is_rejected_before_budgeted_dispatch() {
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
-        panic!("unmetered append must stop before inference");
-    };
-    assert_eq!(rejection.status, 413);
-    assert_action(&ctx, "done");
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
-    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_payload_limit(), Some(64 * 1024 * 1024));
+    assert!(!state.retained_payload_failed);
 }
 
 #[tokio::test]

@@ -162,6 +162,10 @@ impl ResponsesProxyFilter {
         clippy::too_many_lines,
         reason = "streaming splice keeps the large body out of serde_json::Value"
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all inputs are distinct borrowed rewrite owners"
+    )]
     fn serialize_selected_body(
         &self,
         body: &Bytes,
@@ -393,6 +397,10 @@ fn selected_input_messages(
 
 /// Reserve the parsed input, reconciled history, encoded input, and final
 /// selected-upstream body before constructing any of those owned copies.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checked reservation follows every live rewrite owner"
+)]
 fn selected_rewrite_reservation(body: &[u8], members: &[TopLevelMember], state: &ResponsesState) -> Option<usize> {
     let input_bytes = members
         .iter()
@@ -493,6 +501,7 @@ fn selected_compaction_expansion(
         .checked_mul(4)
 }
 
+/// Error sent when a native request rewrite cannot fit its transient owners.
 const REWRITE_BUDGET_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during native request rewrite";
 

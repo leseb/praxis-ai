@@ -149,13 +149,15 @@ pub(super) struct StreamEventsState {
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
     stream_failed: bool,
-    /// Request and history charge cached across ordinary upstream chunks.
-    /// Refreshed at EOS after the loop owner may append the round to history.
+    /// Request, history, prior-round output, and tool snapshots cached across
+    /// ordinary chunks. Refreshed at EOS after the loop owner may append.
+    /// MCP resolution and echo capture finish in request phase; budget failure
+    /// clears them only after the stream is poisoned.
     shared_stable_bytes: OnceLock<usize>,
 }
 
 impl StreamEventsState {
-    /// The owner can append history between ordinary chunks and EOS.
+    /// The owner can append history and output between ordinary chunks and EOS.
     fn clear_shared_budget_cache(&mut self) {
         self.shared_stable_bytes = OnceLock::new();
     }
@@ -812,7 +814,10 @@ fn parse_and_accumulate(
             .iter()
             .filter(|frame| frame.data != b"[DONE]")
             .try_fold(0_usize, |used, frame| {
-                used.checked_add(frame.data.len())
+                // Serde may expand exponent-form numbers while constructing
+                // the event Value. Admit that parsed owner before allocation.
+                let parsed_bound = super::agentic_loop::buffered_parsed_json_bytes_upper_bound(&frame.data)?;
+                used.checked_add(parsed_bound)
                     .and_then(|used| used.checked_add(frame.event_type.as_ref().map_or(0, String::len)))
             });
     // `frames` stays live while `ResponsesEvent` owns newly parsed JSON values.
@@ -841,7 +846,7 @@ fn parse_and_accumulate(
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     }
-    let Some(logical_output_upper_bound) = logical_output_upper_bound(ctx, &events) else {
+    let Some(logical_output_upper_bound) = logical_output_upper_bound(ctx, state, &events) else {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
@@ -979,7 +984,7 @@ fn stream_payload_fits(ctx: &HttpFilterContext<'_>, state: &StreamEventsState, s
     stream_payload_fits_with_budget(state, staging_bytes, shared_retained_budget(ctx, state))
 }
 
-/// Snapshot the shared retained JSON total once for pre-commit checks.
+/// Snapshot request, history, prior output, and tool snapshots once per round.
 /// `None` means no aggregate budget is active; the inner `None` signals that
 /// the current retained state already exceeds the limit.
 fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsState) -> Option<(usize, Option<usize>)> {
@@ -988,6 +993,24 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
     let stable = *stream.shared_stable_bytes.get_or_init(|| {
         responses
             .stream_stable_payload_bytes_bounded(limit)
+            .and_then(|bytes| bytes.checked_add(retained_json_values_bytes(&responses.accumulated_output)?))
+            .and_then(|bytes| {
+                responses
+                    .mcp_tool_map
+                    .iter()
+                    .try_fold(bytes, |used, ((server, tool), value)| {
+                        used.checked_add(server.len())?
+                            .checked_add(tool.len())?
+                            .checked_add(retained_json_bytes(value)?)
+                    })
+            })
+            .and_then(|bytes| match &responses.client_tool_echo {
+                None => Some(bytes),
+                Some(echo) => bytes
+                    .checked_add(retained_json_values_bytes(&echo.tools)?)
+                    .and_then(|bytes| bytes.checked_add(retained_json_bytes(&echo.tool_choice)?)),
+            })
+            .filter(|bytes| *bytes <= limit)
             .unwrap_or(usize::MAX)
     });
     let current = limit
@@ -1094,11 +1117,20 @@ fn local_terminal_output_upper_bound(state: &ResponsesState) -> Option<usize> {
 }
 
 /// Bound all output that `commit_chunk_events` can append for this chunk.
-fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
-    let mut bound = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .map_or(Some(0), local_terminal_output_upper_bound)?;
+fn logical_output_upper_bound(
+    ctx: &HttpFilterContext<'_>,
+    stream: &StreamEventsState,
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    // Local items flush before the first non-creation event, once per round.
+    // Later chunks cannot emit them again and must not rescan prior output.
+    let mut bound = if stream.local_items_flushed || events.iter().all(is_response_lifecycle_creation) {
+        0
+    } else {
+        ctx.extensions
+            .get::<ResponsesState>()
+            .map_or(Some(0), local_terminal_output_upper_bound)?
+    };
     for event in events {
         bound = bound.checked_add(normalized_sse_event_upper_bound(
             ctx,
@@ -2767,7 +2799,7 @@ pub(crate) fn encode_retained_payload_error(ctx: &mut HttpFilterContext<'_>) -> 
 /// Emit the held terminal event only when the current IRR step is terminal.
 #[expect(
     clippy::too_many_lines,
-    reason = "deferred terminal finalization and published charge update"
+    reason = "finalizes deferred output and terminal accounting together"
 )]
 fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
@@ -2931,8 +2963,19 @@ fn emit_deferred_terminal(
     if let Some(response) = terminal.payload.get_mut("response") {
         restore_snapshot_tools(response, state.client_tool_echo.as_ref());
     }
-    let terminal_bytes = retained_json_bytes(&terminal.payload);
-    let staging = terminal_bytes.and_then(|bytes| output.len().checked_add(bytes));
+    // The restored terminal Value remains live while its normalized SSE frame
+    // is serialized into `output`. Reserve both independently owned payloads,
+    // including normalization growth and the optional final sentinel.
+    let staging = normalized_sse_event_upper_bound(ctx, &terminal.event_type, &terminal.payload)
+        .and_then(|event_bytes| event_bytes.checked_mul(2))
+        .and_then(|bytes| output.len().checked_add(bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(if parser_state.deferred_done {
+                b"data: [DONE]\n\n".len()
+            } else {
+                0
+            })
+        });
     if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
         output.clear();
         record_retained_payload_overflow(ctx, parser_state);

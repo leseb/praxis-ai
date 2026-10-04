@@ -68,6 +68,7 @@ use super::{
         agentic_loop::AgenticBudgetPolicy,
         bound_body_outcome,
         error::responses_error_rejection,
+        rehydrate::{DirectFiniteRestoreFraming, FinalizedFiniteRestoreAdmission, FinalizedRestoredBodyDigest},
         state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
     },
     config::{ResponseStoreConfig, validate_config},
@@ -145,6 +146,12 @@ pub struct ResponseStoreFilter {
 /// attempt. EOS must not retry it, including when `failure_mode: open` lets a
 /// failed terminal-chunk write continue.
 struct StreamingResponsePersistenceAttempted;
+
+/// A newly inserted response owned by this exchange. Conversation append-back
+/// may remove it if a later shared-budget check fails before the terminal body
+/// is released. This is set only after an atomic no-overwrite insert succeeds.
+#[cfg(feature = "openai-conversations")]
+pub(crate) struct PersistedResponseForConversation(pub(crate) String);
 
 impl ResponseStoreFilter {
     /// Construct the filter with explicit replay-log bounds.
@@ -249,7 +256,24 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&persist.store, &record, &pending_approvals)?;
+        let budgeted_conversation = cfg!(feature = "openai-conversations")
+            && has_conversation(ctx)
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+        if budgeted_conversation {
+            match persist_response_if_absent_blocking(&persist.store, &record, &pending_approvals) {
+                Ok(true) => {},
+                Ok(false) | Err(StoreError::PayloadTooLarge) => {
+                    return Ok(persistence_budget_failure(ctx, true, body));
+                },
+                Err(error) => return Err(Box::new(error)),
+            }
+        } else {
+            persist_response_blocking(&persist.store, &record, &pending_approvals)?;
+        }
         // Flush the replay event log only after the record is durable, so the
         // parent-exists gate is satisfied, and before releasing the terminal
         // frame, so a client never observes completion for a response whose
@@ -260,10 +284,18 @@ impl ResponseStoreFilter {
             persist.captured_events,
             persist.events_over_budget,
         )?;
+        #[cfg(feature = "openai-conversations")]
+        if budgeted_conversation {
+            ctx.extensions.insert(PersistedResponseForConversation(record.id));
+        }
         Ok(FilterAction::Continue)
     }
 
     /// Persist a non-streaming response from the buffered body bytes.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "body admission and durable persistence must stay in one terminal callback"
+    )]
     fn persist_from_buffered_body(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
@@ -278,7 +310,26 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !persistence_construction_fits(ctx, bytes.len()) {
+        let header_admitted = ctx
+            .extensions
+            .get::<FinalizedPersistenceAdmission>()
+            .is_some_and(|admission| {
+                let expected_digest = if admission.rewritten {
+                    ctx.extensions
+                        .get::<FinalizedRestoredBodyDigest>()
+                        .map(|digest| digest.0)
+                } else {
+                    ctx.extensions
+                        .get::<ResponsesState>()
+                        .and_then(|state| state.buffered_canonical_body_digest)
+                };
+                ctx.extensions
+                    .get::<ResponsesState>()
+                    .is_some_and(|state| state.buffered_canonical_finalized)
+                    && bytes.len() <= admission.response_upper_bytes
+                    && expected_digest == Some(crate::hash::Sha256::digest(bytes))
+            });
+        if !header_admitted && !persistence_construction_fits(ctx, bytes.len()) {
             return Ok(persistence_budget_failure(ctx, false, body));
         }
 
@@ -300,7 +351,28 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&store, &record, &pending_approvals)?;
+        let budgeted_conversation = cfg!(feature = "openai-conversations")
+            && has_conversation(ctx)
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+        if budgeted_conversation {
+            match persist_response_if_absent_blocking(&store, &record, &pending_approvals) {
+                Ok(true) => {},
+                Ok(false) | Err(StoreError::PayloadTooLarge) => {
+                    return Ok(persistence_budget_failure(ctx, false, body));
+                },
+                Err(error) => return Err(Box::new(error)),
+            }
+        } else {
+            persist_response_blocking(&store, &record, &pending_approvals)?;
+        }
+        #[cfg(feature = "openai-conversations")]
+        if budgeted_conversation {
+            ctx.extensions.insert(PersistedResponseForConversation(record.id));
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -755,14 +827,9 @@ struct ResponseStoreRequestState {
     /// Store bytes already charged to `ResponsesState`. The store can run
     /// before another filter creates that state.
     charged_retained_bytes: Option<usize>,
-    /// Request, history, and prior output normally stay stable while a
-    /// streamed round is delivered. Recheck their O(1) shape on each chunk:
-    /// synthesis can advance the iteration before request-side dispatch adds
-    /// history in that same iteration. Request-phase re-entry invalidates the
-    /// cache for same-length rewrites of the request body and history.
+    /// Request, history, and prior output charged once per streamed round.
     shared_stable_bytes: Option<StoreStableCache>,
-    /// Store request-body validation completed before a later filter created
-    /// `ResponsesState`; transfer its approval-persistence signal with the charge.
+    /// Request-side persistence arming that can precede shared state creation.
     persistence_arm: PersistenceArm,
     /// Owner captured before inference begins.
     owner: Option<StateOwner>,
@@ -868,7 +935,7 @@ fn store_stream_budget_fits(
         return false;
     };
     responses
-        .store_stream_changing_payload_bytes_bounded(measurement_limit)
+        .stream_changing_payload_bytes_bounded_with_cached_output(measurement_limit)
         .and_then(|current| current.checked_sub(removed))
         .and_then(|current| current.checked_add(added))
         .is_some_and(|next| next <= remaining)
@@ -926,6 +993,15 @@ pub(crate) fn discard_retained_request_payload(ctx: &mut HttpFilterContext<'_>) 
 
 /// Reserve record, history, and backend serialization owners before building them.
 pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, response_bytes: usize) -> bool {
+    persistence_construction_fits_with_wire(ctx, response_bytes, 0)
+}
+
+/// Include a separately owned wire body when a direct response is buffered.
+fn persistence_construction_fits_with_wire(
+    ctx: &HttpFilterContext<'_>,
+    response_bytes: usize,
+    wire_bytes: usize,
+) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
     };
@@ -945,12 +1021,116 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
             .checked_add(record.arguments.len())?
             .checked_add(record.target_fingerprint.len())
     });
+    let replay_id_bytes = replay_identity_stamp_bytes(ctx, state);
     let additional = response_bytes
         .checked_mul(5)
         .and_then(|bytes| history_bytes.checked_mul(3)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(input_bytes))
-        .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes));
+        .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(replay_id_bytes?))
+        .and_then(|bytes| bytes.checked_add(wire_bytes));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Reserve the response ID copied into each durable replay row. Owner clones
+/// share their `Arc<str>` payloads and do not add per-row owner bytes.
+fn replay_identity_stamp_bytes(ctx: &HttpFilterContext<'_>, state: &ResponsesState) -> Option<usize> {
+    let Some(capture) = ctx.extensions.get::<ResponseStoreRequestState>() else {
+        return Some(0);
+    };
+    if capture.events_over_budget {
+        return Some(0);
+    }
+    let Some(id) = state.response_object.get("id").and_then(Value::as_str) else {
+        return Some(0);
+    };
+    id.len().checked_mul(capture.events.len())
+}
+
+/// A canonical response admitted for persistence before client headers commit.
+struct FinalizedPersistenceAdmission {
+    /// Upper bound for the restored or unchanged serialized response.
+    response_upper_bytes: usize,
+    /// Whether Rehydrate will publish a digest for a rewritten response.
+    rewritten: bool,
+}
+
+/// Bound the canonical response and any later ID rewrite before headers commit.
+fn finalized_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let wire_bytes = state.buffered_canonical_wire_bytes?;
+    let parsed_bound = state.buffered_canonical_parsed_bound_bytes?;
+    state.buffered_canonical_body_digest?;
+    let response_upper_bytes = ctx
+        .extensions
+        .get::<FinalizedFiniteRestoreAdmission>()
+        .map_or(parsed_bound, |admission| admission.response_upper_bytes);
+    // The canonical framework body can remain live beside the later
+    // StreamBuffer body while constructing the persistence record.
+    let transient_wire_bytes = wire_bytes.checked_mul(2)?.max(response_upper_bytes);
+    persistence_construction_fits_with_wire(ctx, response_upper_bytes, transient_wire_bytes)
+        .then_some(response_upper_bytes)
+}
+
+/// Return the unique identity-coded Content-Length used for direct finite
+/// admission. A buffering filter may select this exact cap before Store runs.
+pub(crate) fn trusted_identity_content_length(headers: &http::HeaderMap) -> Option<usize> {
+    if headers.contains_key(http::header::TRANSFER_ENCODING) || headers.contains_key(http::header::CONTENT_ENCODING) {
+        return None;
+    }
+    let mut lengths = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
+    (lengths.next().is_none() && wire_bytes > 0 && wire_bytes <= MAX_JSON_BODY_BYTES).then_some(wire_bytes)
+}
+
+/// Admit direct finite persistence before headers commit using trusted framing.
+/// Rehydrate removes `Content-Length` only after handing its verified length to
+/// this hook. Twelve times the wire length bounds normalized JSON numbers.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one header gate validates framing and computes the conservative wire peak"
+)]
+fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let response = ctx.response_header.as_ref()?;
+    if response.headers.contains_key(http::header::TRANSFER_ENCODING)
+        || response.headers.contains_key(http::header::CONTENT_ENCODING)
+    {
+        return None;
+    }
+    let (wire_bytes, previous_id_bytes) = match &ctx.response_body_mode {
+        BodyMode::Stream => (trusted_identity_content_length(&response.headers)?, None),
+        BodyMode::StreamBuffer {
+            max_bytes: Some(max_bytes),
+        } => {
+            if let Some(framing) = ctx.extensions.get::<DirectFiniteRestoreFraming>() {
+                if response.headers.contains_key(http::header::CONTENT_LENGTH) || *max_bytes != framing.wire_bytes {
+                    return None;
+                }
+                (framing.wire_bytes, Some(framing.previous_id_bytes))
+            } else {
+                let wire_bytes = trusted_identity_content_length(&response.headers)?;
+                if *max_bytes != wire_bytes {
+                    return None;
+                }
+                (wire_bytes, None)
+            }
+        },
+        _ => return None,
+    };
+    if wire_bytes > MAX_JSON_BODY_BYTES {
+        return None;
+    }
+    let mut parsed_bytes = wire_bytes.checked_mul(12)?;
+    if let Some(id_bytes) = previous_id_bytes {
+        parsed_bytes = parsed_bytes.checked_add(id_bytes.checked_mul(6)?)?.checked_add(32)?;
+    }
+    let original_wire_bytes = wire_bytes.checked_mul(2)?;
+    let transient_wire_bytes = if previous_id_bytes.is_some() {
+        original_wire_bytes.max(parsed_bytes)
+    } else {
+        original_wire_bytes
+    };
+    persistence_construction_fits_with_wire(ctx, parsed_bytes, transient_wire_bytes).then_some(wire_bytes)
 }
 
 /// Reject persistence and emit the appropriate buffered or committed-stream error.
@@ -1012,9 +1192,8 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Resul
     state.input = Some(input);
     state.input_retained_bytes = retained_bytes;
     state.shared_stable_bytes = None;
-    let admitted = state
-        .retained_payload_bytes()
-        .is_some_and(|next| charge_store_payload(ctx, &mut state, next));
+    let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
+    let admitted = charge_store_payload(ctx, &mut state, next);
     ctx.extensions.insert(state);
     if !admitted {
         ctx.set_metadata("responses.skip_persist", "true");
@@ -1313,6 +1492,20 @@ fn persist_response_blocking(
     .map_err(|e| -> FilterError { Box::new(e) })
 }
 
+/// Insert only a new response owned by this exchange. A later Conversation
+/// budget rejection may delete that row, so replacing an existing ID would
+/// risk deleting another exchange's response.
+fn persist_response_if_absent_blocking(
+    store: &OwnerScopedResponseStore,
+    record: &ResponseRecord,
+    pending_approvals: &[PendingApprovalRecord],
+) -> Result<bool, StoreError> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| {
+        handle.block_on(store.persist_response_with_pending_approvals_if_absent(record, pending_approvals))
+    })
+}
+
 /// Flush the captured replay event log synchronously, right after the response
 /// record is durable and before the terminal frame is released.
 ///
@@ -1446,7 +1639,8 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     /// Streaming by default. Non-streaming Responses requests select a
-    /// bounded `StreamBuffer` dynamically in [`Self::on_request`].
+    /// bounded `StreamBuffer` at the response-header boundary, when the
+    /// shared retained-payload charge is available.
     ///
     /// Non-streaming Responses API payloads are bounded by output
     /// token limits (typically under 2 MiB). The 64 MiB ceiling is
@@ -1459,20 +1653,12 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // The preceding round may have cached its terminal after the agentic
-        // loop advanced `iteration`; request-side filters can now rewrite
-        // stable fields without changing that counter or vector lengths.
+        // Request re-entry may rewrite cached owners without changing lengths.
         if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
             state.shared_stable_bytes = None;
         }
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
-        }
-
-        if is_responses_format(ctx) && !is_streaming_request(ctx) {
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(MAX_JSON_BODY_BYTES),
-            });
         }
 
         if ctx.request.method == http::Method::DELETE {
@@ -1545,7 +1731,24 @@ impl HttpFilter for ResponseStoreFilter {
         bound_body_outcome(action)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response headers select bounded finite or streaming persistence before commitment"
+    )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The exchange can enter another IRR response round. Never let a
+        // previous round's durable-row marker authorize a later rollback.
+        #[cfg(feature = "openai-conversations")]
+        ctx.extensions.remove::<PersistedResponseForConversation>();
+        ctx.extensions.remove::<FinalizedPersistenceAdmission>();
+        if let Some(limit) = ctx
+            .extensions
+            .get::<AgenticBudgetPolicy>()
+            .map(|policy| policy.max_retained_bytes())
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            state.apply_retained_payload_limit(limit);
+        }
         if should_skip_persist(ctx) {
             return Ok(FilterAction::Continue);
         }
@@ -1556,6 +1759,88 @@ impl HttpFilter for ResponseStoreFilter {
 
         if !store_available(ctx) {
             return Ok(FilterAction::Reject(reject_store_error()));
+        }
+
+        // The loop publishes shared retained state after request headers. Pick
+        // the finite buffer only now, before core reads the response body.
+        if !is_streaming_request(ctx) {
+            let budgeted = ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+            let finalized = ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.buffered_canonical_finalized);
+            if budgeted && finalized {
+                let Some(response_upper_bytes) = finalized_header_persistence_length(ctx) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                let rewritten = ctx.extensions.get::<FinalizedFiniteRestoreAdmission>().is_some();
+                ctx.extensions.insert(FinalizedPersistenceAdmission {
+                    response_upper_bytes,
+                    rewritten,
+                });
+            }
+            let direct = ctx.extensions.get::<praxis_filter::IterationState>().is_none();
+            let admitted_wire_length = if budgeted && !finalized && direct {
+                let Some(length) = buffered_header_persistence_length(ctx) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                Some(length)
+            } else {
+                None
+            };
+            let max_bytes = if budgeted && finalized {
+                let Some(wire_bytes) = ctx
+                    .extensions
+                    .get::<ResponsesState>()
+                    .and_then(|state| state.buffered_canonical_wire_bytes)
+                    .filter(|&wire_bytes| wire_bytes <= MAX_JSON_BODY_BYTES)
+                else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                wire_bytes
+            } else if budgeted && !finalized {
+                let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                let Some(limit) = state.retained_payload_limit() else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                let Some(current) = state.retained_payload_bytes_bounded(limit) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                limit.saturating_sub(current).min(MAX_JSON_BODY_BYTES)
+            } else {
+                MAX_JSON_BODY_BYTES
+            };
+            let max_bytes = admitted_wire_length.map_or(max_bytes, |length| length.min(max_bytes));
+            if max_bytes == 0 {
+                return Ok(persistence_budget_failure(ctx, false, &mut None));
+            }
+            if budgeted
+                && matches!(
+                    ctx.response_body_mode,
+                    BodyMode::StreamBuffer { max_bytes: existing } if existing.is_none_or(|existing| existing > max_bytes)
+                )
+            {
+                return Ok(persistence_budget_failure(ctx, false, &mut None));
+            }
+            if ctx
+                .response_header
+                .as_ref()
+                .and_then(|response| response.headers.get(http::header::CONTENT_LENGTH))
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return Ok(persistence_budget_failure(ctx, false, &mut None));
+            }
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(max_bytes),
+            });
         }
 
         trace!("response body persistence armed");
@@ -2260,14 +2545,48 @@ mod encode_replay_event_tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use bytes::Bytes;
-    use praxis_filter::{FilterAction, HttpFilter as _, sse::SseDecoder};
+    use praxis_filter::{FilterAction, HttpFilter as _, body::BodyMode, sse::SseDecoder};
     use serde_json::json;
 
     use super::{
-        ResponseEventRecord, ResponseStoreFilter, StateOwner, capture_request_input, encode_replay_event,
-        persistence_budget_failure,
+        CapturedEvent, DirectFiniteRestoreFraming, ResponseEventRecord, ResponseStoreFilter, StateOwner,
+        buffered_header_persistence_length, capture_request_input, encode_replay_event, persistence_budget_failure,
+        persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
+
+    #[test]
+    fn budgeted_finite_persistence_requires_trusted_header_or_restore_handoff() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut response = crate::test_utils::make_response();
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut state = ResponsesState::default();
+        state.apply_retained_payload_limit(1 << 20);
+        ctx.extensions.insert(state);
+        ctx.response_header = Some(&mut response);
+        ctx.response_body_mode = BodyMode::Stream;
+
+        assert_eq!(buffered_header_persistence_length(&ctx), None);
+        ctx.response_header
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert(http::header::CONTENT_LENGTH, "80".parse().unwrap());
+        assert_eq!(buffered_header_persistence_length(&ctx), Some(80));
+
+        ctx.response_header
+            .as_mut()
+            .unwrap()
+            .headers
+            .remove(http::header::CONTENT_LENGTH);
+        ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: Some(80) };
+        assert_eq!(buffered_header_persistence_length(&ctx), None);
+        ctx.extensions.insert(DirectFiniteRestoreFraming {
+            wire_bytes: 80,
+            previous_id_bytes: 9,
+        });
+        assert_eq!(buffered_header_persistence_length(&ctx), Some(80));
+    }
 
     /// Build a minimal event record carrying `payload` for the encoder under test.
     fn record_with_payload(event_type: &str, payload: &[u8]) -> ResponseEventRecord {
@@ -2353,6 +2672,43 @@ mod encode_replay_event_tests {
             128 + store_bytes,
             "replay accounting must preserve other sibling-filter charges"
         );
+    }
+
+    /// Replay rows each own a response ID after the parent record is persisted.
+    /// Admit those clones before persistence, even when each captured event is tiny.
+    #[test]
+    fn replay_persistence_reserves_response_id_for_each_event() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState {
+            response_object: json!({"id": "r".repeat(10_000), "created_at": 1, "model": "test", "output": []}),
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(1_048_576);
+        let response_bytes = super::retained_json_bytes(&responses.response_object).unwrap();
+        let events = (0..1_000)
+            .map(|sequence_number| CapturedEvent {
+                sequence_number,
+                event_type: "response.output_text.delta".to_owned(),
+                payload: b"{}".to_vec(),
+                terminal: false,
+            })
+            .collect::<Vec<_>>();
+        let capture = super::ResponseStoreRequestState {
+            event_bytes: events.iter().map(|event| event.payload.len() as u64).sum(),
+            event_name_bytes: events.iter().map(|event| event.event_type.len()).sum(),
+            events,
+            ..super::ResponseStoreRequestState::default()
+        };
+        responses.set_retained_external_payload_bytes(capture.retained_payload_bytes().unwrap());
+        ctx.extensions.insert(responses);
+        ctx.extensions.insert(capture);
+
+        assert!(!persistence_construction_fits(&ctx, response_bytes));
+        let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        *responses.response_object.get_mut("id").unwrap() = json!("r");
+        let short_response_bytes = super::retained_json_bytes(&responses.response_object).unwrap();
+        assert!(persistence_construction_fits(&ctx, short_response_bytes));
     }
 
     #[test]

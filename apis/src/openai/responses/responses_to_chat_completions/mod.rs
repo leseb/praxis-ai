@@ -74,9 +74,12 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// Marker for a streaming Chat Completions SSE response.
 const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 
+/// Error sent when Chat translation cannot fit simultaneous live owners.
 const CHAT_BUDGET_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat translation";
+/// Maximum count of transient copies of one outbound source during lowering.
 const OUTBOUND_SOURCE_COPIES: usize = 6;
+/// Fixed serialization and object overhead reserved for outbound lowering.
 const OUTBOUND_FIXED_BYTES: usize = 4_096;
 
 /// Response-side error when a finite Chat response cannot be translated within
@@ -290,6 +293,10 @@ impl ResponsesToChatCompletionsFilter {
     #[expect(
         clippy::unnecessary_wraps,
         reason = "mirrors the fallible response dispatch handlers so on_response can return every branch uniformly with `?`/`return`"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "installs headers and converter before stream commitment"
     )]
     fn install_stream_converter(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let streaming_requested = request_is_streaming(ctx);
@@ -604,12 +611,17 @@ fn outbound_wire_fits(ctx: &HttpFilterContext<'_>, translated: &serde_json::Valu
         .is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
+/// Reject a translated Chat request before selecting an upstream body.
 fn chat_request_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstreamBodyOutcome {
     SelectedUpstreamBodyOutcome::Reject(super::budget_error::request_rejection(ctx, CHAT_BUDGET_MESSAGE))
 }
 
 /// Reserve the provider parse tree, translated resource, serialized wire body,
 /// and request fields echoed into the resource before creating any of them.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one finite translation admission counts old wire and new JSON owners"
+)]
 fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
@@ -633,11 +645,11 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
         let string_expansion = strings.checked_mul(FINITE_TRANSLATION_STRING_EXPANSION_BYTES)?;
         let number_expansion = numbers.checked_mul(FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES)?;
         // Function-call IDs can be emitted as both `id` and `call_id`.
-        // During serialization, the wire Vec can also hold a new capacity
-        // alongside its previous allocation. Seven raw-sized owners cover the
-        // parsed provider tree, both translated ID copies, and that Vec peak.
+        // At a growth boundary, the serialized wire Vec can retain both its
+        // old and new capacities alongside the raw body and both JSON trees.
+        // Ten raw-sized owners cover that simultaneous peak.
         body.len()
-            .checked_mul(7)?
+            .checked_mul(10)?
             .checked_add(object_expansion)?
             .checked_add(array_expansion)?
             .checked_add(string_expansion)?
@@ -648,7 +660,7 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
             .checked_add(response_id_bytes.checked_mul(12)?)?
             // The fixed Responses resource fields exist even for a minimal
             // provider object; reserve them in the tree and wire buffer.
-            .checked_add(1024)
+            .checked_add(3_072)
     })();
     staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
@@ -656,6 +668,10 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
 /// Count structural objects and numeric tokens without allocating or mistaking
 /// their bytes inside JSON strings for payload structure. Invalid JSON still
 /// reaches provider-response validation unless its projection is over budget.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass JSON structure scanner avoids a tree copy"
+)]
 fn json_structure_counts(body: &[u8]) -> Option<(usize, usize, usize, usize)> {
     let mut in_string = false;
     let mut escaped = false;
@@ -779,13 +795,16 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
         // Cap the raw buffered owner before parsing creates more owned trees.
+        // A later client-tool restore has no transformed wire length at this
+        // header phase, so leave enough headroom for its conservative peak.
         let finite_cap = ctx.extensions.get::<ResponsesState>().map(|state| {
             state.retained_payload_limit().map(|limit| {
                 state
                     .retained_payload_bytes_bounded(limit)
                     .and_then(|current| limit.checked_sub(current))
-                    .map(|remaining| remaining / 8)
-                    .unwrap_or(0)
+                    .map_or(0, |remaining| {
+                        remaining / if state.client_tool_echo.is_some() { 512 } else { 8 }
+                    })
             })
         });
         if finite_cap == Some(Some(0)) {

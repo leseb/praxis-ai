@@ -257,6 +257,16 @@ const META_STATUS: &str = "responses.status";
 /// continuation overflow returns HTTP 502. Once SSE is committed, overflow
 /// emits one `error` event with no `response.completed` or `[DONE]`, and the
 /// failed response is not persisted.
+/// Finite Responses storage and Conversation append bound their response body
+/// buffer to the remaining allowance at the response-header boundary. A
+/// `Content-Length` above that allowance is rejected with HTTP 502 before the
+/// body is read. Without an accurate length, the body buffer still enforces
+/// the cap as chunks arrive; a post-header overflow closes the response.
+/// When client-tool restoration is armed, its finite response buffer reserves
+/// a conservative 256-times raw-body allowance plus echoed-tool overhead
+/// before headers commit. An unframed response may therefore reach its buffer
+/// cap well before the aggregate retained-payload limit; a response larger
+/// than that cap closes after headers rather than exposing lowered tool names.
 ///
 /// # YAML
 ///
@@ -530,27 +540,13 @@ pub(crate) fn finish_request_after_deferred_dispatch(
 
 /// Apply the request-wide retained-payload limit before any local dispatcher
 /// side effect or upstream inference request.
-#[expect(clippy::too_many_lines, reason = "shared initial and continuation budget admission")]
 fn admit_retained_payload_budget(
     ctx: &mut HttpFilterContext<'_>,
     configured_limit: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
-    // Conversation append-back builds independent input/output records and a
-    // store message cache after the agentic response. Until that owner has a
-    // pre-allocation admission hook, reject this budgeted route before the
-    // first provider/tool side effect rather than let it evade the shared cap.
-    #[cfg(feature = "openai-conversations")]
-    if ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
-        && ctx.get_metadata("responses.conversation_id").is_some()
-        && ctx.get_metadata("openai_responses_format.background") != Some("true")
-    {
-        set_action(ctx, ACTION_DONE)?;
-        return Ok(Some(super::budget_error::reject_request(
-            ctx,
-            "conversation append exceeds the current openai_agentic_loop.max_retained_bytes admission policy",
-        )));
-    }
-
+    // Keep the budget obligation visible to response hooks even if an IRR
+    // extension handoff loses ResponsesState before conversation append-back.
+    ctx.set_metadata("responses.retained_budget_active", "true");
     #[cfg(feature = "store")]
     let store_payload_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
     #[cfg(not(feature = "store"))]
@@ -718,14 +714,16 @@ fn convert_dispatch_failure(
         // `encode_local_error`). Only skip persistence of the failed round.
         ctx.set_metadata("responses.skip_persist", "true");
     }
-    #[cfg(feature = "store")]
     let retained_budget_failure = state.retained_payload_failed;
     ctx.extensions.insert(state);
-    #[cfg(feature = "store")]
-    if retained_budget_failure {
-        super::store::discard_retained_request_payload(ctx);
-    }
     set_action(ctx, ACTION_DONE)?;
+
+    if retained_budget_failure {
+        return Ok(FilterAction::Reject(super::budget_error::request_rejection(
+            ctx,
+            &failure.message,
+        )));
+    }
 
     if streaming {
         let body = encode_local_error(ctx, failure.code, &failure.message);
@@ -839,6 +837,10 @@ fn end_stream_with_error(
 /// re-entry, reset `tool_choice`. Header replay has already happened during
 /// body pre-read, before request filters and routing inspect the headers.
 fn prepare_iteration(state: &mut ResponsesState) {
+    state.buffered_canonical_finalized = false;
+    state.buffered_canonical_wire_bytes = None;
+    state.buffered_canonical_parsed_bound_bytes = None;
+    state.buffered_canonical_body_digest = None;
     state.tool_calls.clear();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
@@ -1127,19 +1129,16 @@ fn end_at_iteration_limit(
 // Body Parsing
 // -----------------------------------------------------------------------------
 
-/// Upper bound on compact JSON bytes after parsing a request or response.
+/// Upper bound on compact JSON bytes after parsing a native response.
 ///
-/// `serde_json` can expand exponent-form numbers while serializing its parsed
-/// `Value` (for example, `1e15` becomes `1000000000000000.0`). Its current
-/// finite-float formatter has a 24-byte buffer. Scan number tokens outside
-/// strings without allocating so the parsed tree is admitted before creation.
-/// Integers below 20 bytes and decimal forms without an exponent already have
-/// a shortest round-trip spelling no longer than their input; `-0` is special.
+/// Serde can expand exponent-form numbers while serializing a parsed `Value`.
+/// Scan numeric tokens outside strings without allocating so that growth is
+/// admitted before the parsed tree is created.
 #[expect(
     clippy::too_many_lines,
-    reason = "single-pass lexical bound must skip quoted number-like text"
+    reason = "single-pass lexical bound skips quoted number-like text"
 )]
-pub(super) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+pub(crate) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
     const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
     let mut extra = 0_usize;
     let mut index = 0;
@@ -1191,10 +1190,9 @@ pub(super) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usiz
 )]
 fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     // The framework owns and separately bounds the raw response body. Only the
-    // parsed response and the copies retained by agentic-loop state belong in
-    // this aggregate budget. Numeric normalization can expand the compact JSON
-    // payload beyond the wire length, so reserve its checked upper bound before
-    // serde allocates. Exact owner accounting follows normalization and IDs.
+    // parsed response and copies retained by agentic-loop state belong in this
+    // aggregate budget. Numeric normalization can expand compact JSON beyond
+    // the wire length, so reserve a checked upper bound before serde allocates.
     let parsed_bound = if state.retained_payload_limit().is_some() {
         buffered_parsed_json_bytes_upper_bound(body).ok_or_else(retained_payload_failure)?
     } else {
@@ -1322,12 +1320,15 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
-        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
-            .filter(|id| !state.provider_compaction_ids.contains(*id))
-            .map_or(0, str::len);
+        // A provider compaction item also copies its ID into the replay set.
+        let replay_id_bytes = if item.get("type").and_then(Value::as_str) == Some("compaction") {
+            item.get("id").and_then(Value::as_str).map_or(0, str::len)
+        } else {
+            0
+        };
         let Some(total) = bytes
             .checked_mul(copies)
-            .and_then(|bytes| bytes.checked_add(id_bytes))
+            .and_then(|bytes| bytes.checked_add(replay_id_bytes))
             .and_then(|bytes| copied_item_bytes.checked_add(bytes))
         else {
             return false;
@@ -1783,12 +1784,14 @@ fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
-        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
-            .filter(|id| !state.provider_compaction_ids.contains(*id))
-            .map_or(0, str::len);
+        let replay_id_bytes = if item.get("type").and_then(Value::as_str) == Some("compaction") {
+            item.get("id").and_then(Value::as_str).map_or(0, str::len)
+        } else {
+            0
+        };
         let Some(total) = bytes
             .checked_mul(copies)
-            .and_then(|bytes| bytes.checked_add(id_bytes))
+            .and_then(|bytes| bytes.checked_add(replay_id_bytes))
             .and_then(|bytes| added.checked_add(bytes))
         else {
             return false;

@@ -72,9 +72,10 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
+    agentic_loop::AgenticBudgetPolicy,
     bound_body_outcome,
     error::responses_error_rejection,
-    state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
+    state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
 use crate::{
     StateOwner,
@@ -87,6 +88,22 @@ use crate::{
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
 const MAX_FUNCTION_NAME_LEN: usize = 64;
+
+/// Raw control page, decoded listing, converted JSON, function tools, public
+/// listing, and one owner for transformation overlap.
+const DEFERRED_LISTING_OWNER_RESERVATION: usize = 6;
+
+/// Fixed generated function, dispatch, and discovery fields per listed tool.
+const EAGER_TOOL_OVERHEAD_RESERVATION_BYTES: usize = 512;
+
+/// Shared budget headroom and independently owned request staging at eager discovery.
+#[derive(Clone, Copy)]
+struct EagerListingBudget {
+    /// Request-wide ceiling.
+    limit: usize,
+    /// Existing state, buffered wire body, and local parsed request owners.
+    baseline: usize,
+}
 
 // -----------------------------------------------------------------------------
 // McpToolResolveFilter
@@ -336,6 +353,16 @@ impl McpToolResolveFilter {
         body: &mut Option<Bytes>,
         mut parsed: serde_json::Value,
     ) -> Result<FilterAction, ResolveError> {
+        if let Some(limit) = ctx
+            .extensions
+            .get::<AgenticBudgetPolicy>()
+            .map(|policy| policy.max_retained_bytes())
+        {
+            let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+                return Err(ResolveError::RetainedBudget);
+            };
+            state.apply_retained_payload_limit(limit);
+        }
         let mut mcp_entries = extract_mcp_entries(&mut parsed);
         if mcp_entries.is_empty() {
             return Ok(FilterAction::Continue);
@@ -358,6 +385,15 @@ impl McpToolResolveFilter {
         };
         require_tool_search_for_deferred(ctx, &mcp_entries.values)?;
         self.validate_entries(&mcp_entries.values)?;
+        let eager_budget = if mcp_entries
+            .values
+            .iter()
+            .any(|entry| resolvable_server_url(entry).is_some())
+        {
+            eager_listing_budget(ctx, body, &parsed, &mcp_entries.values)?
+        } else {
+            None
+        };
 
         // Capture the parent transport + downstream attributes for the outbound
         // callout before the resolution work borrows `ctx` mutably; fails closed
@@ -370,7 +406,13 @@ impl McpToolResolveFilter {
             self.max_rewritten_body_bytes,
         );
         let resolution = self
-            .resolve_request_entries(ctx, &mcp_entries.values, &callout, connector_identity.as_ref())
+            .resolve_request_entries(
+                ctx,
+                &mcp_entries.values,
+                &callout,
+                connector_identity.as_ref(),
+                eager_budget,
+            )
             .await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
@@ -398,7 +440,8 @@ impl McpToolResolveFilter {
     /// Rewrite the request body and store resolved plus deferred MCP state.
     #[expect(
         clippy::too_many_arguments,
-        reason = "rewrite needs the parsed body and both resolved maps"
+        clippy::too_many_lines,
+        reason = "rewrite and admission need the parsed body and both resolved maps"
     )]
     fn commit_resolved_tools(
         &self,
@@ -422,19 +465,42 @@ impl McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
+        if !eager_commit_fits(
+            ctx,
+            &parsed,
+            &tool_map,
+            &listings,
+            &deferred_mcp,
+            serialized.len(),
+            body,
+        ) {
+            return Err(ResolveError::RetainedBudget);
+        }
         serialized.commit(body, self.name(), "tools");
         write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy);
         commit_discovery_items(ctx, listings);
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_limit().is_some() && !state.can_retain_payload(0))
+        {
+            return Err(ResolveError::RetainedBudget);
+        }
         Ok(FilterAction::Continue)
     }
 
     /// Resolve request entries using the effective trusted-header view.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "resolution threads callout identity and shared budget"
+    )]
     async fn resolve_request_entries(
         &self,
         ctx: &HttpFilterContext<'_>,
         entries: &[serde_json::Value],
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        budget: Option<EagerListingBudget>,
     ) -> Result<Resolution, ResolveError> {
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
         let owner_fingerprint = ctx
@@ -450,6 +516,7 @@ impl McpToolResolveFilter {
             &forwarded_headers,
             callout,
             connector_identity,
+            budget,
         )
         .await
     }
@@ -469,14 +536,15 @@ impl McpToolResolveFilter {
     /// Resolve all MCP entries, building both the global dispatch
     /// map and pre-built function tools for body rewriting.
     ///
-    /// Server resolutions run concurrently via
-    /// [`futures::future::try_join_all`]. Non-credentialed entries
+    /// Server resolutions run concurrently in batches admitted by the shared
+    /// retained-payload budget. Non-credentialed entries
     /// sharing the same `(server_label, server_url)` are
     /// deduplicated to a single resolution task; credentialed
     /// entries always resolve independently.
     #[expect(
         clippy::too_many_arguments,
-        reason = "concurrent resolution threads cache, trusted headers, executor, and scoped identity"
+        clippy::too_many_lines,
+        reason = "budgeted batch resolution threads cache, trusted headers, executor, and scoped identity"
     )]
     async fn resolve_all_entries(
         &self,
@@ -486,13 +554,34 @@ impl McpToolResolveFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        budget: Option<EagerListingBudget>,
     ) -> Result<Resolution, ResolveError> {
         let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries)?;
-
-        let futures: Vec<_> = task_entries
-            .iter()
-            .zip(&task_allowed_names)
-            .map(|(entry, allowed)| async {
+        let mut task_results = Vec::with_capacity(task_entries.len());
+        let mut start = 0;
+        while start < task_entries.len() {
+            let end = match budget {
+                Some(budget) => {
+                    let reserved = eager_prepared_bytes(&task_results).ok_or(ResolveError::RetainedBudget)?;
+                    let available = budget
+                        .limit
+                        .checked_sub(budget.baseline)
+                        .and_then(|bytes| bytes.checked_sub(reserved))
+                        .ok_or(ResolveError::RetainedBudget)?;
+                    let per_call = mcp_client::MAX_LISTING_RESPONSE_BYTES
+                        .checked_mul(DEFERRED_LISTING_OWNER_RESERVATION)
+                        .ok_or(ResolveError::RetainedBudget)?;
+                    let count = (available / per_call).min(task_entries.len() - start);
+                    if count == 0 {
+                        return Err(ResolveError::RetainedBudget);
+                    }
+                    start + count
+                },
+                None => task_entries.len(),
+            };
+            let batch_entries = task_entries.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+            let batch_allowed = task_allowed_names.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+            let futures = batch_entries.iter().zip(batch_allowed).map(|(entry, allowed)| async {
                 let result = self
                     .resolve_entry(
                         entry,
@@ -505,9 +594,17 @@ impl McpToolResolveFilter {
                     )
                     .await;
                 redact_connector_client_error(result, entry)
-            })
-            .collect();
-        let task_results = futures::future::try_join_all(futures).await?;
+            });
+            task_results.extend(futures::future::try_join_all(futures).await?);
+            if budget.is_some_and(|budget| {
+                eager_prepared_bytes(&task_results)
+                    .and_then(|bytes| budget.baseline.checked_add(bytes))
+                    .is_none_or(|bytes| bytes > budget.limit)
+            }) {
+                return Err(ResolveError::RetainedBudget);
+            }
+            start = end;
+        }
 
         collect_resolutions(entries, &entry_to_task, task_results)
     }
@@ -716,6 +813,11 @@ pub(crate) enum ResolveError {
         limit: usize,
     },
 
+    /// MCP discovery cannot fit its next listing or commit staging in the
+    /// request-wide retained-payload budget.
+    #[error("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during MCP discovery")]
+    RetainedBudget,
+
     /// Unknown `connector_id` was referenced.
     #[error("unknown connector_id \"{0}\"")]
     UnknownConnector(String),
@@ -845,6 +947,92 @@ fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize)
         });
     }
     Ok(())
+}
+
+/// Reserve the parsed request copies and raw buffered body before any eager
+/// `tools/list` callout. An absent request-wide limit preserves standalone
+/// resolver behavior.
+fn eager_listing_budget(
+    ctx: &HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    parsed: &serde_json::Value,
+    entries: &[serde_json::Value],
+) -> Result<Option<EagerListingBudget>, ResolveError> {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Ok(None);
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return Ok(None);
+    };
+    let staged = retained_json_bytes(parsed)
+        .and_then(|bytes| bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(entries)?.checked_mul(3)?))
+        .and_then(|bytes| bytes.checked_add(body.as_ref().map_or(0, Bytes::len)))
+        .ok_or(ResolveError::RetainedBudget)?;
+    let baseline = state
+        .retained_payload_bytes_bounded(limit)
+        .and_then(|bytes| bytes.checked_add(staged))
+        .filter(|&bytes| bytes <= limit)
+        .ok_or(ResolveError::RetainedBudget)?;
+    Ok(Some(EagerListingBudget { limit, baseline }))
+}
+
+/// Keep enough room for the decoded results and their later function, dispatch,
+/// public-listing, and private-cache owners while resolving more servers.
+fn eager_prepared_bytes(results: &[Option<Vec<serde_json::Value>>]) -> Option<usize> {
+    let (bytes, tools) = results
+        .iter()
+        .flatten()
+        .try_fold((0_usize, 0_usize), |(bytes, tools), result| {
+            Some((
+                bytes.checked_add(retained_json_bytes(result)?)?,
+                tools.checked_add(result.len())?,
+            ))
+        })?;
+    bytes
+        .checked_mul(DEFERRED_LISTING_OWNER_RESERVATION)?
+        .checked_add(tools.checked_mul(EAGER_TOOL_OVERHEAD_RESERVATION_BYTES)?)
+}
+
+/// Admit the independently owned rewritten body, dispatch map, discovery
+/// listings, and state copies before committing any of them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "projection counts each simultaneously owned request and listing value"
+)]
+fn eager_commit_fits(
+    ctx: &HttpFilterContext<'_>,
+    parsed: &serde_json::Value,
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+    listings: &[McpListing],
+    deferred_mcp: &[DeferredMcpConnector],
+    serialized_bytes: usize,
+    body: &Option<Bytes>,
+) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let map_bytes = tool_map.iter().try_fold(0_usize, |used, ((server, tool), entry)| {
+        used.checked_add(server.len())?
+            .checked_add(tool.len())?
+            .checked_add(retained_json_bytes(entry)?)
+    });
+    let listing_bytes = listings.iter().try_fold(0_usize, |used, listing| {
+        used.checked_add(listing.server_label.len())?
+            .checked_add(listing.server_url.as_ref().map_or(0, String::len))?
+            .checked_add(retained_json_bytes(&listing.tools)?)
+    });
+    let staging = retained_json_bytes(parsed)
+        .and_then(|bytes| bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(serialized_bytes.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(map_bytes?.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(listing_bytes?.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(pending_deferred_bytes(deferred_mcp)?.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(body.as_ref().map_or(0, Bytes::len)));
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
 /// Collect per-entry resolutions from task results.
@@ -1061,7 +1249,9 @@ fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
             source: mcp_client::McpClientError::ResponseTooLarge { .. },
             ..
         } => (413, "invalid_request_error"),
-        ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } => (502, "server_error"),
+        ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } | ResolveError::RetainedBudget => {
+            (502, "server_error")
+        },
         ResolveError::SecurityContext(_) => (401, "missing_callout_context"),
         ResolveError::Serialization(_) | ResolveError::NoSubrequestClient => (500, "server_error"),
     }
@@ -1101,6 +1291,12 @@ pub(crate) fn resolve_error_action(
     streaming: bool,
     body: &[u8],
 ) -> FilterAction {
+    if matches!(err, ResolveError::RetainedBudget) {
+        ctx.set_metadata("responses.skip_persist", "true");
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.discard_payload_for_budget_error();
+        }
+    }
     if streaming && is_mcp_listing_runtime_failure(err) {
         let (_, error_type) = resolve_error_status(err);
         let msg = err.to_string();
@@ -2452,6 +2648,10 @@ async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), 
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
+#[expect(
+    clippy::too_many_lines,
+    reason = "deferred discovery reserves and commits one bounded connector batch"
+)]
 pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     state: &mut ResponsesState,
     forwarded_header_names: &[http::HeaderName],
@@ -2465,6 +2665,7 @@ pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
 
     let pending = std::mem::take(&mut state.deferred_mcp);
     let prepared = match prepare_deferred_listings(
+        state,
         &pending,
         forwarded_header_names,
         forwarded_headers,
@@ -2482,6 +2683,10 @@ pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     let max_bytes = pending
         .first()
         .map_or(MAX_JSON_BODY_BYTES, |connector| connector.max_rewritten_body_bytes);
+    if !deferred_commit_fits(state, &pending, &prepared) {
+        state.deferred_mcp = pending;
+        return Err(ResolveError::RetainedBudget);
+    }
     if let Err(err) = commit_deferred_listings(state, prepared, max_bytes) {
         state.deferred_mcp = pending;
         return Err(err);
@@ -2503,28 +2708,200 @@ struct PreparedDeferredListing {
     server_label: String,
 }
 
-/// Call `tools/list` for every deferred connector without mutating state.
-///
-/// Independent servers are listed concurrently so total latency is bounded by
-/// the slowest connector rather than the sum of per-server timeouts. Commit
-/// remains transactional in [`discover_deferred_connectors_with_forwarded_headers`].
+/// Run as many `tools/list` calls concurrently as their combined bounded peak
+/// permits. Stop before the next batch when prior listings exhaust the budget.
+/// Commit remains transactional.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "bounded parallel listing admission threads the callout context and prepared owners"
+)]
 async fn prepare_deferred_listings(
+    state: &ResponsesState,
     pending: &[DeferredMcpConnector],
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
 ) -> Result<Vec<PreparedDeferredListing>, ResolveError> {
-    futures::future::try_join_all(pending.iter().map(|connector| {
-        prepare_deferred_listing(
-            connector,
-            forwarded_header_names,
-            forwarded_headers,
-            callout,
-            connector_identity,
-        )
-    }))
-    .await
+    if state.retained_payload_limit().is_none() {
+        return futures::future::try_join_all(pending.iter().map(|connector| {
+            prepare_deferred_listing(
+                connector,
+                forwarded_header_names,
+                forwarded_headers,
+                callout,
+                connector_identity,
+            )
+        }))
+        .await;
+    }
+    let limit = state.retained_payload_limit().ok_or(ResolveError::RetainedBudget)?;
+    let baseline = state
+        .retained_payload_bytes_bounded(limit)
+        .and_then(|bytes| bytes.checked_add(pending_deferred_bytes(pending)?))
+        .ok_or(ResolveError::RetainedBudget)?;
+    let mut prepared = Vec::with_capacity(pending.len());
+    let mut prepared_bytes = 0_usize;
+    let mut start = 0;
+    while start < pending.len() {
+        let mut end = start;
+        let mut entry_staging = 0_usize;
+        while let Some(connector) = pending.get(end) {
+            let Some(next_entry_staging) =
+                deferred_listing_staging_bytes(connector).and_then(|bytes| entry_staging.checked_add(bytes))
+            else {
+                return Err(ResolveError::RetainedBudget);
+            };
+            if !deferred_listing_batch_fits(baseline, prepared_bytes, next_entry_staging, end - start + 1, limit) {
+                break;
+            }
+            entry_staging = next_entry_staging;
+            end += 1;
+        }
+        if end == start {
+            return Err(ResolveError::RetainedBudget);
+        }
+        let batch = pending.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+        let newly_prepared = futures::future::try_join_all(batch.iter().map(|connector| {
+            prepare_deferred_listing(
+                connector,
+                forwarded_header_names,
+                forwarded_headers,
+                callout,
+                connector_identity,
+            )
+        }))
+        .await?;
+        prepared_bytes = prepared_bytes
+            .checked_add(prepared_deferred_bytes(&newly_prepared).ok_or(ResolveError::RetainedBudget)?)
+            .ok_or(ResolveError::RetainedBudget)?;
+        if baseline.checked_add(prepared_bytes).is_none_or(|bytes| bytes > limit) {
+            return Err(ResolveError::RetainedBudget);
+        }
+        prepared.extend(newly_prepared);
+        start = end;
+    }
+    Ok(prepared)
+}
+
+/// Count a connector that was moved out of `ResponsesState` but remains live.
+fn deferred_connector_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
+    let raw = connector
+        .connector_id
+        .len()
+        .checked_add(connector.server_label.len())?
+        .checked_add(connector.server_url.len())?
+        .checked_add(connector.authorization.as_ref().map_or(0, String::len))?;
+    [
+        connector.allowed_tools.as_ref(),
+        connector.headers.as_ref(),
+        connector.require_approval.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(raw, |used, value| used.checked_add(retained_json_bytes(value)?))
+}
+
+/// Compact size of the entry reconstructed before deferred `tools/list`.
+fn deferred_entry_json_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
+    let mut bytes = br#"{"connector_id":,"server_label":,"server_url":}"#
+        .len()
+        .checked_add(retained_json_bytes(&connector.connector_id)?)?
+        .checked_add(retained_json_bytes(&connector.server_label)?)?
+        .checked_add(retained_json_bytes(&connector.server_url)?)?;
+    if let Some(auth) = &connector.authorization {
+        bytes = bytes
+            .checked_add(br#","authorization":"#.len())?
+            .checked_add(retained_json_bytes(auth)?)?;
+    }
+    for (key, value) in [
+        (br#","allowed_tools":"#.len(), connector.allowed_tools.as_ref()),
+        (br#","headers":"#.len(), connector.headers.as_ref()),
+        (br#","require_approval":"#.len(), connector.require_approval.as_ref()),
+    ] {
+        if let Some(value) = value {
+            bytes = bytes.checked_add(key)?.checked_add(retained_json_bytes(value)?)?;
+        }
+    }
+    Some(bytes)
+}
+
+/// Reserve escaped label copies before dialing, including an empty public listing.
+/// `tools/list` bytes are reserved separately by `deferred_listing_batch_fits`.
+fn deferred_listing_staging_bytes(connector: &DeferredMcpConnector) -> Option<usize> {
+    let entry = deferred_entry_json_bytes(connector)?;
+    let listing = br#"{"id":"mcpl_0000000000000000","type":"mcp_list_tools","server_label":,"tools":[]}"#
+        .len()
+        .checked_add(retained_json_bytes(&connector.server_label)?)?;
+    entry
+        .checked_mul(2)?
+        .checked_add(listing)?
+        .checked_add(connector.server_label.len())?
+        .checked_add(4) // Two empty serialized arrays.
+}
+
+/// Retained bytes in the pending deferred connector descriptors.
+fn pending_deferred_bytes(pending: &[DeferredMcpConnector]) -> Option<usize> {
+    pending.iter().try_fold(0_usize, |used, connector| {
+        used.checked_add(deferred_connector_bytes(connector)?)
+    })
+}
+
+/// Retained bytes in prepared deferred listings before commit.
+fn prepared_deferred_bytes(prepared: &[PreparedDeferredListing]) -> Option<usize> {
+    prepared.iter().try_fold(0_usize, |used, item| {
+        used.checked_add(retained_json_bytes(&item.entry)?)?
+            .checked_add(retained_json_bytes(&item.filtered)?)?
+            .checked_add(retained_json_bytes(&item.functions)?)?
+            .checked_add(retained_json_bytes(&item.listing_item)?)?
+            .checked_add(item.server_label.len())
+    })
+}
+
+/// The MCP transport caps a complete listing at 4 MiB. Reserve each in-flight
+/// call's raw page, decoded tools, function tools, and public listing before
+/// dialing while earlier prepared listings remain live.
+fn deferred_listing_batch_fits(
+    baseline: usize,
+    prepared_bytes: usize,
+    entry_staging: usize,
+    batch_count: usize,
+    limit: usize,
+) -> bool {
+    baseline
+        .checked_add(prepared_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(
+                mcp_client::MAX_LISTING_RESPONSE_BYTES
+                    .checked_mul(DEFERRED_LISTING_OWNER_RESERVATION)?
+                    .checked_mul(batch_count)?,
+            )
+        })
+        .and_then(|bytes| bytes.checked_add(entry_staging))
+        .is_some_and(|bytes| bytes <= limit)
+}
+
+/// Admit the copies made while expanding the request and inserting dispatch
+/// entries before cloning either tree or changing the canonical state.
+fn deferred_commit_fits(
+    state: &ResponsesState,
+    pending: &[DeferredMcpConnector],
+    prepared: &[PreparedDeferredListing],
+) -> bool {
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let fanout = prepared.iter().try_fold(0_usize, |used, item| {
+        let per_tool = retained_json_bytes(&item.entry)?.checked_mul(2)?;
+        used.checked_add(per_tool.checked_mul(item.filtered.len())?)
+    });
+    let staging = pending_deferred_bytes(pending)
+        .and_then(|bytes| bytes.checked_add(prepared_deferred_bytes(prepared)?.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(&state.tools)?.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(&state.request_body)?.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(fanout?));
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
 /// List and rewrite one deferred connector without mutating shared state.
