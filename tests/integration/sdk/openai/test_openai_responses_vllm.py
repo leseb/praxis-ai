@@ -2010,7 +2010,10 @@ def direct_budget_client(tmp_path, request):
         proxy_port,
         backend_endpoint=f"127.0.0.1:{backend.server_port}",
     )
-    config = config.replace("max_retained_bytes: 67108864", "max_retained_bytes: 16384")
+    budget_limit = getattr(request, "param", 16_384)
+    config = config.replace(
+        "max_retained_bytes: 67108864", f"max_retained_bytes: {budget_limit}"
+    )
     anchor = "      - filter: iterative_request_router\n"
     assert config.count(anchor) == 1
     config = config.replace(
@@ -2061,10 +2064,6 @@ def direct_budget_client(tmp_path, request):
 def test_direct_budget_store_rejects_before_success_headers(direct_budget_client):
     """A noncanonical direct branch reports a structured budget failure."""
     client = direct_budget_client
-    admitted = client.responses.create(model="10", input="hello", store=True)
-    assert admitted.status == "completed"
-    assert admitted.output[0].content[0].text == "x" * 10
-
     with pytest.raises(APIStatusError) as known:
         client.responses.create(model="3000", input="hello", store=True)
     assert known.value.status_code == 502
@@ -2078,6 +2077,14 @@ def test_direct_budget_store_rejects_before_success_headers(direct_budget_client
     passthrough = client.responses.create(model="3000", input="hello", store=False)
     assert passthrough.status == "completed"
     assert passthrough.output[0].content[0].text == "x" * 3000
+
+
+@pytest.mark.parametrize("direct_budget_client", [32_768], indirect=True)
+def test_direct_budget_store_admits_bounded_known_length(direct_budget_client):
+    """A known safe direct body still reaches persistence with budget headroom."""
+    admitted = direct_budget_client.responses.create(model="10", input="hello", store=True)
+    assert admitted.status == "completed"
+    assert admitted.output[0].content[0].text == "x" * 10
 
 
 @pytest.fixture()
