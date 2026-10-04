@@ -3814,7 +3814,7 @@ impl ResponseStore for MockStore {
         if encoded > max_bytes {
             return Err(StoreError::PayloadTooLarge);
         }
-        self.get_conversation(tenant_id, conversation_id).await
+        ResponseStore::get_conversation(self, tenant_id, conversation_id).await
     }
 }
 
