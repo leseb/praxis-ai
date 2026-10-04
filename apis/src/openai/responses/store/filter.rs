@@ -69,6 +69,7 @@ use super::{
         bound_body_outcome,
         budget_error::reject_retained_payload_budget,
         error::responses_error_rejection,
+        rehydrate::DirectFiniteRestoreFraming,
         state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
     },
     config::{ResponseStoreConfig, validate_config},
@@ -1259,30 +1260,65 @@ fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, bytes: &[
 }
 
 /// Admit a noncanonical JSON body before core commits the upstream headers.
-/// Without the body we cannot inspect number tokens. The scanner above can
-/// add at most 21 bytes for each exponent token, whose shortest spelling is
-/// three bytes (`1e0`). It also reserves up to 24 bytes for `-0`, a two-byte
-/// token. Thus twelve times a trusted wire length bounds the same scanner's
-/// projection. A missing or ambiguous length cannot establish the persistence
-/// peak before commitment.
+/// Without the body we cannot inspect number tokens. Twelve times a trusted
+/// wire length bounds the scanner's normalized JSON projection. A prior
+/// Rehydrate filter can remove `Content-Length` after validating it; its typed
+/// framing handoff also reserves the escaped replacement ID and any new key.
+/// Missing or ambiguous framing cannot establish the persistence peak before
+/// commitment.
 fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let (wire_bytes, replacement_id_bytes) = trusted_persistence_framing(ctx)?;
+    if wire_bytes > MAX_JSON_BODY_BYTES {
+        return None;
+    }
+    let mut parsed_bytes = wire_bytes.checked_mul(12)?;
+    if let Some(previous_id_bytes) = replacement_id_bytes {
+        // JSON control-byte escapes can use six bytes per input byte. Allow
+        // for adding the key when the upstream object omitted it entirely.
+        parsed_bytes = parsed_bytes
+            .checked_add(previous_id_bytes.checked_mul(6)?)?
+            .checked_add(32)?;
+    }
+    // Core's multi-chunk freeze can hold two original wire copies. After
+    // Rehydrate rewrites the body, Store instead holds the replacement wire,
+    // which can be longer than both originals when the ID requires escaping.
+    let transient_wire_bytes = wire_bytes.checked_mul(2)?;
+    let transient_wire_bytes = if replacement_id_bytes.is_some() {
+        transient_wire_bytes.max(parsed_bytes)
+    } else {
+        transient_wire_bytes
+    };
+    persistence_construction_fits_with_wire(ctx, parsed_bytes, transient_wire_bytes).then_some(wire_bytes)
+}
+
+/// Recover trusted upstream framing from the header or Rehydrate's bounded handoff.
+fn trusted_persistence_framing(ctx: &HttpFilterContext<'_>) -> Option<(usize, Option<usize>)> {
     let response = ctx.response_header.as_ref()?;
     if response.headers.contains_key(http::header::TRANSFER_ENCODING)
         || response.headers.contains_key(http::header::CONTENT_ENCODING)
-        || !matches!(&ctx.response_body_mode, BodyMode::Stream)
     {
         return None;
     }
-    let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
-    let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
-    if lengths.next().is_some() || wire_bytes > MAX_JSON_BODY_BYTES {
-        return None;
+    match &ctx.response_body_mode {
+        BodyMode::Stream => {
+            let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
+            let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
+            if lengths.next().is_some() {
+                return None;
+            }
+            Some((wire_bytes, None))
+        },
+        BodyMode::StreamBuffer {
+            max_bytes: Some(max_bytes),
+        } => {
+            let framing = ctx.extensions.get::<DirectFiniteRestoreFraming>()?;
+            if response.headers.contains_key(http::header::CONTENT_LENGTH) || *max_bytes != framing.wire_bytes {
+                return None;
+            }
+            Some((framing.wire_bytes, Some(framing.previous_id_bytes)))
+        },
+        _ => None,
     }
-    let parsed_bytes = wire_bytes.checked_mul(12)?;
-    // Core's multi-chunk BodyBuffer::freeze copies into a contiguous Bytes
-    // while the original chunks are still owned by the buffer.
-    let transient_wire_bytes = wire_bytes.checked_mul(2)?;
-    persistence_construction_fits_with_wire(ctx, parsed_bytes, transient_wire_bytes).then_some(wire_bytes)
 }
 
 /// The response, messages, and input columns may each be zstd-compressed and
@@ -3903,6 +3939,62 @@ mod encode_replay_event_tests {
             store_filter.on_response(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the direct response crosses both rehydrate and store header filters"
+    )]
+    async fn budgeted_direct_stored_restore_uses_validated_framing() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "false");
+        let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"next","store":true}));
+        state.history_rehydrated = true;
+        state.previous_response_id = Some("resp_previous".to_owned());
+        state.apply_retained_payload_limit(65_536);
+        ctx.extensions.insert(state);
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        response
+            .headers
+            .insert(http::header::CONTENT_LENGTH, "300".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        let rehydrate = crate::openai::RehydrateFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+        assert!(matches!(
+            rehydrate.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(
+            ctx.response_header
+                .as_ref()
+                .unwrap()
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .is_none()
+        );
+        let store_filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(100).unwrap(), NonZeroU64::new(1_000_000).unwrap());
+        assert!(matches!(
+            store_filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert_eq!(
+            ctx.response_body_mode,
+            praxis_filter::body::BodyMode::StreamBuffer { max_bytes: Some(300) }
+        );
     }
 
     #[tokio::test]

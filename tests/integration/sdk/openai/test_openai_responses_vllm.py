@@ -2087,9 +2087,24 @@ def test_direct_budget_store_admits_bounded_known_length(direct_budget_client):
     assert admitted.output[0].content[0].text == "x" * 10
 
 
+@pytest.mark.parametrize("direct_budget_client", [65_536], indirect=True)
+def test_direct_budget_store_persists_bounded_previous_response(direct_budget_client):
+    """A stored direct continuation survives both restoration and persistence."""
+    client = direct_budget_client
+    seed = client.responses.create(model="10", input="seed", store=True)
+    continued = client.responses.create(
+        model="20", input="next", previous_response_id=seed.id, store=True
+    )
+    assert continued.status == "completed"
+    assert continued.previous_response_id == seed.id
+    retrieved = client.responses.retrieve(continued.id)
+    assert retrieved.previous_response_id == seed.id
+
+
 @pytest.mark.parametrize("direct_budget_client", [32_768], indirect=True)
 @pytest.mark.parametrize("model", ["8000", "chunked"])
-def test_direct_budget_restore_rejects_before_success_headers(direct_budget_client, model):
+@pytest.mark.parametrize("store", [False, True])
+def test_direct_budget_restore_rejects_before_success_headers(direct_budget_client, model, store):
     """A direct previous-response rewrite reports budget failures as HTTP 502."""
     client = direct_budget_client
     seed = client.responses.create(model="10", input="seed", store=True)
@@ -2101,7 +2116,7 @@ def test_direct_budget_restore_rejects_before_success_headers(direct_budget_clie
 
     with pytest.raises(APIStatusError) as failed:
         client.responses.create(
-            model=model, input="next", previous_response_id=seed.id, store=False
+            model=model, input="next", previous_response_id=seed.id, store=store
         )
     assert failed.value.status_code == 502
     assert failed.value.response.json()["error"]["type"] == "server_error"

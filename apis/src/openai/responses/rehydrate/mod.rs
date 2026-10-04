@@ -95,6 +95,15 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 #[derive(Default)]
 pub struct RehydrateFilter;
 
+/// Trusted upstream framing retained for a direct finite restore after its
+/// `Content-Length` is removed so core can frame the rewritten body.
+pub(super) struct DirectFiniteRestoreFraming {
+    /// Original identity-coded upstream body length, verified before rewriting.
+    pub wire_bytes: usize,
+    /// Byte length of the caller's ID inserted into the rewritten JSON body.
+    pub previous_id_bytes: usize,
+}
+
 /// Configuration for `openai_responses_rehydrate`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -283,7 +292,12 @@ impl HttpFilter for RehydrateFilter {
         bound_body_outcome(action)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "finite and SSE restoration eligibility share the response header"
+    )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.extensions.remove::<DirectFiniteRestoreFraming>();
         // The response header is only available in this header phase, so every
         // eligibility decision (status + content-type + rehydration state) is
         // made here and carried into `on_response_body` via filter state. A finite
@@ -309,7 +323,14 @@ impl HttpFilter for RehydrateFilter {
             } else {
                 MAX_JSON_BODY_BYTES
             };
+            let previous_id_bytes = prev_id.len();
             arm_json_restore(ctx, prev_id, max_bytes);
+            if direct_budgeted {
+                ctx.extensions.insert(DirectFiniteRestoreFraming {
+                    wire_bytes: max_bytes,
+                    previous_id_bytes,
+                });
+            }
         } else {
             arm_streaming_restore(ctx);
         }
