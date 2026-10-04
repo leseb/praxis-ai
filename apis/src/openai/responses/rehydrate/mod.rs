@@ -414,7 +414,7 @@ fn finite_restore_fits(ctx: &HttpFilterContext<'_>, body: Option<&[u8]>, previou
 /// Before direct-route headers commit, bound every finite restore owner using
 /// the exact identity-coded wire length. The scanner's largest normalized
 /// number expansion is 24 bytes from the two-byte `-0` token, hence 12x.
-/// Multi-chunk BodyBuffer freeze can own two copies of the original wire body.
+/// Multi-chunk `BodyBuffer` freeze can own two copies of the original wire body.
 /// Unknown framing or an earlier buffering/rewrite request cannot establish a
 /// trustworthy bound at this point and is rejected before header commitment.
 fn finite_restore_header_length(ctx: &HttpFilterContext<'_>, previous_id: &str) -> Option<usize> {
@@ -1313,6 +1313,10 @@ fn frame_may_have_response_key(frame: &[u8]) -> bool {
 
 /// Read a provider frame's top-level integer sequence without allocating its
 /// data payload. A local terminal error must follow frames already forwarded.
+#[expect(
+    clippy::too_many_lines,
+    reason = "joined SSE data and JSON number scan share one state machine"
+)]
 fn frame_sequence_number(frame: &[u8]) -> Option<u64> {
     let mut probe = ResponseKeyProbe::for_key(b"sequence_number");
     let mut sequence = 0_u64;
@@ -1342,9 +1346,7 @@ fn frame_sequence_number(frame: &[u8]) -> Option<u64> {
                     return;
                 };
                 sequence = next;
-            } else if !saw_digit && byte.is_ascii_whitespace() {
-                continue;
-            } else {
+            } else if saw_digit || !byte.is_ascii_whitespace() {
                 valid = saw_digit && matches!(byte, b',' | b'}' | b' ' | b'\t' | b'\n');
                 done = true;
                 return;
@@ -1354,6 +1356,7 @@ fn frame_sequence_number(frame: &[u8]) -> Option<u64> {
     (saw_digit && (valid || !done)).then_some(sequence)
 }
 
+/// Preserve the largest forwarded sequence when a chunk contains several frames.
 fn max_sequence(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
@@ -1401,6 +1404,7 @@ impl Default for ResponseKeyProbe {
 }
 
 impl ResponseKeyProbe {
+    /// Use the same allocation-free lexical scan for another top-level key.
     fn for_key(target: &'static [u8]) -> Self {
         Self {
             target,

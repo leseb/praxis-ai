@@ -1987,7 +1987,7 @@ async fn direct_finite_restore_rejects_before_success_headers() {
     ctx.response_header = Some(&mut response);
 
     let action = filter.on_response(&mut ctx).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(ref rejection) if rejection.status == 502));
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
@@ -2005,7 +2005,7 @@ async fn direct_finite_restore_rejects_unknown_framing_before_headers() {
 
     assert!(matches!(
         filter.on_response(&mut ctx).await.unwrap(),
-        FilterAction::Reject(ref rejection) if rejection.status == 502
+        FilterAction::Reject(rejection) if rejection.status == 502
     ));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
