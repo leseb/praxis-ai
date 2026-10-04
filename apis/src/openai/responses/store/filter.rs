@@ -1780,6 +1780,10 @@ fn pending_approvals_from_ctx(ctx: &HttpFilterContext<'_>) -> Vec<PendingApprova
 // -----------------------------------------------------------------------------
 
 /// Reserve the original input snapshot before parsing another owned JSON tree.
+#[expect(
+    clippy::too_many_lines,
+    reason = "both Store placements must reserve the live wire and parsed tree"
+)]
 fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<(), FilterAction> {
     if should_skip(ctx) {
         return Ok(());
