@@ -11,12 +11,118 @@ use serde_json::json;
 
 use super::{
     ARMED_KEY, CREATED_AT_KEY, RESPONSE_STATUS_KEY, RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM,
-    ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
+    ResponsesToChatCompletionsFilter, error::normalize_provider_error, finite_translation_fits, outbound_source_fits,
+    reject_incompatible_reasoning, stream::StreamConverter,
 };
 use crate::openai::{
     responses::state::ResponsesState,
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
+
+#[test]
+fn chat_translation_admits_small_and_rejects_oversized_owners() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "stream": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    assert!(outbound_source_fits(&context));
+    assert!(finite_translation_fits(&context, br#"{"choices":[]}"#));
+    let many_small_strings = format!("[{}]", vec!["\"\""; 1_200].join(","));
+    assert!(
+        !finite_translation_fits(&context, many_small_strings.as_bytes()),
+        "small JSON strings still create many owned values"
+    );
+
+    let mut state = context.extensions.remove::<ResponsesState>().unwrap();
+    state.apply_retained_payload_limit(4_096);
+    context.extensions.insert(state);
+    assert!(!outbound_source_fits(&context));
+    assert!(!finite_translation_fits(&context, &vec![b'x'; 4_096]));
+}
+
+#[tokio::test]
+async fn finite_chat_buffer_uses_remaining_aggregate_headroom() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    context.response_body_mode = BodyMode::StreamBuffer {
+        max_bytes: Some(67_108_864),
+    };
+
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let BodyMode::StreamBuffer { max_bytes: Some(cap) } = context.response_body_mode else {
+        panic!("finite Chat must stay buffered");
+    };
+    assert!(
+        cap > 0 && cap < 8_192,
+        "the active budget must reduce the prior 64 MiB cap"
+    );
+}
+
+#[test]
+fn chat_stream_budget_failure_is_sticky_and_emits_no_success_terminal() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": true
+    }));
+    state.apply_retained_payload_limit(4_096);
+    context.extensions.insert(state);
+    let mut converter = StreamConverter::new(
+        "resp_budget".to_owned(),
+        1_700_000_000,
+        super::config::ResponsesToChatCompletionsConfig::default().stream_limits(),
+    );
+    converter.set_echo_budget_bytes(Some(128));
+    context.insert_filter_state(converter);
+
+    let mut body = Some(Bytes::from(vec![b'x'; 256]));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let failed = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
+    assert!(failed.contains("event: error"));
+    assert!(!failed.contains("response.completed"));
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+
+    let mut later = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut later, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(later.is_none(), "later provider data cannot revive the failed stream");
+}
 
 #[test]
 fn default_config_parses() {

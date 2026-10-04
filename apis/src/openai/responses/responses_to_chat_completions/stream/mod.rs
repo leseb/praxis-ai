@@ -356,9 +356,52 @@ pub(super) struct StreamConverter {
     accumulated_bytes: usize,
     /// Count of decoded SSE frames processed.
     frames_processed: usize,
+    /// Size of stable request fields echoed into translated resources.
+    echo_budget_bytes: Option<usize>,
 }
 
 impl StreamConverter {
+    /// Conservative size of independently owned converter state. The caller
+    /// reserves further callback staging before parsing the next chunk.
+    pub(super) fn retained_budget_bytes(&self) -> Option<usize> {
+        let mut bytes = self.framing.retained_bytes().checked_add(self.accumulated_bytes)?;
+        for value in [
+            Some(self.response_id.as_str()),
+            self.chat_id.as_deref(),
+            self.model.as_deref(),
+            self.finish_reason.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.checked_add(value.len())?;
+        }
+        for value in [&self.service_tier, &self.usage].into_iter().flatten() {
+            bytes = bytes.checked_add(super::super::bounded_json_size(value, usize::MAX).ok().flatten()?)?;
+        }
+        if let Some(message) = &self.message {
+            bytes = bytes
+                .checked_add(message.item_id.len())?
+                .checked_add(message.text.len())?
+                .checked_add(message.refusal.len())?;
+            for value in &message.logprobs {
+                bytes = bytes.checked_add(super::super::bounded_json_size(value, usize::MAX).ok().flatten()?)?;
+            }
+        }
+        for call in &self.tool_calls {
+            bytes = bytes
+                .checked_add(call.item_id.as_ref().map_or(0, String::len))?
+                .checked_add(call.call_id.len())?
+                .checked_add(call.name.len())?
+                .checked_add(call.arguments.len())?;
+        }
+        Some(bytes)
+    }
+
+    pub(super) fn successful_terminal_emitted(&self) -> bool {
+        self.phase == Phase::EmittedTerminal
+    }
+
     /// Create a converter for a streaming response.
     pub(super) fn new(response_id: String, created_at: u64, limits: StreamLimits) -> Self {
         Self {
@@ -384,7 +427,16 @@ impl StreamConverter {
             tool_calls: Vec::new(),
             accumulated_bytes: 0,
             frames_processed: 0,
+            echo_budget_bytes: None,
         }
+    }
+
+    pub(super) fn set_echo_budget_bytes(&mut self, bytes: Option<usize>) {
+        self.echo_budget_bytes = bytes;
+    }
+
+    pub(super) fn echo_budget_bytes(&self) -> Option<usize> {
+        self.echo_budget_bytes
     }
 
     /// Feed one response body chunk, returning any completed Responses SSE bytes.
