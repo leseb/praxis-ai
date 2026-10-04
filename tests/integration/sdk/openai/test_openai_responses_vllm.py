@@ -2795,8 +2795,9 @@ class TestOpenAIResponsesVLLM:
         finally:
             client.conversations.delete(conversation.id)
 
+    @pytest.mark.parametrize("store", [False, True])
     def test_budgeted_canonical_incomplete_conversation_keeps_partial_response(
-        self, witness_budgeted_continuation_client
+        self, witness_budgeted_continuation_client, store
     ):
         """A finalized incomplete response needs no append and keeps its 200 wire."""
         client, _ = witness_budgeted_continuation_client
@@ -2806,7 +2807,7 @@ class TestOpenAIResponsesVLLM:
                 model="sdk-conversation-stream",
                 input="BUDGET-CANONICAL-INCOMPLETE-410",
                 conversation=conversation.id,
-                store=False,
+                store=store,
                 max_output_tokens=1,
             )
             assert response.status == "incomplete"
