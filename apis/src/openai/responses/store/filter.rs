@@ -3681,6 +3681,7 @@ mod encode_replay_event_tests {
         ));
     }
 
+    #[cfg(feature = "openai-conversations")]
     #[test]
     fn router_step_stream_selection_does_not_outlive_its_round() {
         let inner_step = super::ResponseRound {
