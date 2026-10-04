@@ -8008,3 +8008,89 @@ fn budget_rejects_escaped_done_fallback_before_cloning() {
     assert!(body.is_none(), "the rejected chunk must not be forwarded");
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
+
+#[test]
+fn budget_rejects_lowered_done_fallback_before_restore_plan() {
+    use crate::openai::sse::responses::ResponsesEvent;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    responses.client_tool_lowering.insert(
+        "custom".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(responses);
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "custom", "arguments": "", "status": "in_progress"
+            }
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    stream.tool_call_args.insert(
+        "item:fc_1".to_owned(),
+        serde_json::to_string(&json!({"input": "x".repeat(200_000)})).unwrap(),
+    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(700_000);
+    let done_payload = json!({"item_id": "fc_1", "output_index": 0});
+    let done = ResponsesEvent::FunctionCallArgumentsDone(done_payload.clone());
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    let restore = super::client_tools::lifecycle_fallback_staging_bytes(
+        &responses.client_tool_lowering,
+        &stream.client_tool_items,
+        &stream.tool_call_args,
+        &[done],
+    )
+    .unwrap();
+    assert!(
+        restore > 800_000,
+        "the completion artifact and restored input need separate reservations"
+    );
+    stream.tool_call_args.insert("item:native".to_owned(), "{}".to_owned());
+    let native_done = ResponsesEvent::FunctionCallArgumentsDone(json!({"item_id": "native"}));
+    assert_eq!(
+        super::client_tools::lifecycle_fallback_staging_bytes(
+            &responses.client_tool_lowering,
+            &stream.client_tool_items,
+            &stream.tool_call_args,
+            &[native_done],
+        ),
+        Some(0),
+        "an unrelated native function must not reserve lowered restoration owners"
+    );
+    stream.tool_call_args.remove("item:native");
+    let budget = super::shared_retained_budget(&ctx, &mut stream);
+    assert!(budget.unwrap().1.is_some(), "the buffered source itself fits");
+    assert!(
+        !super::stream_payload_fits_with_budget(&stream, restore, budget),
+        "precommit admission must reject the restore plan before it allocates"
+    );
+    ctx.insert_filter_state(stream);
+
+    let mut body = Some(make_sse_chunk("response.function_call_arguments.done", &done_payload));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        responses.retained_payload_failed,
+        "the lowered fallback exceeds the budget"
+    );
+    assert!(
+        responses.tool_calls.is_empty(),
+        "no completed tool copy may be retained"
+    );
+    assert!(body.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}

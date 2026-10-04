@@ -1024,11 +1024,18 @@ fn parse_and_accumulate(
     let projected_state_clone_bytes = projected_responses_state_clone_bytes(ctx, &events);
     let projected_argument_fallback_bytes = projected_argument_fallback_clone_bytes(state, &events);
     let projected_client_restore_bytes = ctx.extensions.get::<ResponsesState>().map_or(Some(0), |responses| {
-        client_tools::lifecycle_restore_staging_bytes(
+        let lifecycle = client_tools::lifecycle_restore_staging_bytes(
             &responses.client_tool_lowering,
             responses.client_tool_echo.as_ref(),
             &events,
-        )
+        )?;
+        let fallback = client_tools::lifecycle_fallback_staging_bytes(
+            &responses.client_tool_lowering,
+            &state.client_tool_items,
+            &state.tool_call_args,
+            &events,
+        )?;
+        lifecycle.checked_add(fallback)
     });
     if !construction_bytes
         .and_then(|staging| staging.checked_add(projected_item_scratch_bytes?))

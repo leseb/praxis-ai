@@ -268,6 +268,81 @@ pub(super) fn lifecycle_restore_staging_bytes(
     })
 }
 
+/// Reserve the lowered completion artifact and restoration owners when a `done`
+/// frame uses arguments retained from prior deltas. The ordinary done frame is
+/// tiny, so its event payload cannot bound the captured item, parsed input,
+/// synthesized event values, and outgoing SSE wire made from that fallback.
+pub(super) fn lifecycle_fallback_staging_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    committed: &[ClientToolStreamItem],
+    buffered_arguments: &HashMap<String, String>,
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    if reverse.is_empty() {
+        return Some(0);
+    }
+    events.iter().enumerate().try_fold(0_usize, |used, (index, event)| {
+        let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
+            return Some(used);
+        };
+        if payload.get("arguments").and_then(Value::as_str).is_some() {
+            return Some(used);
+        }
+        let Some(key) = client_tool_event_key(payload) else {
+            return Some(used);
+        };
+        let Some(arguments) = buffered_arguments.get(&key) else {
+            return Some(used);
+        };
+        let Some(restore) = fallback_restore_kind(reverse, committed, events, index, &key) else {
+            return Some(used);
+        };
+        // `capture_client_tool_completion` retains a third completed-item copy
+        // beyond the output item and tool_calls charged by the common projection.
+        let completion_bytes = retained_json_bytes(arguments)?;
+        let restoration_bytes = if restore == ClientToolRestore::Namespace {
+            0
+        } else {
+            // Custom/typed restoration parses the envelope, retains the plan
+            // input, constructs a synthetic event value, and writes up to two
+            // SSE frames while that plan remains live.
+            let parsed = super::super::agentic_loop::buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())?;
+            parsed.checked_mul(4)?.checked_add(512)?
+        };
+        used.checked_add(completion_bytes)?.checked_add(restoration_bytes)
+    })
+}
+
+/// Find a lowered call already tracked or opened earlier in this same chunk.
+fn fallback_restore_kind(
+    reverse: &HashMap<String, LoweredClientTool>,
+    committed: &[ClientToolStreamItem],
+    events: &[ResponsesEvent],
+    index: usize,
+    key: &str,
+) -> Option<ClientToolRestore> {
+    committed
+        .iter()
+        .find(|item| item.key == key)
+        .map(|item| item.restore)
+        .or_else(|| {
+            events.get(..index)?.iter().find_map(|prior| {
+                let ResponsesEvent::OutputItemAdded(added) = prior else {
+                    return None;
+                };
+                if client_tool_event_key(added).as_deref() != Some(key) {
+                    return None;
+                }
+                added
+                    .get("item")
+                    .and_then(|item| item.get("name"))
+                    .and_then(Value::as_str)
+                    .and_then(|name| reverse.get(name))
+                    .map(|lowered| lowered.restore)
+            })
+        })
+}
+
 /// Plan the restoration for a single committed event, advancing `next_items`.
 fn plan_one_event(
     reverse: &HashMap<String, LoweredClientTool>,
