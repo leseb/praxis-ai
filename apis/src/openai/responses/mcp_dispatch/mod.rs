@@ -756,7 +756,7 @@ fn minimum_approval_dispatch_reserve(
                 .checked_mul(mcp_client::MIN_TOOL_INITIALIZE_BYTES)?
                 .checked_mul(4)?,
         )?
-        .checked_add(minimum.checked_mul(4)?)
+        .checked_add(mcp_callout_peak_bytes(minimum, calls)?)
 }
 
 /// Count independently owned callout arguments, correlation ID, and target
@@ -1970,6 +1970,9 @@ fn result_payload_limit(retained_result_limit: usize) -> usize {
 /// the adapter classifies an overflowing chunk. Charge every call in the batch
 /// because their futures may run concurrently.
 fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<usize> {
+    if call_count == 0 {
+        return (admitted_results == 0).then_some(0);
+    }
     let per_call = admitted_results / call_count;
     let wire = mcp_client::tool_result_wire_cap(result_payload_limit(per_call));
     admitted_results

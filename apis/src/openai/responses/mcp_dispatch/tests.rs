@@ -69,7 +69,8 @@ async fn approval_remains_claimable_when_minimum_dispatch_cannot_fit() {
         messages: vec![approval_response("call_1", true, None)],
         ..ResponsesState::default()
     };
-    state.apply_retained_payload_limit(4_096);
+    // This fits the old retained-result floor but cannot hold the wire envelope.
+    state.apply_retained_payload_limit(20_000);
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"model":"m"}"#));
 
