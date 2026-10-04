@@ -74,7 +74,7 @@ use self::config::{McpToolResolveConfig, build_config};
 use super::{
     AgenticBudgetPolicy,
     agentic_loop::buffered_parsed_json_bytes_upper_bound,
-    bound_body_outcome,
+    bound_body_outcome, budget_error,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -841,15 +841,13 @@ fn parse_budgeted_mcp_request(
             })
         });
     if !parse_fits {
-        let streaming = is_streaming(ctx);
-        return Err(reject_retained_budget(ctx, streaming, bytes));
+        return Err(reject_retained_budget(ctx));
     }
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return Ok(None);
     };
     if listener_budget.is_some_and(|budget| !reserve_new_state_request_owners(budget, &parsed, bytes.len())) {
-        let streaming = is_streaming(ctx);
-        return Err(reject_retained_budget(ctx, streaming, bytes));
+        return Err(reject_retained_budget(ctx));
     }
     Ok(Some(parsed))
 }
@@ -941,7 +939,7 @@ impl HttpFilter for McpToolResolveFilter {
         // captures the size-bounded request options from it) is cheap.
         match Box::pin(self.resolve_mcp_tools(ctx, body, parsed, listener_budget.as_ref())).await {
             Ok(action) => Ok(action),
-            Err(ResolveError::RetainedBudget) => Ok(reject_retained_budget(ctx, streaming, &bytes)),
+            Err(ResolveError::RetainedBudget) => Ok(reject_retained_budget(ctx)),
             Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
     }
@@ -958,28 +956,8 @@ impl HttpFilter for McpToolResolveFilter {
 
 /// Mark an aggregate-budget failure terminal before constructing its response.
 /// No successful response may later be persisted for this request body.
-fn reject_retained_budget(ctx: &mut HttpFilterContext<'_>, streaming: bool, body: &[u8]) -> FilterAction {
-    // The first request has not committed an upstream response. Report its
-    // aggregate admission failure as a client-sized request rejection even
-    // when MCP resolution runs before the validator installs shared state.
-    let initial = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .is_none_or(|state| state.iteration == 0);
-    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-        state.discard_payload_for_budget_error();
-    }
-    #[cfg(feature = "store")]
-    super::store::discard_retained_request_payload(ctx);
-    ctx.set_metadata("responses.skip_persist", "true");
-    if initial {
-        return FilterAction::Reject(responses_error_rejection(
-            413,
-            "invalid_request_error",
-            "request and MCP discovery exceed openai_agentic_loop.max_retained_bytes",
-        ));
-    }
-    resolve_error_action(ctx, &ResolveError::RetainedBudget, streaming, body)
+fn reject_retained_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    budget_error::reject_request(ctx, &ResolveError::RetainedBudget.to_string())
 }
 
 // -----------------------------------------------------------------------------
@@ -1031,9 +1009,9 @@ pub(crate) enum ResolveError {
         limit: usize,
     },
 
-    /// Deferred discovery cannot fit its next listing or commit staging in
-    /// the request-wide retained-payload budget.
-    #[error("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during deferred MCP discovery")]
+    /// MCP discovery cannot fit its next listing or commit staging in the
+    /// request-wide retained-payload budget.
+    #[error("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during MCP discovery")]
     RetainedBudget,
 
     /// Unknown `connector_id` was referenced.
@@ -1533,6 +1511,9 @@ pub(crate) fn resolve_error_action(
     streaming: bool,
     body: &[u8],
 ) -> FilterAction {
+    if matches!(err, ResolveError::RetainedBudget) {
+        return reject_retained_budget(ctx);
+    }
     if streaming && is_mcp_listing_runtime_failure(err) {
         return stash_list_tools_failure(ctx, err, capture_echoed_options(body));
     }
