@@ -6169,6 +6169,7 @@ class TestAgenticLoopVLLM:
         assert "during document extraction" in exc_info.value.response.text
         assert RetainedToolSearchBackendHandler.requests == 0
 
+    @requires_real_inference
     def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
         """The example's explicit 64 MiB aggregate budget admits an ordinary response."""
         response = agentic_client.responses.create(
@@ -6181,6 +6182,7 @@ class TestAgenticLoopVLLM:
         assert response.status in ("completed", "incomplete")
         assert response.output
 
+    @requires_real_inference
     def test_explicit_retained_budget_streaming_happy_path(self, agentic_client):
         """The same explicit budget preserves the normal logical SSE lifecycle."""
         stream = agentic_client.responses.create(
