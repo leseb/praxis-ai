@@ -2562,6 +2562,10 @@ async fn dispatcher_namespaces_prevent_cross_filter_session_reuse() {
 /// Open one real, initialized session against `url` for direct pool bookkeeping
 /// tests (the fast paths that only touch `checkin`/`checkout`, not a full call).
 async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
+    open_pooled_session_with_budget(url, callout, false).await
+}
+
+async fn open_pooled_session_with_budget(url: &str, callout: &McpCallout, budgeted: bool) -> PooledSession {
     open_tool_session(
         url,
         None,
@@ -2572,7 +2576,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
         MAX_CONTROL_RESPONSE_BYTES,
-        false,
+        budgeted,
         callout,
         &parse_display_url(url),
     )
@@ -2630,6 +2634,27 @@ async fn budgeted_checkout_rejects_unbudgeted_get_stream_session() {
     assert!(
         checkout.session.is_none(),
         "an unbounded GET session cannot satisfy a budgeted checkout"
+    );
+    assert_eq!(checkout.rejected.len(), 1);
+    close_sessions(checkout.rejected).await;
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn checkout_rejects_session_whose_idle_get_exhausted_its_budget() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "exhausted-get".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let session = open_pooled_session_with_budget(&url, &callout, true).await;
+    let signal_state = session.signal_state_for_test();
+    assert!(pool.checkin(key.clone(), session).is_empty());
+
+    assert!(!signal_state.admit_get_stream_bytes(usize::MAX));
+    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, true);
+    assert!(
+        checkout.session.is_none(),
+        "an exhausted session cannot resume a later tool call"
     );
     assert_eq!(checkout.rejected.len(), 1);
     close_sessions(checkout.rejected).await;

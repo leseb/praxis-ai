@@ -154,6 +154,12 @@ impl PooledSession {
         &self.service
     }
 
+    #[cfg(test)]
+    /// Let pool tests simulate idle GET traffic after the session is parked.
+    pub(crate) fn signal_state_for_test(&self) -> Arc<TransportSignalState> {
+        Arc::clone(&self.signal_state)
+    }
+
     /// Start a new call-error generation, isolating this request from any
     /// signal recorded by an earlier exchange on the same session.
     pub(crate) fn begin_call(&self) -> Arc<OnceLock<TransportSignal>> {
@@ -359,6 +365,7 @@ impl McpSessionPool {
                 && candidate.payload_limit == payload_limit
                 && candidate.initialize_limit == initialize_limit
                 && candidate.signal_state.has_get_stream_budget() == budgeted
+                && !candidate.signal_state.get_stream_exhausted()
                 && !candidate.is_closed()
                 && !candidate.is_expired_at(now)
             {

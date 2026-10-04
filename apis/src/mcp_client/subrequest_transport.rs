@@ -278,7 +278,7 @@ impl TransportSignalState {
     }
 
     /// Refuse a reconnect before opening another GET after the cap is spent.
-    fn get_stream_exhausted(&self) -> bool {
+    pub(crate) fn get_stream_exhausted(&self) -> bool {
         self.get_stream_bytes
             .as_ref()
             .is_some_and(|(used, cap)| used.load(AtomicOrdering::Acquire) >= *cap)
