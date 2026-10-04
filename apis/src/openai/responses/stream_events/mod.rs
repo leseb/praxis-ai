@@ -992,6 +992,7 @@ fn parse_and_accumulate(
         return Ok(None);
     }
     let projected_state_clone_bytes = projected_responses_state_clone_bytes(ctx, &events);
+    let projected_argument_fallback_bytes = projected_argument_fallback_clone_bytes(state, &events);
     let projected_client_restore_bytes = ctx.extensions.get::<ResponsesState>().map_or(Some(0), |responses| {
         client_tools::lifecycle_restore_staging_bytes(
             &responses.client_tool_lowering,
@@ -1002,6 +1003,7 @@ fn parse_and_accumulate(
     if !construction_bytes
         .and_then(|staging| staging.checked_add(projected_item_scratch_bytes?))
         .and_then(|staging| staging.checked_add(projected_state_clone_bytes?))
+        .and_then(|staging| staging.checked_add(projected_argument_fallback_bytes?))
         .and_then(|staging| staging.checked_add(projected_client_restore_bytes?))
         .and_then(|staging| staging.checked_add(logical_output_upper_bound.checked_mul(2)?))
         .is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget))
@@ -1019,6 +1021,29 @@ fn parse_and_accumulate(
     }
 
     Ok((!logical_output.is_empty()).then(|| Bytes::from(logical_output)))
+}
+
+/// Reserve both copies made when a `done` event uses previously buffered deltas.
+/// The source string is already charged in `StreamEventsState`; completion moves
+/// it into a local owner, copies it into the output item, then clones that item
+/// into `tool_calls` while the local string remains live.
+fn projected_argument_fallback_clone_bytes(state: &StreamEventsState, events: &[ResponsesEvent]) -> Option<usize> {
+    events.iter().try_fold(0_usize, |total, event| {
+        let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
+            return Some(total);
+        };
+        if payload.get("arguments").and_then(Value::as_str).is_some() {
+            return Some(total);
+        }
+        let Some(key) = tool_call_key(payload) else {
+            return Some(total);
+        };
+        if state.rejected_tool_call_args.contains(&key) {
+            return Some(total);
+        }
+        let fallback_bytes = state.tool_call_args.get(&key).map_or(0, String::len);
+        total.checked_add(fallback_bytes.checked_mul(2)?)
+    })
 }
 
 /// Count the independently owned payloads in the completed frame collection.
