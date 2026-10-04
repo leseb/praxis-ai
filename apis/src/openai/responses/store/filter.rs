@@ -483,6 +483,8 @@ impl ResponseStoreFilter {
         };
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
         state.terminal_in_chunk = false;
+        state.max_sequence_in_chunk = None;
+        state.unclassified_in_chunk = false;
         let previously_retained = state.retained_payload_bytes();
         let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
         if let Some(responses) = ctx.extensions.get::<ResponsesState>()
@@ -565,9 +567,19 @@ impl ResponseStoreFilter {
             ctx.extensions.insert(state);
             return false;
         }
+        let track_direct_metadata = ctx.extensions.get::<praxis_filter::IterationState>().is_none()
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
         state.error_event_detector.push(chunk);
-        if !state.events_over_budget {
-            self.accumulate_events(&mut state, chunk);
+        if state.events_over_budget {
+            if track_direct_metadata {
+                Self::observe_abandoned_replay(ctx, &mut state, chunk);
+            }
+        } else {
+            self.accumulate_events(&mut state, chunk, track_direct_metadata);
         }
         state.track_pending_wire_bytes(chunk);
         let retained = state.retained_payload_bytes();
@@ -588,7 +600,11 @@ impl ResponseStoreFilter {
 
     /// Decode `chunk` and append each contained SSE event, stopping and marking
     /// the log non-replayable on a bound overrun or decoder poison.
-    fn accumulate_events(&self, state: &mut ResponseStoreRequestState, chunk: &Bytes) {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps replay capture and the decoder's failure cleanup together"
+    )]
+    fn accumulate_events(&self, state: &mut ResponseStoreRequestState, chunk: &Bytes, track_direct_metadata: bool) {
         let max_event_bytes = self.max_event_bytes.get();
         let decoder = state.event_decoder.get_or_insert_with(|| {
             // Allow a single event whose JSON `data` payload fills the whole byte
@@ -608,10 +624,19 @@ impl ResponseStoreFilter {
         });
         let batch = decoder.push(chunk);
         for record in &batch.records {
-            state.terminal_in_chunk |= is_forwarded_terminal_record(record);
+            if track_direct_metadata {
+                observe_forwarded_record(state, record);
+            } else {
+                state.terminal_in_chunk |= is_forwarded_terminal_record(record, &record.data());
+            }
+        }
+        for record in &batch.records {
             if !self.capture_one(state, record) {
                 // The replay log is abandoned, but the separate header scanner
                 // still checks later chunks for a client-visible error.
+                if !track_direct_metadata {
+                    state.event_decoder = None;
+                }
                 return;
             }
         }
@@ -623,6 +648,52 @@ impl ResponseStoreFilter {
             state.event_bytes = 0;
             state.event_name_bytes = 0;
             state.event_decoder = None;
+            state.unclassified_in_chunk = true;
+        }
+    }
+
+    /// Keep observing provider wire metadata after the replay log has reached
+    /// its independent cap. The existing decoder is reused only when its
+    /// transient scratch fits the aggregate budget; otherwise the released
+    /// frame is marked unclassified and a later failure must abort the wire.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the decoder peak check and metadata observation in one admission boundary"
+    )]
+    fn observe_abandoned_replay(ctx: &HttpFilterContext<'_>, state: &mut ResponseStoreRequestState, chunk: &Bytes) {
+        let peak = state
+            .pending_wire_bytes
+            .checked_add(chunk.len())
+            .and_then(|bytes| bytes.checked_mul(4))
+            .and_then(|bytes| state.retained_payload_bytes()?.checked_add(bytes));
+        let fits = state.event_decoder.is_some()
+            && peak.is_some_and(|peak| {
+                ctx.extensions.get::<ResponsesState>().is_none_or(|responses| {
+                    store_stream_budget_fits(
+                        responses,
+                        state.shared_stable_bytes,
+                        state.charged_retained_bytes.unwrap_or(0),
+                        peak,
+                    )
+                })
+            });
+        if !fits {
+            state.event_decoder = None;
+            state.pending_wire_bytes = 0;
+            state.unclassified_in_chunk = true;
+            return;
+        }
+        let Some(decoder) = state.event_decoder.as_mut() else {
+            return;
+        };
+        let batch = decoder.push(chunk);
+        for record in &batch.records {
+            observe_forwarded_record(state, record);
+        }
+        if batch.error.is_some() {
+            state.event_decoder = None;
+            state.pending_wire_bytes = 0;
+            state.unclassified_in_chunk = true;
         }
     }
 
@@ -692,18 +763,49 @@ fn decode_replay_row(record: &SseRecord) -> Option<(u64, CapturedEvent)> {
 /// indexed in the replay log (for example, a direct provider omitted a
 /// sequence number). `SseDecoder` emits only frames with a `data:` field, so
 /// a data-less `event:` line cannot falsely mark the stream complete.
-fn is_forwarded_terminal_record(record: &SseRecord) -> bool {
-    if !record.is_event() || record.data().as_ref() == b"[DONE]" {
+fn is_forwarded_terminal_record(record: &SseRecord, data: &[u8]) -> bool {
+    if !record.is_event() || data == b"[DONE]" {
         return false;
     }
     if let Some(event) = record.event().and_then(|value| std::str::from_utf8(value).ok()) {
         return is_terminal_event_type(event);
     }
-    let data = record.data();
-    serde_json::from_slice::<EventType<'_>>(&data)
+    serde_json::from_slice::<EventType<'_>>(data)
         .ok()
         .and_then(|event| event.ty)
         .is_some_and(|event| is_terminal_event_type(&event))
+}
+
+/// Inspect provider wire metadata without retaining another event payload.
+fn observe_forwarded_record(state: &mut ResponseStoreRequestState, record: &SseRecord) {
+    if !record.is_event() {
+        return;
+    }
+    let data = record.data();
+    if data.as_ref() == b"[DONE]" {
+        return;
+    }
+    state.terminal_in_chunk |= is_forwarded_terminal_record(record, &data);
+    match serde_json::from_slice::<WireSequenceHead>(&data) {
+        Ok(WireSequenceHead {
+            sequence_number: Some(sequence),
+        }) => {
+            state.max_sequence_in_chunk = Some(
+                state
+                    .max_sequence_in_chunk
+                    .map_or(sequence, |previous| previous.max(sequence)),
+            );
+        },
+        Ok(_) => {},
+        Err(_) => state.unclassified_in_chunk = true,
+    }
+}
+
+/// Minimal borrowing parse of the public provider sequence.
+#[derive(serde::Deserialize)]
+struct WireSequenceHead {
+    /// Sequence to follow if Store later emits a local budget error.
+    sequence_number: Option<u64>,
 }
 
 /// Borrow the `type` field for a data-only SSE terminal without materializing
@@ -994,6 +1096,10 @@ enum WireLineEnding {
 
 /// Request-phase data needed when persisting the response.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "stream replay status and per-chunk wire classification are independent"
+)]
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
     input: Option<Value>,
@@ -1038,12 +1144,20 @@ struct ResponseStoreRequestState {
     error_event_detector: SseErrorEventDetector,
     /// A logical terminal decoded from the current admitted wire chunk.
     terminal_in_chunk: bool,
+    /// Largest provider sequence decoded in the current admitted chunk.
+    max_sequence_in_chunk: Option<u64>,
+    /// A released frame could not be classified safely after replay stopped.
+    unclassified_in_chunk: bool,
 }
 
 /// A logical SSE terminal from a chunk that this filter already released in
 /// this loop round. Kept outside capture state because persistence may consume
 /// that state; a later IRR round must not inherit the prior round's marker.
 struct StoreForwardedTerminal(u32);
+
+/// A released frame could not be classified after replay capture stopped.
+/// A later budget error must abort instead of guessing its terminal/sequence.
+struct StoreForwardedUnclassified(u32);
 
 impl ResponseStoreRequestState {
     /// Count the sibling-owned input, replay rows, and unfinished decoder data.
@@ -1056,9 +1170,8 @@ impl ResponseStoreRequestState {
 
     /// Track a safe upper bound for the decoder's unfinished record.
     fn track_pending_wire_bytes(&mut self, chunk: &[u8]) {
-        if self.events_over_budget {
+        if self.events_over_budget && self.event_decoder.is_none() {
             self.pending_wire_bytes = 0;
-            self.event_decoder = None;
             return;
         }
         for &byte in chunk {
@@ -1473,10 +1586,14 @@ fn streaming_persistence_budget_failure(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
 ) -> Result<FilterAction, FilterError> {
-    let terminal_forwarded_this_round = ctx.extensions.get::<StoreForwardedTerminal>().is_some_and(|marker| {
+    let terminal_forwarded_this_round = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
         ctx.extensions
-            .get::<ResponsesState>()
-            .is_some_and(|state| state.iteration == marker.0)
+            .get::<StoreForwardedTerminal>()
+            .is_some_and(|marker| state.iteration == marker.0)
+            || ctx
+                .extensions
+                .get::<StoreForwardedUnclassified>()
+                .is_some_and(|marker| state.iteration == marker.0)
     });
     if !terminal_forwarded_this_round {
         return Ok(persistence_budget_failure(ctx, true, body));
@@ -1490,6 +1607,39 @@ fn streaming_persistence_budget_failure(
     crate::openai::responses::fs_arm_stream_stop(ctx);
     *body = None;
     Err("response store retained budget exceeded after a forwarded SSE terminal".into())
+}
+
+/// Publish wire metadata only after Store has admitted and released the chunk.
+/// A terminal or sequence in a rejected chunk must not affect local error
+/// framing, and the round marker must not survive into a later IRR iteration.
+fn mark_released_stream_chunk(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    terminal: bool,
+    max_sequence: Option<u64>,
+    unclassified: bool,
+) {
+    if body.is_none() {
+        return;
+    }
+    let Some(iteration) = ctx.extensions.get::<ResponsesState>().map(|state| state.iteration) else {
+        return;
+    };
+    if terminal {
+        ctx.extensions.insert(StoreForwardedTerminal(iteration));
+    }
+    if unclassified {
+        ctx.extensions.insert(StoreForwardedUnclassified(iteration));
+    }
+    if let Some(sequence) = max_sequence {
+        if let Some(next) = sequence.checked_add(1) {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.logical_stream_sequence = state.logical_stream_sequence.max(next);
+            }
+        } else {
+            ctx.extensions.insert(StoreForwardedUnclassified(iteration));
+        }
+    }
 }
 
 /// Capture the immutable owner once, before inference or a body-first consumer.
@@ -2244,7 +2394,16 @@ impl HttpFilter for ResponseStoreFilter {
                 .extensions
                 .get_mut::<ResponseStoreRequestState>()
                 .is_some_and(|state| std::mem::take(&mut state.terminal_in_chunk));
-
+            let (max_sequence_in_chunk, unclassified_in_chunk) = ctx
+                .extensions
+                .get_mut::<ResponseStoreRequestState>()
+                .map(|state| {
+                    (
+                        state.max_sequence_in_chunk.take(),
+                        std::mem::take(&mut state.unclassified_in_chunk),
+                    )
+                })
+                .unwrap_or_default();
             if !end_of_stream {
                 // Deferred and locally encoded terminals can both reach this
                 // pre-IRR filter before EOS. Once either marker is set,
@@ -2266,12 +2425,13 @@ impl HttpFilter for ResponseStoreFilter {
                         action => return Ok(action),
                     }
                 }
-                if terminal_in_chunk
-                    && body.is_some()
-                    && let Some(iteration) = ctx.extensions.get::<ResponsesState>().map(|state| state.iteration)
-                {
-                    ctx.extensions.insert(StoreForwardedTerminal(iteration));
-                }
+                mark_released_stream_chunk(
+                    ctx,
+                    body,
+                    terminal_in_chunk,
+                    max_sequence_in_chunk,
+                    unclassified_in_chunk,
+                );
                 return Ok(FilterAction::Release);
             }
             // Skip after an earlier chunk consumed persistence state. This
@@ -2282,12 +2442,14 @@ impl HttpFilter for ResponseStoreFilter {
                 return Ok(FilterAction::Continue);
             }
             let action = Self::persist_from_streaming_state(ctx, body)?;
-            if terminal_in_chunk
-                && body.is_some()
-                && matches!(action, FilterAction::Continue | FilterAction::Release)
-                && let Some(iteration) = ctx.extensions.get::<ResponsesState>().map(|state| state.iteration)
-            {
-                ctx.extensions.insert(StoreForwardedTerminal(iteration));
+            if matches!(action, FilterAction::Continue | FilterAction::Release) {
+                mark_released_stream_chunk(
+                    ctx,
+                    body,
+                    terminal_in_chunk,
+                    max_sequence_in_chunk,
+                    unclassified_in_chunk,
+                );
             }
             return Ok(action);
         }
@@ -3719,6 +3881,107 @@ mod encode_replay_event_tests {
                 .as_ref()
                 .is_some_and(|bytes| bytes.starts_with(b"event: error"))
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reproduces an EOS overflow after replay capture was abandoned"
+    )]
+    fn abandoned_replay_still_tracks_a_forwarded_terminal_before_eos() {
+        let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        let input = "x".repeat(400);
+        let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":input,"stream":true}));
+        responses.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(responses);
+        capture_request_input(&mut ctx, json!(input)).unwrap();
+
+        let mut first = Some(Bytes::from_static(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n",
+        ));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut first, false).unwrap(),
+            FilterAction::Release
+        ));
+        assert!(
+            ctx.extensions
+                .get::<super::ResponseStoreRequestState>()
+                .unwrap()
+                .events_over_budget
+        );
+
+        let terminal = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1}\n\n";
+        let mut completed = Some(Bytes::copy_from_slice(terminal));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut completed, false).unwrap(),
+            FilterAction::Release
+        ));
+        assert_eq!(completed.as_deref(), Some(terminal.as_slice()));
+
+        let mut eos = None;
+        assert!(filter.on_response_body(&mut ctx, &mut eos, true).is_err());
+        assert!(eos.is_none(), "a second terminal must not follow the completed frame");
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks admitted provider sequences with and without replay capture"
+    )]
+    fn direct_store_budget_error_follows_admitted_provider_sequence() {
+        for max_event_bytes in [1, 1_048_576] {
+            let filter = ResponseStoreFilter::with_bounds(
+                NonZeroU32::new(1_024).unwrap(),
+                NonZeroU64::new(max_event_bytes).unwrap(),
+            );
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.set_metadata("openai_responses_format.stream", "true");
+            let registry = crate::store::ResponseStoreRegistry::new();
+            registry
+                .register(
+                    &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                    std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+                )
+                .unwrap();
+            ctx.extensions.insert(registry);
+            let input = "x".repeat(400);
+            let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":input,"stream":true}));
+            responses.apply_retained_payload_limit(4_096);
+            ctx.extensions.insert(responses);
+            capture_request_input(&mut ctx, json!(input)).unwrap();
+
+            let first =
+                b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":7}\n\n";
+            let mut frame = Some(Bytes::copy_from_slice(first));
+            assert!(matches!(
+                filter.on_response_body(&mut ctx, &mut frame, false).unwrap(),
+                FilterAction::Release
+            ));
+            assert_eq!(frame.as_deref(), Some(first.as_slice()));
+
+            let mut eos = None;
+            let action = filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+            assert!(matches!(action, FilterAction::Continue));
+            let (_, payload) = decode_single(eos.as_deref().unwrap());
+            let error: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(error.get("sequence_number"), Some(&json!(8)));
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
     }
 
     /// Once replay is abandoned at its independent cap, later wire chunks do

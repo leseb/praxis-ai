@@ -1970,7 +1970,7 @@ class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         request_body = json.loads(self.rfile.read(length))
         model = request_body["model"]
-        if model in {"terminal-stream", "terminal-stream-no-event"}:
+        if model in {"terminal-stream", "terminal-stream-no-event", "sequence-stream"}:
             response = {
                 "id": "resp_direct_budget_terminal_stream",
                 "object": "response",
@@ -1979,16 +1979,25 @@ class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
                 "status": "completed",
                 "output": [],
             }
-            event_prefix = "event: response.completed\n" if model == "terminal-stream" else ""
-            terminal = (
-                event_prefix + "data: "
-                + json.dumps({
-                    "type": "response.completed",
-                    "sequence_number": 1,
-                    "response": response,
-                }, separators=(",", ":"))
-                + "\n\n"
-            ).encode()
+            if model == "sequence-stream":
+                terminal = (
+                    "event: response.in_progress\ndata: "
+                    + json.dumps({
+                        "type": "response.in_progress", "sequence_number": 7,
+                    }, separators=(",", ":"))
+                    + "\n\n"
+                ).encode()
+            else:
+                event_prefix = "event: response.completed\n" if model == "terminal-stream" else ""
+                terminal = (
+                    event_prefix + "data: "
+                    + json.dumps({
+                        "type": "response.completed",
+                        "sequence_number": 1,
+                        "response": response,
+                    }, separators=(",", ":"))
+                    + "\n\n"
+                ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -2253,6 +2262,38 @@ def test_direct_store_stream_overflow_after_completion_closes_wire(direct_budget
     assert b"x" * 128 not in wire
     with pytest.raises(NotFoundError):
         direct_budget_client.responses.retrieve("resp_direct_budget_terminal_stream")
+
+
+@pytest.mark.parametrize("direct_budget_client", [(65_536, True)], indirect=True)
+def test_direct_store_stream_budget_error_follows_provider_sequence(direct_budget_client):
+    """A local Store error follows the last admitted provider SSE sequence."""
+    seed = direct_budget_client.responses.create(model="10", input="seed", store=True)
+    url = f"{str(direct_budget_client.base_url).rstrip('/')}/responses"
+    wire = bytearray()
+    gate = threading.Event()
+    DirectBudgetBackendHandler.terminal_gate = gate
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            with client.stream(
+                "POST", url,
+                headers={"Content-Type": "application/json", **TRUSTED_OWNER_HEADERS},
+                json={
+                    "model": "sequence-stream", "input": "next", "stream": True,
+                    "store": True, "previous_response_id": seed.id,
+                },
+            ) as response:
+                assert response.status_code == 200
+                for chunk in response.iter_raw():
+                    wire.extend(chunk)
+                    if b"event: response.in_progress" in wire and b"\n\n" in wire:
+                        gate.set()
+    finally:
+        gate.set()
+        DirectBudgetBackendHandler.terminal_gate = None
+    assert wire.count(b"event: response.in_progress") == 1
+    assert wire.count(b"event: error") == 1
+    assert b'"sequence_number":8' in wire
+    assert b"x" * 128 not in wire
 
 
 @pytest.fixture()
