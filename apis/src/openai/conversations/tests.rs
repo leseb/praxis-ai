@@ -4763,6 +4763,7 @@ async fn append_budget_failure_removes_only_response_persisted_by_this_exchange(
     ctx.set_metadata("responses.conversation_id", &conv_id);
     let mut state = ResponsesState::default();
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 128);
+    ctx.extensions.insert(state);
     capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
     let mut response = make_response();
     response
@@ -4770,9 +4771,8 @@ async fn append_budget_failure_removes_only_response_persisted_by_this_exchange(
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
     ctx.response_header = Some(&mut response);
     drop(filter.on_response(&mut ctx).await.unwrap());
-    // Exercise the compatibility body seam with state installed after the
-    // header hook; full-flow canonical turns append in the header hook.
-    ctx.extensions.insert(state);
+    // Exercise the compatibility body seam for a noncanonical response;
+    // full-flow canonical turns append in the header hook.
     store
         .persist_response_with_pending_approvals_if_absent(
             &ResponseRecord {
@@ -5006,7 +5006,7 @@ async fn streaming_terminal_propagates_append_failure_before_release() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delegated_streaming_append_failure_is_explicit_rejection() {
+async fn delegated_streaming_append_failure_follows_store_error_policy() {
     let (filter, store) = build_failing_filter(FailingItemStore {
         append_failure: AppendFailure::CreateItems,
         conversation_exists: false,
@@ -5034,8 +5034,8 @@ async fn delegated_streaming_append_failure_is_explicit_rejection() {
     let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
     let action = super::append_after_store_body(&mut ctx, &mut terminal, false);
     assert!(
-        matches!(action, FilterAction::Reject(rejection) if rejection.status == 500),
-        "the Store's fail-open setting must not release a failed delegated append"
+        action.is_err(),
+        "the Store pipeline hook applies its configured failure mode to ordinary append errors"
     );
 }
 
@@ -6519,4 +6519,98 @@ async fn create_conversation_response_field_order_matches_openai() {
     let resp = rejection_body(&rejection);
     let keys: Vec<&String> = resp.as_object().unwrap().keys().collect();
     assert_eq!(keys, &["id", "object", "created_at", "metadata"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_final_gate_must_not_revive_a_conversation_hook_skipped_this_round() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_store_excluded", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    // An intermediate IRR response did run Store. Its participation marker
+    // must not count for the completed round excluded by response_conditions.
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.current_filter_id = Some(0);
+    drop(conversations.on_response(&mut ctx).await.unwrap());
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().iteration = 1;
+    mark_buffered_agentic_done(&mut ctx);
+
+    // This final round excludes Conversations as well as Store by response_conditions.
+    // Its response hook is not called, so the previous round's state is still present.
+    // The configured Store's response_conditions exclude this exchange, so
+    // core never calls its response hook. The final readiness hook must end
+    // the request-phase-only handoff without inventing a response write.
+    assert!(matches!(
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_store_excluded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "Conversations was not selected for this final response"
+    );
 }

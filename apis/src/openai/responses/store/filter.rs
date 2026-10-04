@@ -352,7 +352,7 @@ impl ResponseStoreFilter {
         }
         #[cfg(feature = "openai-conversations")]
         {
-            Ok(crate::openai::conversations::append_after_store_body(ctx, body, false))
+            crate::openai::conversations::append_after_store_body(ctx, body, false)
         }
         #[cfg(not(feature = "openai-conversations"))]
         {
@@ -425,7 +425,7 @@ impl ResponseStoreFilter {
         }
         #[cfg(feature = "openai-conversations")]
         {
-            Ok(crate::openai::conversations::append_after_store_body(ctx, body, true))
+            crate::openai::conversations::append_after_store_body(ctx, body, true)
         }
         #[cfg(not(feature = "openai-conversations"))]
         {

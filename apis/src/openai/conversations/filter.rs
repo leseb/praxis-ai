@@ -33,7 +33,10 @@ use crate::{
             bound_body_outcome, buffered_parsed_json_bytes_upper_bound,
             error::responses_error_rejection,
             state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
-            store::{PersistedResponseForConversation, request_persistence_armed, store_response_header_skipped},
+            store::{
+                PersistedResponseForConversation, ResponseRound, request_persistence_armed, response_round,
+                store_response_header_skipped,
+            },
         },
     },
     operation::Transport,
@@ -100,6 +103,9 @@ struct ConversationRequestState {
 /// Per-request response-phase state that controls whether append-back
 /// should run during `on_response_body`.
 struct ConversationResponseState {
+    /// The response attempt whose hook selected this append. Request extensions
+    /// outlive intermediate IRR responses, including skipped later rounds.
+    round: ResponseRound,
     /// A deferred streaming terminal is followed by a separate EOS callback.
     /// Even failure-mode-open paths must not retry a possibly committed write.
     append_attempted: bool,
@@ -119,43 +125,35 @@ fn awaiting_response_store(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Finish a header append after a later response-store hook persisted the
 /// canonical response. A store hook that runs first leaves the ordinary
-/// Conversations response hook to do this work instead.
+/// Conversations response hook to do this work instead. Ordinary backend
+/// errors follow the Store hook's failure mode; request-wide budget errors
+/// remain explicit terminal actions regardless of failure mode.
 pub(crate) async fn append_after_store_response(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-    if ctx.extensions.get::<ConversationResponseState>().is_none() {
+    if !conversation_response_selected(ctx) {
         return Ok(FilterAction::Continue);
     }
-    match OpenaiConversationsFilter.on_response(ctx).await {
-        Ok(action) => Ok(action),
-        Err(error) => Ok(delegated_append_failure(&error)),
-    }
+    OpenaiConversationsFilter.on_response(ctx).await
 }
 
 /// Finish a body append after the response-store terminal hook persisted its
-/// record and replay events, before the terminal body is released.
+/// record and replay events, before the terminal body is released. Ordinary
+/// backend errors follow the Store hook's failure mode.
 pub(crate) fn append_after_store_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
-) -> FilterAction {
-    if ctx.extensions.get::<ConversationResponseState>().is_none() {
-        return FilterAction::Continue;
+) -> Result<FilterAction, FilterError> {
+    if !conversation_response_selected(ctx) {
+        return Ok(FilterAction::Continue);
     }
-    match OpenaiConversationsFilter.on_response_body(ctx, body, end_of_stream) {
-        Ok(action) => action,
-        Err(error) => delegated_append_failure(&error),
-    }
+    OpenaiConversationsFilter.on_response_body(ctx, body, end_of_stream)
 }
 
-/// A delegated append runs under the store filter's failure policy. Return an
-/// explicit rejection so a fail-open store cannot release a failed conversation
-/// completion that the conversation filter would have withheld.
-fn delegated_append_failure(error: &FilterError) -> FilterAction {
-    warn!(%error, "conversation append-back failed after response-store write");
-    FilterAction::Reject(responses_error_rejection(
-        500,
-        "server_error",
-        "conversation append-back failed",
-    ))
+/// A deferred append is eligible only when Conversations ran on this response.
+pub(crate) fn conversation_response_selected(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ConversationResponseState>()
+        .is_some_and(|state| state.round == response_round(ctx))
 }
 
 /// Owner captured on the request path before inference begins.
@@ -564,6 +562,7 @@ impl HttpFilter for OpenaiConversationsFilter {
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !should_append_back(ctx) {
             ctx.extensions.insert(ConversationResponseState {
+                round: response_round(ctx),
                 append_attempted: false,
                 append_owner: None,
                 streaming: false,
@@ -596,6 +595,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                 .map(|captured| captured.0.clone())
                 .ok_or_else(|| FilterError::from("openai_conversations: append-back owner was not captured"))?;
             ctx.extensions.insert(ConversationResponseState {
+                round: response_round(ctx),
                 append_attempted: false,
                 append_owner: Some(owner),
                 streaming: is_stream,
@@ -688,6 +688,7 @@ impl HttpFilter for OpenaiConversationsFilter {
             }
         } else {
             ctx.extensions.insert(ConversationResponseState {
+                round: response_round(ctx),
                 append_attempted: false,
                 append_owner: None,
                 streaming: false,
@@ -708,7 +709,9 @@ impl HttpFilter for OpenaiConversationsFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         let response_state = ctx.extensions.get::<ConversationResponseState>();
-        if response_state.is_none_or(|state| state.append_owner.is_none() || state.append_attempted) {
+        if response_state.is_none_or(|state| {
+            state.round != response_round(ctx) || state.append_owner.is_none() || state.append_attempted
+        }) {
             // This filter is composed with other response-body consumers, such
             // as `openai_response_store`. Releasing here drains a shared
             // StreamBuffer before those filters see end-of-stream, which can
