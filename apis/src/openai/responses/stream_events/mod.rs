@@ -149,8 +149,10 @@ pub(super) struct StreamEventsState {
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
     stream_failed: bool,
-    /// Request, history, and prior-round output charge cached across ordinary
-    /// upstream chunks. Refreshed at EOS after the loop owner may append output.
+    /// Request, history, prior-round output, and tool snapshots cached across
+    /// ordinary chunks. Refreshed at EOS after the loop owner may append.
+    /// MCP resolution and echo capture finish in request phase; budget failure
+    /// clears them only after the stream is poisoned.
     shared_stable_bytes: OnceLock<usize>,
 }
 
@@ -982,7 +984,7 @@ fn stream_payload_fits(ctx: &HttpFilterContext<'_>, state: &StreamEventsState, s
     stream_payload_fits_with_budget(state, staging_bytes, shared_retained_budget(ctx, state))
 }
 
-/// Snapshot request, history, and prior output once per round for pre-commit checks.
+/// Snapshot request, history, prior output, and tool snapshots once per round.
 /// `None` means no aggregate budget is active; the inner `None` signals that
 /// the current retained state already exceeds the limit.
 fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsState) -> Option<(usize, Option<usize>)> {
@@ -992,6 +994,22 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
         responses
             .stream_stable_payload_bytes_bounded(limit)
             .and_then(|bytes| bytes.checked_add(retained_json_values_bytes(&responses.accumulated_output)?))
+            .and_then(|bytes| {
+                responses
+                    .mcp_tool_map
+                    .iter()
+                    .try_fold(bytes, |used, ((server, tool), value)| {
+                        used.checked_add(server.len())?
+                            .checked_add(tool.len())?
+                            .checked_add(retained_json_bytes(value)?)
+                    })
+            })
+            .and_then(|bytes| match &responses.client_tool_echo {
+                None => Some(bytes),
+                Some(echo) => bytes
+                    .checked_add(retained_json_values_bytes(&echo.tools)?)
+                    .and_then(|bytes| bytes.checked_add(retained_json_bytes(&echo.tool_choice)?)),
+            })
             .filter(|bytes| *bytes <= limit)
             .unwrap_or(usize::MAX)
     });

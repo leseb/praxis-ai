@@ -1068,7 +1068,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, false, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false)?
             .checked_add(stream_bytes)
     }
 
@@ -1095,10 +1095,10 @@ impl ResponsesState {
 
     /// Count the owners which may change during a streaming response. The
     /// stream-local meter adds the cached request/history and prior-round
-    /// output charges separately; `accumulated_output` is fixed until EOS.
+    /// output and tool-snapshot charges separately; all are fixed until EOS.
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true)?
             .checked_add(self.retained_rehydrate_stream_bytes)
     }
 
@@ -1109,7 +1109,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, false)?
             .checked_add(stream_bytes)
     }
 
@@ -1122,7 +1122,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, false)?
             .checked_add(stream_bytes)
     }
 
@@ -1134,7 +1134,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1142,6 +1142,7 @@ impl ResponsesState {
         clippy::too_many_lines,
         clippy::cognitive_complexity,
         clippy::fn_params_excessive_bools,
+        clippy::too_many_arguments,
         reason = "exhaustive accounting for the request-scoped state bag"
     )]
     fn retained_payload_bytes_bounded_inner(
@@ -1150,6 +1151,7 @@ impl ResponsesState {
         include_external: bool,
         skip_stream_stable: bool,
         skip_accumulated_output: bool,
+        skip_stream_fixed_tools: bool,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
@@ -1197,10 +1199,12 @@ impl ResponsesState {
         {
             meter.json(value)?;
         }
-        for ((server, tool), value) in &self.mcp_tool_map {
-            meter.raw(server.len())?;
-            meter.raw(tool.len())?;
-            meter.json(value)?;
+        if !skip_stream_fixed_tools {
+            for ((server, tool), value) in &self.mcp_tool_map {
+                meter.raw(server.len())?;
+                meter.raw(tool.len())?;
+                meter.json(value)?;
+            }
         }
         for (private_name, lowered) in &self.client_tool_lowering {
             meter.raw(private_name.len())?;
@@ -1209,7 +1213,7 @@ impl ResponsesState {
                 meter.raw(namespace.len())?;
             }
         }
-        if let Some(echo) = &self.client_tool_echo {
+        if !skip_stream_fixed_tools && let Some(echo) = &self.client_tool_echo {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
         }

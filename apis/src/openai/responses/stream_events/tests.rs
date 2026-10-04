@@ -518,6 +518,65 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
 }
 
 #[test]
+fn streaming_budget_cache_counts_tool_snapshots_once_per_round() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState {
+        client_tool_echo: Some(ClientToolEcho {
+            tools: vec![
+                json!({"type": "function", "name": "tool", "parameters": {"description": "x".repeat(1_048_576)}}),
+            ],
+            tool_choice: json!("auto"),
+        }),
+        mcp_tool_map: [(
+            ("server".to_owned(), "tool".to_owned()),
+            json!({"schema": "y".repeat(1_048_576)}),
+        )]
+        .into(),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(3_000_000);
+    ctx.extensions.insert(responses);
+
+    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let stable = stream.shared_stable_bytes.get().copied().unwrap();
+    assert!(
+        stable > 2_097_152,
+        "echo and resolved MCP schema must be cached for the round"
+    );
+    assert_eq!(
+        initial,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    for _ in 0..100 {
+        assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(initial));
+    }
+
+    // A newly armed round remeasures the stable owners after prior state was
+    // discarded; the old echo charge must not remain in its cache.
+    stream.clear_shared_budget_cache();
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_echo = None;
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().mcp_tool_map.clear();
+    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    assert_eq!(
+        next,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert!(
+        next < initial,
+        "clearing tool snapshots must release their retained charge"
+    );
+}
+
+#[test]
 fn numeric_sse_event_is_rejected_before_expanded_value_allocation() {
     let (_filter, mut ctx) = make_armed_context();
     let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
