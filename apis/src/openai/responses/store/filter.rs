@@ -160,7 +160,12 @@ pub(crate) struct StoreResponseHeaderRan(ResponseRound);
 
 /// The store was armed on request, but response conditions excluded its hook.
 #[cfg(feature = "openai-conversations")]
-pub(crate) struct StoreResponseHeaderSkipped(ResponseRound);
+pub(crate) struct StoreResponseHeaderSkipped {
+    /// The response attempt excluded by Store response conditions.
+    round: ResponseRound,
+    /// A committed parent SSE header keeps this decision through tool rounds.
+    outer_stream: bool,
+}
 
 /// A response callback can run more than once inside IRR. Match handoff
 /// markers to the current round so an intermediate response cannot satisfy
@@ -172,6 +177,15 @@ pub(crate) struct ResponseRound {
     router: Option<u32>,
     /// Responses loop round, including local continuations.
     agentic: Option<u32>,
+}
+
+#[cfg(feature = "openai-conversations")]
+impl ResponseRound {
+    /// The router strips its iteration extension before the committed parent
+    /// streaming header runs. Step filters retain it until their response ends.
+    pub(crate) fn is_outside_router(self) -> bool {
+        self.router.is_none()
+    }
 }
 
 /// Identify the current response attempt across both loop owners.
@@ -191,7 +205,7 @@ pub(crate) fn response_round(ctx: &HttpFilterContext<'_>) -> ResponseRound {
 pub(crate) fn store_response_header_skipped(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.extensions
         .get::<StoreResponseHeaderSkipped>()
-        .is_some_and(|marker| marker.0 == response_round(ctx))
+        .is_some_and(|marker| marker.outer_stream || marker.round == response_round(ctx))
 }
 
 /// Record that Store response conditions excluded this round's response hook.
@@ -206,7 +220,15 @@ pub(crate) fn mark_store_response_header_skipped(ctx: &mut HttpFilterContext<'_>
     {
         return false;
     }
-    ctx.extensions.insert(StoreResponseHeaderSkipped(round));
+    let outer_stream = round.is_outside_router()
+        && ctx
+            .response_header
+            .as_ref()
+            .and_then(|response| response.headers.get(http::header::CONTENT_TYPE))
+            .and_then(|content_type| content_type.to_str().ok())
+            .is_some_and(is_event_stream_content_type);
+    ctx.extensions
+        .insert(StoreResponseHeaderSkipped { round, outer_stream });
     true
 }
 
@@ -3657,5 +3679,19 @@ mod encode_replay_event_tests {
             store_filter.on_response(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ));
+    }
+
+    #[test]
+    fn router_step_stream_selection_does_not_outlive_its_round() {
+        let inner_step = super::ResponseRound {
+            router: Some(0),
+            agentic: Some(0),
+        };
+        let parent_stream = super::ResponseRound {
+            router: None,
+            agentic: Some(0),
+        };
+        assert!(!inner_step.is_outside_router());
+        assert!(parent_stream.is_outside_router());
     }
 }

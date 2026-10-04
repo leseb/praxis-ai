@@ -6656,7 +6656,114 @@ async fn review_outer_stream_append_survives_inner_tool_round() {
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_probe_store_must_not_revive_inner_stream_selection() {
+async fn review_outer_branch_stream_append_survives_tool_round_probe() {
+    let (conversations, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let mut registry = crate::test_utils::make_ai_registry();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_conversations" => OpenaiConversationsFilter::from_config
+    );
+    let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
+        "
+- filter: openai_response_store
+  backend: sqlite
+  database_url: 'sqlite::memory:'
+  responses_table: test_responses
+  conversations_table: test_conversations
+- filter: headers
+  request_add:
+    - name: X-Probe
+      value: '1'
+  branch_chains:
+    - name: outer-conversations
+      rejoin: next
+      chains:
+        - name: managed-conversations
+          filters:
+            - filter: openai_conversations
+              backend: sqlite
+              database_url: 'sqlite::memory:'
+              conversations_table: test_conversations
+              items_table: test_items
+",
+    )
+    .unwrap();
+    let pipeline = praxis_filter::FilterPipeline::build_with_chains(
+        &mut entries,
+        &registry,
+        &std::collections::HashMap::new(),
+        &praxis_core::config::InsecureOptions::default(),
+    )
+    .unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    assert!(matches!(
+        pipeline.execute_http_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.executed_branch_filters.iter().any(|ran| *ran));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        pipeline
+            .execute_http_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(1_048_576);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    // The parent pipeline runs this committed header only once, including its branch.
+    drop(pipeline.execute_http_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+    // The inner IRR session advances while producing the parent's streamed body.
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.iteration += 1;
+    state.response_object = serde_json::json!({
+        "id":"resp_outer_branch", "created_at":1, "model":"test", "status":"completed",
+        "output":[{"type":"message","role":"assistant","content":"answer"}]
+    });
+    state.logical_stream_terminal_emitted = true;
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    drop(
+        pipeline
+            .execute_http_response_body(&mut ctx, &mut terminal, false)
+            .unwrap(),
+    );
+    assert!(store.get_response(&owner, "resp_outer_branch").await.unwrap().is_some());
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the outer branch is still selected for the committed stream after an inner tool round"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_excluded_store_survives_tool_round() {
     let (conversations, store) = sqlite_harness().await;
     let response_store_config: serde_yaml::Value = serde_yaml::from_str(
         "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
@@ -6676,16 +6783,13 @@ async fn review_probe_store_must_not_revive_inner_stream_selection() {
         )
         .unwrap();
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
     ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
     ctx.set_metadata("responses.conversation_id", &conv_id);
     ctx.current_filter_id = Some(0);
     capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
     ctx.current_filter_id = Some(1);
-    assert!(matches!(
-        response_store.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    drop(response_store.on_request(&mut ctx).await.unwrap());
     let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
     drop(
         response_store
@@ -6696,9 +6800,10 @@ async fn review_probe_store_must_not_revive_inner_stream_selection() {
     let mut state = ResponsesState {
         input: vec![serde_json::json!({"role":"user","content":"question"})],
         response_object: serde_json::json!({
-            "id":"resp_store_excluded", "created_at":1, "model":"test", "status":"completed",
+            "id":"resp_stream_excluded", "created_at":1, "model":"test", "status":"completed",
             "output":[{"type":"message","role":"assistant","content":"answer"}]
         }),
+        logical_stream_terminal_emitted: true,
         ..ResponsesState::default()
     };
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
@@ -6708,42 +6813,26 @@ async fn review_probe_store_must_not_revive_inner_stream_selection() {
         .headers
         .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
     ctx.response_header = Some(&mut response);
-
-    // An intermediate IRR response did run Store. Its participation marker
-    // must not count for the completed round excluded by response_conditions.
-    ctx.current_filter_id = Some(1);
+    ctx.current_filter_id = Some(0);
+    drop(conversations.on_response(&mut ctx).await.unwrap());
     assert!(matches!(
-        response_store.on_response(&mut ctx).await.unwrap(),
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
         FilterAction::Continue
     ));
-    ctx.current_filter_id = Some(0);
-    // Core records branch filter IDs when their request hooks execute.
-    ctx.executed_branch_filters.resize(1, true);
-    drop(conversations.on_response(&mut ctx).await.unwrap());
-    // A same-round handoff under Store's filter ID must preserve the branch
-    // selection classification before the final round excludes Conversations.
-    ctx.current_filter_id = Some(1);
-    drop(super::append_after_store_response(&mut ctx).await.unwrap());
-    ctx.extensions.get_mut::<ResponsesState>().unwrap().iteration = 1;
-    mark_buffered_agentic_done(&mut ctx);
-
-    // Conversations is inside a conditional IRR step. It ran on the first
-    // response above, but response_conditions exclude it from the final round.
-    // Store is still selected and delegates after its final durable write.
-    ctx.extensions
-        .get_mut::<ResponsesState>()
-        .unwrap()
-        .logical_stream_terminal_emitted = true;
-    ctx.current_filter_id = Some(1);
-    drop(response_store.on_response(&mut ctx).await.unwrap());
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().iteration += 1;
     let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
-    drop(response_store.on_response_body(&mut ctx, &mut terminal, false).unwrap());
+    assert!(matches!(
+        conversations.on_response_body(&mut ctx, &mut terminal, false).unwrap(),
+        FilterAction::Continue
+    ));
     assert!(
         store
-            .get_response(&owner, "resp_store_excluded")
+            .get_response(&owner, "resp_stream_excluded")
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
     assert_eq!(
         store
@@ -6751,7 +6840,6 @@ async fn review_probe_store_must_not_revive_inner_stream_selection() {
             .await
             .unwrap()
             .len(),
-        0,
-        "Conversations was not selected for this final response"
+        2
     );
 }

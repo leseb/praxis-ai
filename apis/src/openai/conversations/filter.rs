@@ -176,12 +176,11 @@ fn conversation_body_selected(ctx: &HttpFilterContext<'_>) -> bool {
     })
 }
 
-/// Core records branch filter IDs when their request hooks execute. A
-/// top-level Conversations hook owns the one committed SSE header; a branch
-/// hook can be selected on one IRR response and skipped on a later response.
+/// IRR strips its iteration state before handing the committed stream to its
+/// parent pipeline. A Conversations hook in a router step still has that state
+/// and may be excluded by response conditions in a later step.
 fn is_outer_response_filter(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.current_filter_id
-        .is_none_or(|id| ctx.executed_branch_filters.get(id) != Some(&true))
+    response_round(ctx).is_outside_router()
 }
 
 /// Owner captured on the request path before inference begins.
