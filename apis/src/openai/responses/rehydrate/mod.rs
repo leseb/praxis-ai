@@ -696,6 +696,7 @@ fn arm_streaming_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
         previous_response_id: prev_id,
         last_forwarded_sequence: None,
         forwarded_terminal: false,
+        stable_payload: None,
     });
 
     true
@@ -752,6 +753,68 @@ struct RestorePreviousResponseIdStream {
     last_forwarded_sequence: Option<u64>,
     /// A terminal SSE frame was admitted and forwarded in an earlier callback.
     forwarded_terminal: bool,
+    /// Stable request/history payload measured once per streaming round.
+    stable_payload: Option<RestoreStablePayloadCache>,
+}
+
+/// An O(1) invalidation key for the request/history owners cached by Rehydrate.
+#[derive(Clone, Copy)]
+struct RestoreStablePayloadCache {
+    /// Limit under which the charge was measured.
+    limit: usize,
+    /// Agentic round containing the stable request/history.
+    iteration: u32,
+    /// In-place mutation revision of those owners.
+    revision: u64,
+    /// Shapes of all stable collections, catching appends without a revision.
+    collection_lengths: [usize; 6],
+    /// Serialized payload charge of the stable owners.
+    bytes: usize,
+}
+
+impl RestoreStablePayloadCache {
+    /// Capture the current stable-owner identity and measured charge.
+    fn new(state: &ResponsesState, limit: usize, bytes: usize) -> Option<Self> {
+        Some(Self {
+            limit,
+            iteration: state.iteration,
+            revision: state.replay_stable_payload_revision?,
+            collection_lengths: Self::collection_lengths(state),
+            bytes,
+        })
+    }
+
+    /// Reuse only when both the round and stable-owner shape are unchanged.
+    fn matches(&self, state: &ResponsesState, limit: usize) -> bool {
+        self.limit == limit
+            && self.iteration == state.iteration
+            && Some(self.revision) == state.replay_stable_payload_revision
+            && self.collection_lengths == Self::collection_lengths(state)
+    }
+
+    /// Snapshot collection lengths without scanning their JSON payloads.
+    fn collection_lengths(state: &ResponsesState) -> [usize; 6] {
+        [
+            state.input.len(),
+            state.messages.len(),
+            state.persisted_messages.len(),
+            state.previous_tools.len(),
+            state.tools.len(),
+            state.provider_compaction_ids.len(),
+        ]
+    }
+}
+
+/// Current shared allowance after adding the cached stable charge to changing
+/// state. All later frame checks use this snapshot for the same callback.
+#[derive(Clone, Copy)]
+struct RestoreBudgetView {
+    /// Request-wide retained-payload limit.
+    limit: usize,
+    /// Current independently owned payload, including cached stable owners.
+    current: usize,
+    /// Prior partial frame charged in `ResponsesState` and replaceable now.
+    retained_rehydrate_stream_bytes: usize,
 }
 
 /// Return the caller's `previous_response_id` when it must be restored into the
@@ -954,6 +1017,7 @@ fn restore_previous_response_id_stream_chunk_with_budget(
     end_of_stream: bool,
     budget: Option<&ResponsesState>,
 ) -> Result<bool, ()> {
+    let budget = streaming_restore_budget(armed, budget)?;
     let incoming = body.take().unwrap_or_default();
     if armed.pending.is_empty() {
         restore_stream_fresh_chunk(armed, &incoming, body, end_of_stream, budget)
@@ -962,12 +1026,47 @@ fn restore_previous_response_id_stream_chunk_with_budget(
     }
 }
 
-/// Admit one rewrite staging allocation against the request-wide retained meter.
-fn streaming_restore_fits(budget: Option<&ResponsesState>, removed_bytes: usize, staging_bytes: usize) -> bool {
+/// Measure stable request/history once, while counting changing owners on each
+/// callback. The old pending buffer can be replaced in the same admission.
+fn streaming_restore_budget(
+    armed: &mut RestorePreviousResponseIdStream,
+    budget: Option<&ResponsesState>,
+) -> Result<Option<RestoreBudgetView>, ()> {
     let Some(state) = budget else {
+        return Ok(None);
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return Ok(None);
+    };
+    let stable = if let Some(cache) = armed.stable_payload.filter(|cache| cache.matches(state, limit)) {
+        cache.bytes
+    } else {
+        let bytes = state.stream_stable_payload_bytes_bounded(limit).ok_or(())?;
+        armed.stable_payload = RestoreStablePayloadCache::new(state, limit, bytes);
+        bytes
+    };
+    let measurement_limit = limit.checked_add(state.retained_rehydrate_stream_bytes).ok_or(())?;
+    let changing = state
+        .rehydrate_stream_changing_payload_bytes_bounded(measurement_limit.checked_sub(stable).ok_or(())?)
+        .ok_or(())?;
+    let current = stable.checked_add(changing).ok_or(())?;
+    Ok(Some(RestoreBudgetView {
+        limit,
+        current,
+        retained_rehydrate_stream_bytes: state.retained_rehydrate_stream_bytes,
+    }))
+}
+
+/// Admit one rewrite staging allocation against the current callback snapshot.
+fn streaming_restore_fits(budget: Option<RestoreBudgetView>, removed_bytes: usize, staging_bytes: usize) -> bool {
+    let Some(budget) = budget else {
         return true;
     };
-    state.can_replace_retained_payload(removed_bytes, 0, staging_bytes)
+    budget
+        .current
+        .checked_sub(removed_bytes)
+        .and_then(|bytes| bytes.checked_add(staging_bytes))
+        .is_some_and(|bytes| bytes <= budget.limit)
 }
 
 /// Fast path: nothing carried over, so scan the incoming chunk directly and forward
@@ -978,7 +1077,7 @@ fn restore_stream_fresh_chunk(
     incoming: &Bytes,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
-    budget: Option<&ResponsesState>,
+    budget: Option<RestoreBudgetView>,
 ) -> Result<bool, ()> {
     let scan = scan_complete_frames(
         incoming,
@@ -1039,14 +1138,12 @@ fn restore_stream_buffered_chunk(
     incoming: &Bytes,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
-    budget: Option<&ResponsesState>,
+    budget: Option<RestoreBudgetView>,
 ) -> Result<bool, ()> {
     // The old partial remains live if BytesMut grows a replacement allocation.
     // The incoming Bytes also stays live through the append. No JSON parse is
     // needed for this check, and each incoming byte is visited only once.
-    if let Some(state) = budget
-        && state.retained_payload_limit().is_some()
-    {
+    if let Some(view) = budget {
         let next_len = armed.pending.len().checked_add(incoming.len());
         let peak = next_len
             .and_then(|bytes| bytes.checked_add(incoming.len()))
@@ -1057,7 +1154,7 @@ fn restore_stream_buffered_chunk(
                     bytes.checked_add(armed.pending.len())
                 }
             });
-        if !peak.is_some_and(|bytes| streaming_restore_fits(budget, state.retained_rehydrate_stream_bytes, bytes)) {
+        if !peak.is_some_and(|bytes| streaming_restore_fits(budget, view.retained_rehydrate_stream_bytes, bytes)) {
             return Err(());
         }
     }
@@ -1193,7 +1290,7 @@ fn scan_complete_frames(
     max_buffer_bytes: usize,
     resume: ScanResume,
     at_stream_end: bool,
-    budget: Option<&ResponsesState>,
+    budget: Option<RestoreBudgetView>,
 ) -> Result<FrameScan, ()> {
     let (mut out, mut overflow): (Option<Vec<u8>>, bool) = (None, false);
     let (mut cursor, mut run_start) = (0_usize, 0_usize);
@@ -1212,7 +1309,7 @@ fn scan_complete_frames(
                     break (end, true);
                 }
                 accumulate_frame(&mut out, &mut run_start, buf, cursor..end, prev_id, budget)?;
-                if budget.is_some_and(|state| state.retained_payload_limit().is_some()) {
+                if budget.is_some() {
                     let (sequence, terminal) = frame_sequence_and_terminal(buf.get(cursor..end).unwrap_or_default());
                     max_forwarded_sequence = max_sequence(max_forwarded_sequence, sequence);
                     forwarded_terminal |= terminal;
@@ -1251,17 +1348,14 @@ fn accumulate_frame(
     buf: &[u8],
     frame_range: core::ops::Range<usize>,
     prev_id: &str,
-    budget: Option<&ResponsesState>,
+    budget: Option<RestoreBudgetView>,
 ) -> Result<(), ()> {
     let core::ops::Range { start, end } = frame_range;
     let frame = buf.get(start..end).unwrap_or_default();
     // A non-lifecycle frame is forwarded without even joining its data lines.
     // The key scan never allocates and conservatively includes escaped keys.
     let possible_response = frame_may_have_response_key(frame);
-    if possible_response
-        && let Some(state) = budget
-        && state.retained_payload_limit().is_some()
-    {
+    if possible_response && let Some(view) = budget {
         let id_growth = prev_id.len().checked_mul(6).and_then(|bytes| bytes.checked_add(64));
         // Once a rewrite creates `out`, later plain frames can extend it
         // without another rewrite check. Reserve the whole scanned buffer:
@@ -1287,7 +1381,7 @@ fn accumulate_frame(
                     .checked_add(bytes)
             })
             .and_then(|bytes| id_growth?.checked_mul(3)?.checked_add(bytes));
-        if !peak.is_some_and(|bytes| streaming_restore_fits(budget, state.retained_rehydrate_stream_bytes, bytes)) {
+        if !peak.is_some_and(|bytes| streaming_restore_fits(budget, view.retained_rehydrate_stream_bytes, bytes)) {
             return Err(());
         }
     }

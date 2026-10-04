@@ -1113,6 +1113,18 @@ impl ResponsesState {
             .checked_add(stream_bytes)
     }
 
+    /// Count owners that may change between Rehydrate SSE callbacks, including
+    /// accumulated output and both published stream-parser charges. The stable
+    /// request and history owners are measured once by the Rehydrate stream.
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, false)?
+            .checked_add(stream_bytes)
+    }
+
     /// Count payload owned directly by this state, excluding sibling-filter
     /// owners that participate only in the aggregate agentic budget.
     ///

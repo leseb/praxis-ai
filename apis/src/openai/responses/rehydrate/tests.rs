@@ -2217,6 +2217,64 @@ async fn budgeted_direct_sse_restore_admits_stream() {
     );
 }
 
+#[tokio::test]
+async fn budgeted_partial_frame_callbacks_do_not_rescan_prompt() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({
+        "input": "x".repeat(1 << 20),
+        "stream": true,
+        "previous_response_id": "resp_prev",
+    }));
+    state.history_rehydrated = true;
+    state.apply_retained_payload_limit(64 << 20);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        RehydrateFilter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let mut body = Some(Bytes::from_static(b"data: abc"));
+        assert!(matches!(
+            RehydrateFilter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(body.is_none());
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "200 partial SSE callbacks with a stable prompt took {elapsed:?}"
+    );
+}
+
+#[test]
+fn streaming_restore_cache_remeasures_changed_request_and_output() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "short", "previous_response_id": "resp_prev"}));
+    state.apply_retained_payload_limit(4_096);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state.request_body = json!({"input": "x".repeat(4_096)});
+    state.mark_replay_stable_payload_changed();
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+
+    state.request_body = json!({"input": "short", "previous_response_id": "resp_prev"});
+    state.mark_replay_stable_payload_changed();
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+    state.input.push(json!("x".repeat(4_096)));
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+    state.input.truncate(1);
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+    state.accumulated_output.push(json!({"text": "x".repeat(4_096)}));
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+}
+
 /// Re-parse assembled SSE output bytes into frames for assertions.
 fn parse_sse_frames(bytes: &[u8]) -> Vec<SseFrame> {
     SseFrameParser::new(1 << 20)
@@ -3391,6 +3449,7 @@ fn armed_stream(max_buffer_bytes: usize, prev_id: &str) -> RestorePreviousRespon
         previous_response_id: prev_id.to_owned(),
         last_forwarded_sequence: None,
         forwarded_terminal: false,
+        stable_payload: None,
     }
 }
 
