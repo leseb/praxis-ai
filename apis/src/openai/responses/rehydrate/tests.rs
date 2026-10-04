@@ -1914,6 +1914,9 @@ async fn finite_restore_rejects_before_copying_a_near_limit_response() {
     .unwrap();
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(baseline + body_bytes.len() * 2);
+    // This exercises the body-phase backstop after an already admitted
+    // canonical response, rather than the direct-route header admission.
+    state.buffered_canonical_finalized = true;
     ctx.extensions.insert(state);
     ctx.response_header = Some(&mut response);
     assert!(matches!(
@@ -1950,6 +1953,7 @@ async fn finite_restore_reserves_numeric_normalization_before_parsing() {
     let baseline = state.retained_payload_bytes().unwrap();
     let raw_only_reservation = body_bytes.len() * 5 + "resp_prev".len() * 12 + 128;
     state.apply_retained_payload_limit(baseline + raw_only_reservation);
+    state.buffered_canonical_finalized = true;
     ctx.extensions.insert(state);
     ctx.response_header = Some(&mut response);
     assert!(matches!(
@@ -1965,6 +1969,66 @@ async fn finite_restore_reserves_numeric_normalization_before_parsing() {
     }
     assert_eq!(body.as_deref(), Some(body_bytes.as_bytes()));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn direct_finite_restore_rejects_before_success_headers() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, "8250".parse().unwrap());
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(32_768);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(ref rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn direct_finite_restore_rejects_unknown_framing_before_headers() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(32_768);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Reject(ref rejection) if rejection.status == 502
+    ));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn canonical_incomplete_restore_keeps_existing_header_path() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(32_768);
+    state.buffered_canonical_finalized = true;
+    state.response_object = json!({"id":"resp_new","object":"response","status":"incomplete"});
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.get_filter_state::<RestorePreviousResponseId>().is_some());
 }
 
 #[tokio::test]
@@ -2222,6 +2286,90 @@ async fn streaming_restore_emits_one_error_before_near_limit_frame_rewrite() {
 }
 
 #[tokio::test]
+async fn direct_stream_restore_error_follows_forwarded_provider_sequences() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 4_096);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let created = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_new\",\"previous_response_id\":null}}\n\n";
+    let mut body = Some(Bytes::from_static(created));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(parse_sse_frames(body.as_ref().unwrap()).len(), 1);
+
+    let delta = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"Hi\"}\n\n";
+    let mut body = Some(Bytes::from_static(delta));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(parse_sse_frames(body.as_ref().unwrap()).len(), 1);
+
+    let completed = format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({
+            "type":"response.completed", "sequence_number":2,
+            "response":{"id":"resp_new","previous_response_id":null,"output":"x".repeat(8_000)}
+        })
+    );
+    let mut body = Some(Bytes::from(completed));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let error = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(error.len(), 1);
+    assert_eq!(error[0].event_type.as_deref(), Some("error"));
+    let payload: Value = serde_json::from_slice(&error[0].data).unwrap();
+    assert_eq!(payload["sequence_number"], 2);
+}
+
+#[tokio::test]
+async fn streaming_restore_reserves_exponent_normalization_before_rewrite() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let numbers = vec!["1e15"; 10_000].join(",");
+    let frame = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":0,\"response\":{{\"id\":\"resp_new\",\"previous_response_id\":null,\"output\":[{numbers}]}}}}\n\n"
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + frame.len() * 10);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from(frame));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let frames = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+}
+
+#[tokio::test]
 async fn buffered_rewrite_reserves_later_plain_frame_output_growth() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -2314,6 +2462,20 @@ fn response_key_probe_skips_comments_and_preserves_escaped_keys() {
     assert!(!frame_may_have_response_key(
         b"data: {\"ty\\u0070e\":\"response.output_item.done\"}\n\n"
     ));
+}
+
+#[test]
+fn forwarded_sequence_probe_reads_only_top_level_integer() {
+    assert_eq!(
+        frame_sequence_number(
+            b"data: {\"nested\":{\"sequence_number\":99},\"sequence_numb\\u0065r\":7,\"delta\":\"sequence_number: 100\"}\n\n"
+        ),
+        Some(7)
+    );
+    assert_eq!(
+        frame_sequence_number(b"data: {\"nested\":{\"sequence_number\":99}}\n\n"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -3575,6 +3737,7 @@ fn armed_stream(max_buffer_bytes: usize, prev_id: &str) -> RestorePreviousRespon
         max_buffer_bytes,
         previous_response_id: prev_id.to_owned(),
         stable_budget: None,
+        last_forwarded_sequence: None,
     }
 }
 

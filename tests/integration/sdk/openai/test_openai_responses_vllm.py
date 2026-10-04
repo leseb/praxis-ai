@@ -2087,6 +2087,26 @@ def test_direct_budget_store_admits_bounded_known_length(direct_budget_client):
     assert admitted.output[0].content[0].text == "x" * 10
 
 
+@pytest.mark.parametrize("direct_budget_client", [32_768], indirect=True)
+@pytest.mark.parametrize("model", ["8000", "chunked"])
+def test_direct_budget_restore_rejects_before_success_headers(direct_budget_client, model):
+    """A direct previous-response rewrite reports budget failures as HTTP 502."""
+    client = direct_budget_client
+    seed = client.responses.create(model="10", input="seed", store=True)
+    continued = client.responses.create(
+        model="20", input="next", previous_response_id=seed.id, store=False
+    )
+    assert continued.status == "completed"
+    assert continued.previous_response_id == seed.id
+
+    with pytest.raises(APIStatusError) as failed:
+        client.responses.create(
+            model=model, input="next", previous_response_id=seed.id, store=False
+        )
+    assert failed.value.status_code == 502
+    assert failed.value.response.json()["error"]["type"] == "server_error"
+
+
 @pytest.fixture()
 def provider_compaction_client(tmp_path_factory, request):
     """Function-scoped native Responses backend with a provider compaction."""
