@@ -808,6 +808,7 @@ fn prepare_streamed_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesStat
     if !super::streamed_round_is_dispatchable(ctx, state) {
         collect_streaming_output_items(state)?;
         state.tool_calls.clear();
+        state.mark_current_output_changed();
         state.tool_search_calls.clear();
         state.web_search_calls.clear();
         // No dispatcher runs on a non-dispatchable (terminal) round, so drop the
@@ -829,6 +830,7 @@ fn end_stream_with_error(
     message: &str,
 ) -> Result<(), FilterError> {
     state.tool_calls.clear();
+    state.mark_current_output_changed();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
@@ -847,6 +849,7 @@ fn end_stream_with_error(
 /// body pre-read, before request filters and routing inspect the headers.
 fn prepare_iteration(state: &mut ResponsesState) {
     state.tool_calls.clear();
+    state.mark_current_output_changed();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
 
@@ -1012,6 +1015,7 @@ fn mcp_tool_index_charge(state: &ResponsesState) -> Option<usize> {
 }
 
 #[cfg(not(feature = "openai-mcp-tools"))]
+/// No MCP index is constructed when MCP tool support is disabled.
 const fn mcp_tool_index_fits(_state: &ResponsesState) -> bool {
     true
 }
@@ -1297,6 +1301,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
     let Some(mut response) = response else {
         state.response_object = Value::Null;
         state.tool_calls.clear();
+        state.mark_current_output_changed();
         return Ok(());
     };
     let normalization_staging = output_normalization_staging_bytes(&response, has_file_search_tool(state))
@@ -1328,6 +1333,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
         merge_usage(&mut state.usage, usage);
     }
     state.response_object = response;
+    state.mark_current_output_changed();
     Ok(())
 }
 
@@ -1815,6 +1821,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
     }
     record_file_search_assignments(state, pending_file_search);
     mark_provider_history(state);
+    state.mark_current_output_changed();
     Ok(())
 }
 
@@ -1912,6 +1919,7 @@ fn is_responses_api_output(response: &Value) -> bool {
 /// Drop this round's dispatcher queues so a terminal outcome cannot re-dispatch.
 fn clear_round_dispatch_state(state: &mut ResponsesState) {
     state.tool_calls.clear();
+    state.mark_current_output_changed();
     state.web_search_calls.clear();
     state.tool_search_calls.clear();
     state.file_search_assignments.clear();

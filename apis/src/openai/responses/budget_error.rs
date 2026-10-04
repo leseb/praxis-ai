@@ -20,6 +20,11 @@ pub(crate) fn reject_request(ctx: &mut HttpFilterContext<'_>, message: &str) -> 
     FilterAction::Reject(request_rejection(ctx, message))
 }
 
+/// Compatibility entry point for request-side budget checks in translated paths.
+pub(super) fn reject_retained_payload_budget(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
+    reject_request(ctx, message)
+}
+
 /// The selected upstream body hook needs a `Rejection` directly.
 pub(crate) fn request_rejection(ctx: &mut HttpFilterContext<'_>, message: &str) -> Rejection {
     let initial = ctx
@@ -36,6 +41,11 @@ pub(crate) fn request_rejection(ctx: &mut HttpFilterContext<'_>, message: &str) 
 /// Reject a provider response that exceeds the shared budget.
 pub(crate) fn response_rejection(ctx: &mut HttpFilterContext<'_>, message: &str) -> Rejection {
     rejection(ctx, message, false)
+}
+
+/// Reject a provider response through the same response-phase cleanup path.
+pub(super) fn reject_retained_payload_response_budget(ctx: &mut HttpFilterContext<'_>, message: &str) -> FilterAction {
+    FilterAction::Reject(response_rejection(ctx, message))
 }
 
 fn rejection(ctx: &mut HttpFilterContext<'_>, message: &str, initial: bool) -> Rejection {

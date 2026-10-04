@@ -272,6 +272,7 @@ async fn agentic_budget_rejects_raw_body_before_classification() {
 }
 
 #[test]
+#[cfg(feature = "openai-responses")]
 fn history_selector_probe_handles_escaped_keys_without_allocating_payload() {
     assert!(may_rehydrate_history(br#"{"prev\u0069ous_response_id":"resp_x"}"#));
     assert!(may_rehydrate_history(br#"{"conversation":{"id":"conv_x"}}"#));

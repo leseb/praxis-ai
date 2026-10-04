@@ -65,7 +65,7 @@ use tracing::{debug, trace, warn};
 use super::{
     super::{
         DEFAULT_STORE_NAME,
-        agentic_loop::AgenticBudgetPolicy,
+        agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
         bound_body_outcome,
         error::responses_error_rejection,
         state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
@@ -210,6 +210,10 @@ impl ResponseStoreFilter {
         clippy::too_many_lines,
         reason = "checks aggregate admission before constructing the store record"
     )]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "distinguishes absent state from an unmeasurable response before persistence"
+    )]
     fn persist_from_streaming_state(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
@@ -228,10 +232,11 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let response_bytes = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .and_then(|state| retained_json_bytes(&state.response_object));
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            trace!("skipping streaming persistence: no Responses state");
+            return Ok(FilterAction::Continue);
+        };
+        let response_bytes = retained_json_bytes(&state.response_object);
         if !response_bytes.is_some_and(|bytes| persistence_construction_fits(ctx, bytes)) {
             return Ok(persistence_budget_failure(ctx, true, body));
         }
@@ -278,7 +283,7 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !persistence_construction_fits(ctx, bytes.len()) {
+        if !buffered_persistence_construction_fits(ctx, bytes) {
             return Ok(persistence_budget_failure(ctx, false, body));
         }
 
@@ -354,7 +359,24 @@ impl ResponseStoreFilter {
                 ctx.extensions.insert(state);
                 return false;
             };
-            let Some(cache) = StoreStableCache::new(responses, stable) else {
+            // Completed output stays unchanged across ordinary text deltas. Measure
+            // its three independent JSON owners once per revision, just as the
+            // stream parser does for its own filter-local admission checks.
+            let Some(remaining) = limit.checked_sub(stable) else {
+                ctx.extensions.insert(state);
+                return false;
+            };
+            let mut current_output_meter = PayloadMeter::new(remaining);
+            if current_output_meter.json(&responses.response_object).is_none()
+                || current_output_meter
+                    .json(&responses.local_completion_response_template)
+                    .is_none()
+                || current_output_meter.json_values(&responses.tool_calls).is_none()
+            {
+                ctx.extensions.insert(state);
+                return false;
+            }
+            let Some(cache) = StoreStableCache::new(responses, stable, current_output_meter.used()) else {
                 ctx.extensions.insert(state);
                 return false;
             };
@@ -697,28 +719,34 @@ enum PersistenceArm {
     Armed,
 }
 
-/// Cached stable payload charge and its O(1) invalidation key.
+/// Cached request, history, prior output, and completed output charges.
 #[derive(Clone, Copy)]
 struct StoreStableCache {
     /// Logical loop round when the charge was measured.
     iteration: u32,
     /// In-place mutation revision of the cached owners.
     revision: u64,
+    /// In-place mutation revision of the current response owners.
+    current_output_revision: u64,
     /// Lengths of every cached collection. Dispatch may append after synthesis
     /// has already advanced the iteration.
     collection_lengths: [usize; 7],
     /// Serialized payload charge of the cached request, history, and output.
     bytes: usize,
+    /// Serialized response, local completion template, and tool-call owners.
+    current_output_bytes: usize,
 }
 
 impl StoreStableCache {
     /// Capture the measured charge and the current O(1) collection shape.
-    fn new(state: &ResponsesState, bytes: usize) -> Option<Self> {
+    fn new(state: &ResponsesState, bytes: usize, current_output_bytes: usize) -> Option<Self> {
         Some(Self {
             iteration: state.iteration,
             revision: state.replay_stable_payload_revision?,
+            current_output_revision: state.current_output_revision?,
             collection_lengths: Self::collection_lengths(state),
             bytes,
+            current_output_bytes,
         })
     }
 
@@ -726,6 +754,7 @@ impl StoreStableCache {
     fn matches(&self, state: &ResponsesState) -> bool {
         self.iteration == state.iteration
             && Some(self.revision) == state.replay_stable_payload_revision
+            && Some(self.current_output_revision) == state.current_output_revision
             && self.collection_lengths == Self::collection_lengths(state)
     }
 
@@ -868,7 +897,7 @@ fn store_stream_budget_fits(
         return false;
     };
     responses
-        .store_stream_changing_payload_bytes_bounded(measurement_limit)
+        .store_stream_changing_payload_bytes_bounded_with_current_output(measurement_limit, cache.current_output_bytes)
         .and_then(|current| current.checked_sub(removed))
         .and_then(|current| current.checked_add(added))
         .is_some_and(|next| next <= remaining)
@@ -959,8 +988,43 @@ fn replay_payload_staging_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
         .checked_add(capture.events.len().checked_mul(64)?)
 }
 
-/// Reserve record, history, replay-row IDs, and backend serialization owners
-/// before building them.
+/// Bound a buffered response's normalized JSON size before parsing its store record.
+fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> bool {
+    let projected = if ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+        .is_some()
+    {
+        // serde_json can expand exponent-form numbers while constructing the
+        // record; use the same no-allocation upper bound as agentic admission.
+        buffered_parsed_json_bytes_upper_bound(bytes)
+    } else {
+        Some(bytes.len())
+    };
+    projected.is_some_and(|response_bytes| persistence_construction_fits(ctx, response_bytes))
+}
+
+/// The response, messages, and input columns may each be zstd-compressed and
+/// then copied once more into `PostgreSQL`'s query arguments. Reserve twice the
+/// maximum frame expansion while the original JSON columns remain live.
+pub(super) fn encoded_column_headroom(
+    response_bytes: usize,
+    history_bytes: usize,
+    input_bytes: usize,
+) -> Option<usize> {
+    response_bytes
+        .checked_mul(2)?
+        .checked_add(history_bytes)?
+        .checked_add(input_bytes)?
+        .checked_shr(8)?
+        .checked_add(3 * 64)?
+        .checked_mul(2)
+}
+
+/// Reserve record, history, replay-row IDs, backend serialization, and the
+/// `PostgreSQL` input parameter buffer before building them.
+#[expect(clippy::too_many_lines, reason = "persistence owners share one aggregate admission")]
 pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, response_bytes: usize) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
@@ -971,9 +1035,13 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
     let Some(history_bytes) = retained_json_values_bytes(&state.persisted_messages) else {
         return false;
     };
-    let Some(input_bytes) = retained_request_payload_bytes(ctx) else {
+    let Some(store_snapshot_bytes) = retained_request_payload_bytes(ctx) else {
         return false;
     };
+    let input_bind_bytes = ctx
+        .extensions
+        .get::<ResponseStoreRequestState>()
+        .map_or(0, |capture| capture.input_retained_bytes);
     let approval_bytes = state.pending_approvals.iter().try_fold(0_usize, |used, record| {
         used.checked_add(record.approval_id.len())?
             .checked_add(record.server_label.len())?
@@ -983,13 +1051,23 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
     });
     let replay_id_bytes = replay_row_id_copy_bytes(ctx, state);
     let replay_payload_bytes = replay_payload_staging_bytes(ctx);
+    let compression_headroom = encoded_column_headroom(response_bytes, history_bytes, input_bind_bytes);
+    // Record construction owns the parsed response and a separate clone of
+    // its output in messages. Serialization and PostgreSQL binds then own one
+    // copy of each column, for six response-sized owners at the peak. Prior
+    // history is charged separately and cannot cover newly appended output.
     let additional = response_bytes
-        .checked_mul(5)
+        .checked_mul(6)
         .and_then(|bytes| history_bytes.checked_mul(3)?.checked_add(bytes))
-        .and_then(|bytes| bytes.checked_add(input_bytes))
+        // The whole store snapshot is already charged in state. Serialization
+        // owns another copy, and PostgreSQL's query bind copies only the input
+        // from that snapshot, not its captured replay rows.
+        .and_then(|bytes| bytes.checked_add(store_snapshot_bytes))
+        .and_then(|bytes| bytes.checked_add(input_bind_bytes))
         .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(replay_id_bytes?))
-        .and_then(|bytes| bytes.checked_add(replay_payload_bytes?));
+        .and_then(|bytes| bytes.checked_add(replay_payload_bytes?))
+        .and_then(|bytes| bytes.checked_add(compression_headroom?));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
@@ -2304,10 +2382,39 @@ mod encode_replay_event_tests {
     use serde_json::json;
 
     use super::{
-        CapturedEvent, ResponseEventRecord, ResponseStoreFilter, StateOwner, capture_request_input,
-        encode_replay_event, persistence_budget_failure, persistence_construction_fits,
+        CapturedEvent, ResponseEventRecord, ResponseStoreFilter, StateOwner, buffered_parsed_json_bytes_upper_bound,
+        buffered_persistence_construction_fits, capture_request_input, encode_replay_event, encoded_column_headroom,
+        persistence_budget_failure, persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
+
+    #[test]
+    fn streaming_persistence_without_response_state_keeps_final_chunk() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from("default"),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        ctx.extensions.insert(super::ResponseStoreRequestState {
+            owner: Some(StateOwner::from_trusted_parts("t", "i", "s").unwrap()),
+            ..Default::default()
+        });
+        let frame = Bytes::from_static(b"event: response.completed\ndata: {}\n\n");
+        let mut body = Some(frame.clone());
+
+        let action = ResponseStoreFilter::persist_from_streaming_state(&mut ctx, &mut body).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, Some(frame));
+        assert_ne!(ctx.get_metadata("responses.store_stream_budget_failed"), Some("true"));
+    }
 
     /// Build a minimal event record carrying `payload` for the encoder under test.
     fn record_with_payload(event_type: &str, payload: &[u8]) -> ResponseEventRecord {
@@ -2432,7 +2539,8 @@ mod encode_replay_event_tests {
         let baseline = responses.retained_payload_bytes().unwrap();
         let payload_bytes = usize::try_from(store.event_bytes).unwrap();
         let replay_staging = payload_bytes * 2 + (payload_bytes >> 8) + store.events.len() * 64;
-        let record_staging = response_bytes * 5 + store_bytes + replay_staging;
+        let record_staging =
+            response_bytes * 6 + encoded_column_headroom(response_bytes, 0, 0).unwrap() + store_bytes + replay_staging;
         let replay_id_copies = response_id_len * store.events.len();
         responses.apply_retained_payload_limit(baseline + record_staging + replay_id_copies);
         ctx.extensions.insert(responses);
@@ -2483,7 +2591,10 @@ mod encode_replay_event_tests {
         responses.set_retained_external_payload_bytes(captured_bytes);
         let response_bytes = super::retained_json_bytes(&responses.response_object).unwrap();
         let baseline = responses.retained_payload_bytes().unwrap();
-        let existing_staging = response_bytes * 5 + captured_bytes + "resp_zstd".len() * capture.events.len();
+        let existing_staging = response_bytes * 6
+            + encoded_column_headroom(response_bytes, 0, 0).unwrap()
+            + captured_bytes
+            + "resp_zstd".len() * capture.events.len();
         responses.apply_retained_payload_limit(baseline + existing_staging + replay_staging);
         ctx.extensions.insert(responses);
         ctx.extensions.insert(capture);
@@ -2494,6 +2605,136 @@ mod encode_replay_event_tests {
             .unwrap()
             .apply_retained_payload_limit(baseline + existing_staging + replay_staging - 1);
         assert!(!persistence_construction_fits(&ctx, response_bytes));
+    }
+
+    /// `PostgreSQL` copies serialized input into its query argument buffer while
+    /// both the request snapshot and serialized input still own their bytes.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "checks both input bind and replay row boundaries")]
+    fn persistence_preflights_postgres_input_bind_copy() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let input = json!([{"role": "user", "content": "x".repeat(1_048_576)}]);
+        let input_bytes = super::retained_json_bytes(&input).unwrap();
+        let responses = ResponsesState {
+            response_object: json!({"id": "resp_pg_bind", "created_at": 0, "model": "m", "output": []}),
+            ..ResponsesState::default()
+        };
+        ctx.extensions.insert(responses);
+        capture_request_input(&mut ctx, input).unwrap();
+
+        let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        let response_bytes = super::retained_json_bytes(&state.response_object).unwrap();
+        let baseline = state.retained_payload_bytes().unwrap();
+        let construction =
+            response_bytes * 6 + input_bytes * 2 + encoded_column_headroom(response_bytes, 0, input_bytes).unwrap();
+        state.apply_retained_payload_limit(baseline + construction);
+        assert!(persistence_construction_fits(&ctx, response_bytes));
+
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(baseline + construction - 1);
+        assert!(
+            !persistence_construction_fits(&ctx, response_bytes),
+            "one byte below the PostgreSQL bind-copy peak must reject"
+        );
+
+        // Replay rows share the store snapshot charge, but do not enter the
+        // PostgreSQL input bind parameter. They must not be doubled here.
+        let event_type = "response.output_text.delta";
+        let replay_bytes = 65_536;
+        let capture = ctx.extensions.get_mut::<super::ResponseStoreRequestState>().unwrap();
+        capture.event_bytes += replay_bytes as u64;
+        capture.event_name_bytes += event_type.len();
+        capture.events.push(CapturedEvent {
+            sequence_number: 1,
+            event_type: event_type.to_owned(),
+            payload: vec![b'x'; replay_bytes],
+            terminal: false,
+        });
+        let snapshot_bytes = capture.retained_payload_bytes().unwrap();
+        let replay_staging = replay_bytes * 2 + (replay_bytes >> 8) + 64;
+        ctx.extensions.insert(ResponsesState {
+            response_object: json!({"id": "resp_pg_bind", "created_at": 0, "model": "m", "output": []}),
+            ..ResponsesState::default()
+        });
+        let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        state.set_retained_external_payload_bytes(snapshot_bytes);
+        let baseline = state.retained_payload_bytes().unwrap();
+        let construction = response_bytes * 6
+            + encoded_column_headroom(response_bytes, 0, input_bytes).unwrap()
+            + snapshot_bytes
+            + input_bytes
+            + replay_staging
+            + "resp_pg_bind".len();
+        state.apply_retained_payload_limit(baseline + construction);
+        assert!(persistence_construction_fits(&ctx, response_bytes));
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(baseline + construction - 1);
+        assert!(!persistence_construction_fits(&ctx, response_bytes));
+    }
+
+    /// A buffered assistant message enters the stored record's messages even
+    /// though it is absent from the pre-persist history charge. The response
+    /// and messages columns are both serialized and copied by `PostgreSQL`.
+    #[test]
+    fn persistence_preflights_new_assistant_output_message_bind_copy() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let response_object = json!({
+            "id": "resp_output_bind", "created_at": 0, "model": "m",
+            "output": [{"type": "message", "role": "assistant", "content": "x".repeat(1_048_576)}]
+        });
+        let response_bytes = super::retained_json_bytes(&response_object).unwrap();
+        let mut state = ResponsesState {
+            response_object,
+            ..ResponsesState::default()
+        };
+        assert!(state.persisted_messages.is_empty());
+        let baseline = state.retained_payload_bytes().unwrap();
+        let headroom = encoded_column_headroom(response_bytes, 0, 0).unwrap();
+        state.apply_retained_payload_limit(baseline + response_bytes * 6 + headroom);
+        ctx.extensions.insert(state);
+        assert!(persistence_construction_fits(&ctx, response_bytes));
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(baseline + response_bytes * 5 + response_bytes / 2);
+        assert!(
+            !persistence_construction_fits(&ctx, response_bytes),
+            "newly appended output must count in both stored columns and binds"
+        );
+    }
+
+    /// Exponent-form numbers in an opaque response field expand after JSON
+    /// parsing, so the store must reserve parsed owners before decoding.
+    #[test]
+    fn buffered_persistence_preflights_numeric_normalization() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let numbers = vec!["1e15"; 128].join(",");
+        let wire = format!(
+            "{{\"id\":\"resp_numeric\",\"created_at\":0,\"model\":\"m\",\"output\":[],\"metadata\":[{numbers}]}}"
+        );
+        let projected = buffered_parsed_json_bytes_upper_bound(wire.as_bytes()).unwrap();
+        assert!(projected > wire.len());
+        let mut state = ResponsesState {
+            response_object: serde_json::from_str(&wire).unwrap(),
+            ..ResponsesState::default()
+        };
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(
+            baseline
+                + wire.len() * 6
+                + (projected - wire.len()) * 3
+                + encoded_column_headroom(projected, 0, 0).unwrap(),
+        );
+        ctx.extensions.insert(state);
+        assert!(persistence_construction_fits(&ctx, wire.len()));
+        assert!(!buffered_persistence_construction_fits(&ctx, wire.as_bytes()));
     }
 
     #[test]
@@ -2803,6 +3044,86 @@ mod encode_replay_event_tests {
         assert!(responses.messages.is_empty());
         assert!(responses.can_retain_payload(0));
         assert!(!responses.can_retain_payload(frame.as_ref().unwrap().len() * 4));
+        assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercises repeated store admission and its cached charge"
+    )]
+    fn replay_meter_reuses_completed_output_across_small_chunks() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let call = json!({"type": "function_call", "arguments": "x".repeat(512 * 1_024)});
+        let mut responses = ResponsesState {
+            response_object: json!({"output": [call.clone()]}),
+            tool_calls: vec![call],
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(4 * 1_048_576);
+        ctx.extensions.insert(responses);
+        let frame = Some(Bytes::from_static(b": heartbeat\n\n"));
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        let cache = ctx
+            .extensions
+            .get::<super::ResponseStoreRequestState>()
+            .unwrap()
+            .shared_stable_bytes
+            .unwrap();
+        assert!(cache.current_output_bytes > 1_048_576);
+
+        for _ in 0..200 {
+            assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        }
+        assert!(
+            ctx.extensions
+                .get::<super::ResponseStoreRequestState>()
+                .unwrap()
+                .shared_stable_bytes
+                .unwrap()
+                .matches(ctx.extensions.get::<ResponsesState>().unwrap())
+        );
+        // A deliberately impossible cached charge proves the repeated-chunk
+        // admission reads this measurement instead of rescanning the JSON.
+        ctx.extensions
+            .get_mut::<super::ResponseStoreRequestState>()
+            .unwrap()
+            .shared_stable_bytes
+            .as_mut()
+            .unwrap()
+            .current_output_bytes = usize::MAX;
+        assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "the fixture contains one known output item")]
+    fn replay_meter_refreshes_same_length_completed_output_rewrite() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState {
+            response_object: json!({"output": [{"text": "a".repeat(4_096)}]}),
+            ..ResponsesState::default()
+        };
+        responses.apply_retained_payload_limit(16_384);
+        ctx.extensions.insert(responses);
+        let frame = Some(Bytes::from_static(b": heartbeat\n\n"));
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        let old_cache = ctx
+            .extensions
+            .get::<super::ResponseStoreRequestState>()
+            .unwrap()
+            .shared_stable_bytes
+            .unwrap();
+        let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        responses.response_object["output"][0]["text"] = json!("\u{0001}".repeat(4_096));
+        responses.mark_current_output_changed();
+        assert_eq!(responses.output_items().len(), 1);
+        assert!(!old_cache.matches(responses));
         assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
     }
 

@@ -1408,6 +1408,61 @@ async fn per_call_overflow_remains_fail_open_when_aggregate_budget_only_tightens
 }
 
 #[tokio::test]
+async fn aggregate_budget_reserves_concurrent_outbound_search_bodies_before_callout() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "on_failure: open\n");
+    let store_ids: Vec<String> = (0..MAX_CONCURRENT_SEARCHES)
+        .map(|index| format!("vs-{index}"))
+        .collect();
+    let store_refs: Vec<&str> = store_ids.iter().map(String::as_str).collect();
+    let mut state = one_pending_state(&store_refs);
+    state.tools[0]["filters"] = json!({"tag": "x".repeat(4_096)});
+    let baseline = state.retained_payload_bytes().unwrap();
+    let plan = build_search_plan(&state, &state.file_search_assignments);
+    let plan_bytes = plan.retained_payload_bytes().unwrap();
+    // This headroom can hold one body but not the concurrent eight-body peak.
+    state.apply_retained_payload_limit(baseline + plan_bytes + 8_192);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert!(
+        server.requests().is_empty(),
+        "the serialized outbound body needs admission before any search starts"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.dispatch_failure.is_some());
+}
+
+#[tokio::test]
+async fn aggregate_response_overflow_stops_later_searches_when_callout_policy_is_open() {
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, &"x".repeat(4_096)));
+    let filter = make_filter(
+        server.port,
+        "on_failure: open\nmax_response_bytes: 8192\nmax_total_response_bytes: 65536\n",
+    );
+    let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
+        .map(|index| format!("vs-{index}"))
+        .collect();
+    let store_refs: Vec<&str> = store_ids.iter().map(String::as_str).collect();
+    let mut state = one_pending_state(&store_refs);
+    let baseline = state.retained_payload_bytes().unwrap();
+    let plan = build_search_plan(&state, &state.file_search_assignments);
+    state.apply_retained_payload_limit(baseline + plan.retained_payload_bytes().unwrap() + 6_000);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "retained-budget overflow must stop before the next scheduling chunk even when ordinary callout failures stay open"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.dispatch_failure.is_some());
+}
+
+#[tokio::test]
 async fn whole_call_timeout_covers_slow_response_body() {
     let server = MockServer::slow_body(&json!({"data": []}), Duration::from_millis(500));
     let filter = make_filter(server.port, "timeout_ms: 50\n");

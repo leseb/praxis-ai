@@ -41,7 +41,8 @@ use tracing::warn;
 use self::{
     client::{
         CalloutTransport, FileSearchClient, FileSearchClientConfig, FileSearchError, MAX_QUERY_BYTES,
-        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec, request_error,
+        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec,
+        outbound_request_peak_bytes, request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client, require_inline_outbound_chain},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
@@ -402,11 +403,13 @@ impl FileSearchCalloutFilter {
     /// Execute the bounded fan-out for a completed plan.
     #[expect(
         clippy::too_many_lines,
+        clippy::too_many_arguments,
         reason = "separates global, per-call, and transport planning failures"
     )]
     async fn execute_plan(
         &self,
         plan: &SearchPlan,
+        specs: &[SearchSpec<'_>],
         request_headers: &HeaderMap,
         transport: &CalloutTransport<'_>,
         max_decoded_bytes: usize,
@@ -435,12 +438,11 @@ impl FileSearchCalloutFilter {
                 })
             })
             .collect::<Vec<_>>();
-        let specs = build_search_specs(plan);
         let mut batch = if specs.is_empty() {
             SearchBatch::new(plan.calls.len())
         } else {
             self.client
-                .search_with_retained_limit(&specs, plan.calls.len(), request_headers, transport, max_decoded_bytes)
+                .search_with_retained_limit(specs, plan.calls.len(), request_headers, transport, max_decoded_bytes)
                 .await
         };
         batch.failures.extend(planning_failures);
@@ -536,6 +538,22 @@ impl FileSearchCalloutFilter {
             }
             return Ok(FilterAction::Continue);
         };
+        let specs = build_search_specs(&plan);
+        // A search body is serialized into an owned Vec before the callout,
+        // and up to eight such bodies may coexist. Reserve their peak while
+        // the plan and decoded responses are also live.
+        let execution_bytes = if state.retained_payload_limit().is_some() && plan.planning_error.is_none() {
+            outbound_request_peak_bytes(&specs).and_then(|peak| plan_bytes.checked_add(peak))
+        } else {
+            Some(plan_bytes)
+        };
+        let Some(execution_bytes) = execution_bytes else {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            return Ok(FilterAction::Continue);
+        };
         let hdrs = callout_request_headers(ctx);
         // Keep the existing filtered callout transport and request identity.
         let downstream = SubrequestRuntime::new(
@@ -549,14 +567,16 @@ impl FileSearchCalloutFilter {
             downstream,
             identity: &identity,
         };
-        let Some(max_decoded_bytes) = retained_payload_available(state, plan_bytes) else {
+        let Some(max_decoded_bytes) = retained_payload_available(state, execution_bytes) else {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
                 state.dispatch_failure = Some(file_search_budget_failure());
             }
             return Ok(FilterAction::Continue);
         };
-        let batch = self.execute_plan(&plan, &hdrs, &transport, max_decoded_bytes).await;
+        let batch = self
+            .execute_plan(&plan, &specs, &hdrs, &transport, max_decoded_bytes)
+            .await;
         if batch.retained_payload_overflow() {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();

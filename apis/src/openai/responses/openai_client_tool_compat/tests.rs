@@ -9,7 +9,10 @@ use praxis_filter::body::MAX_JSON_BODY_BYTES;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    openai::responses::AgenticBudgetPolicy,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Test helpers
@@ -1063,6 +1066,383 @@ fn state_with_custom_lowered() -> ResponsesState {
         .lower_request(&mut state, false, false)
         .expect("lowering succeeds");
     state
+}
+
+#[test]
+fn buffered_restoration_preflights_parse_and_rewrite_owners() {
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "run_python", "arguments": "{\"input\":\"print(1)\"}"
+        }],
+        "payload": "x".repeat(16 * 1024),
+    });
+    let raw = response.to_string();
+    let mut state = state_with_custom_lowered();
+    let baseline = state.retained_payload_bytes().expect("bounded baseline");
+    state.apply_retained_payload_limit(baseline + 4_096);
+    let error = filter()
+        .restore_response(&state, raw.as_bytes())
+        .expect_err("a provider body larger than remaining headroom must not be parsed");
+    assert_eq!(
+        reject_parts(&error).0,
+        502,
+        "preparse admission rejects aggregate exhaustion"
+    );
+
+    let small = json!({"object": "response", "output": [], "payload": "x".repeat(512)}).to_string();
+    state.apply_retained_payload_limit(baseline + small.len() + 16);
+    let error = filter()
+        .restore_response(&state, small.as_bytes())
+        .expect_err("the parse may fit while restoration and serialization do not");
+    assert_eq!(
+        reject_parts(&error).0,
+        502,
+        "restoration peak is admitted before mutation"
+    );
+}
+
+#[test]
+fn buffered_restoration_charges_repeated_namespace_metadata() {
+    let namespace = "n".repeat(64 * 1024);
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{
+            "type": "namespace", "name": namespace, "description": "group",
+            "tools": [{"type": "function", "name": "m", "parameters": {"type": "object"}}]
+        }]
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("large namespace declaration lowers within independent rewrite cap");
+    let wire_name = namespace_member_name(&namespace, "m");
+    let output: Vec<_> = (0..100)
+        .map(|i| {
+            json!({
+                "type": "function_call", "id": format!("fc_{i}"),
+                "call_id": format!("call_{i}"), "name": wire_name,
+                "arguments": "{}"
+            })
+        })
+        .collect();
+    let raw = json!({"object": "response", "output": output}).to_string();
+    assert!(raw.len() < 16 * 1024, "private wire names keep the provider body small");
+    let baseline = state.retained_payload_bytes().expect("bounded baseline");
+    state.apply_retained_payload_limit(baseline + 1024 * 1024);
+    let rejected = filter().restore_response(&state, raw.as_bytes());
+    assert!(
+        rejected.is_err(),
+        "the repeated restored namespace must exceed one MiB of headroom"
+    );
+    assert_eq!(reject_parts(&rejected.err().unwrap()).0, 502);
+}
+
+#[test]
+fn buffered_restoration_uses_listener_budget_and_discards_failed_state() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(state_with_custom_lowered());
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap())
+            .expect("valid listener policy"),
+    );
+    let mut body = Some(Bytes::from(
+        json!({"object": "response", "output": [], "payload": "x".repeat(16 * 1024)}).to_string(),
+    ));
+    let action = filter()
+        .on_response_body(&mut ctx, &mut body, true)
+        .expect("budget rejection is a filter action");
+    assert_eq!(reject_parts(&action).0, 502, "provider output growth is a server error");
+    assert!(body.is_none(), "the oversized buffered provider body is released");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().expect("state remains present");
+    assert!(
+        state.retained_payload_failed,
+        "the request cannot persist a successful response"
+    );
+    assert_eq!(state.retained_payload_limit(), Some(4096));
+}
+
+#[test]
+fn buffered_restoration_without_state_has_no_owned_echo_to_restore() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap())
+            .expect("valid listener policy"),
+    );
+    let raw = json!({"object": "response", "payload": "x".repeat(16 * 1024)}).to_string();
+    let mut body = Some(Bytes::from(raw.clone()));
+    let action = filter()
+        .on_response_body(&mut ctx, &mut body, true)
+        .expect("no-state traffic passes through this compatibility filter");
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body.as_ref().unwrap().as_ref(), raw.as_bytes());
+}
+
+#[tokio::test]
+async fn request_lowering_rejects_before_expanding_tool_state_past_aggregate_budget() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let tools: Vec<Value> = (0..10)
+        .map(|index| json!({"type": "custom", "name": format!("tool_{index}")}))
+        .collect();
+    let parsed = json!({"model": "m", "input": "hi", "tools": tools, "store": false});
+    let raw = serde_json::to_vec(&parsed).expect("request serializes");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let mut tight = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    tight
+        .extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+    assert!(
+        super::super::initial_budget_rejection(&tight, &raw).is_none(),
+        "the supported pipeline admits the raw request before lowering"
+    );
+    super::super::insert_budgeted_responses_state(&mut tight, parsed.clone(), "resp_test")
+        .expect("initial parsed state fits");
+    let mut body = Some(Bytes::from(raw.clone()));
+    let agentic = super::super::AgenticLoopFilter::from_config(&config).unwrap();
+    assert!(matches!(
+        agentic.on_request_body(&mut tight, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let baseline = tight.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        baseline.can_retain_payload(0),
+        "state fits before compatibility lowering"
+    );
+
+    let rejection = filter().on_request_body(&mut tight, &mut body, true).await.unwrap();
+    assert_eq!(
+        reject_parts(&rejection).0,
+        413,
+        "initial request fails before the upstream call"
+    );
+    assert_eq!(tight.get_metadata("responses.skip_persist"), Some("true"));
+    let discarded = tight.extensions.get::<ResponsesState>().unwrap();
+    assert!(discarded.retained_payload_failed, "successful persistence is disabled");
+    assert!(
+        discarded.retained_payload_bytes().unwrap() <= 4096,
+        "large lowered owners are never committed over the aggregate cap"
+    );
+
+    let loose_config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 1048576").unwrap();
+    let mut loose = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    loose
+        .extensions
+        .insert(AgenticBudgetPolicy::from_config(&loose_config).expect("valid policy"));
+    super::super::insert_budgeted_responses_state(&mut loose, parsed, "resp_test").expect("initial parsed state fits");
+    let mut loose_body = Some(Bytes::from(raw));
+    assert!(matches!(
+        filter()
+            .on_request_body(&mut loose, &mut loose_body, true)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        loose
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .client_tool_echo
+            .is_some(),
+        "adequate headroom still permits client-tool lowering"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_native_function_history_remains_passthrough() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let parsed = json!({
+        "model": "m", "store": false,
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "x".repeat(1024 * 1024)},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    });
+    let raw = serde_json::to_vec(&parsed).expect("request serializes");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 16777216").unwrap();
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+    assert!(
+        super::super::initial_budget_rejection(&ctx, &raw).is_none(),
+        "the raw body fits the supported initial admission"
+    );
+    super::super::insert_budgeted_responses_state(&mut ctx, parsed, "resp_test").expect("initial parsed state fits");
+    let mut body = Some(Bytes::from(raw));
+    let agentic = super::super::AgenticLoopFilter::from_config(&config).unwrap();
+    assert!(matches!(
+        agentic.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let before = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    assert!(matches!(
+        filter().on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.retained_payload_bytes().unwrap(),
+        before,
+        "native history is unchanged"
+    );
+    assert!(state.client_tool_echo.is_none(), "no response restoration is armed");
+}
+
+#[tokio::test]
+async fn discovered_namespace_header_fanout_is_reserved_before_lowering() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let members: Vec<Value> = (0..96)
+        .map(|index| json!({"type": "function", "name": format!("f{index}"), "parameters": {}}))
+        .collect();
+    let parsed = json!({
+        "model": "m", "store": false,
+        "input": [
+            {"type": "tool_search_call", "call_id": "s", "execution": "client", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "s", "tools": [{
+                "type": "namespace", "name": "n", "description": "d".repeat(16_384), "tools": members
+            }]}
+        ]
+    });
+    let raw = serde_json::to_vec(&parsed).expect("request serializes");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 1000000").unwrap();
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+    assert!(super::super::initial_budget_rejection(&ctx, &raw).is_none());
+    super::super::insert_budgeted_responses_state(&mut ctx, parsed, "resp_test").expect("initial parsed state fits");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.can_retain_payload(0), "history fits before discovery");
+    assert!(
+        !request_lowering_reservation(state).is_some_and(|bytes| state.can_retain_payload(bytes)),
+        "the repeated namespace header exceeds remaining headroom"
+    );
+    let mut body = Some(Bytes::from(raw));
+    let rejection = filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert_eq!(reject_parts(&rejection).0, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn nonterminal_discovery_does_not_reserve_namespace_fanout() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let members: Vec<Value> = (0..96)
+        .map(|index| json!({"type": "function", "name": format!("f{index}"), "parameters": {}}))
+        .collect();
+    let parsed = json!({
+        "model": "m", "store": false,
+        "input": [
+            {"type": "tool_search_call", "call_id": "s", "execution": "client", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "s", "status": "in_progress", "tools": [{
+                "type": "namespace", "name": "n", "description": "d".repeat(16_384), "tools": members
+            }]}
+        ]
+    });
+    let raw = serde_json::to_vec(&parsed).expect("request serializes");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 1000000").unwrap();
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+    assert!(super::super::initial_budget_rejection(&ctx, &raw).is_none());
+    super::super::insert_budgeted_responses_state(&mut ctx, parsed, "resp_test").expect("initial parsed state fits");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.can_retain_payload(request_lowering_reservation(state).unwrap()),
+        "only the history rewrite is reserved while discovery is unfinished"
+    );
+    let mut body = Some(Bytes::from(raw));
+    assert!(matches!(
+        filter().on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(0));
+}
+
+#[tokio::test]
+async fn withheld_namespace_members_do_not_reserve_description_fanout() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let members: Vec<Value> = (0..96)
+        .map(|index| json!({"type": "function", "name": format!("f{index}"), "parameters": {}, "defer_loading": true}))
+        .collect();
+    let parsed = json!({
+        "model": "m", "store": false, "input": "hi",
+        "tools": [{
+            "type": "namespace", "name": "n", "description": "d".repeat(16_384), "tools": members
+        }]
+    });
+    let raw = serde_json::to_vec(&parsed).expect("request serializes");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 1000000").unwrap();
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).expect("valid policy"));
+    assert!(super::super::initial_budget_rejection(&ctx, &raw).is_none());
+    super::super::insert_budgeted_responses_state(&mut ctx, parsed, "resp_test").expect("initial parsed state fits");
+    let mut body = Some(Bytes::from(raw));
+    let agentic = super::super::AgenticLoopFilter::from_config(&config).unwrap();
+    assert!(matches!(
+        agentic.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.can_retain_payload(request_lowering_reservation(state).unwrap()),
+        "withheld members do not repeat the namespace description"
+    );
+    assert!(matches!(
+        filter().on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.request_body["tools"],
+        json!([]),
+        "all deferred members stay withheld"
+    );
+    assert!(state.can_retain_payload(0));
+}
+
+#[tokio::test]
+async fn already_lowered_request_does_not_reserve_original_tools_again() {
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let parsed = json!({
+        "model": "m", "store": false, "input": "hi",
+        "tools": [{"type": "custom", "name": "f", "description": "d".repeat(100)}]
+    });
+    let mut state = ResponsesState::from_request_body(parsed);
+    state.apply_retained_payload_limit(1024 * 1024);
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.extensions.insert(state);
+    let mut body = None;
+    assert!(matches!(
+        filter().on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    let lowered_bytes = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(lowered_bytes + 1);
+    assert!(
+        state.can_retain_payload(request_lowering_reservation(state).unwrap()),
+        "an already lowered round does not need the original-tool reserve"
+    );
+    assert!(matches!(
+        filter().on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap(),
+        lowered_bytes,
+        "idempotent lowering leaves retained owners unchanged"
+    );
 }
 
 #[test]

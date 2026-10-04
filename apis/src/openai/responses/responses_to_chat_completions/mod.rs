@@ -519,10 +519,13 @@ fn converter_budget_remaining(
         return Some(usize::MAX);
     };
     let stable = converter.shared_stable_bytes(state, limit)?;
+    let current_output = converter.current_output_bytes(state, limit)?;
     limit
         .checked_sub(stable)
         .and_then(|remaining| remaining.checked_add(state.retained_chat_converter_bytes))
-        .and_then(|measurement_limit| state.stream_changing_payload_bytes_bounded_with_cached_output(measurement_limit))
+        .and_then(|measurement_limit| {
+            state.chat_stream_changing_payload_bytes_bounded_with_current_output(measurement_limit, current_output)
+        })
         .and_then(|changing| stable.checked_add(changing))
         .and_then(|total| total.checked_sub(state.retained_chat_converter_bytes))
         .and_then(|total| total.checked_add(replacement_bytes))

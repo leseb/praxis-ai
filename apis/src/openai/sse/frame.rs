@@ -151,6 +151,68 @@ impl SseFrameParser {
             .saturating_add(self.event_type.as_ref().map_or(0, String::len))
     }
 
+    /// Bound copies of parser bytes from preceding chunks before processing a
+    /// new chunk. A terminated pending line can be copied into a field owner;
+    /// replacing invalid UTF-8 in an `event:` value may expand threefold. A
+    /// completed `data:` field can also reallocate the previous data buffer,
+    /// briefly retaining both its old and new allocations.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one pass over completed SSE lines bounds parser copies"
+    )]
+    pub(crate) fn previous_chunk_copy_bound(&self, chunk: &[u8]) -> Option<usize> {
+        // Match parse_chunk_inner: a CRLF is one terminator, even when the
+        // CR and LF arrive in separate chunks.
+        let mut start = usize::from(self.prev_cr && chunk.first() == Some(&b'\n'));
+        let mut first_line = true;
+        let mut pending_line_copy = 0;
+        let mut appends_data = false;
+        let mut prior_data_live = !self.data_buf.is_empty();
+        while let Some(offset) = chunk
+            .get(start..)?
+            .iter()
+            .position(|byte| matches!(*byte, b'\n' | b'\r'))
+        {
+            let end = start.checked_add(offset)?;
+            let line = chunk.get(start..end)?;
+            if first_line && !self.line_buf.is_empty() {
+                let data_field = self
+                    .line_buf
+                    .iter()
+                    .chain(line.iter())
+                    .copied()
+                    .take(5)
+                    .eq(b"data:".iter().copied());
+                let event_field = self
+                    .line_buf
+                    .iter()
+                    .chain(line.iter())
+                    .copied()
+                    .take(6)
+                    .eq(b"event:".iter().copied());
+                pending_line_copy = if data_field {
+                    self.line_buf.len()
+                } else if event_field {
+                    self.line_buf.len().checked_mul(3)?
+                } else {
+                    0
+                };
+                appends_data |= data_field && prior_data_live;
+            } else {
+                appends_data |= line.starts_with(b"data:") && prior_data_live;
+                if line.is_empty() {
+                    prior_data_live = false;
+                }
+            }
+            first_line = false;
+            start = end.checked_add(1)?;
+            if chunk.get(end) == Some(&b'\r') && chunk.get(start) == Some(&b'\n') {
+                start = start.checked_add(1)?;
+            }
+        }
+        pending_line_copy.checked_add(if appends_data { self.data_buf.len() } else { 0 })
+    }
+
     /// Release all partial frame payload after a terminal aggregate failure.
     pub(crate) fn clear(&mut self) {
         self.line_buf.clear();

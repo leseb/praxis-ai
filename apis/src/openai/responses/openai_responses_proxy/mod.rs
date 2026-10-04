@@ -166,6 +166,10 @@ impl ResponsesProxyFilter {
         clippy::too_many_lines,
         reason = "streaming splice keeps the large body out of serde_json::Value"
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "move the admitted parsed input into serialization without cloning it"
+    )]
     fn serialize_selected_body(
         &self,
         body: &Bytes,
@@ -404,9 +408,9 @@ fn selected_rewrite_reservation(body: &[u8], members: &[TopLevelMember], state: 
         .find(|member| member.name == TopLevelField::Input)
         .map_or(Some(0), |member| {
             let raw = body.get(member.value_start..member.value_end)?;
-            // Normalization can turn a string into a message object, while
-            // parsed numeric values can serialize longer than their spelling.
-            raw.len().checked_mul(8)?.checked_add(64)
+            let parsed = super::agentic_loop::buffered_parsed_json_bytes_upper_bound(raw)?;
+            // A string input is normalized into a message object.
+            parsed.checked_add(usize::from(raw.first() == Some(&b'"')) * 64)
         })?;
     let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
         state.messages.get(state.provider_history_len..).unwrap_or_default()
@@ -1046,6 +1050,24 @@ fn serialize_outbound_body(
 
 /// Project compaction items into the selected backend's input format.
 ///
+/// Keep opaque provider compaction items unchanged for a native backend.
+fn is_provider_compaction(
+    message: &serde_json::Value,
+    preserve_native_compaction: bool,
+    provider_compaction_ids: &HashSet<String>,
+) -> bool {
+    preserve_native_compaction
+        && message.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+        && message
+            .get(crate::openai::responses::state::LOCAL_COMPACTION_MARKER)
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        && match message.get("id").and_then(serde_json::Value::as_str) {
+            Some(id) => provider_compaction_ids.contains(id),
+            None => true,
+        }
+}
+
 /// Returns `Cow::Borrowed` when no compaction items are present, avoiding
 /// allocation. Native mode borrows only provider-originated compaction items;
 /// locally generated Praxis summaries are still translated to assistant
@@ -1058,16 +1080,9 @@ fn messages_for_backend<'a>(
     let mut translated: Option<Vec<serde_json::Value>> = None;
 
     for (i, m) in messages.iter().enumerate() {
-        let is_provider_compaction = preserve_native_compaction
-            && m.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-            && m.get(crate::openai::responses::state::LOCAL_COMPACTION_MARKER)
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-            && match m.get("id").and_then(serde_json::Value::as_str) {
-                Some(id) => provider_compaction_ids.contains(id),
-                None => true,
-            };
-        if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction") && !is_provider_compaction {
+        if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            && !is_provider_compaction(m, preserve_native_compaction, provider_compaction_ids)
+        {
             let vec = translated.get_or_insert_with(|| messages.get(..i).unwrap_or(&[]).to_vec());
             vec.push(compaction_to_assistant_message(m));
         } else if let Some(vec) = &mut translated {

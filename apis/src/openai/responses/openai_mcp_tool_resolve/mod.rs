@@ -72,7 +72,7 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
-    bound_body_outcome,
+    AgenticBudgetPolicy, bound_body_outcome,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -344,6 +344,7 @@ impl McpToolResolveFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         mut parsed: serde_json::Value,
+        listener_budget: Option<&ResponsesState>,
     ) -> Result<FilterAction, ResolveError> {
         let mut mcp_entries = extract_mcp_entries(&mut parsed);
         if mcp_entries.is_empty() {
@@ -351,7 +352,7 @@ impl McpToolResolveFilter {
         }
 
         resolve_connector_ids(&self.connectors, &mut mcp_entries.values)?;
-        let local_staging = match ctx.extensions.get::<ResponsesState>() {
+        let local_staging = match ctx.extensions.get::<ResponsesState>().or(listener_budget) {
             Some(state) if state.retained_payload_limit().is_some() => retained_json_bytes(&parsed)
                 .and_then(|bytes| bytes.checked_add(retained_json_bytes(&mcp_entries.values)?.checked_mul(2)?))
                 .filter(|bytes| state.can_retain_payload(*bytes)),
@@ -404,6 +405,7 @@ impl McpToolResolveFilter {
                 &callout,
                 connector_identity.as_ref(),
                 local_staging,
+                listener_budget,
             )
             .await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
@@ -426,6 +428,7 @@ impl McpToolResolveFilter {
             resolution,
             deferred_mcp,
             connector_context_policy,
+            listener_budget,
         )
     }
 
@@ -444,6 +447,7 @@ impl McpToolResolveFilter {
         resolution: Resolution,
         deferred_mcp: Vec<DeferredMcpConnector>,
         connector_context_policy: McpConnectorContextPolicy,
+        listener_budget: Option<&ResponsesState>,
     ) -> Result<FilterAction, ResolveError> {
         let Resolution {
             per_entry,
@@ -455,6 +459,7 @@ impl McpToolResolveFilter {
         let rewrite_budget = if let Some(state) = ctx
             .extensions
             .get::<ResponsesState>()
+            .or(listener_budget)
             .filter(|state| state.retained_payload_limit().is_some())
         {
             Some(EagerRewriteBudget {
@@ -477,17 +482,21 @@ impl McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
-        let commit_fits = ctx.extensions.get::<ResponsesState>().is_none_or(|state| {
-            eager_commit_fits(
-                state,
-                &parsed,
-                &tool_map,
-                &deferred_mcp,
-                &listings,
-                &connector_context_policy,
-                serialized.len(),
-            )
-        });
+        let commit_fits = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .or(listener_budget)
+            .is_none_or(|state| {
+                eager_commit_fits(
+                    state,
+                    &parsed,
+                    &tool_map,
+                    &deferred_mcp,
+                    &listings,
+                    &connector_context_policy,
+                    serialized.len(),
+                )
+            });
         if !commit_fits {
             return Err(ResolveError::RetainedBudget);
         }
@@ -516,6 +525,7 @@ impl McpToolResolveFilter {
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
         local_staging: usize,
+        listener_budget: Option<&ResponsesState>,
     ) -> Result<Resolution, ResolveError> {
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
         let owner_fingerprint = ctx
@@ -531,7 +541,7 @@ impl McpToolResolveFilter {
             &forwarded_headers,
             callout,
             connector_identity,
-            ctx.extensions.get::<ResponsesState>(),
+            ctx.extensions.get::<ResponsesState>().or(listener_budget),
             local_staging,
         )
         .await
@@ -770,6 +780,72 @@ impl McpToolResolveFilter {
     }
 }
 
+/// Borrow the listener policy until the resolver commits canonical state.
+/// Validation may run later, so discovery cannot depend on its state setup.
+fn resolver_listener_budget(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &[u8],
+) -> Result<Option<ResponsesState>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>().copied() else {
+        return Ok(None);
+    };
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.apply_retained_payload_limit(policy.max_retained_bytes());
+        return Ok(None);
+    }
+    if let Some(rejection) = super::initial_budget_rejection(ctx, body) {
+        #[cfg(feature = "store")]
+        super::store::discard_retained_request_payload(ctx);
+        return Err(rejection);
+    }
+    let mut budget = ResponsesState::default();
+    budget.apply_retained_payload_limit(policy.max_retained_bytes());
+    #[cfg(feature = "store")]
+    budget.set_retained_external_payload_bytes(super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX));
+    Ok(Some(budget))
+}
+
+/// Reserve the copies created when `write_state` first installs a request.
+fn reserve_new_state_request_owners(
+    budget: &mut ResponsesState,
+    parsed: &serde_json::Value,
+    wire_bytes: usize,
+) -> bool {
+    // from_request_body retains input in three vectors plus the request tree,
+    // and clones selected fields. The buffered wire body remains live too.
+    retained_json_bytes(parsed)
+        .and_then(|owned| owned.checked_mul(5))
+        .and_then(|owned| owned.checked_add(wire_bytes))
+        .is_some_and(|bytes| budget.retain_external_payload_bytes(bytes) && budget.can_retain_payload(0))
+}
+
+/// Parse one MCP request after admitting temporary JSON and state owners.
+fn parse_budgeted_mcp_request(
+    ctx: &mut HttpFilterContext<'_>,
+    bytes: &Bytes,
+    listener_budget: Option<&mut ResponsesState>,
+) -> Result<Option<serde_json::Value>, FilterAction> {
+    // Rehydrate may leave earlier history near the aggregate ceiling. Charge
+    // the second JSON tree before parsing the buffered wire body.
+    let parse_fits = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .or(listener_budget.as_deref())
+        .is_none_or(|state| state.retained_payload_limit().is_none() || state.can_retain_payload(bytes.len()));
+    if !parse_fits {
+        let streaming = is_streaming(ctx);
+        return Err(reject_retained_budget(ctx, streaming, bytes));
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Ok(None);
+    };
+    if listener_budget.is_some_and(|budget| !reserve_new_state_request_owners(budget, &parsed, bytes.len())) {
+        let streaming = is_streaming(ctx);
+        return Err(reject_retained_budget(ctx, streaming, bytes));
+    }
+    Ok(Some(parsed))
+}
+
 #[async_trait]
 impl HttpFilter for McpToolResolveFilter {
     fn name(&self) -> &'static str {
@@ -840,19 +916,14 @@ impl HttpFilter for McpToolResolveFilter {
         let Some(bytes) = body.as_ref().cloned() else {
             return Ok(FilterAction::Continue);
         };
-        // Rehydrate can leave earlier history near the aggregate ceiling.
-        // Charge the second JSON tree before parsing this already-buffered body;
-        // the Bytes handle above only increments an Arc refcount.
-        let parse_fits = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .is_none_or(|state| state.retained_payload_limit().is_none() || state.can_retain_payload(bytes.len()));
-        if !parse_fits {
-            let streaming = is_streaming(ctx);
-            return Ok(reject_retained_budget(ctx, streaming, &bytes));
-        }
-        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return Ok(FilterAction::Continue);
+        let mut listener_budget = match resolver_listener_budget(ctx, &bytes) {
+            Ok(budget) => budget,
+            Err(rejection) => return Ok(rejection),
+        };
+        let parsed = match parse_budgeted_mcp_request(ctx, &bytes, listener_budget.as_mut()) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return Ok(FilterAction::Continue),
+            Err(rejection) => return Ok(rejection),
         };
 
         let streaming = is_streaming(ctx);
@@ -860,7 +931,7 @@ impl HttpFilter for McpToolResolveFilter {
         // `bytes` is an `Arc`-backed `Bytes`; cloning bumps a refcount rather than
         // copying the body, so keeping a handle for the failure path (which
         // captures the size-bounded request options from it) is cheap.
-        match Box::pin(self.resolve_mcp_tools(ctx, body, parsed)).await {
+        match Box::pin(self.resolve_mcp_tools(ctx, body, parsed, listener_budget.as_ref())).await {
             Ok(action) => Ok(action),
             Err(ResolveError::RetainedBudget) => Ok(reject_retained_budget(ctx, streaming, &bytes)),
             Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
@@ -880,10 +951,26 @@ impl HttpFilter for McpToolResolveFilter {
 /// Mark an aggregate-budget failure terminal before constructing its response.
 /// No successful response may later be persisted for this request body.
 fn reject_retained_budget(ctx: &mut HttpFilterContext<'_>, streaming: bool, body: &[u8]) -> FilterAction {
+    // The first request has not committed an upstream response. Report its
+    // aggregate admission failure as a client-sized request rejection even
+    // when MCP resolution runs before the validator installs shared state.
+    let initial = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_none_or(|state| state.iteration == 0);
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.discard_payload_for_budget_error();
     }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
     ctx.set_metadata("responses.skip_persist", "true");
+    if initial {
+        return FilterAction::Reject(responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request and MCP discovery exceed openai_agentic_loop.max_retained_bytes",
+        ));
+    }
     resolve_error_action(ctx, &ResolveError::RetainedBudget, streaming, body)
 }
 
@@ -1851,9 +1938,9 @@ fn build_list_tools_failure_response(
     // `pending` (not `ctx`) and the `model` metadata borrow of `ctx` both ended
     // with the final `discovery_response` call above, so the snapshot is moved
     // into state here without a clone.
-    ctx.extensions
-        .get_or_insert_with(ResponsesState::default)
-        .response_object = response;
+    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
+    state.response_object = response;
+    state.mark_current_output_changed();
 
     // Emit as a header-phase `TerminalResponse`, not a `Reject`. A terminal
     // response preserves downstream keepalive (this is a successful 200 transport
@@ -2879,6 +2966,10 @@ impl<'a> McpToolIndex<'a> {
 /// Skips state creation when the body carries
 /// `previous_response_id` to avoid the downstream rebuild
 /// path in `openai_responses_proxy` which would strip it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "existing-state update and first-state creation preserve distinct owners"
+)]
 fn write_state(
     ctx: &mut HttpFilterContext<'_>,
     parsed: serde_json::Value,
@@ -2905,7 +2996,19 @@ fn write_state(
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
         state.mcp_connector_context_policy = connector_context_policy;
+        #[cfg(feature = "store")]
+        {
+            state.set_retained_external_payload_bytes(
+                super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX),
+            );
+            state.store_persist_armed = super::store::request_persistence_armed(ctx);
+        }
+        if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+            state.apply_retained_payload_limit(policy.max_retained_bytes());
+        }
         ctx.extensions.insert(state);
+        #[cfg(feature = "store")]
+        super::store::mark_retained_request_payload_charged(ctx);
     }
 }
 
