@@ -1351,10 +1351,11 @@ fn retained_payload_failure() -> DispatchFailure {
 /// Bound payload allocated while provider output is normalized in place.
 ///
 /// Private file-search translation parses the arguments JSON and clones its
-/// decoded queries before removing the original argument string. Two argument
-/// lengths cover the parsed tree plus decoded-query owner; call-id copies and
-/// fixed rewritten fields are charged separately. Synthetic public IDs are
-/// bounded without formatting them first.
+/// decoded queries before removing the original argument string. The parsed
+/// tree can grow when exponent-form numbers normalize; the raw length covers
+/// the copied query strings. Call-id copies and fixed rewritten fields are
+/// charged separately. Synthetic public IDs are bounded without formatting
+/// them first.
 fn output_normalization_staging_bytes(response: &Value, translate_file_search: bool) -> Option<usize> {
     let Some(output) = response.get("output").and_then(Value::as_array) else {
         return Some(0);
@@ -1362,10 +1363,12 @@ fn output_normalization_staging_bytes(response: &Value, translate_file_search: b
     output.iter().try_fold(0_usize, |used, item| {
         let mut added = 0_usize;
         if translate_file_search && is_file_search_function_call(item) {
-            let arguments = item.get("arguments").and_then(Value::as_str).map_or(0, str::len);
+            let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+            let parsed_arguments = buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())?;
             let call_id = item.get("call_id").and_then(Value::as_str).map_or(0, str::len);
             added = arguments
-                .checked_mul(2)?
+                .len()
+                .checked_add(parsed_arguments)?
                 .checked_add(call_id.checked_mul(2)?)?
                 .checked_add(256)?;
         }
