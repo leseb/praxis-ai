@@ -458,6 +458,42 @@ fn deferred_terminal_reserves_restored_payload_and_wire_together() {
 }
 
 #[test]
+fn deferred_terminal_rejects_echo_before_restoring_canonical_response() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState::from_request_body(json!({"stream": true}));
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type":"custom", "name":"custom", "description":"x".repeat(20_000)})],
+        tool_choice: json!("auto"),
+    });
+    state.replace_response_object(json!({"id":"r", "status":"completed", "output":[], "tools":[]}));
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type":"response.completed", "response":{"id":"r", "output":[], "tools":[]}}),
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let terminal_bytes = terminal.retained_payload_bytes().unwrap();
+    let echo_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    assert!(echo_staging > 40_000, "both restored response owners must be projected");
+    state.apply_retained_payload_limit(baseline + terminal_bytes + 1_024);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(terminal.payload["response"]["tools"], json!([]));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
 fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     let (_filter, mut ctx) = make_armed_context();
     let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -2683,6 +2719,109 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
 
     assert!(body.is_none(), "the commit must reject all simultaneous owners");
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn lifecycle_echo_snapshots_are_rejected_before_plan_allocation() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut state = ResponsesState::from_request_body(json!({"stream":true}));
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type":"custom", "name":"custom", "description":"x".repeat(20_000)})],
+        tool_choice: json!("auto"),
+    });
+    ctx.extensions.insert(state);
+    filter.arm(&mut ctx);
+    let payload = json!({"type":"response.in_progress", "response":{"id":"r", "output":[], "tools":[]}});
+    let mut chunk = Vec::new();
+    for _ in 0..32 {
+        chunk.extend_from_slice(&make_sse_chunk("response.in_progress", &payload));
+    }
+    let mut frame_parser = SseFrameParser::new(65_536);
+    let frames = frame_parser.parse_chunk(&chunk).unwrap();
+    let events = frames
+        .iter()
+        .map(crate::openai::sse::responses::ResponsesEvent::from_frame)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let echo_projection = {
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        super::client_tools::lifecycle_restore_staging_bytes(
+            &state.client_tool_lowering,
+            state.client_tool_echo.as_ref(),
+            &events,
+        )
+        .unwrap()
+    };
+    assert!(echo_projection > 640_000);
+    let baseline = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let construction = super::retained_frame_payload_bytes(&frames).unwrap()
+        + events
+            .iter()
+            .map(|event| super::retained_event_payload_bytes(event).unwrap())
+            .sum::<usize>();
+    let clones = super::projected_responses_state_clone_bytes(&ctx, &events).unwrap();
+    let output =
+        super::logical_output_upper_bound(&ctx, ctx.get_filter_state::<StreamEventsState>().unwrap(), &events).unwrap();
+    let limit = baseline + construction + clones + output * 2 + 4_096;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(limit);
+
+    let mut body = Some(Bytes::from(chunk));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_none(), "unadmitted echoed lifecycle must not be emitted");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn lifecycle_echo_snapshot_with_headroom_is_emitted() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut state = ResponsesState::from_request_body(json!({"stream":true}));
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type":"custom", "name":"custom"})],
+        tool_choice: json!("auto"),
+    });
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 65_536);
+    ctx.extensions.insert(state);
+    filter.arm(&mut ctx);
+
+    let payload = json!({"type":"response.in_progress", "response":{"id":"r", "output":[], "tools":[]}});
+    let mut body = Some(make_sse_chunk("response.in_progress", &payload));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let emitted = String::from_utf8(body.expect("admitted lifecycle").to_vec()).unwrap();
+    assert!(emitted.contains("\"name\":\"custom\""), "{emitted}");
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[test]

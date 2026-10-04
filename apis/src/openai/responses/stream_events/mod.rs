@@ -992,9 +992,17 @@ fn parse_and_accumulate(
         return Ok(None);
     }
     let projected_state_clone_bytes = projected_responses_state_clone_bytes(ctx, &events);
+    let projected_client_restore_bytes = ctx.extensions.get::<ResponsesState>().map_or(Some(0), |responses| {
+        client_tools::lifecycle_restore_staging_bytes(
+            &responses.client_tool_lowering,
+            responses.client_tool_echo.as_ref(),
+            &events,
+        )
+    });
     if !construction_bytes
         .and_then(|staging| staging.checked_add(projected_item_scratch_bytes?))
         .and_then(|staging| staging.checked_add(projected_state_clone_bytes?))
+        .and_then(|staging| staging.checked_add(projected_client_restore_bytes?))
         .and_then(|staging| staging.checked_add(logical_output_upper_bound.checked_mul(2)?))
         .is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget))
     {
@@ -1385,9 +1393,15 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
         &state.citation_files,
     )
     .ok()?;
+    let echo_bytes = client_tools::echoed_tools_bytes(state.client_tool_echo.as_ref())?;
+    let restored_growth = client_tools::restored_output_growth_bytes(&state.client_tool_lowering, output)?;
     output_bytes
         .checked_mul(2)?
         .checked_add(annotation_bytes.checked_mul(3)?)?
+        // State and deferred terminal can each own the echoed tools; the
+        // restored output can coexist in the state, terminal, and local vec.
+        .checked_add(echo_bytes.checked_mul(2)?)?
+        .checked_add(restored_growth.checked_mul(3)?)?
         .checked_add(existing_output_bytes)
 }
 

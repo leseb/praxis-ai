@@ -25,7 +25,9 @@ use crate::openai::{
             custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
             restore_shell_call, restore_snapshot, restore_snapshot_tools, restore_tool_search_call,
         },
-        state::{ClientToolEcho, ClientToolRestore, LoweredClientTool},
+        state::{
+            ClientToolEcho, ClientToolRestore, LoweredClientTool, retained_json_bytes, retained_json_values_bytes,
+        },
     },
     sse::{SseParseError, responses::ResponsesEvent},
 };
@@ -185,6 +187,85 @@ pub(super) fn plan_client_tool_restore(
         plan.dispositions.push(disposition);
     }
     Ok(plan)
+}
+
+/// Bound the additional serialized payload owned when an echoed tool list is
+/// inserted into a response snapshot. The original echo remains in request
+/// state while the restored snapshot owns a separate copy.
+pub(super) fn echoed_tools_bytes(echo: Option<&ClientToolEcho>) -> Option<usize> {
+    let Some(echo) = echo else {
+        return Some(0);
+    };
+    retained_json_values_bytes(&echo.tools)?
+        .checked_add(echo.tools.len())? // commas and array brackets
+        .checked_add(2)?
+        .checked_add(retained_json_bytes(&echo.tool_choice)?.max(6))? // null becomes "auto"
+        .checked_add(32) // tools/tool_choice keys and object punctuation
+}
+
+/// Bound growth when lowered output items are restored to public typed items.
+/// The input item remains live during restoration; argument parsing may expand
+/// numeric tokens, and public name/namespace strings can be larger than the
+/// private name. This is additional staging beyond the original item owner.
+pub(super) fn restored_output_growth_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    output: &[Value],
+) -> Option<usize> {
+    output.iter().try_fold(0_usize, |used, item| {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return Some(used);
+        }
+        let Some(lowered) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| reverse.get(name))
+        else {
+            return Some(used);
+        };
+        let item_bytes = retained_json_bytes(item)?;
+        let parsed_arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map_or(Some(0), |arguments| {
+                super::super::agentic_loop::buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())
+            })?;
+        used.checked_add(item_bytes.checked_mul(2)?)?
+            .checked_add(parsed_arguments)?
+            .checked_add(lowered.original_name.len())?
+            .checked_add(lowered.namespace.as_ref().map_or(0, String::len))?
+            .checked_add(256)
+    })
+}
+
+/// Reserve plan-owned restored snapshots and their enlarged outgoing SSE frames
+/// before `plan_client_tool_restore` clones any lifecycle response.
+pub(super) fn lifecycle_restore_staging_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    echo: Option<&ClientToolEcho>,
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    if reverse.is_empty() {
+        return Some(0);
+    }
+    let echo_bytes = echoed_tools_bytes(echo)?;
+    events.iter().try_fold(0_usize, |used, event| {
+        if event.is_terminal() {
+            return Some(used);
+        }
+        let Some(response) = event.payload().get("response") else {
+            return Some(used);
+        };
+        let response_bytes = retained_json_bytes(response)?;
+        let growth = response
+            .get("output")
+            .and_then(Value::as_array)
+            .map_or(Some(0), |items| restored_output_growth_bytes(reverse, items))?;
+        // The plan owns a cloned response, the event owns another copy after
+        // disposition application, and the outgoing SSE buffer serializes a
+        // third copy while the whole plan remains live.
+        used.checked_add(response_bytes)?
+            .checked_add(echo_bytes.checked_add(growth)?.checked_mul(3)?)
+    })
 }
 
 /// Plan the restoration for a single committed event, advancing `next_items`.
