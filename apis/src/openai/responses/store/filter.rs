@@ -2011,7 +2011,7 @@ impl HttpFilter for ResponseStoreFilter {
             } else {
                 None
             };
-            let max_bytes = if body_finalized {
+            let max_bytes = if canonical_finalized {
                 // The agentic loop already admitted and serialized this exact
                 // body. A previous-response restore may have selected a 64 MiB
                 // ceiling, but the ceiling itself owns no payload allocation.
@@ -3919,6 +3919,7 @@ mod encode_replay_event_tests {
         ctx.extensions.insert(registry);
         ctx.set_metadata("openai_responses_format.format", "openai_responses");
         ctx.set_metadata("openai_responses_format.stream", "false");
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
         let mut state = ResponsesState {
             response_object: json!({"id":"resp_incomplete", "status":"incomplete", "output":[]}),
             ..ResponsesState::default()
@@ -3938,6 +3939,7 @@ mod encode_replay_event_tests {
             store_filter.on_response(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ));
+        assert!(crate::openai::responses::final_conversation_buffer_budget_rejection(&ctx).is_none());
     }
 
     #[tokio::test]
