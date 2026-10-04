@@ -949,6 +949,18 @@ impl StoreStableCache {
     }
 }
 
+/// Last logical line ending seen while tracking unfinished SSE wire bytes.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum WireLineEnding {
+    /// The last byte belonged to a field line.
+    #[default]
+    None,
+    /// The last byte ended a line with CR; a following LF is paired with it.
+    Cr,
+    /// The last byte ended a line with LF.
+    Lf,
+}
+
 /// Request-phase data needed when persisting the response.
 #[derive(Default)]
 struct ResponseStoreRequestState {
@@ -981,13 +993,13 @@ struct ResponseStoreRequestState {
     event_bytes: u64,
     /// Raw bytes in independently owned captured event names.
     event_name_bytes: usize,
-    /// Upper bound on raw bytes after the last complete LF-delimited record.
+    /// Upper bound on raw bytes after the last complete SSE record.
     /// The retained meter charges this twice because the decoder may keep a
-    /// field value and the current line independently. CR-delimited records
-    /// are deliberately overcounted.
+    /// field value and the current line independently.
     pending_wire_bytes: usize,
-    /// Whether the previous wire byte was LF, including across chunk edges.
-    last_wire_byte_was_lf: bool,
+    /// Last wire line ending, including across chunk edges. A following LF
+    /// after CR belongs to the same line ending.
+    last_wire_line_ending: WireLineEnding,
     /// Sticky flag: capture exceeded a bound or the decoder was poisoned, so the
     /// partial log is abandoned and the response becomes non-replayable.
     events_over_budget: bool,
@@ -1012,13 +1024,76 @@ impl ResponseStoreRequestState {
             return;
         }
         for &byte in chunk {
-            if byte == b'\n' && self.pending_wire_bytes > 0 && self.last_wire_byte_was_lf {
-                self.pending_wire_bytes = 0;
-            } else {
-                self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+            match byte {
+                b'\n' if self.last_wire_line_ending == WireLineEnding::Cr => {
+                    // CRLF is one line ending. Its LF belongs to the still-open
+                    // record only if the preceding CR did not finish that record.
+                    if self.pending_wire_bytes > 0 {
+                        self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                    }
+                },
+                b'\r' | b'\n' if self.last_wire_line_ending == WireLineEnding::None => {
+                    self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                },
+                b'\r' | b'\n' => self.pending_wire_bytes = 0,
+                _ => {
+                    self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                },
             }
-            self.last_wire_byte_was_lf = byte == b'\n';
+            self.last_wire_line_ending = match byte {
+                b'\r' => WireLineEnding::Cr,
+                b'\n' => WireLineEnding::Lf,
+                _ => WireLineEnding::None,
+            };
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_wire_tests {
+    use bytes::Bytes;
+    use praxis_filter::sse::SseDecoder;
+
+    use super::ResponseStoreRequestState;
+
+    #[test]
+    fn completed_crlf_sse_records_release_pending_wire_charge_across_chunks() {
+        for frame in [
+            b"event: response.output_text.delta\ndata: {}\n\n".as_slice(),
+            b"event: response.output_text.delta\r\ndata: {}\r\n\r\n",
+            b"event: response.output_text.delta\rdata: {}\r\r",
+            b"event: response.output_text.delta\ndata: {}\r\n\n",
+        ] {
+            for split in 0..=frame.len() {
+                let mut capture = ResponseStoreRequestState::default();
+                let mut decoder = SseDecoder::new();
+                let mut completed = 0;
+                for chunk in [
+                    frame.get(..split).unwrap_or_default(),
+                    frame.get(split..).unwrap_or_default(),
+                ] {
+                    capture.track_pending_wire_bytes(chunk);
+                    let batch = decoder.push(&Bytes::copy_from_slice(chunk));
+                    assert!(batch.error.is_none());
+                    completed += batch.records.len();
+                }
+                assert_eq!(completed, 1, "frame={frame:?}, split={split}");
+                assert_eq!(capture.pending_wire_bytes, 0, "frame={frame:?}, split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_crlf_line_ending_stays_charged_until_blank_line() {
+        let mut capture = ResponseStoreRequestState::default();
+        capture.track_pending_wire_bytes(b"data: {}\r");
+        let before_lf = capture.pending_wire_bytes;
+        capture.track_pending_wire_bytes(b"\n");
+        assert_eq!(capture.pending_wire_bytes, before_lf + 1);
+        capture.track_pending_wire_bytes(b"\r");
+        assert_eq!(capture.pending_wire_bytes, 0);
+        capture.track_pending_wire_bytes(b"\n");
+        assert_eq!(capture.pending_wire_bytes, 0);
     }
 }
 
