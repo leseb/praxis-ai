@@ -146,6 +146,14 @@ pub struct ResponseStoreFilter {
 /// failed terminal-chunk write continue.
 struct StreamingResponsePersistenceAttempted;
 
+/// A budgeted buffered conversation response was persisted before headers.
+struct BufferedResponsePersistenceAttempted;
+
+/// This exchange wrote its response before a later conversation append hook.
+/// A budget failure in that hook may remove only this exchange's durable row.
+#[cfg(feature = "openai-conversations")]
+pub(crate) struct PersistedResponseForConversation(pub(crate) String);
+
 impl ResponseStoreFilter {
     /// Construct the filter with explicit replay-log bounds.
     ///
@@ -254,7 +262,24 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&persist.store, &record, &pending_approvals)?;
+        let budgeted_conversation = ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+        if budgeted_conversation {
+            let inserted = match persist_response_if_absent_blocking(&persist.store, &record, &pending_approvals) {
+                Ok(inserted) => inserted,
+                Err(StoreError::PayloadTooLarge) => return Ok(persistence_budget_failure(ctx, true, body)),
+                Err(error) => return Err(Box::new(error)),
+            };
+            if !inserted {
+                return Ok(persistence_budget_failure(ctx, true, body));
+            }
+        } else {
+            persist_response_blocking(&persist.store, &record, &pending_approvals)?;
+        }
         // Flush the replay event log only after the record is durable, so the
         // parent-exists gate is satisfied, and before releasing the terminal
         // frame, so a client never observes completion for a response whose
@@ -265,10 +290,25 @@ impl ResponseStoreFilter {
             persist.captured_events,
             persist.events_over_budget,
         )?;
-        Ok(FilterAction::Continue)
+        #[cfg(feature = "openai-conversations")]
+        if ctx.get_metadata("openai_responses_format.has_conversation") == Some("true") {
+            ctx.extensions.insert(PersistedResponseForConversation(record.id));
+        }
+        #[cfg(feature = "openai-conversations")]
+        {
+            crate::openai::conversations::append_after_store_body(ctx, body, false)
+        }
+        #[cfg(not(feature = "openai-conversations"))]
+        {
+            Ok(FilterAction::Continue)
+        }
     }
 
     /// Persist a non-streaming response from the buffered body bytes.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "body record projection and conditional insert share one persistence seam"
+    )]
     fn persist_from_buffered_body(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
@@ -305,8 +345,36 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&store, &record, &pending_approvals)?;
-        Ok(FilterAction::Continue)
+        let budgeted_conversation = ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+        if budgeted_conversation {
+            let inserted = match persist_response_if_absent_blocking(&store, &record, &pending_approvals) {
+                Ok(inserted) => inserted,
+                Err(StoreError::PayloadTooLarge) => return Ok(persistence_budget_failure(ctx, false, body)),
+                Err(error) => return Err(Box::new(error)),
+            };
+            if !inserted {
+                return Ok(persistence_budget_failure(ctx, false, body));
+            }
+        } else {
+            persist_response_blocking(&store, &record, &pending_approvals)?;
+        }
+        #[cfg(feature = "openai-conversations")]
+        if ctx.get_metadata("openai_responses_format.has_conversation") == Some("true") {
+            ctx.extensions.insert(PersistedResponseForConversation(record.id));
+        }
+        #[cfg(feature = "openai-conversations")]
+        {
+            crate::openai::conversations::append_after_store_body(ctx, body, true)
+        }
+        #[cfg(not(feature = "openai-conversations"))]
+        {
+            Ok(FilterAction::Continue)
+        }
     }
 
     /// Parse the outbound SSE chunk into normalized events and accumulate them in
@@ -1053,8 +1121,18 @@ pub(super) fn encoded_column_headroom(
 
 /// Reserve record, history, replay-row IDs, backend serialization, and the
 /// `PostgreSQL` input parameter buffer before building them.
-#[expect(clippy::too_many_lines, reason = "persistence owners share one aggregate admission")]
 pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, response_bytes: usize) -> bool {
+    persistence_construction_fits_with_wire(ctx, response_bytes, 0)
+}
+
+/// The completed buffered wire body is a separate owner from the canonical
+/// response tree while the record is written in the response-header hook.
+#[expect(clippy::too_many_lines, reason = "persistence owners share one aggregate admission")]
+fn persistence_construction_fits_with_wire(
+    ctx: &HttpFilterContext<'_>,
+    response_bytes: usize,
+    wire_bytes: usize,
+) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
     };
@@ -1096,7 +1174,8 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
         .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(replay_id_bytes?))
         .and_then(|bytes| bytes.checked_add(replay_payload_bytes?))
-        .and_then(|bytes| bytes.checked_add(compression_headroom?));
+        .and_then(|bytes| bytes.checked_add(compression_headroom?))
+        .and_then(|bytes| bytes.checked_add(wire_bytes));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
@@ -1460,6 +1539,18 @@ fn persist_response_blocking(
     .map_err(|e| -> FilterError { Box::new(e) })
 }
 
+/// Bridge the atomic no-overwrite write to the synchronous body callback.
+fn persist_response_if_absent_blocking(
+    store: &OwnerScopedResponseStore,
+    record: &ResponseRecord,
+    pending_approvals: &[PendingApprovalRecord],
+) -> Result<bool, StoreError> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| {
+        handle.block_on(store.persist_response_with_pending_approvals_if_absent(record, pending_approvals))
+    })
+}
+
 /// Flush the captured replay event log synchronously, right after the response
 /// record is durable and before the terminal frame is released.
 ///
@@ -1593,7 +1684,7 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     /// Streaming by default. Non-streaming Responses requests select a
-    /// bounded `StreamBuffer` dynamically in [`Self::on_request`].
+    /// bounded `StreamBuffer` dynamically in [`Self::on_response`].
     ///
     /// Non-streaming Responses API payloads are bounded by output
     /// token limits (typically under 2 MiB). The 64 MiB ceiling is
@@ -1614,12 +1705,6 @@ impl HttpFilter for ResponseStoreFilter {
         }
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
-        }
-
-        if is_responses_format(ctx) && !is_streaming_request(ctx) {
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(MAX_JSON_BODY_BYTES),
-            });
         }
 
         if ctx.request.method == http::Method::DELETE {
@@ -1692,7 +1777,14 @@ impl HttpFilter for ResponseStoreFilter {
         bound_body_outcome(action)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "canonical header persistence and fallback buffer selection share one phase"
+    )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if ctx.extensions.get::<BufferedResponsePersistenceAttempted>().is_some() {
+            return Ok(FilterAction::Continue);
+        }
         if should_skip_persist(ctx) {
             return Ok(FilterAction::Continue);
         }
@@ -1703,6 +1795,87 @@ impl HttpFilter for ResponseStoreFilter {
 
         if !store_available(ctx) {
             return Ok(FilterAction::Reject(reject_store_error()));
+        }
+
+        let budgeted = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(ResponsesState::retained_payload_limit)
+            .is_some();
+        let canonical_completed = has_conversation(ctx) && budgeted && super::super::buffered_canonical_completed(ctx);
+        if !is_streaming_request(ctx) && !canonical_completed {
+            let max_bytes = if let Some(state) = ctx.extensions.get::<ResponsesState>().filter(|_| budgeted) {
+                let Some(limit) = state.retained_payload_limit() else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                let Some(current) = state.retained_payload_bytes_bounded(limit) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                limit.saturating_sub(current).min(MAX_JSON_BODY_BYTES)
+            } else {
+                MAX_JSON_BODY_BYTES
+            };
+            if budgeted
+                && let BodyMode::StreamBuffer { max_bytes: existing } = &ctx.response_body_mode
+                && existing.is_none_or(|bytes| bytes > max_bytes)
+            {
+                // Core keeps the larger cap. An earlier response filter's
+                // buffer would otherwise allocate beyond this request's
+                // remaining aggregate allowance before our body hook runs.
+                return Ok(persistence_budget_failure(ctx, false, &mut None));
+            }
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(max_bytes),
+            });
+        }
+
+        if canonical_completed && !is_streaming_request(ctx) {
+            let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+                return Ok(FilterAction::Reject(reject_store_error()));
+            };
+            if state.response_object.get("status").and_then(Value::as_str) == Some("completed") {
+                let Some(response_bytes) = retained_json_bytes(&state.response_object) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                // The serialized wire body remains live outside ResponsesState
+                // while the record, SQL arguments, and conversation append are built.
+                if !persistence_construction_fits_with_wire(ctx, response_bytes, response_bytes) {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                }
+                let pending_approvals = pending_approvals_from_ctx(ctx);
+                let persist = match take_persist_context(ctx) {
+                    Ok(parts) => parts,
+                    Err(action) => return Ok(action),
+                };
+                let Some(record) = build_streaming_record(ctx, persist.owner, persist.request_input) else {
+                    return Ok(FilterAction::Reject(reject_store_error()));
+                };
+                let inserted = match persist
+                    .store
+                    .persist_response_with_pending_approvals_if_absent(&record, &pending_approvals)
+                    .await
+                {
+                    Ok(inserted) => inserted,
+                    Err(StoreError::PayloadTooLarge) => {
+                        return Ok(persistence_budget_failure(ctx, false, &mut None));
+                    },
+                    Err(error) => return Err(Box::new(error)),
+                };
+                if !inserted {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                }
+                ctx.extensions.insert(BufferedResponsePersistenceAttempted);
+                #[cfg(feature = "openai-conversations")]
+                ctx.extensions.insert(PersistedResponseForConversation(record.id));
+                #[cfg(feature = "openai-conversations")]
+                {
+                    return crate::openai::conversations::append_after_store_response(ctx).await;
+                }
+                #[cfg(not(feature = "openai-conversations"))]
+                {
+                    return Ok(FilterAction::Continue);
+                }
+            }
         }
 
         trace!("response body persistence armed");
@@ -1720,6 +1893,9 @@ impl HttpFilter for ResponseStoreFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx.extensions.get::<BufferedResponsePersistenceAttempted>().is_some() {
+            return Ok(FilterAction::Continue);
+        }
         if ctx.get_metadata("responses.store_stream_budget_failed") == Some("true") {
             *body = None;
             return Ok(FilterAction::Continue);
@@ -2443,6 +2619,105 @@ mod encode_replay_event_tests {
         assert!(matches!(action, FilterAction::Continue));
         assert_eq!(body, Some(frame));
         assert_ne!(ctx.get_metadata("responses.store_stream_budget_failed"), Some("true"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "collision proof checks the response, replay, and approval rows"
+    )]
+    async fn budgeted_stream_collision_preserves_prior_response_events_and_approvals() {
+        use crate::store::{PendingApprovalRecord, ResponseRecord};
+
+        let owner = StateOwner::from_trusted_parts("t", "i", "s").unwrap();
+        let store: std::sync::Arc<dyn crate::store::PersistedStateBackend> =
+            std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new());
+        let prior = ResponseRecord {
+            id: "resp_collision".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            model: "old".to_owned(),
+            response_object: json!({"id":"resp_collision","status":"completed","output":[]}),
+            input: json!([]),
+            messages: json!([]),
+        };
+        let approval = PendingApprovalRecord {
+            approval_id: "approval_old".to_owned(),
+            server_label: "server".to_owned(),
+            tool_name: "old_tool".to_owned(),
+            arguments: "{\"old\":true}".to_owned(),
+            target_fingerprint: "old_fp".to_owned(),
+        };
+        store
+            .persist_response_with_pending_approvals(&prior, std::slice::from_ref(&approval))
+            .await
+            .unwrap();
+        store
+            .append_events(
+                &owner,
+                &prior.id,
+                &[ResponseEventRecord {
+                    response_id: prior.id.clone(),
+                    owner: owner.clone(),
+                    sequence_number: 1,
+                    event_type: "response.completed".to_owned(),
+                    payload: b"old event".to_vec(),
+                    terminal: true,
+                    created_at: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(&std::sync::Arc::from("default"), std::sync::Arc::clone(&store))
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        ctx.extensions.insert(super::ResponseStoreRequestState {
+            owner: Some(owner.clone()),
+            ..Default::default()
+        });
+        let mut state = ResponsesState {
+            response_object: json!({
+                "id":"resp_collision", "created_at":2, "model":"new", "status":"completed",
+                "output":[{"type":"message","role":"assistant","content":[]}]
+            }),
+            ..Default::default()
+        };
+        state.apply_retained_payload_limit(1024 * 1024);
+        ctx.extensions.insert(state);
+        let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+        let action = ResponseStoreFilter::persist_from_streaming_state(&mut ctx, &mut terminal).unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            terminal
+                .as_deref()
+                .is_some_and(|body| body.starts_with(b"event: error\n"))
+        );
+        assert_eq!(
+            store.get_response(&owner, &prior.id).await.unwrap().unwrap().model,
+            "old"
+        );
+        assert_eq!(
+            store
+                .list_events_after(&owner, &prior.id, None, 10)
+                .await
+                .unwrap()
+                .first()
+                .unwrap()
+                .payload,
+            b"old event"
+        );
+        let approvals = store
+            .get_pending_approvals(&owner, &prior.id, &["approval_old"])
+            .await
+            .unwrap();
+        assert_eq!(approvals.first().unwrap().arguments, approval.arguments);
     }
 
     /// Build a minimal event record carrying `payload` for the encoder under test.

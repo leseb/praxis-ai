@@ -342,6 +342,20 @@ impl ResponseStore for InMemoryStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        if inner.responses.contains_key(&record.id) {
+            return Ok(false);
+        }
+        upsert_response_into(&mut inner, record)?;
+        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
+        Ok(true)
+    }
+
     async fn get_pending_approvals(
         &self,
         owner: &StateOwner,
@@ -710,10 +724,81 @@ impl ConversationItemStore for InMemoryStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.delete_item_and_sync_messages_inner(owner, conversation_id, item_id)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "bounded cache helpers sit beside their trait implementation"
+)]
+impl InMemoryStore {
+    /// Validate the complete message-cache projection before updating items.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preflight and the mutex-protected commit form one atomic operation"
+    )]
+    fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
         let key = (owner.clone(), conversation_id.to_owned());
         require_conversation_scope(&inner, owner, conversation_id, items)?;
         reject_duplicate_item_ids(&inner, items)?;
+        if let Some(max_rebuild_bytes) = max_rebuild_bytes {
+            let previous = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+            let count = previous
+                .len()
+                .checked_add(items.len())
+                .ok_or(StoreError::PayloadTooLarge)?;
+            let raw_allowance = max_rebuild_bytes
+                .checked_sub(count.checked_mul(4).ok_or(StoreError::PayloadTooLarge)?)
+                .and_then(|bytes| bytes.checked_sub(4))
+                .map(|bytes| bytes / 26)
+                .ok_or(StoreError::PayloadTooLarge)?;
+            let mut remaining = raw_allowance;
+            for item in previous.iter().chain(items) {
+                struct Counter<'a>(&'a mut usize);
+                impl io::Write for Counter<'_> {
+                    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                        *self.0 = self
+                            .0
+                            .checked_sub(buf.len())
+                            .ok_or_else(|| io::Error::other("stored payload exceeds request limit"))?;
+                        Ok(buf.len())
+                    }
+
+                    fn flush(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                serde_json::to_writer(Counter(&mut remaining), &item.item_data)
+                    .map_err(|_error| StoreError::PayloadTooLarge)?;
+            }
+        }
         let mut next = inner
             .items
             .get(&key)
@@ -735,7 +820,8 @@ impl ConversationItemStore for InMemoryStore {
         Ok(())
     }
 
-    async fn delete_item_and_sync_messages(
+    /// Remove one item and rebuild the cache under the same mutex.
+    fn delete_item_and_sync_messages_inner(
         &self,
         owner: &StateOwner,
         conversation_id: &str,
@@ -801,6 +887,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_if_absent_keeps_existing_response_and_approval() {
+        let store = InMemoryStore::new();
+        let o = owner("tenant");
+        let prior = ResponseRecord {
+            id: "resp_existing".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            model: "old".to_owned(),
+            response_object: serde_json::json!({"status":"completed"}),
+            input: serde_json::json!([]),
+            messages: serde_json::json!([]),
+        };
+        store
+            .persist_response_with_pending_approvals(&prior, &[approval("old")])
+            .await
+            .unwrap();
+        let next = ResponseRecord {
+            model: "new".to_owned(),
+            ..prior.clone()
+        };
+        assert!(
+            !store
+                .persist_response_with_pending_approvals_if_absent(&next, &[approval("new")])
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get_response(&o, &prior.id).await.unwrap().unwrap().model, "old");
+        assert_eq!(
+            store
+                .get_pending_approvals(&o, &prior.id, &["old"])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .get_pending_approvals(&o, &prior.id, &["new"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn tenant_isolation_hides_other_owners() {
         let store = InMemoryStore::new();
         let a = owner("a");
@@ -819,6 +950,38 @@ mod tests {
             .unwrap();
         assert!(store.get_response(&a, "r1").await.unwrap().is_some());
         assert!(store.get_response(&b, "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_conversation_append_keeps_prior_cache_on_overflow() {
+        let store = InMemoryStore::new();
+        let o = owner("a");
+        store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: "c1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .create_items_and_sync_messages(&o, "c1", &[item(&o, "c1", "prior", 0)])
+            .await
+            .unwrap();
+        let rejected = store
+            .create_items_and_sync_messages_bounded(&o, "c1", &[item(&o, "c1", "new", 0)], 1)
+            .await;
+        assert!(matches!(rejected, Err(StoreError::PayloadTooLarge)));
+        let listed = store.list_conversation_items(&o, "c1", None, 10, true).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].item_id, "prior");
+        let conversation = ResponseStore::get_conversation(&store, &o, "c1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.messages.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

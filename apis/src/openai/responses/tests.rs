@@ -7,6 +7,51 @@ use bytes::Bytes;
 
 use super::*;
 
+#[cfg(feature = "store")]
+#[test]
+fn final_conversation_buffer_guard_checks_effective_mode_after_wideners() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    let mut response = crate::test_utils::make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let mut state = state::ResponsesState::default();
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 1024);
+    ctx.extensions.insert(state);
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: Some(1024) };
+    assert!(final_conversation_buffer_budget_rejection(&ctx).is_none());
+
+    // A later eligible response filter can ratchet the shared framework
+    // buffer to a larger cap after Store and Conversations selected 1024.
+    ctx.response_body_mode = BodyMode::StreamBuffer {
+        max_bytes: Some(MAX_JSON_BODY_BYTES),
+    };
+    let rejection = final_conversation_buffer_budget_rejection(&ctx).unwrap();
+    assert_eq!(rejection.status, 502);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(rejection.body.as_deref().unwrap()).unwrap()["error"]["type"],
+        "server_error"
+    );
+
+    // Canonical completed output has a known, separately admitted wire owner
+    // and may have been persisted before the final guard runs.
+    ctx.extensions
+        .get_mut::<state::ResponsesState>()
+        .unwrap()
+        .response_object = serde_json::json!({"status":"completed","output":[]});
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "done")
+        .unwrap();
+    assert!(final_conversation_buffer_budget_rejection(&ctx).is_none());
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------

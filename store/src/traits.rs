@@ -185,6 +185,18 @@ pub trait ResponseStore: Send + Sync {
         Ok(())
     }
 
+    /// Insert a response and its pending approvals only if the ID is unused.
+    /// The insert and approval writes must be atomic. `false` means an existing
+    /// response was left untouched, including its events and approvals.
+    /// Backends without an atomic implementation fail closed.
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        _record: &ResponseRecord,
+        _pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
+
     /// Fetch the server-owned pending approvals matching `approval_ids` that
     /// were issued by `response_id`.
     ///
@@ -564,6 +576,20 @@ pub trait ConversationItemStore: Send + Sync {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
+
+    /// Append and rebuild the message cache only when the complete SQL rebuild
+    /// fits `max_rebuild_bytes`. Backends must check the owner-scoped row sizes
+    /// inside the append transaction before loading item data. Unsupported
+    /// backends fail closed for budgeted Responses append-back.
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+        _max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
 
     /// Atomically delete an item and rebuild the conversation message cache.
     ///

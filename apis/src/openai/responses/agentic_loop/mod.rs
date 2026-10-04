@@ -1239,7 +1239,7 @@ fn end_at_iteration_limit(
     clippy::too_many_lines,
     reason = "single-pass lexical bound must skip quoted number-like text"
 )]
-pub(super) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+pub(crate) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
     const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
     let mut extra = 0_usize;
     let mut index = 0;
