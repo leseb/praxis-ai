@@ -1362,6 +1362,60 @@ async fn start_method_recording_mcp_server() -> (String, tokio_util::sync::Cance
     (format!("http://{addr}/mcp"), ct, methods)
 }
 
+/// A stateful server leaves a partial standalone GET event in rmcp's parser
+/// after the successful tool call has returned its session to the pool.
+async fn start_partial_get_mcp_server() -> (String, tokio_util::sync::CancellationToken, StdArc<tokio::sync::Notify>) {
+    use axum::response::IntoResponse as _;
+    use futures::StreamExt as _;
+
+    let ct = tokio_util::sync::CancellationToken::new();
+    let service = StreamableHttpService::new(
+        || Ok(TestMcpServer::new()),
+        StdArc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_sse_keep_alive(None)
+            .with_cancellation_token(ct.child_token()),
+    );
+    let partial_delivered = StdArc::new(tokio::sync::Notify::new());
+    let notify = StdArc::clone(&partial_delivered);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let notify = StdArc::clone(&notify);
+                async move {
+                    if request.method() == http::Method::GET {
+                        let partial = futures::stream::once(async move {
+                            notify.notify_one();
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(format!(
+                                "data: {}",
+                                "x".repeat(32 * 1024)
+                            )))
+                        })
+                        .chain(futures::stream::pending());
+                        return (
+                            [(http::header::CONTENT_TYPE, "text/event-stream")],
+                            axum::body::Body::from_stream(partial),
+                        )
+                            .into_response();
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, partial_delivered)
+}
+
 /// A stateful rmcp server whose session table can be cleared to force the next
 /// request through rmcp's 404 `SessionExpired` reinitialization path.
 async fn start_expirable_mcp_server() -> (
@@ -2082,6 +2136,43 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
     assert!(result.is_ok(), "small initialize should permit a tool call: {result:?}");
     let retained = pool.retained_payload_bytes().unwrap();
     assert!(retained >= 32 * "instruction".len() + "small-initialize".len());
+    pool.drain().await;
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn parked_session_reserves_partial_get_sse_parser() {
+    let (url, ct, partial_delivered) = start_partial_get_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "partial-get".to_owned()).unwrap();
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, &key)),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "ok"}),
+        INTEGRATION_TIMEOUT,
+        2_048,
+        2_048,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "tool call must succeed while the GET stays open: {result:?}"
+    );
+    tokio::time::timeout(INTEGRATION_TIMEOUT, partial_delivered.notified())
+        .await
+        .expect("standalone GET must receive a partial SSE event");
+    let stream_reserve = tool_stream_retained_reserve(2_048, 2_048).unwrap();
+    assert!(
+        pool.retained_payload_bytes().unwrap() >= stream_reserve,
+        "the parked session must reserve its still-live partial SSE parser"
+    );
     pool.drain().await;
     ct.cancel();
 }

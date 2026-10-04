@@ -105,10 +105,21 @@ pub(crate) fn streaming_executor_backstop(binding_cap: usize) -> usize {
     binding_cap.saturating_mul(2)
 }
 
-/// Bound a tool session's GET stream while allowing one control response in
-/// addition to its tool-result wire allowance.
-pub(crate) fn tool_stream_cumulative_cap(tool_wire_cap: usize) -> usize {
-    tool_wire_cap.saturating_add(MAX_CONTROL_RESPONSE_BYTES)
+/// Bound a tool session's GET stream by its result wire allowance and admitted
+/// handshake ceiling. A budgeted session cannot retain an unrelated 1 MiB
+/// control event in the standalone stream after the tool call completes.
+pub(crate) fn tool_stream_cumulative_cap(tool_wire_cap: usize, initialize_limit: usize) -> usize {
+    tool_wire_cap.saturating_add(initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES))
+}
+
+/// Reserve the parser's unfinished line, decoded event, and source chunk that
+/// can coexist while a standalone GET remains polled by a parked rmcp session.
+pub(crate) fn tool_stream_retained_reserve(result_payload_limit: usize, initialize_limit: usize) -> Option<usize> {
+    let wire = result_payload_limit
+        .checked_mul(MAX_JSON_STRING_EXPANSION)?
+        .checked_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)?;
+    wire.checked_add(initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES))?
+        .checked_mul(3)
 }
 
 /// The `mcp-session-id` header carrying the Streamable-HTTP session token.
@@ -581,8 +592,10 @@ pub(crate) struct McpSubrequestClient {
     ///
     /// An intentionally coarse raw-wire `DoS` backstop, not decoded parity: for a
     /// control client it is `MAX_LISTING_RESPONSE_BYTES + MAX_CONTROL_RESPONSE_BYTES`
-    /// (5 MiB); `paginate_tools` remains the authoritative decoded gate. Read
-    /// only by the GET-stream path.
+    /// (5 MiB); `paginate_tools` remains the authoritative decoded gate. A
+    /// tool client uses its result wire cap plus admitted handshake cap so a
+    /// parked stream has a bounded request-budget reservation. Read only by
+    /// the GET-stream path.
     stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
@@ -624,6 +637,7 @@ impl McpSubrequestClient {
     /// With an aggregate budget, `initialize` uses the supplied decoded cap
     /// (with a 1 KiB floor). Otherwise it keeps the 1 MiB control ceiling.
     /// `tools/call` expands its result cap for worst-case JSON string escaping.
+    /// The standalone GET stream uses the sum of these two admitted caps.
     ///
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
@@ -642,7 +656,7 @@ impl McpSubrequestClient {
             step_timeout,
             wire,
             initialize_bytes,
-            tool_stream_cumulative_cap(wire),
+            tool_stream_cumulative_cap(wire, initialize_bytes),
             owner,
         )
     }
@@ -2038,6 +2052,7 @@ mod tests {
             serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
                 .expect("deserialize initialized notification");
         assert_eq!(client.response_limit(&initialized), 2048);
+        assert_eq!(client.stream_cumulative_cap(), tool_result_wire_cap(2048) + 2048);
         let unbudgeted = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
@@ -2047,6 +2062,10 @@ mod tests {
         );
         assert_eq!(unbudgeted.response_limit(&initialize), MAX_CONTROL_RESPONSE_BYTES);
         assert_eq!(unbudgeted.response_limit(&initialized), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(
+            unbudgeted.stream_cumulative_cap(),
+            tool_result_wire_cap(2048) + MAX_CONTROL_RESPONSE_BYTES
+        );
 
         let list: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)

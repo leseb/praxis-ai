@@ -1974,10 +1974,13 @@ fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<
         return (admitted_results == 0).then_some(0);
     }
     let per_call = admitted_results / call_count;
-    let wire = mcp_client::tool_result_wire_cap(result_payload_limit(per_call));
+    let payload = result_payload_limit(per_call);
+    let wire = mcp_client::tool_result_wire_cap(payload);
+    let stream = mcp_client::tool_stream_retained_reserve(payload, payload)?;
     admitted_results
         .checked_mul(RESULT_PAYLOAD_OWNER_COUNT)?
         .checked_add(wire.checked_mul(2)?.checked_mul(call_count)?)
+        .and_then(|peak| peak.checked_add(stream.checked_mul(call_count)?))
 }
 
 /// Find the largest batch allowance whose complete wire and decoded peak
@@ -2173,8 +2176,14 @@ fn aggregate_transport_ceiling_lowered(
             mcp_client::tool_result_wire_cap(configured_payload),
         ),
         mcp_client::McpResponseLimitKind::GetStream => (
-            mcp_client::tool_stream_cumulative_cap(mcp_client::tool_result_wire_cap(admitted_payload)),
-            mcp_client::tool_stream_cumulative_cap(mcp_client::tool_result_wire_cap(configured_payload)),
+            mcp_client::tool_stream_cumulative_cap(
+                mcp_client::tool_result_wire_cap(admitted_payload),
+                admitted_payload,
+            ),
+            mcp_client::tool_stream_cumulative_cap(
+                mcp_client::tool_result_wire_cap(configured_payload),
+                configured_payload,
+            ),
         ),
         mcp_client::McpResponseLimitKind::Control => return false,
     };

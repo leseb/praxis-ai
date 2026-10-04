@@ -671,7 +671,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    let headroom = 170_000;
+    let headroom = 400_000;
     state.apply_retained_payload_limit(current + result_id_bytes + headroom);
     let calls = call_refs(&state.tool_calls);
 
@@ -702,6 +702,24 @@ fn aggregate_mcp_limit_rejects_when_tool_wire_envelope_exceeds_headroom() {
     assert!(
         aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
         "the tools/call wire envelope alone can exceed 20 KiB of request headroom"
+    );
+}
+
+#[test]
+fn aggregate_mcp_limit_reserves_parked_get_parser_before_execution() {
+    let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    // The old wire/result reservation admitted this call with 200 KiB of
+    // headroom, although a session-ID server could park a live GET parser.
+    state.apply_retained_payload_limit(current + 200_000);
+    assert!(
+        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        "the standalone GET parser must be reserved before an external tool call"
     );
 }
 
@@ -1376,11 +1394,11 @@ fn aggregate_lowered_streaming_backstops_are_terminal() {
         ),
         (tool_wire * 2, crate::mcp_client::McpResponseLimitKind::Tool),
         (
-            tool_wire + crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+            tool_wire + admitted_payload,
             crate::mcp_client::McpResponseLimitKind::GetStream,
         ),
         (
-            (tool_wire + crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES) * 2,
+            (tool_wire + admitted_payload) * 2,
             crate::mcp_client::McpResponseLimitKind::GetStream,
         ),
     ] {
@@ -1412,11 +1430,11 @@ fn configured_streaming_backstops_remain_recoverable() {
         ),
         (configured_wire * 2, crate::mcp_client::McpResponseLimitKind::Tool),
         (
-            configured_wire + crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+            configured_wire + configured_payload,
             crate::mcp_client::McpResponseLimitKind::GetStream,
         ),
         (
-            (configured_wire + crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES) * 2,
+            (configured_wire + configured_payload) * 2,
             crate::mcp_client::McpResponseLimitKind::GetStream,
         ),
     ] {

@@ -23,6 +23,7 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -115,6 +116,9 @@ pub(crate) struct PooledSession {
     payload_limit: usize,
     /// Immutable initialize ceiling baked into this session's transport.
     initialize_limit: usize,
+    /// Bound for the standalone GET parser while rmcp keeps polling this
+    /// session after a successful tool call.
+    stream_retained_reserve: Option<NonZeroUsize>,
     /// Instant when the session most recently entered the idle pool.
     last_used: Instant,
     /// Guard that disarms the idle cancellation task when taken or closed.
@@ -135,6 +139,11 @@ impl PooledSession {
             signal_state,
             payload_limit,
             initialize_limit,
+            stream_retained_reserve: super::subrequest_transport::tool_stream_retained_reserve(
+                payload_limit,
+                initialize_limit,
+            )
+            .and_then(NonZeroUsize::new),
             last_used: Instant::now(),
             idle_timer: None,
         }
@@ -301,7 +310,8 @@ impl McpSessionPool {
         }
     }
 
-    /// Payload retained by parked rmcp peer information and pool identities.
+    /// Payload retained by parked rmcp peer information, pool identities, and
+    /// a possible incomplete standalone GET SSE event.
     /// rmcp keeps initialize `instructions` and `_meta` in `peer_info`; read the
     /// live value so a transparent reinitialization cannot leave a stale charge.
     pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
@@ -309,7 +319,8 @@ impl McpSessionPool {
             let used = used.checked_add(key.target_fingerprint.len())?;
             sessions.iter().try_fold(used, |used, session| {
                 let info = session.service.peer_info()?;
-                used.checked_add(retained_json_bytes(info.as_ref())?)
+                used.checked_add(retained_json_bytes(info.as_ref())?)?
+                    .checked_add(session.stream_retained_reserve?.get())
             })
         })
     }
