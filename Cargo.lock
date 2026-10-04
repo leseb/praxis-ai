@@ -1914,6 +1914,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3859,7 +3861,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=43d0707a3df0aef8cd04b3a05780662d5c0af189#43d0707a3df0aef8cd04b3a05780662d5c0af189"
+source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3880,7 +3882,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=43d0707a3df0aef8cd04b3a05780662d5c0af189#43d0707a3df0aef8cd04b3a05780662d5c0af189"
+source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
 dependencies = [
  "bytes",
  "chrono",
@@ -3905,7 +3907,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=43d0707a3df0aef8cd04b3a05780662d5c0af189#43d0707a3df0aef8cd04b3a05780662d5c0af189"
+source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3938,7 +3940,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=43d0707a3df0aef8cd04b3a05780662d5c0af189#43d0707a3df0aef8cd04b3a05780662d5c0af189"
+source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3966,7 +3968,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=43d0707a3df0aef8cd04b3a05780662d5c0af189#43d0707a3df0aef8cd04b3a05780662d5c0af189"
+source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4140,7 +4142,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -4161,7 +4163,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4439,7 +4441,7 @@ dependencies = [
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "log",
  "parking_lot",
  "rand 0.10.3",

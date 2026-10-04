@@ -39,7 +39,11 @@ pub(crate) fn response_rejection(ctx: &mut HttpFilterContext<'_>, message: &str)
 }
 
 fn rejection(ctx: &mut HttpFilterContext<'_>, message: &str, initial: bool) -> Rejection {
-    let committed = ctx.extensions.get::<ObservedResponsesSse>().is_some();
+    let committed = ctx.extensions.get::<ObservedResponsesSse>().is_some()
+        || ctx
+            .extensions
+            .get::<praxis_filter::ClientResponseHeadersCommitted>()
+            .is_some();
     ctx.set_metadata("responses.skip_persist", "true");
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.discard_payload_for_budget_error();
@@ -94,5 +98,21 @@ mod tests {
         assert!(body.contains("event: error"));
         assert!(!body.contains("response.completed"));
         assert!(!body.contains("[DONE]"));
+
+        let mut headers_only = ResponsesState::from_request_body(json!({"stream": true}));
+        headers_only.iteration = 1;
+        ctx.extensions.insert(headers_only);
+        ctx.extensions.remove::<ObservedResponsesSse>();
+        ctx.extensions.insert(praxis_filter::ClientResponseHeadersCommitted);
+        let first_pull = request_rejection(&mut ctx, "over budget");
+        assert_eq!(
+            first_pull.status, 200,
+            "headers commit the status before the first body pull"
+        );
+        assert!(
+            std::str::from_utf8(first_pull.body.as_deref().unwrap())
+                .unwrap()
+                .contains("event: error")
+        );
     }
 }
