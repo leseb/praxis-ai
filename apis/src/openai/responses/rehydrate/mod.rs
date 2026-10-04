@@ -973,9 +973,9 @@ fn restore_stream_fresh_chunk(
         &mut armed.stable_budget,
     )?;
     let remainder = incoming.len() - scan.cursor;
-    armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
     if flush_streaming_restore(&scan, remainder, armed.max_buffer_bytes, end_of_stream) {
         *body = finalize_view(scan.out, incoming, scan.run_start, incoming.len());
+        armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
         return Ok(false);
     }
     *body = finalize_view(scan.out, incoming, scan.run_start, scan.cursor);
@@ -989,6 +989,9 @@ fn restore_stream_fresh_chunk(
         .extend_from_slice(incoming.get(scan.cursor..).unwrap_or_default());
     armed.scan_from = scan.resume_from - scan.cursor;
     armed.scan_at_line_start = scan.resume_at_line_start;
+    // The just-scanned frames are visible only after every trailing-partial
+    // reservation succeeds; an error replaces this entire chunk.
+    armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
     Ok(true)
 }
 
@@ -1060,14 +1063,15 @@ fn restore_stream_buffered_chunk(
         &mut armed.stable_budget,
     )?;
     let remainder = armed.pending.len() - scan.cursor;
-    armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
     if flush_streaming_restore(&scan, remainder, armed.max_buffer_bytes, end_of_stream) {
         *body = flush_pending(scan.out, &mut armed.pending, scan.run_start);
+        armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
         return Ok(false);
     }
     *body = emit_pending_prefix(scan.out, &mut armed.pending, scan.cursor);
     armed.scan_from = scan.resume_from - scan.cursor;
     armed.scan_at_line_start = scan.resume_at_line_start;
+    armed.last_forwarded_sequence = max_sequence(armed.last_forwarded_sequence, scan.max_forwarded_sequence);
     Ok(true)
 }
 

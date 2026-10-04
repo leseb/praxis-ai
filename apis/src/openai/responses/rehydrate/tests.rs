@@ -2339,6 +2339,42 @@ async fn direct_stream_restore_error_follows_forwarded_provider_sequences() {
 }
 
 #[tokio::test]
+async fn rejected_chunk_does_not_count_complete_frames_it_never_forwarded() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 4_096);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    // The first frame is complete, but the second is an oversized partial.
+    // Admission rejects the whole chunk, so neither provider frame is sent.
+    let chunk = format!(
+        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"delta\":\"Hi\"}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"{}",
+        "x".repeat(8_000)
+    );
+    let mut body = Some(Bytes::from(chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let frames = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+    let error: Value = serde_json::from_slice(&frames[0].data).unwrap();
+    assert_eq!(error["sequence_number"], 0);
+}
+
+#[tokio::test]
 async fn streaming_restore_reserves_exponent_normalization_before_rewrite() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
