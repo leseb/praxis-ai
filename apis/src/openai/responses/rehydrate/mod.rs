@@ -608,11 +608,27 @@ impl RestoreStableBudget {
     }
 
     /// Detect a new round or any append to a stable request/history collection.
-    fn matches(self, state: &ResponsesState) -> bool {
+    fn stable_matches(self, state: &ResponsesState) -> bool {
         self.iteration == state.iteration
             && state.replay_stable_payload_revision == Some(self.revision)
-            && state.current_output_revision == Some(self.current_output_revision)
             && self.collection_lengths == Self::collection_lengths(state)
+    }
+
+    /// Measure only the independently changing current-output owners.
+    fn refresh_current(&mut self, state: &ResponsesState, limit: usize) -> Option<()> {
+        let revision = state.current_output_revision?;
+        let mut meter = PayloadMeter::new(limit.checked_sub(self.bytes)?);
+        meter.json(&state.response_object)?;
+        meter.json(&state.local_completion_response_template)?;
+        meter.json_values(&state.tool_calls)?;
+        self.current_output_bytes = meter.used();
+        self.current_output_revision = revision;
+        Some(())
+    }
+
+    #[cfg(test)]
+    fn matches(self, state: &ResponsesState) -> bool {
+        self.stable_matches(state) && state.current_output_revision == Some(self.current_output_revision)
     }
 
     /// Read the sizes of the collections charged by the stable meter.
@@ -851,8 +867,13 @@ fn streaming_restore_fits(
     let Some(limit) = state.retained_payload_limit() else {
         return true;
     };
-    if stable_budget.is_none_or(|cache| !cache.matches(state)) {
+    if stable_budget.is_none_or(|cache| !cache.stable_matches(state)) {
         *stable_budget = RestoreStableBudget::measure(state, limit);
+    } else if let Some(cache) = stable_budget.as_mut()
+        && Some(cache.current_output_revision) != state.current_output_revision
+        && cache.refresh_current(state, limit).is_none()
+    {
+        return false;
     }
     let Some(cache) = stable_budget.as_ref() else {
         return false;

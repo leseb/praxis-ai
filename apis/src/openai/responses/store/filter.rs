@@ -340,7 +340,7 @@ impl ResponseStoreFilter {
                 || state
                     .shared_stable_bytes
                     .as_ref()
-                    .is_none_or(|cache| !cache.matches(responses)))
+                    .is_none_or(|cache| !cache.stable_matches(responses)))
         {
             let Some(stable) = responses.stream_stable_payload_bytes_bounded(limit) else {
                 ctx.extensions.insert(state);
@@ -381,6 +381,14 @@ impl ResponseStoreFilter {
                 return false;
             };
             state.shared_stable_bytes = Some(cache);
+        } else if let Some(responses) = ctx.extensions.get::<ResponsesState>()
+            && let Some(limit) = responses.retained_payload_limit()
+            && let Some(cache) = state.shared_stable_bytes.as_mut()
+            && !cache.current_matches(responses)
+            && cache.refresh_current(responses, limit).is_none()
+        {
+            ctx.extensions.insert(state);
+            return false;
         }
         // The decoder can simultaneously hold an unfinished record, completed
         // records, and a newly captured replay row. Reserve their peak before
@@ -751,11 +759,32 @@ impl StoreStableCache {
     }
 
     /// Whether the cached charge still describes the current round and shape.
-    fn matches(&self, state: &ResponsesState) -> bool {
+    fn stable_matches(&self, state: &ResponsesState) -> bool {
         self.iteration == state.iteration
             && Some(self.revision) == state.replay_stable_payload_revision
-            && Some(self.current_output_revision) == state.current_output_revision
             && self.collection_lengths == Self::collection_lengths(state)
+    }
+
+    /// Whether the independently changing current-output owners are fresh.
+    fn current_matches(&self, state: &ResponsesState) -> bool {
+        Some(self.current_output_revision) == state.current_output_revision
+    }
+
+    /// Refresh current-output charge without serializing the unchanged prompt and history.
+    fn refresh_current(&mut self, state: &ResponsesState, limit: usize) -> Option<()> {
+        let revision = state.current_output_revision?;
+        let mut meter = PayloadMeter::new(limit.checked_sub(self.bytes)?);
+        meter.json(&state.response_object)?;
+        meter.json(&state.local_completion_response_template)?;
+        meter.json_values(&state.tool_calls)?;
+        self.current_output_bytes = meter.used();
+        self.current_output_revision = revision;
+        Some(())
+    }
+
+    /// Whether both stable and current-output charges can be used for admission.
+    fn matches(&self, state: &ResponsesState) -> bool {
+        self.stable_matches(state) && self.current_matches(state)
     }
 
     /// Lengths of the collections covered by the stable charge.
@@ -3125,6 +3154,41 @@ mod encode_replay_event_tests {
         assert_eq!(responses.output_items().len(), 1);
         assert!(!old_cache.matches(responses));
         assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
+    }
+
+    #[test]
+    fn replay_meter_reuses_history_when_only_current_output_changes() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState::from_request_body(json!({"input": "x".repeat(1_048_576)}));
+        responses.apply_retained_payload_limit(8 * 1_048_576);
+        ctx.extensions.insert(responses);
+        let frame = Some(Bytes::from_static(b": heartbeat\n\n"));
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        let cached = ctx
+            .extensions
+            .get_mut::<super::ResponseStoreRequestState>()
+            .unwrap()
+            .shared_stable_bytes
+            .as_mut()
+            .unwrap();
+        // A distinct, still-admissible baseline reveals an unwanted rescan of
+        // the megabyte prompt while the response output alone changes.
+        cached.bytes += 32;
+        let charged_baseline = cached.bytes;
+        let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        responses.response_object = json!({"output": [{"text": "delta"}]});
+        responses.mark_current_output_changed();
+        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
+        let cached = ctx
+            .extensions
+            .get::<super::ResponseStoreRequestState>()
+            .unwrap()
+            .shared_stable_bytes
+            .unwrap();
+        assert_eq!(cached.bytes, charged_baseline);
     }
 
     #[test]
