@@ -64,9 +64,6 @@ const RESPONSE_BODY_BUDGET_UNIT_BYTES: usize = 1_048_576; // 1 MiB
 /// Charge wire bodies, parser scratch, and retained decoded storage.
 const RESPONSE_ADMISSION_WIRE_MULTIPLIER: usize = 4;
 
-/// Charge both the collected body and its decoded representation.
-const RESPONSE_DECODE_MEMORY_MULTIPLIER: usize = 2;
-
 /// Decoded-storage headroom reserved for each response in one execution.
 const RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES: usize = 65_536; // 64 KiB
 
@@ -582,8 +579,9 @@ impl FileSearchClient {
     }
 
     /// Search with a request-scoped ceiling for decoded result payload.
-    /// The collected body and decoded values coexist, so half of the available
-    /// bytes are reserved for each owner before a callout is scheduled.
+    /// Collected bodies, parser scratch, and decoded values coexist. Reserve
+    /// the same worst-case amount used by process-wide response admission
+    /// before a callout is scheduled.
     #[expect(
         clippy::too_many_lines,
         clippy::too_many_arguments,
@@ -603,7 +601,7 @@ impl FileSearchClient {
         let mut next_spec = 0_usize;
         let execution_started = Instant::now();
         let (total_response_limit, retained_payload_controls_limit) =
-            retained_response_body_limit(self.max_total_response_bytes, max_decoded_bytes);
+            retained_response_body_limit(self.max_total_response_bytes, max_decoded_bytes, specs.len());
         if total_response_limit == 0 {
             append_budget_failures(
                 &mut batch.failures,
@@ -2323,11 +2321,16 @@ fn aggregate_limit_error(store_id: &str, limit: usize, retained_payload: bool) -
 }
 
 /// Intersect the configured response ceiling with the request-wide allowance.
-fn retained_response_body_limit(configured_limit: usize, available_bytes: usize) -> (usize, bool) {
+/// The decoder may retain up to one body-sized allocation plus fixed per-page
+/// storage while the wire body and parser-owned values are still live.
+fn retained_response_body_limit(configured_limit: usize, available_bytes: usize, spec_count: usize) -> (usize, bool) {
     if available_bytes == usize::MAX {
         return (configured_limit, false);
     }
-    let retained_limit = available_bytes / RESPONSE_DECODE_MEMORY_MULTIPLIER;
+    let retained_limit = RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES
+        .checked_mul(spec_count)
+        .and_then(|overhead| available_bytes.checked_sub(overhead))
+        .map_or(0, |remaining| remaining / RESPONSE_ADMISSION_WIRE_MULTIPLIER);
     (configured_limit.min(retained_limit), retained_limit < configured_limit)
 }
 
@@ -2390,11 +2393,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_BODY_BUDGET_UNIT_BYTES,
-        RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchFailure, SearchResult, SearchSpec,
-        VectorStoreSearchRequest, append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results,
-        parse_response_body, response_admission_units, retained_payload_controls_per_call,
-        retained_response_body_limit,
+        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_ADMISSION_WIRE_MULTIPLIER,
+        RESPONSE_BODY_BUDGET_UNIT_BYTES, RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchFailure,
+        SearchResult, SearchSpec, VectorStoreSearchRequest, append_unprocessed_deadline_failures,
+        deserialize_search_results, merge_top_results, parse_response_body, response_admission_units,
+        retained_payload_controls_per_call, retained_response_body_limit,
     };
 
     const MINIMAL_RESULT: &[u8] = br#"{"content":[],"file_id":"","filename":"","score":0}"#;
@@ -2458,13 +2461,33 @@ mod tests {
 
     #[test]
     fn retained_budget_reserves_raw_and_decoded_response_owners() {
-        assert_eq!(retained_response_body_limit(8_192, usize::MAX), (8_192, false));
-        assert_eq!(retained_response_body_limit(8_192, 4_096), (2_048, true));
-        assert_eq!(retained_response_body_limit(1_024, 4_096), (1_024, false));
-        assert_eq!(retained_response_body_limit(1_024, 2_048), (1_024, false));
+        assert_eq!(retained_response_body_limit(8_192, usize::MAX, 1), (8_192, false));
+        assert_eq!(retained_response_body_limit(8_192, 4_096, 1), (0, true));
+        assert_eq!(retained_response_body_limit(1_024, 100_000, 1), (1_024, false));
+        assert_eq!(retained_response_body_limit(1_024, 68_000, 1), (616, true));
         assert!(!retained_payload_controls_per_call(512, 1_024, true));
         assert!(retained_payload_controls_per_call(2_048, 1_024, true));
         assert!(!retained_payload_controls_per_call(2_048, 1_024, false));
+    }
+
+    #[test]
+    fn retained_budget_reserves_numeric_decode_expansion_across_pages() {
+        let body = format!(
+            r#"{{"data":[{{"file_id":"f","filename":"f","score":1,"content":[],"attributes":{{"a":[{}]}}}}]}}"#,
+            std::iter::repeat_n("1e15", 300).collect::<Vec<_>>().join(",")
+        );
+        let available = 4_000;
+        let decoded = parse_response_body(body.as_bytes(), "store", 10).expect("valid compact numeric result");
+        let decoded_bytes =
+            crate::openai::responses::state::retained_json_bytes(&decoded.data).expect("decoded size is representable");
+        assert!(body.len() < available);
+        assert!(body.len() + decoded_bytes > available);
+        assert_eq!(retained_response_body_limit(1_048_576, available, 1), (0, true));
+
+        let available = 300_000;
+        let (limit, retained_controls) = retained_response_body_limit(1_048_576, available, 3);
+        assert!(retained_controls);
+        assert!(limit * RESPONSE_ADMISSION_WIRE_MULTIPLIER + 3 * RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES <= available);
     }
 
     #[test]
