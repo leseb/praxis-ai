@@ -649,6 +649,41 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
 }
 
 #[test]
+fn aggregate_mcp_limit_rejects_expanding_numeric_arguments_before_execution() {
+    let numbers = std::iter::repeat_n("1e15", 10_000).collect::<Vec<_>>().join(",");
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "call_1",
+            "arguments": format!("{{\"values\":[{numbers}]}}")
+        })],
+        ..ResponsesState::default()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    let raw = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap();
+    let expanded = super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap();
+    assert!(
+        expanded > raw * 3,
+        "serde numeric normalization must increase the argument reserve"
+    );
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
+        panic!("weather tool must resolve")
+    };
+    let tool_bytes = retained_json_bytes(entry).unwrap();
+    // This limit passed the previous raw-byte projection. It cannot hold the
+    // parsed Value, canonical string, and transport owner together.
+    state.apply_retained_payload_limit(
+        current + "call_1".len() + raw * 3 + tool_bytes + 3 * super::MIN_RETAINED_RESULT_BYTES,
+    );
+    assert!(
+        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        "expanding numeric arguments must be rejected before the MCP call"
+    );
+}
+
+#[test]
 fn approval_resume_peak_charges_stored_arguments_before_resolved_clone() {
     let input = ApprovalResponseInput {
         approval_id: "approval_1".to_owned(),

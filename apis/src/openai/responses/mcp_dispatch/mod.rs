@@ -1764,8 +1764,7 @@ fn aggregate_mcp_result_limit(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .len();
-        let arguments =
-            retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?.checked_mul(3)?;
+        let arguments = mcp_argument_staging_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?;
         let tool_bytes =
             call.get("name")
                 .and_then(serde_json::Value::as_str)
@@ -1781,6 +1780,20 @@ fn aggregate_mcp_result_limit(
     let admitted = configured_limit.min(available / 3);
     let minimum = mcp_calls.len().checked_mul(MIN_RETAINED_RESULT_BYTES)?;
     (admitted >= minimum).then_some((admitted, admitted < configured_limit))
+}
+
+/// Bound the parsed argument value, canonical string, and transport owner.
+/// A JSON string can contain compact exponent numbers that expand when serde
+/// parses them; the original encoded argument remains live throughout.
+fn mcp_argument_staging_bytes(raw: &serde_json::Value) -> Option<usize> {
+    let raw_bytes = retained_json_bytes(raw)?;
+    let parsed_bound = match raw {
+        serde_json::Value::String(value) => {
+            super::agentic_loop::buffered_parsed_json_bytes_upper_bound(value.as_bytes())?
+        },
+        _ => raw_bytes,
+    };
+    raw_bytes.checked_add(parsed_bound.checked_mul(2)?)
 }
 
 /// The result vector remains live while messages are cloned into two distinct
