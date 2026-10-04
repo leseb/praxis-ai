@@ -346,9 +346,13 @@ pub(crate) struct ResponsesState {
     pub(crate) retained_rehydrate_stream_bytes: usize,
     /// Semantic and framing payload published by the Chat stream translator.
     pub(crate) retained_chat_converter_bytes: usize,
-    /// Initialized MCP peer metadata retained in the request-scoped session pool.
+    /// Parked MCP session payload last published by the dispatcher.
     #[cfg(feature = "openai-mcp-tools")]
     pub(crate) retained_mcp_session_bytes: usize,
+    /// Closing sessions release asynchronously, so read their live charge at
+    /// each admission instead of keeping a stale dispatcher snapshot.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub(crate) retained_mcp_closing_pool: Option<crate::mcp_client::McpSessionPool>,
 
     /// Revision of request, history, prior output, and resolved MCP definitions
     /// cached by streaming admission. In-place changes do not alter lengths.
@@ -935,6 +939,8 @@ impl Default for ResponsesState {
             retained_chat_converter_bytes: 0,
             #[cfg(feature = "openai-mcp-tools")]
             retained_mcp_session_bytes: 0,
+            #[cfg(feature = "openai-mcp-tools")]
+            retained_mcp_closing_pool: None,
             replay_stable_payload_revision: Some(0),
             current_output_revision: Some(0),
             retained_payload_failed: false,
@@ -1098,7 +1104,41 @@ impl ResponsesState {
             meter.raw(tool.len())?;
             meter.json(value)?;
         }
+        self.meter_deferred_mcp_payload(&mut meter)?;
         Some(meter.used())
+    }
+
+    /// Charge deferred connector definitions in the revision-invalidated stable owner.
+    fn meter_deferred_mcp_payload(&self, meter: &mut PayloadMeter) -> Option<()> {
+        for connector in &self.deferred_mcp {
+            meter.raw(connector.connector_id.len())?;
+            meter.raw(connector.server_label.len())?;
+            meter.raw(connector.server_url.len())?;
+            if let Some(authorization) = &connector.authorization {
+                meter.raw(authorization.len())?;
+            }
+            for value in [
+                connector.allowed_tools.as_ref(),
+                connector.headers.as_ref(),
+                connector.require_approval.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                meter.json(value)?;
+            }
+        }
+        #[cfg(feature = "openai-mcp-tools")]
+        for slot in [
+            self.mcp_connector_context_policy.credential_slot.as_ref(),
+            self.mcp_connector_context_policy.authorization_slot.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.raw(slot.len())?;
+        }
+        Some(())
     }
 
     /// The Chat stream converter caches the current response/template/call
@@ -1184,6 +1224,9 @@ impl ResponsesState {
         #[cfg(feature = "openai-mcp-tools")]
         if include_external {
             meter.raw(self.retained_mcp_session_bytes)?;
+            if let Some(pool) = &self.retained_mcp_closing_pool {
+                meter.raw(pool.retained_closing_payload_bytes()?)?;
+            }
         }
 
         if !skip_stream_stable {
@@ -1209,6 +1252,7 @@ impl ResponsesState {
                 meter.raw(tool.len())?;
                 meter.json(value)?;
             }
+            self.meter_deferred_mcp_payload(&mut meter)?;
         }
         if let Some(bytes) = cached_current_output_bytes {
             meter.raw(bytes)?;
@@ -1242,36 +1286,6 @@ impl ResponsesState {
             meter.raw(lowered.original_name.len())?;
             if let Some(namespace) = &lowered.namespace {
                 meter.raw(namespace.len())?;
-            }
-        }
-        for connector in &self.deferred_mcp {
-            meter.raw(connector.connector_id.len())?;
-            meter.raw(connector.server_label.len())?;
-            meter.raw(connector.server_url.len())?;
-            if let Some(authorization) = &connector.authorization {
-                meter.raw(authorization.len())?;
-            }
-            for value in [
-                connector.allowed_tools.as_ref(),
-                connector.headers.as_ref(),
-                connector.require_approval.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                meter.json(value)?;
-            }
-        }
-        #[cfg(feature = "openai-mcp-tools")]
-        {
-            for slot in [
-                self.mcp_connector_context_policy.credential_slot.as_ref(),
-                self.mcp_connector_context_policy.authorization_slot.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                meter.raw(slot.len())?;
             }
         }
         for (key, value) in &self.citation_files {
@@ -1389,6 +1403,8 @@ impl ResponsesState {
         #[cfg(feature = "openai-mcp-tools")]
         {
             self.retained_mcp_session_bytes = 0;
+            self.retained_mcp_closing_pool = None;
+            self.mcp_connector_context_policy = McpConnectorContextPolicy::default();
         }
         self.messages.clear();
         self.persisted_messages.clear();
@@ -1415,6 +1431,7 @@ impl ResponsesState {
         self.retained_rehydrate_stream_bytes = 0;
         self.retained_chat_converter_bytes = 0;
         self.dispatch_failure = None;
+        self.mark_replay_stable_payload_changed();
     }
 
     /// Create initial state from a parsed request body.
@@ -1669,14 +1686,15 @@ impl ResponsesState {
                 "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during final serialization",
             ));
         }
-        let serialized = match serde_json::to_vec(&response) {
-            Ok(serialized) => serialized,
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode final response");
-                self.response_object = response;
-                return Err(finalize_rejection("failed to encode final response"));
-            },
-        };
+        // The size pass measured this exact serialization. Allocate its one
+        // admitted wire owner up front so Vec growth cannot keep an old buffer
+        // alive alongside its replacement near the request-wide limit.
+        let mut serialized = Vec::with_capacity(serialized_bytes);
+        if let Err(error) = serde_json::to_writer(&mut serialized, &response) {
+            tracing::warn!(%error, "failed to encode final response");
+            self.response_object = response;
+            return Err(finalize_rejection("failed to encode final response"));
+        }
         self.response_object = response;
         *body = Some(Bytes::from(serialized));
         Ok(())
@@ -2093,6 +2111,68 @@ mod tests {
         ] {
             assert_eq!(changing, Some(baseline_changing));
         }
+        assert_eq!(state.retained_payload_bytes().unwrap(), stable + baseline_changing);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks every deferred descriptor owner against all stream meters"
+    )]
+    fn deferred_mcp_payload_is_measured_once_in_stream_stable_charge() {
+        let mut state = ResponsesState::default();
+        let baseline_stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let baseline_changing = state.stream_changing_payload_bytes_bounded_for_parser(1_024).unwrap();
+        let allowed_tools = json!({"names": ["x".repeat(1_048_576)]});
+        let headers = json!({"x-tenant": "team"});
+        let approval = json!({"never": ["lookup"]});
+        let connector_bytes = "id".len()
+            + "label".len()
+            + "https://mcp.example.com".len()
+            + "secret".len()
+            + retained_json_bytes(&allowed_tools).unwrap()
+            + retained_json_bytes(&headers).unwrap()
+            + retained_json_bytes(&approval).unwrap();
+        state.deferred_mcp.push(DeferredMcpConnector {
+            authorization: Some("secret".to_owned()),
+            allowed_tools: Some(allowed_tools),
+            connector_id: "id".to_owned(),
+            headers: Some(headers),
+            max_rewritten_body_bytes: 1_200_000,
+            max_tools: 128,
+            require_approval: Some(approval),
+            server_label: "label".to_owned(),
+            server_url: "https://mcp.example.com".to_owned(),
+            timeout: Duration::from_secs(5),
+        });
+        #[cfg(feature = "openai-mcp-tools")]
+        let policy_bytes = {
+            state.mcp_connector_context_policy =
+                McpConnectorContextPolicy::new(Some("credential-slot"), Some("assertion-slot"));
+            state.mcp_connector_context_policy.retained_payload_bytes().unwrap()
+        };
+        #[cfg(not(feature = "openai-mcp-tools"))]
+        let policy_bytes = 0;
+        state.mark_replay_stable_payload_changed();
+
+        let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
+        assert_eq!(stable, baseline_stable + connector_bytes + policy_bytes);
+        let current_output = current_output_bytes(&state);
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            for changing in [
+                state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+                state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+                #[cfg(feature = "store")]
+                state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+            ] {
+                assert_eq!(changing, Some(baseline_changing));
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deferred descriptors must not be rescanned per chunk"
+        );
         assert_eq!(state.retained_payload_bytes().unwrap(), stable + baseline_changing);
     }
 
@@ -2999,6 +3079,36 @@ mod tests {
         assert!(
             body.is_none(),
             "failed serialization reservation must not produce a body"
+        );
+    }
+
+    #[test]
+    fn finalize_response_body_serializes_with_one_admitted_wire_allocation() {
+        let mut state = ResponsesState {
+            response_object: json!({
+                "object": "response",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "x".repeat(1_048_576)}]
+                }]
+            }),
+            ..ResponsesState::default()
+        };
+        let serialized_bytes = bounded_json_size(&state.response_object, MAX_JSON_BODY_BYTES)
+            .unwrap()
+            .unwrap();
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(baseline + serialized_bytes);
+
+        let mut body = None;
+        let allocations = allocation_counter::measure(|| {
+            state.finalize_response_body(&mut body).unwrap();
+        });
+        assert_eq!(body.as_ref().map(Bytes::len), Some(serialized_bytes));
+        assert!(!state.retained_payload_failed);
+        assert!(
+            allocations.bytes_max <= u64::try_from(serialized_bytes).unwrap() + 65_536,
+            "one wire-sized buffer is admitted; serializer growth must not keep a second buffer: {allocations:?}"
         );
     }
 

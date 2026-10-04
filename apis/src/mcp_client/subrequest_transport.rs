@@ -21,7 +21,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -39,7 +42,7 @@ use praxis_filter::{
     StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime, TraceContext,
 };
 use rmcp::{
-    model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
+    model::{ClientJsonRpcMessage, ClientNotification, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
     transport::{
         common::http_header::{HEADER_LAST_EVENT_ID, HEADER_SESSION_ID},
         streamable_http_client::{
@@ -82,7 +85,7 @@ const DEFAULT_MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
 /// Translate a configured *decoded* `tools/call` result cap into the *wire* byte
 /// ceiling to enforce before deserialization (worst-case JSON expansion plus the
 /// JSON-RPC envelope allowance).
-fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
+pub(crate) fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
     max_result_bytes
         .saturating_mul(MAX_JSON_STRING_EXPANSION)
         .saturating_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)
@@ -101,8 +104,37 @@ fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
 /// size and yields HTTP 413, while the ceiling stays finite (not `usize::MAX`) so
 /// the `None`-body buffered fallback and the success-`application/json` drain
 /// (`collect_body`/`drain_body`) remain memory-bounded — at 2x the cap.
-fn streaming_executor_backstop(binding_cap: usize) -> usize {
+pub(crate) fn streaming_executor_backstop(binding_cap: usize) -> usize {
     binding_cap.saturating_mul(2)
+}
+
+/// Bound a tool session's GET stream by its result wire allowance and admitted
+/// handshake ceiling. A budgeted session cannot retain an unrelated 1 MiB
+/// control event in the standalone stream after the tool call completes.
+pub(crate) fn tool_stream_cumulative_cap(tool_wire_cap: usize, initialize_limit: usize) -> usize {
+    tool_wire_cap.saturating_add(initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES))
+}
+
+/// Reserve a parked GET stream's parser, transport, and rmcp message queues.
+/// The cumulative cap bounds all raw events across both queues. JSON number
+/// normalization can grow a three-byte exponent token to 24 bytes, so decoded
+/// JSON-RPC messages need up to eight raw-byte owners. Four more cover the raw
+/// SSE event, unfinished parser line, streaming body, and executor chunk.
+pub(crate) fn tool_stream_retained_reserve(result_payload_limit: usize, initialize_limit: usize) -> Option<usize> {
+    let wire = result_payload_limit
+        .checked_mul(MAX_JSON_STRING_EXPANSION)?
+        .checked_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)?;
+    wire.checked_add(initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES))?
+        .checked_mul(12)
+}
+
+/// Buffered DELETE can retain the executor body and returned response at once.
+/// Tool cleanup uses the same admitted control ceiling as its initialize; the
+/// unbudgeted control client continues to use the 1 MiB ceiling.
+pub(crate) fn tool_delete_retained_reserve(initialize_limit: usize) -> Option<usize> {
+    initialize_limit
+        .clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES)
+        .checked_mul(2)
 }
 
 /// The `mcp-session-id` header carrying the Streamable-HTTP session token.
@@ -194,6 +226,8 @@ pub(crate) enum TransportSignal {
     ResponseTooLarge {
         /// The effective response-size limit that was exceeded.
         limit: usize,
+        /// Exchange whose wire ceiling produced the limit.
+        kind: McpResponseLimitKind,
     },
     /// The MCP target resolved to an address the SSRF policy rejected.
     SsrfBlocked,
@@ -202,6 +236,19 @@ pub(crate) enum TransportSignal {
     /// literal) — rejected before any dial. Distinct from [`Self::SsrfBlocked`]
     /// only in the surfaced error text; both are permanent, hard rejections.
     TargetRejected,
+}
+
+/// The MCP exchange whose response-size ceiling was enforced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpResponseLimitKind {
+    /// Initialize request or initialized acknowledgment.
+    Initialize,
+    /// A tools/call response.
+    Tool,
+    /// The cumulative GET event stream.
+    GetStream,
+    /// A fixed control exchange, independent of the retained-result allowance.
+    Control,
 }
 
 /// Replaceable transport-error slot for a reusable rmcp session.
@@ -213,14 +260,42 @@ pub(crate) enum TransportSignal {
 pub(crate) struct TransportSignalState {
     /// Signal generation assigned to the active initialization or tool call.
     active: Mutex<Option<Arc<OnceLock<TransportSignal>>>>,
+    /// Session-wide raw GET bytes for a budgeted tool session. Reconnects share
+    /// this counter so queued messages cannot multiply the parked reservation.
+    get_stream_bytes: Option<(AtomicUsize, usize)>,
 }
 
 impl TransportSignalState {
     /// Create state with a pristine initialization-generation signal.
-    fn new() -> Self {
+    pub(super) fn new(get_stream_lifetime_cap: Option<usize>) -> Self {
         Self {
             active: Mutex::new(Some(Arc::new(OnceLock::new()))),
+            get_stream_bytes: get_stream_lifetime_cap.map(|cap| (AtomicUsize::new(0), cap)),
         }
+    }
+
+    /// Admit raw bytes across every GET connection in this pooled session.
+    pub(super) fn admit_get_stream_bytes(&self, added: usize) -> bool {
+        self.get_stream_bytes.as_ref().is_none_or(|(used, cap)| {
+            let previous = used
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+                    Some(current.saturating_add(added).min(*cap))
+                })
+                .unwrap_or_else(|current| current);
+            previous.checked_add(added).is_some_and(|next| next <= *cap)
+        })
+    }
+
+    /// Refuse a reconnect before opening another GET after the cap is spent.
+    pub(crate) fn get_stream_exhausted(&self) -> bool {
+        self.get_stream_bytes
+            .as_ref()
+            .is_some_and(|(used, cap)| used.load(AtomicOrdering::Acquire) >= *cap)
+    }
+
+    /// Pool compatibility must preserve whether GET reconnects share a cap.
+    pub(crate) fn has_get_stream_budget(&self) -> bool {
+        self.get_stream_bytes.is_some()
     }
 
     /// Return the active signal, or a detached slot for idle traffic.
@@ -560,8 +635,10 @@ pub(crate) struct McpSubrequestClient {
     ///
     /// An intentionally coarse raw-wire `DoS` backstop, not decoded parity: for a
     /// control client it is `MAX_LISTING_RESPONSE_BYTES + MAX_CONTROL_RESPONSE_BYTES`
-    /// (5 MiB); `paginate_tools` remains the authoritative decoded gate. Read
-    /// only by the GET-stream path.
+    /// (5 MiB); `paginate_tools` remains the authoritative decoded gate. A
+    /// tool client uses its result wire cap plus admitted handshake cap so a
+    /// parked stream has a bounded request-budget reservation. Read only by
+    /// the GET-stream path.
     stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
@@ -594,6 +671,7 @@ impl McpSubrequestClient {
             MAX_CONTROL_RESPONSE_BYTES,
             MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            false,
             owner,
         )
     }
@@ -603,15 +681,21 @@ impl McpSubrequestClient {
     /// With an aggregate budget, `initialize` uses the supplied decoded cap
     /// (with a 1 KiB floor). Otherwise it keeps the 1 MiB control ceiling.
     /// `tools/call` expands its result cap for worst-case JSON string escaping.
+    /// The standalone GET stream uses the sum of these two admitted caps.
     ///
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
     /// posture decides whether loopback destinations are permitted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the tool transport binds independent response, handshake, and lifetime limits"
+    )]
     pub(crate) fn for_tool(
         callout: McpCallout,
         step_timeout: Duration,
         max_result_bytes: usize,
         initialize_limit: usize,
+        budgeted: bool,
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
@@ -621,7 +705,8 @@ impl McpSubrequestClient {
             step_timeout,
             wire,
             initialize_bytes,
-            wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            tool_stream_cumulative_cap(wire, initialize_bytes),
+            budgeted,
             owner,
         )
     }
@@ -638,6 +723,7 @@ impl McpSubrequestClient {
         tool_result_bytes: usize,
         initialize_bytes: usize,
         stream_cumulative_cap: usize,
+        budgeted: bool,
         owner: Option<StateOwner>,
     ) -> Self {
         Self {
@@ -647,7 +733,7 @@ impl McpSubrequestClient {
             step_timeout,
             stream_cumulative_cap,
             owner,
-            signal_state: Arc::new(TransportSignalState::new()),
+            signal_state: Arc::new(TransportSignalState::new(budgeted.then_some(stream_cumulative_cap))),
         }
     }
 
@@ -679,22 +765,56 @@ impl McpSubrequestClient {
         self.stream_cumulative_cap
     }
 
+    /// An exhausted budgeted session cannot open another successful GET
+    /// reconnect; rmcp then follows its bounded failed-reconnect path.
+    fn ensure_get_stream_budget_available(&self) -> Result<(), StreamableHttpError<McpTransportError>> {
+        if self.signal_state.get_stream_exhausted() {
+            self.signal_state.record_active(TransportSignal::ResponseTooLarge {
+                limit: self.stream_cumulative_cap(),
+                kind: McpResponseLimitKind::GetStream,
+            });
+            return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+        }
+        Ok(())
+    }
+
     /// Select the wire byte ceiling for one outbound message.
     ///
     /// `tools/call` uses the configured result ceiling. Tool-session
-    /// `initialize` is separately bounded because rmcp retains its metadata;
-    /// other exchanges use the control ceiling.
+    /// `initialize` and its following `initialized` acknowledgment share the
+    /// admitted handshake ceiling because both can buffer a response body;
+    /// other POST exchanges use the control ceiling. DELETE also uses the
+    /// admitted initialize ceiling so background cleanup stays within its
+    /// request-owned reservation.
     fn response_limit(&self, message: &ClientJsonRpcMessage) -> usize {
+        match Self::response_limit_kind(message) {
+            McpResponseLimitKind::Initialize => self.initialize_bytes,
+            McpResponseLimitKind::Tool => self.tool_result_bytes,
+            McpResponseLimitKind::GetStream => self.stream_cumulative_cap,
+            McpResponseLimitKind::Control => MAX_CONTROL_RESPONSE_BYTES,
+        }
+    }
+
+    /// Preserve the selected exchange kind with any recorded size signal.
+    fn response_limit_kind(message: &ClientJsonRpcMessage) -> McpResponseLimitKind {
         match message {
             ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)) => {
-                self.tool_result_bytes
+                McpResponseLimitKind::Tool
             },
             ClientJsonRpcMessage::Request(request)
                 if matches!(request.request, ClientRequest::InitializeRequest(_)) =>
             {
-                self.initialize_bytes
+                McpResponseLimitKind::Initialize
             },
-            _ => MAX_CONTROL_RESPONSE_BYTES,
+            ClientJsonRpcMessage::Notification(notification)
+                if matches!(
+                    notification.notification,
+                    ClientNotification::InitializedNotification(_)
+                ) =>
+            {
+                McpResponseLimitKind::Initialize
+            },
+            _ => McpResponseLimitKind::Control,
         }
     }
 
@@ -787,6 +907,7 @@ impl McpSubrequestClient {
         body: Bytes,
         headers: HeaderMap,
         max_response_bytes: usize,
+        kind: McpResponseLimitKind,
         signal: &Arc<OnceLock<TransportSignal>>,
     ) -> Result<SubResponse, StreamableHttpError<McpTransportError>> {
         let (executor, request, extensions, deadline) = self
@@ -801,7 +922,7 @@ impl McpSubrequestClient {
                 tracing::debug!(actual = ?actual, limit, "mcp callout response exceeded size limit");
                 // First signal wins; the caller reads this back after rmcp
                 // discards the typed error (see `transport_signal_error`).
-                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit, kind });
                 Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
             },
             // A single request/response MCP exchange never selects streaming, and
@@ -929,12 +1050,14 @@ impl McpSubrequestClient {
 
         Ok(crate::mcp_client::sse_adapter::sse_stream_from_body(
             body,
-            self.wire_cap(),
-            self.stream_cumulative_cap(),
-            // rmcp always passes its `config.max_sse_event_size` (16 MiB default),
-            // which is only an outer sanity backstop. Raise it to the wire cap so it
-            // can never clamp the authoritative per-event bound below `wire_cap()`.
-            max_sse_event_size.max(self.wire_cap()),
+            crate::mcp_client::sse_adapter::SseSizeCeilings {
+                per_event: self.wire_cap(),
+                operation: self.stream_cumulative_cap(),
+                // rmcp's limit is only an outer sanity backstop.
+                max_event: max_sse_event_size.max(self.wire_cap()),
+                per_event_kind: McpResponseLimitKind::Tool,
+                operation_kind: McpResponseLimitKind::GetStream,
+            },
             signal,
         ))
     }
@@ -957,6 +1080,7 @@ impl McpSubrequestClient {
         body: Bytes,
         headers: HeaderMap,
         max_response_bytes: usize,
+        kind: McpResponseLimitKind,
         signal: &Arc<OnceLock<TransportSignal>>,
     ) -> Result<(SubResponse, Option<Box<dyn StreamingResponseBody>>), StreamableHttpError<McpTransportError>> {
         let (executor, request, mut extensions, deadline) = self
@@ -971,7 +1095,7 @@ impl McpSubrequestClient {
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => Ok((response, None)),
             CalloutOutcome::ResponseTooLarge { actual, limit } => {
                 tracing::debug!(actual = ?actual, limit, "mcp streaming callout response exceeded size limit");
-                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit, kind });
                 Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
             },
             _ => Err(StreamableHttpError::Client(McpTransportError::Transport)),
@@ -999,6 +1123,7 @@ impl McpSubrequestClient {
         session_was_attached: bool,
         per_event_cap: usize,
         max_sse_event_size: usize,
+        kind: McpResponseLimitKind,
         signal: Arc<OnceLock<TransportSignal>>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
         let status = StatusCode::from_u16(response.status)
@@ -1064,11 +1189,13 @@ impl McpSubrequestClient {
             Some(ct) if is_event_stream_content_type(ct) => {
                 let sse = crate::mcp_client::sse_adapter::sse_stream_from_body(
                     body,
-                    per_event_cap,
-                    per_event_cap, // POST cumulative == per-message ceiling (F3: both from response_limit)
-                    // rmcp's `config.max_sse_event_size` is an outer backstop only; raise it to
-                    // the per-message cap so it never clamps the per-event bound below it.
-                    max_sse_event_size.max(per_event_cap),
+                    crate::mcp_client::sse_adapter::SseSizeCeilings {
+                        per_event: per_event_cap,
+                        operation: per_event_cap,
+                        max_event: max_sse_event_size.max(per_event_cap),
+                        per_event_kind: kind,
+                        operation_kind: kind,
+                    },
                     Arc::clone(&signal).into(),
                 );
                 Ok(StreamableHttpPostResponse::Sse(sse, session_id_out))
@@ -1079,7 +1206,7 @@ impl McpSubrequestClient {
                 // terminal message. A Request always needs a reply, so an
                 // unparseable body is a typed UnexpectedServerResponse, never an
                 // Accepted ack (which is reserved for one-way messages).
-                let buffered = collect_body(&mut body, per_event_cap, &signal).await?;
+                let buffered = collect_body(&mut body, per_event_cap, kind, &signal).await?;
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&buffered) {
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                     Err(_error) => Err(StreamableHttpError::UnexpectedServerResponse(
@@ -1109,6 +1236,7 @@ impl StreamableHttpClient for McpSubrequestClient {
         let session_was_attached = session_id.is_some();
         let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
         let max_response_bytes = self.response_limit(&message);
+        let kind = Self::response_limit_kind(&message);
         let signal = self.signal_handle();
         let body =
             serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
@@ -1118,6 +1246,7 @@ impl StreamableHttpClient for McpSubrequestClient {
             Bytes::from(body),
             headers,
             max_response_bytes,
+            kind,
             &signal,
         ))
         .await?;
@@ -1142,7 +1271,8 @@ impl StreamableHttpClient for McpSubrequestClient {
             &uri,
             Bytes::new(),
             headers,
-            MAX_CONTROL_RESPONSE_BYTES,
+            self.initialize_bytes,
+            McpResponseLimitKind::Control,
             &signal,
         ))
         .await?;
@@ -1189,6 +1319,7 @@ impl StreamableHttpClient for McpSubrequestClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<McpTransportError>> {
+        self.ensure_get_stream_budget_available()?;
         let headers = self.build_get_stream_headers(
             auth_header,
             custom_headers,
@@ -1206,6 +1337,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                 Bytes::new(),
                 headers,
                 streaming_executor_backstop(self.stream_cumulative_cap()),
+                McpResponseLimitKind::GetStream,
                 &signal,
             )
             .await?;
@@ -1244,6 +1376,7 @@ impl StreamableHttpClient for McpSubrequestClient {
         let session_was_attached = session_id.is_some();
         let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
         let max_response_bytes = self.response_limit(&message);
+        let kind = Self::response_limit_kind(&message);
         let signal = self.signal_handle();
         let body =
             serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
@@ -1255,6 +1388,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                 Bytes::from(body),
                 headers,
                 streaming_executor_backstop(max_response_bytes),
+                kind,
                 &signal,
             )
             .await?;
@@ -1274,6 +1408,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                     session_was_attached,
                     max_response_bytes,
                     max_sse_event_size,
+                    kind,
                     signal,
                 )
                 .await
@@ -1312,7 +1447,8 @@ fn classify_bounded_buffered_post_response(
                 format!("HTTP {status}").into(),
             ));
         }
-        signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+        let kind = McpSubrequestClient::response_limit_kind(message);
+        signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap, kind });
         return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
     }
     classify_buffered_post_response(response, message, session_was_attached)
@@ -1438,6 +1574,7 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
 async fn collect_body(
     body: &mut Box<dyn StreamingResponseBody>,
     cap: usize,
+    kind: McpResponseLimitKind,
     signal: &Arc<OnceLock<TransportSignal>>,
 ) -> Result<Bytes, StreamableHttpError<McpTransportError>> {
     let mut buf = bytes::BytesMut::new();
@@ -1445,7 +1582,7 @@ async fn collect_body(
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
                 if buf.len().checked_add(chunk.len()).is_none_or(|bytes| bytes > cap) {
-                    signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+                    signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap, kind });
                     body.cancel().await;
                     return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
                 }
@@ -1461,7 +1598,7 @@ async fn collect_body(
                 // dominant failure mode, so any next_chunk error fails closed as a
                 // 413. This never yields a false success and never returns the
                 // partial buffer.
-                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap, kind });
                 body.cancel().await;
                 return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
             },
@@ -1580,9 +1717,10 @@ pub(crate) fn transport_signal_error(
     url: &McpDisplayUrl,
 ) -> Option<McpClientError> {
     match signal.get()? {
-        TransportSignal::ResponseTooLarge { limit } => Some(McpClientError::ResponseTooLarge {
+        TransportSignal::ResponseTooLarge { limit, kind } => Some(McpClientError::ResponseTooLarge {
             url: url.clone(),
             limit: *limit,
+            kind: *kind,
         }),
         TransportSignal::SsrfBlocked => Some(super::ssrf_blocked(url.clone(), super::SSRF_BLOCK_REASON)),
         TransportSignal::TargetRejected => Some(McpClientError::InvalidTarget { url: url.clone() }),
@@ -1786,10 +1924,21 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test covers signal replacement and active generation isolation"
+    )]
     fn reusable_session_starts_each_exchange_with_a_pristine_signal() {
-        let state = TransportSignalState::new();
+        let state = TransportSignalState::new(None);
         let prior = state.current();
-        assert!(prior.set(TransportSignal::ResponseTooLarge { limit: 7 }).is_ok());
+        assert!(
+            prior
+                .set(TransportSignal::ResponseTooLarge {
+                    limit: 7,
+                    kind: McpResponseLimitKind::Control
+                })
+                .is_ok()
+        );
 
         let current = state.begin_exchange();
         assert!(
@@ -1797,7 +1946,13 @@ mod tests {
             "a later call must not inherit an idle-stream or prior-call error"
         );
         assert!(
-            matches!(prior.get(), Some(TransportSignal::ResponseTooLarge { limit: 7 })),
+            matches!(
+                prior.get(),
+                Some(TransportSignal::ResponseTooLarge {
+                    limit: 7,
+                    kind: McpResponseLimitKind::Control
+                })
+            ),
             "replacing the current generation must not mutate in-flight readers"
         );
 
@@ -1926,18 +2081,40 @@ mod tests {
     }
 
     #[test]
+    fn parked_get_reserve_covers_numeric_message_normalization() {
+        let raw = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"values\":[{}]}}}}",
+            vec!["1e15"; 10_000].join(",")
+        );
+        let decoded: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON-RPC notification");
+        let decoded_bytes = crate::openai::responses::state::retained_json_bytes(&decoded).expect("decoded size");
+        let cap = tool_stream_cumulative_cap(tool_result_wire_cap(2_048), 2_048);
+        assert!(raw.len() < cap, "notification fits the admitted GET stream");
+        let reserve = tool_stream_retained_reserve(2_048, 2_048).expect("stream reserve");
+        assert!(
+            reserve >= raw.len() * 2 + decoded_bytes,
+            "source and parser bytes can coexist with a normalized rmcp message: raw {}, decoded {}, reserve {}",
+            raw.len(),
+            decoded_bytes,
+            reserve
+        );
+    }
+
+    #[test]
     fn streaming_executor_backstop_doubles_and_saturates() {
         assert_eq!(streaming_executor_backstop(1000), 2000);
         assert_eq!(streaming_executor_backstop(usize::MAX), usize::MAX);
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "exercise all three MCP request ceilings together")]
     fn tool_session_initialize_uses_admitted_payload_cap() {
         let client = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
             2048,
+            true,
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -1945,25 +2122,211 @@ mod tests {
         )
         .expect("deserialize tools/call");
         assert_eq!(client.response_limit(&call), tool_result_wire_cap(2048));
+        assert_eq!(
+            McpSubrequestClient::response_limit_kind(&call),
+            McpResponseLimitKind::Tool
+        );
 
         let initialize: ClientJsonRpcMessage = serde_json::from_str(
             r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
         )
         .expect("deserialize initialize");
         assert_eq!(client.response_limit(&initialize), 2048);
+        assert_eq!(
+            McpSubrequestClient::response_limit_kind(&initialize),
+            McpResponseLimitKind::Initialize
+        );
+        let initialized: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .expect("deserialize initialized notification");
+        assert_eq!(client.response_limit(&initialized), 2048);
+        assert_eq!(client.stream_cumulative_cap(), tool_result_wire_cap(2048) + 2048);
         let unbudgeted = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
             MAX_CONTROL_RESPONSE_BYTES,
+            false,
             None,
         );
         assert_eq!(unbudgeted.response_limit(&initialize), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(unbudgeted.response_limit(&initialized), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(
+            unbudgeted.stream_cumulative_cap(),
+            tool_result_wire_cap(2048) + MAX_CONTROL_RESPONSE_BYTES
+        );
 
         let list: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
                 .expect("deserialize tools/list");
         assert_eq!(client.response_limit(&list), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(
+            McpSubrequestClient::response_limit_kind(&list),
+            McpResponseLimitKind::Control
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real HTTP ACK exercises the admitted handshake cap"
+    )]
+    async fn initialized_ack_cannot_buffer_beyond_admitted_handshake_cap() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 32768\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            socket.write_all(&vec![b'x'; 32_768]).unwrap();
+        });
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(true).unwrap(),
+            Duration::from_secs(5),
+            1024,
+            1024,
+            true,
+            None,
+        );
+        let initialized: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).unwrap();
+        let result = client
+            .post_message_with_max_sse_event_size(
+                Arc::from(format!("http://{address}/mcp")),
+                initialized,
+                None,
+                None,
+                HashMap::new(),
+                1024,
+            )
+            .await;
+        server.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+            ),
+            "an oversized initialized ACK must hit the admitted handshake cap"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare budgeted and unbudgeted real DELETE bodies"
+    )]
+    async fn budgeted_delete_response_uses_admitted_control_cap() {
+        use std::io::{Read as _, Write as _};
+
+        for budgeted in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = [0_u8; 8_192];
+                let read = socket.read(&mut request).unwrap();
+                assert!(request[..read].starts_with(b"DELETE /mcp "));
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                drop(socket.write_all(&vec![b'x'; 2_048]));
+            });
+            let client = McpSubrequestClient::for_tool(
+                McpCallout::fabricated(true).unwrap(),
+                Duration::from_secs(5),
+                256,
+                if budgeted { 1_024 } else { MAX_CONTROL_RESPONSE_BYTES },
+                budgeted,
+                None,
+            );
+            let result = client
+                .delete_session(
+                    Arc::from(format!("http://{address}/mcp")),
+                    Arc::from("session"),
+                    None,
+                    HashMap::new(),
+                )
+                .await;
+            server.join().unwrap();
+            if budgeted {
+                assert!(
+                    matches!(
+                        result,
+                        Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+                    ),
+                    "budgeted cleanup must reject above its admitted handshake cap: {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "unbudgeted cleanup retains the 1 MiB control cap: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real HTTP body proves the executor backstop signal"
+    )]
+    async fn oversized_tool_response_reports_streaming_executor_backstop() {
+        use std::io::{Read as _, Write as _};
+
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(true).unwrap(),
+            Duration::from_secs(5),
+            4_096,
+            1_024,
+            true,
+            None,
+        );
+        let message: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .unwrap();
+        let backstop = streaming_executor_backstop(client.response_limit(&message));
+        let signal = client.signal_handle();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let body = vec![b'x'; backstop + 1];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).unwrap();
+            drop(socket.write_all(&body));
+        });
+        let result = client
+            .post_message_with_max_sse_event_size(
+                Arc::from(format!("http://{address}/mcp")),
+                message,
+                None,
+                None,
+                HashMap::new(),
+                16 * 1024 * 1024,
+            )
+            .await;
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(
+            matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit, kind: McpResponseLimitKind::Tool }) if *limit == backstop)
+        );
     }
 
     #[test]
@@ -2251,6 +2614,7 @@ mod tests {
             Duration::from_secs(1),
             max_result_bytes,
             MAX_CONTROL_RESPONSE_BYTES,
+            false,
             None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
@@ -2281,6 +2645,7 @@ mod tests {
             Duration::from_secs(5),
             1024,
             MAX_CONTROL_RESPONSE_BYTES,
+            false,
             None,
         )
     }
@@ -2296,7 +2661,15 @@ mod tests {
         ));
         let response = sub_response(200, Some("text/event-stream"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await
             .unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Sse(_, _)));
@@ -2313,7 +2686,15 @@ mod tests {
         ));
         let response = sub_response(202, None, b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await
             .unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Accepted));
@@ -2336,7 +2717,15 @@ mod tests {
             Arc::clone(&cancelled),
         ));
         let err = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StreamableHttpError::AuthRequired(_)));
@@ -2352,7 +2741,15 @@ mod tests {
         ));
         let response = sub_response(200, Some("application/json"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await
             .unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
@@ -2378,7 +2775,7 @@ mod tests {
         ));
         assert!(matches!(
             signal.get(),
-            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048, .. })
         ));
     }
 
@@ -2440,13 +2837,16 @@ mod tests {
         // a typed 413, record the signal, cancel, and NOT return the partial buffer.
         let (mut body, cancelled) = erroring_body([Bytes::from_static(b"partial")]);
         let signal = Arc::new(OnceLock::new());
-        let result = collect_body(&mut body, 1024, &signal).await;
+        let result = collect_body(&mut body, 1024, McpResponseLimitKind::Tool, &signal).await;
         assert!(matches!(
             result,
             Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
         ));
         assert!(
-            matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 1024 })),
+            matches!(
+                signal.get(),
+                Some(TransportSignal::ResponseTooLarge { limit: 1024, .. })
+            ),
             "a next_chunk error on the armed drain records a 413 signal at the cap"
         );
         assert!(
@@ -2460,13 +2860,13 @@ mod tests {
         // Two 4-byte chunks exceed a 6-byte cap on the second chunk.
         let (mut body, cancelled) = fake_body([Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]);
         let signal = Arc::new(OnceLock::new());
-        let result = collect_body(&mut body, 6, &signal).await;
+        let result = collect_body(&mut body, 6, McpResponseLimitKind::Tool, &signal).await;
         assert!(matches!(
             result,
             Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
         ));
         assert!(
-            matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 6 })),
+            matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 6, .. })),
             "an over-cap buffer records a 413 signal at the local cap"
         );
         assert!(
@@ -2479,7 +2879,7 @@ mod tests {
     async fn collect_body_returns_bytes_on_clean_eof() {
         let (mut body, cancelled) = fake_body([Bytes::from_static(b"hello "), Bytes::from_static(b"world")]);
         let signal = Arc::new(OnceLock::new());
-        let bytes = collect_body(&mut body, 1024, &signal)
+        let bytes = collect_body(&mut body, 1024, McpResponseLimitKind::Tool, &signal)
             .await
             .expect("clean body collects");
         assert_eq!(bytes.as_ref(), b"hello world");
@@ -2497,7 +2897,15 @@ mod tests {
         let (body, _cancelled) = fake_body([Bytes::from_static(b"{not json")]);
         let response = sub_response(200, Some("application/json"), b"");
         let result = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await;
         assert!(
             matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))),
@@ -2602,7 +3010,15 @@ mod tests {
         )]);
         let response = sub_response(500, Some("application/json"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await
             .expect("a JSON-RPC error is a valid reply, surfaced as Json");
         assert!(matches!(
@@ -2617,7 +3033,15 @@ mod tests {
         let response = sub_response(500, Some("application/json"), b"");
         let client = client();
         let result = client
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await;
         let Err(StreamableHttpError::UnexpectedServerResponse(msg)) = result else {
             panic!("expected UnexpectedServerResponse for a non-JSON-RPC 500 body");
@@ -2634,7 +3058,15 @@ mod tests {
         let (body, cancelled) = fake_body([Bytes::from_static(b"boom")]);
         let response = sub_response(503, Some("text/plain"), b"");
         let result = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await;
         assert!(matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))));
         assert!(
@@ -2644,6 +3076,48 @@ mod tests {
     }
 
     // -- GET SSE stream path (Task 7) --
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "pre-open refusal and its typed signal are checked together"
+    )]
+    async fn exhausted_budgeted_get_reconnect_fails_before_opening_a_stream() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            2_048,
+            true,
+            None,
+        );
+        let limit = client.stream_cumulative_cap();
+        assert!(client.signal_state.admit_get_stream_bytes(limit));
+        assert!(client.signal_state.get_stream_exhausted());
+        let signal = client.signal_handle();
+        let reconnect_client = client.clone();
+        let result = reconnect_client
+            .get_stream_with_max_sse_event_size(
+                Arc::from("http://unreachable.invalid/mcp"),
+                None,
+                None,
+                None,
+                HashMap::new(),
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge {
+                limit: reached,
+                kind: McpResponseLimitKind::GetStream
+            }) if *reached == limit
+        ));
+    }
 
     #[tokio::test]
     async fn get_stream_forwards_event_stream() {
@@ -2703,7 +3177,15 @@ mod tests {
         ));
         let response = sub_response(200, Some("text/event-stream"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 8, test_signal())
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                1024,
+                8,
+                McpResponseLimitKind::Tool,
+                test_signal(),
+            )
             .await
             .unwrap();
         let StreamableHttpPostResponse::Sse(mut stream, _) = out else {
@@ -2727,6 +3209,7 @@ mod tests {
             Duration::from_secs(5),
             2_048,
             2_048,
+            true,
             None,
         );
         let initialize: ClientJsonRpcMessage = serde_json::from_str(
@@ -2745,7 +3228,15 @@ mod tests {
         let signal = test_signal();
         let response = sub_response(200, Some("text/event-stream"), b"");
         let out = client
-            .classify_streaming_post_response(response, body, false, cap, 16 * 1024 * 1024, Arc::clone(&signal))
+            .classify_streaming_post_response(
+                response,
+                body,
+                false,
+                cap,
+                16 * 1024 * 1024,
+                McpResponseLimitKind::Initialize,
+                Arc::clone(&signal),
+            )
             .await
             .unwrap();
         let StreamableHttpPostResponse::Sse(mut stream, _) = out else {
@@ -2754,7 +3245,7 @@ mod tests {
         assert!(matches!(futures::StreamExt::next(&mut stream).await, Some(Err(_))));
         assert!(matches!(
             signal.get(),
-            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048, .. })
         ));
     }
 

@@ -3259,6 +3259,7 @@ fn mcp_response_too_large_maps_to_413() {
         source: mcp_client::McpClientError::ResponseTooLarge {
             url: mcp_client::parse_display_url("https://mcp.example/mcp"),
             limit: 1_048_576,
+            kind: mcp_client::McpResponseLimitKind::Control,
         },
     };
     let action = resolve_error_action(&mut ctx, &err, false, b"{}");
@@ -4754,6 +4755,7 @@ fn runtime_tools_list_failure_sources() -> Vec<mcp_client::McpClientError> {
         mcp_client::McpClientError::ResponseTooLarge {
             url: url(),
             limit: 1_048_576,
+            kind: mcp_client::McpResponseLimitKind::Control,
         },
         mcp_client::McpClientError::Serialization(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
     ]

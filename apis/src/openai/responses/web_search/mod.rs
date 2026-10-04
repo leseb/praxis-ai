@@ -614,10 +614,17 @@ impl HttpFilter for WebSearchFilter {
 fn take_pending_search_calls(state: &mut ResponsesState) -> Option<(Vec<Value>, usize)> {
     let bytes = retained_json_values_bytes(&state.web_search_calls)?;
     let held = bytes.checked_mul(2)?;
-    if !state.retain_external_payload_bytes(held) || !state.can_retain_payload(0) {
+    // The queue moves into `calls`; it does not remain an additional owner in
+    // state. Admit the replacement before moving, then publish its local charge.
+    if !state.can_replace_retained_payload(bytes, held, 0) {
         return None;
     }
-    Some((mem::take(&mut state.web_search_calls), held))
+    let calls = mem::take(&mut state.web_search_calls);
+    if !state.retain_external_payload_bytes(held) {
+        state.web_search_calls = calls;
+        return None;
+    }
+    Some((calls, held))
 }
 
 /// Return the response fan-out cap this dispatcher published for the owner.
@@ -1025,7 +1032,9 @@ fn web_search_response_limit(
     let prior = web_search_results_bytes(prior_results)?.checked_mul(32)?;
     let request = query.len().checked_mul(8)?.checked_add(4_096)?;
     let available = limit.checked_sub(current)?.checked_sub(prior)?.checked_sub(request)?;
-    let response_limit = available / 32;
+    // The buffered transport can stage and copy a full chunk before its
+    // response-length check, even when the derived limit is only a few bytes.
+    let response_limit = available.checked_sub(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES)? / 32;
     (response_limit > 0).then_some(response_limit.min(MAX_SEARCH_RESPONSE_BYTES))
 }
 

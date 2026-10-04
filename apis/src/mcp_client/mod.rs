@@ -47,8 +47,10 @@ pub use self::streaming_selector::McpStreamingSelectorFilter;
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
-        MAX_CONTROL_RESPONSE_BYTES, MIN_TOOL_INITIALIZE_BYTES, McpCallout, bind_mcp_outbound_chain,
-        build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+        MAX_CONTROL_RESPONSE_BYTES, MIN_TOOL_INITIALIZE_BYTES, McpCallout, McpResponseLimitKind,
+        bind_mcp_outbound_chain, build_bare_outbound_pipeline, streaming_executor_backstop,
+        tool_delete_retained_reserve, tool_result_wire_cap, tool_stream_cumulative_cap, tool_stream_retained_reserve,
+        transport_signal_error, validate_mcp_target,
     },
 };
 use crate::StateOwner;
@@ -254,6 +256,9 @@ pub(crate) enum McpClientError {
 
         /// The effective response-size limit that was exceeded.
         limit: usize,
+
+        /// Exchange whose wire ceiling produced the limit.
+        kind: McpResponseLimitKind,
     },
 
     /// MCP server URL is invalid or resolves to a blocked address.
@@ -493,6 +498,7 @@ async fn open_tool_session(
     timeout: Duration,
     max_result_bytes: usize,
     initialize_limit: usize,
+    budgeted: bool,
     callout: &McpCallout,
     display_url: &McpDisplayUrl,
 ) -> Result<PooledSession, McpClientError> {
@@ -501,6 +507,7 @@ async fn open_tool_session(
         timeout,
         max_result_bytes,
         initialize_limit,
+        budgeted,
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();
@@ -599,7 +606,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     call_tool_with_forwarded_headers_bounded_initialize(
-        pool,
+        pool.map(|(pool, key)| (pool, Some(key))),
         server_url,
         headers,
         authorization,
@@ -611,6 +618,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
         timeout,
         max_result_bytes,
         MAX_CONTROL_RESPONSE_BYTES,
+        false,
         callout,
     )
     .await
@@ -628,7 +636,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
 )]
 #[expect(clippy::large_stack_frames, reason = "rmcp session setup owns its callout state")]
 pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
-    pool: Option<(&McpSessionPool, &McpPoolKey)>,
+    pool: Option<(&McpSessionPool, Option<&McpPoolKey>)>,
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
@@ -640,6 +648,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     timeout: Duration,
     max_result_bytes: usize,
     initialize_limit: usize,
+    budgeted: bool,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let initialize_limit = initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES);
@@ -650,9 +659,9 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     //    those sessions are explicitly closed in the background so their DELETE cannot consume this call's delivery
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
-    if let Some((pool, key)) = pool {
-        let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit);
-        session_pool::close_sessions_in_background(checkout.rejected);
+    if let Some((pool, Some(key))) = pool {
+        let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit, budgeted);
+        pool.close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
             let signal = session.begin_call();
             let outcome = tokio::time::timeout_at(
@@ -664,28 +673,28 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             return match outcome {
                 Ok(Ok(result)) => {
                     let rejected = pool.checkin(key.clone(), session);
-                    session_pool::close_sessions_in_background(rejected);
+                    pool.close_sessions_in_background(rejected);
                     Ok(result)
                 },
                 // A reused session's failure is evicted, never retried: rmcp already transparently reinitializes a 404
                 // `SessionExpired` session, so any error surfaced here is genuine and of unknown delivery — retrying a
                 // timeout or 5xx could execute a non-idempotent tool twice (at-most-once for the reused path).
                 Ok(Err(err)) => {
-                    session.close_before(deadline).await;
+                    pool.close_sessions_in_background(vec![session]);
                     Err(err)
                 },
                 Err(_elapsed) => {
                     // Read the signal (an oversized/SSRF exchange surfaced only when the deadline fired) before
                     // closing.
-                    session.close_before(deadline).await;
+                    pool.close_sessions_in_background(vec![session]);
                     Err(classify_deadline(&signal, &display_url, timeout))
                 },
             };
         }
     }
 
-    // 2. Fresh session: first use, a `None` pool, or the empty-fingerprint sentinel. Close (not drop) the service on
-    //    every post-serve exit so no background worker task is left holding our subrequest executor.
+    // 2. Fresh session: first use, no pool, or the empty-fingerprint sentinel. A request-owned pool tracks closure even
+    //    when the target is unkeyable and cannot be reused. Only callers without a pool use the call deadline.
     let mut session: Option<PooledSession> = None;
     let mut call_signal = None;
     let outcome = tokio::time::timeout_at(deadline, async {
@@ -699,6 +708,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             timeout,
             max_result_bytes,
             initialize_limit,
+            budgeted,
             callout,
             &display_url,
         )
@@ -717,10 +727,11 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     match outcome {
         Ok(Ok(result)) => {
             match (pool, session.take()) {
-                (Some((pool, key)), Some(session)) => {
+                (Some((pool, Some(key))), Some(session)) => {
                     let rejected = pool.checkin(key.clone(), session);
-                    session_pool::close_sessions_in_background(rejected);
+                    pool.close_sessions_in_background(rejected);
                 },
+                (Some((pool, None)), Some(session)) => pool.close_sessions_in_background(vec![session]),
                 (None, Some(session)) => session.close_before(deadline).await,
                 (_, None) => {},
             }
@@ -728,7 +739,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
         },
         Ok(Err(err)) => {
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_failed_tool_session(pool.map(|(pool, _key)| pool), session, deadline).await;
             }
             Err(err)
         },
@@ -737,7 +748,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             // oversized/SSRF exchange surfaced only when the deadline fired still
             // maps to its typed error.
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_failed_tool_session(pool.map(|(pool, _key)| pool), session, deadline).await;
             }
             Err(call_signal.map_or_else(
                 || McpClientError::Timeout {
@@ -747,6 +758,20 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
                 |signal| classify_deadline(&signal, &display_url, timeout),
             ))
         },
+    }
+}
+
+/// A pooled failure stays charged until rmcp releases its peer information
+/// and transport, even when the tool call's deadline has expired.
+async fn close_failed_tool_session(
+    pool: Option<&McpSessionPool>,
+    session: PooledSession,
+    deadline: tokio::time::Instant,
+) {
+    if let Some(pool) = pool {
+        pool.close_sessions_in_background(vec![session]);
+    } else {
+        session.close_before(deadline).await;
     }
 }
 

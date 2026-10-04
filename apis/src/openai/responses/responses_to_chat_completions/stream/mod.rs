@@ -592,6 +592,23 @@ impl StreamConverter {
         self.emit.callback_budget_failed
     }
 
+    /// Next sequence number after the events admitted by this converter.
+    pub(super) const fn next_sequence_number(&self) -> u64 {
+        self.emit.sequence_number
+    }
+
+    /// A failed terminal already went to the client; later provider chunks
+    /// cannot produce another terminal or affect the retained-payload meter.
+    pub(super) const fn failed_terminal_emitted(&self) -> bool {
+        matches!(self.phase, Phase::Failed)
+    }
+
+    /// A successful terminal was produced in an earlier callback. The logical
+    /// stream parser may still be holding it until finalization.
+    pub(super) const fn successful_terminal_emitted(&self) -> bool {
+        matches!(self.phase, Phase::EmittedTerminal)
+    }
+
     /// Create a converter for a streaming response.
     #[expect(
         clippy::too_many_lines,

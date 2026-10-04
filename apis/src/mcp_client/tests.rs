@@ -1362,6 +1362,107 @@ async fn start_method_recording_mcp_server() -> (String, tokio_util::sync::Cance
     (format!("http://{addr}/mcp"), ct, methods)
 }
 
+/// Hold a session DELETE in flight so its closing rmcp service remains live.
+async fn start_delayed_delete_mcp_server() -> (
+    String,
+    tokio_util::sync::CancellationToken,
+    StdArc<tokio::sync::Notify>,
+    StdArc<tokio::sync::Notify>,
+) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let service = StreamableHttpService::new(
+        || Ok(TestMcpServer::new()),
+        StdArc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_sse_keep_alive(None)
+            .with_cancellation_token(ct.child_token()),
+    );
+    let delete_started = StdArc::new(tokio::sync::Notify::new());
+    let delete_release = StdArc::new(tokio::sync::Notify::new());
+    let started = StdArc::clone(&delete_started);
+    let release = StdArc::clone(&delete_release);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let started = StdArc::clone(&started);
+                let release = StdArc::clone(&release);
+                async move {
+                    if request.method() == http::Method::DELETE {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, delete_started, delete_release)
+}
+
+/// A stateful server leaves a partial standalone GET event in rmcp's parser
+/// after the successful tool call has returned its session to the pool.
+async fn start_partial_get_mcp_server() -> (String, tokio_util::sync::CancellationToken, StdArc<tokio::sync::Notify>) {
+    use axum::response::IntoResponse as _;
+    use futures::StreamExt as _;
+
+    let ct = tokio_util::sync::CancellationToken::new();
+    let service = StreamableHttpService::new(
+        || Ok(TestMcpServer::new()),
+        StdArc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_sse_keep_alive(None)
+            .with_cancellation_token(ct.child_token()),
+    );
+    let partial_delivered = StdArc::new(tokio::sync::Notify::new());
+    let notify = StdArc::clone(&partial_delivered);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let notify = StdArc::clone(&notify);
+                async move {
+                    if request.method() == http::Method::GET {
+                        let partial = futures::stream::once(async move {
+                            notify.notify_one();
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(format!(
+                                "data: {}",
+                                "x".repeat(32 * 1024)
+                            )))
+                        })
+                        .chain(futures::stream::pending());
+                        return (
+                            [(http::header::CONTENT_TYPE, "text/event-stream")],
+                            axum::body::Body::from_stream(partial),
+                        )
+                            .into_response();
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, partial_delivered)
+}
+
 /// A stateful rmcp server whose session table can be cleared to force the next
 /// request through rmcp's 404 `SessionExpired` reinitialization path.
 async fn start_expirable_mcp_server() -> (
@@ -2030,7 +2131,7 @@ async fn oversized_tool_initialize_is_rejected_before_tool_call() {
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "large-initialize".to_owned()).unwrap();
     let result = call_tool_with_forwarded_headers_bounded_initialize(
-        Some((&pool, &key)),
+        Some((&pool, Some(&key))),
         &url,
         None,
         None,
@@ -2042,6 +2143,7 @@ async fn oversized_tool_initialize_is_rejected_before_tool_call() {
         INTEGRATION_TIMEOUT,
         2_048,
         2_048,
+        true,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await;
@@ -2064,7 +2166,7 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "small-initialize".to_owned()).unwrap();
     let result = call_tool_with_forwarded_headers_bounded_initialize(
-        Some((&pool, &key)),
+        Some((&pool, Some(&key))),
         &url,
         None,
         None,
@@ -2076,12 +2178,51 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
         INTEGRATION_TIMEOUT,
         2_048,
         2_048,
+        true,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await;
     assert!(result.is_ok(), "small initialize should permit a tool call: {result:?}");
     let retained = pool.retained_payload_bytes().unwrap();
     assert!(retained >= 32 * "instruction".len() + "small-initialize".len());
+    pool.drain().await;
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn parked_session_reserves_partial_get_sse_parser() {
+    let (url, ct, partial_delivered) = start_partial_get_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "partial-get".to_owned()).unwrap();
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, Some(&key))),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "ok"}),
+        INTEGRATION_TIMEOUT,
+        2_048,
+        2_048,
+        true,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "tool call must succeed while the GET stays open: {result:?}"
+    );
+    tokio::time::timeout(INTEGRATION_TIMEOUT, partial_delivered.notified())
+        .await
+        .expect("standalone GET must receive a partial SSE event");
+    let stream_reserve = tool_stream_retained_reserve(2_048, 2_048).unwrap();
+    assert!(
+        pool.retained_payload_bytes().unwrap() >= stream_reserve,
+        "the parked session must reserve its still-live partial SSE parser"
+    );
     pool.drain().await;
     ct.cancel();
 }
@@ -2468,6 +2609,10 @@ async fn dispatcher_namespaces_prevent_cross_filter_session_reuse() {
 /// Open one real, initialized session against `url` for direct pool bookkeeping
 /// tests (the fast paths that only touch `checkin`/`checkout`, not a full call).
 async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
+    open_pooled_session_with_budget(url, callout, false).await
+}
+
+async fn open_pooled_session_with_budget(url: &str, callout: &McpCallout, budgeted: bool) -> PooledSession {
     open_tool_session(
         url,
         None,
@@ -2478,6 +2623,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
         MAX_CONTROL_RESPONSE_BYTES,
+        budgeted,
         callout,
         &parse_display_url(url),
     )
@@ -2519,6 +2665,267 @@ async fn checkout_removes_emptied_key() {
         pool.checkout(&key, TEST_MAX_RESULT_BYTES).session.is_none(),
         "the emptied key must be removed, so a second checkout finds nothing"
     );
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn budgeted_checkout_rejects_unbudgeted_get_stream_session() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "budget-mode".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let rejected = pool.checkin(key.clone(), open_pooled_session(&url, &callout).await);
+    close_sessions(rejected).await;
+
+    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, true);
+    assert!(
+        checkout.session.is_none(),
+        "an unbounded GET session cannot satisfy a budgeted checkout"
+    );
+    assert_eq!(checkout.rejected.len(), 1);
+    close_sessions(checkout.rejected).await;
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn background_closing_session_remains_charged_until_delete_finishes() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "closing-owner".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let session = open_pooled_session_with_budget(&url, &callout, true).await;
+    let parked_bytes = pool.retained_payload_bytes().unwrap();
+    assert_eq!(parked_bytes, 0);
+    assert!(pool.checkin(key.clone(), session).is_empty());
+    let parked_bytes = pool.retained_payload_bytes().unwrap();
+    assert!(parked_bytes > "closing-owner".len());
+
+    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, false);
+    assert!(checkout.session.is_none());
+    assert_eq!(checkout.rejected.len(), 1);
+    pool.close_sessions_in_background(checkout.rejected);
+    tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+        .await
+        .expect("background DELETE must start");
+    let mut state = crate::openai::responses::state::ResponsesState::default();
+    let (parked, closing) = pool.retained_payload_parts().unwrap();
+    assert_eq!(parked, 0);
+    assert!(closing > 0);
+    state.retained_mcp_session_bytes = parked;
+    state.retained_mcp_closing_pool = Some(pool.clone());
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 16);
+    assert!(!state.can_retain_payload(32), "live closing owner must block admission");
+    assert!(
+        pool.retained_payload_bytes().unwrap() >= parked_bytes - "closing-owner".len(),
+        "closing peer info and GET stream remain live until DELETE completes"
+    );
+    delete_release.notify_one();
+    tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+        while pool.retained_payload_bytes() != Some(0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("closing charge must clear after DELETE completes");
+    assert!(
+        state.can_retain_payload(32),
+        "released closing owner must free request-wide admission"
+    );
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn budgeted_background_delete_charges_its_buffered_response_while_in_flight() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let fingerprint = "small-delete";
+    let key = McpPoolKey::new(McpPoolNamespace::new(), fingerprint.to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, Some(&key))),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "warm"}),
+        INTEGRATION_TIMEOUT,
+        256,
+        1_024,
+        true,
+        &callout,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "small admitted initialize should open a session: {result:?}"
+    );
+    let parked = pool.retained_payload_bytes().unwrap();
+    let checkout = pool.checkout_with_initialize_limit(&key, 256, 1_024, true);
+    assert!(checkout.rejected.is_empty());
+    let session = checkout.session.expect("warm session must be reusable");
+    let peer_bytes =
+        crate::openai::responses::state::retained_json_bytes(session.service().peer_info().unwrap().as_ref()).unwrap();
+    let expected = peer_bytes + tool_stream_retained_reserve(256, 1_024).unwrap() + 2 * 1_024;
+    pool.close_sessions_in_background(vec![session]);
+    tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+        .await
+        .expect("background DELETE must start");
+    let closing = pool.retained_closing_payload_bytes().unwrap();
+    delete_release.notify_one();
+    tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+        while pool.retained_closing_payload_bytes() != Some(0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("closing charge must clear after DELETE");
+    assert_eq!(
+        parked - fingerprint.len(),
+        expected,
+        "parked owner must pre-reserve DELETE"
+    );
+    assert_eq!(
+        closing, expected,
+        "closing owner must retain the same charge through DELETE"
+    );
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn timed_out_pooled_tool_sessions_remain_charged_during_delete() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "timed-close".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    // First establish a reusable initialized session; then exercise both the
+    // reused and fresh timeout branches with a server-held DELETE.
+    let warm = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, Some(&key))),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "warm"}),
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
+        true,
+        &callout,
+    )
+    .await;
+    assert!(warm.is_ok());
+
+    for expected_parked in [true, false] {
+        assert_eq!(pool.retained_payload_bytes().unwrap() > 0, expected_parked);
+        let result = call_tool_with_forwarded_headers_bounded_initialize(
+            Some((&pool, Some(&key))),
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "slow",
+            serde_json::json!({"sleep_ms": 5_000}),
+            Duration::from_secs(1),
+            TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
+            true,
+            &callout,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(McpClientError::Timeout { .. })),
+            "slow tool must time out"
+        );
+        tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+            .await
+            .expect("timed-out session DELETE must start");
+        assert!(
+            pool.retained_payload_bytes().unwrap() > 0,
+            "timed-out session must remain charged while rmcp owns cleanup"
+        );
+        delete_release.notify_one();
+        tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+            while pool.retained_payload_bytes() != Some(0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed-out session charge must clear after DELETE");
+    }
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn unkeyable_budgeted_tool_session_remains_charged_during_delete() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let headers = serde_json::json!({"X-Target-Tenant": "A", "x-target-tenant": "B"});
+    assert!(McpPoolKey::new(McpPoolNamespace::new(), String::new()).is_none());
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, None)),
+        &url,
+        Some(&headers),
+        None,
+        &[],
+        None,
+        None,
+        "slow",
+        serde_json::json!({"sleep_ms": 5_000}),
+        Duration::from_secs(1),
+        TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
+        true,
+        &callout,
+    )
+    .await;
+    assert!(matches!(result, Err(McpClientError::Timeout { .. })));
+    tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+        .await
+        .expect("timed-out unkeyable session DELETE must start");
+    assert!(
+        pool.retained_payload_bytes().unwrap() > 0,
+        "request pool must charge an unkeyable budgeted session until rmcp closes"
+    );
+    delete_release.notify_one();
+    tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+        while pool.retained_payload_bytes() != Some(0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unkeyable session charge must clear after DELETE");
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn checkout_rejects_session_whose_idle_get_exhausted_its_budget() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "exhausted-get".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let session = open_pooled_session_with_budget(&url, &callout, true).await;
+    let signal_state = session.signal_state_for_test();
+    assert!(pool.checkin(key.clone(), session).is_empty());
+
+    assert!(!signal_state.admit_get_stream_bytes(usize::MAX));
+    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, true);
+    assert!(
+        checkout.session.is_none(),
+        "an exhausted session cannot resume a later tool call"
+    );
+    assert_eq!(checkout.rejected.len(), 1);
+    close_sessions(checkout.rejected).await;
     ct.cancel();
 }
 
@@ -2925,7 +3332,10 @@ fn classify_deadline_maps_size_signal_to_413_else_timeout() {
     let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
     assert!(
         signal
-            .set(subrequest_transport::TransportSignal::ResponseTooLarge { limit: 5 })
+            .set(subrequest_transport::TransportSignal::ResponseTooLarge {
+                limit: 5,
+                kind: McpResponseLimitKind::Control,
+            })
             .is_ok(),
         "signal OnceLock should be empty"
     );

@@ -1338,6 +1338,80 @@ async fn aggregate_budget_stops_later_searches_and_marks_call_incomplete() {
 }
 
 #[tokio::test]
+async fn retained_budget_allows_later_small_store_after_tight_first_call_cap() {
+    let response = one_result("file-a", "a.txt", 0.9, "small");
+    let response_bytes = serde_json::to_vec(&response).unwrap().len();
+    let server = MockServer::json(200, &response);
+    let filter = make_filter(
+        server.port,
+        "max_response_bytes: 1024\nmax_total_response_bytes: 4096\n",
+    );
+    let mut state = one_pending_state(&["vs-a", "vs-b"]);
+    let baseline = state.retained_payload_bytes().unwrap();
+    let plan = build_search_plan(&state, &state.file_search_assignments);
+    let specs = build_search_specs(&plan);
+    let execution_bytes = plan.retained_payload_bytes().unwrap() + outbound_request_peak_bytes(&specs).unwrap();
+    // Two decoder allowances plus enough wire bytes for both small bodies.
+    // This still yields an aggregate wire cap below the configured 1024-byte
+    // per-call ceiling, so each search needs a cap based on remaining bytes.
+    let available = 2 * 65_536 + 4 * (response_bytes * 2 + 64);
+    assert!(available < 2 * 65_536 + 4 * 1024);
+    state.apply_retained_payload_limit(baseline + execution_bytes + available);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "both small store responses fit the retained budget"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.retained_payload_failed);
+    assert!(state.dispatch_failure.is_none());
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn retained_budget_later_store_overflow_stays_terminal_with_open_policy() {
+    let small = one_result("file-a", "a.txt", 0.9, "small");
+    let small_bytes = serde_json::to_vec(&small).unwrap().len();
+    let server = MockServer::routes([
+        ("vs-a", 200, small, Duration::ZERO),
+        (
+            "vs-b",
+            200,
+            one_result("file-b", "b.txt", 0.8, &"x".repeat(4_096)),
+            Duration::ZERO,
+        ),
+    ]);
+    let filter = make_filter(
+        server.port,
+        "on_failure: open\nmax_response_bytes: 1024\nmax_total_response_bytes: 4096\n",
+    );
+    let mut state = one_pending_state(&["vs-a", "vs-b"]);
+    let baseline = state.retained_payload_bytes().unwrap();
+    let plan = build_search_plan(&state, &state.file_search_assignments);
+    let specs = build_search_specs(&plan);
+    let execution_bytes = plan.retained_payload_bytes().unwrap() + outbound_request_peak_bytes(&specs).unwrap();
+    let available = 2 * 65_536 + 4 * (small_bytes * 2 + 64);
+    state.apply_retained_payload_limit(baseline + execution_bytes + available);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "the later store must use the remaining byte cap"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.retained_payload_failed,
+        "open policy cannot ignore a retained-budget overflow"
+    );
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+}
+
+#[tokio::test]
 async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
     let server = MockServer::start_with(|_path| MockResponse {
         body: "x".to_owned(),
@@ -1393,7 +1467,13 @@ async fn per_call_overflow_remains_fail_open_when_aggregate_budget_only_tightens
         "on_failure: open\nmax_response_bytes: 256\nmax_total_response_bytes: 8192\n",
     );
     let mut state = one_pending_state(&["vs-a"]);
-    state.apply_retained_payload_limit(4_096);
+    let baseline = state.retained_payload_bytes().unwrap();
+    let plan = build_search_plan(&state, &state.file_search_assignments);
+    let specs = build_search_specs(&plan);
+    let execution_bytes = plan.retained_payload_bytes().unwrap() + outbound_request_peak_bytes(&specs).unwrap();
+    // Leave enough room for one decoder's fixed allowance and a per-call 256
+    // byte response, while the request-wide cap still tightens the total.
+    state.apply_retained_payload_limit(baseline + execution_bytes + 80_000);
     let mut ctx = make_context(Some(state));
 
     assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
@@ -1448,7 +1528,11 @@ async fn aggregate_response_overflow_stops_later_searches_when_callout_policy_is
     let mut state = one_pending_state(&store_refs);
     let baseline = state.retained_payload_bytes().unwrap();
     let plan = build_search_plan(&state, &state.file_search_assignments);
-    state.apply_retained_payload_limit(baseline + plan.retained_payload_bytes().unwrap() + 6_000);
+    let specs = build_search_specs(&plan);
+    let execution_bytes = plan.retained_payload_bytes().unwrap() + outbound_request_peak_bytes(&specs).unwrap();
+    // Nine pages reserve 64 KiB of decoder headroom each. The remaining
+    // allowance fits one scheduled response but not its 4 KiB body.
+    state.apply_retained_payload_limit(baseline + execution_bytes + 600_000);
     let mut ctx = make_context(Some(state));
 
     assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));

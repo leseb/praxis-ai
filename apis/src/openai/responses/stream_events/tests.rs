@@ -818,6 +818,117 @@ fn deferred_terminal_preflights_canonical_output_owners() {
 }
 
 #[test]
+fn deferred_terminal_reserves_wire_copy_before_serializing() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        accumulated_output: vec![json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "x".repeat(65_536)}]
+        })],
+        response_object: json!({"id":"resp_budget", "object":"response", "status":"completed", "output":[]}),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type":"response.completed", "response":{"id":"resp_budget", "status":"completed", "output":[]}}),
+    };
+    state.retained_stream_parser_bytes = terminal.retained_payload_bytes().unwrap();
+    let limit =
+        state.retained_payload_bytes().unwrap() + super::canonicalization_staging_bytes(&state, 0).unwrap() + 1_000;
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn deferred_terminal_reserves_client_tool_echo_before_canonicalization() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        response_object: json!({"id":"resp_budget", "object":"response", "status":"completed", "output":[], "tools":[]}),
+        client_tool_echo: Some(ClientToolEcho {
+            tools: vec![json!({"type":"custom", "name":"public", "description":"x".repeat(65_536)})],
+            tool_choice: json!("auto"),
+        }),
+        ..ResponsesState::default()
+    };
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type":"response.completed", "response":{"id":"resp_budget", "output":[]}}),
+    };
+    let limit = state.retained_payload_bytes().unwrap() + terminal.retained_payload_bytes().unwrap() + 1_024;
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert!(terminal.payload["response"]["output"].as_array().unwrap().is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn deferred_terminal_reserves_namespaced_call_fanout_before_canonicalization() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let namespace = "n".repeat(8_192);
+    let mut state = ResponsesState {
+        accumulated_output: (0..128)
+            .map(|index| {
+                json!({
+                    "type": "function_call", "id": format!("fc_{index}"),
+                    "call_id": format!("call_{index}"), "name": "private",
+                    "arguments": "{}", "status": "completed"
+                })
+            })
+            .collect(),
+        response_object: json!({"id":"resp_budget", "object":"response", "status":"completed", "output":[]}),
+        client_tool_echo: Some(ClientToolEcho {
+            tools: vec![
+                json!({"type":"namespace", "name":namespace.as_str(), "tools":[{"type":"function", "name":"public", "parameters":{"type":"object"}}]}),
+            ],
+            tool_choice: json!("auto"),
+        }),
+        ..ResponsesState::default()
+    };
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some(namespace),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    state.apply_retained_payload_limit(400_000);
+    assert!(state.can_retain_payload(0));
+    assert!(!state.can_retain_payload(super::canonicalization_staging_bytes(&state, 0).unwrap()));
+    ctx.extensions.insert(state);
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type":"response.completed", "response":{"id":"resp_budget", "output":[]}}),
+    };
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert!(terminal.payload["response"]["output"].as_array().unwrap().is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
 fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -1798,6 +1909,11 @@ fn arm_publishes_logical_stream_marker() {
         ctx.get_metadata("responses.logical_stream"),
         Some("true"),
         "arming must publish the per-round marker openai_agentic_loop consumes"
+    );
+    assert_eq!(
+        ctx.get_metadata(super::super::STREAM_ERROR_FINALIZER_ARMED_KEY),
+        Some("true"),
+        "the translator can leave overflow emission to this armed parser"
     );
 }
 
@@ -8329,4 +8445,73 @@ fn make_armed_context_with_filter(
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
     (filter, ctx)
+}
+
+#[tokio::test]
+async fn chat_budget_failure_replaces_deferred_terminal_with_error() {
+    use crate::openai::responses::responses_to_chat_completions::ResponsesToChatCompletionsFilter;
+
+    let (parser, mut ctx) = make_armed_context();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    ctx.extensions.insert(state);
+    ctx.current_filter_id = Some(1);
+    ctx.set_metadata("responses_to_chat_completions.armed", "true");
+    ctx.set_metadata("responses.response_id", "resp_deferred_budget");
+    ctx.set_metadata("responses_to_chat_completions.created_at", "1700000000");
+    let translator = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        translator.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.current_filter_id = Some(0);
+    parser.on_response(&mut ctx).await.unwrap();
+    ctx.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chatcmpl_deferred", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    ctx.current_filter_id = Some(1);
+    translator.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        std::str::from_utf8(body.as_ref().unwrap())
+            .unwrap()
+            .contains("event: response.completed")
+    );
+    ctx.current_filter_id = Some(0);
+    parser.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let wire = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+    assert!(wire.contains("event: response.created"));
+    assert!(!wire.contains("event: response.completed"));
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .deferred_terminal
+            .is_some()
+    );
+
+    ctx.current_filter_id = Some(1);
+    body = Some(Bytes::from(format!(": {}\n\n", "x".repeat(16_384))));
+    assert!(
+        translator.on_response_body(&mut ctx, &mut body, false).is_ok(),
+        "the parser still owns the terminal, so a budget error must remain in band"
+    );
+    ctx.current_filter_id = Some(0);
+    parser.on_response_body(&mut ctx, &mut body, true).unwrap();
+    let final_wire = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+    assert!(final_wire.contains("event: error"), "{final_wire}");
+    assert!(!final_wire.contains("event: response.completed"), "{final_wire}");
 }

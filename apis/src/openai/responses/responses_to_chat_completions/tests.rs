@@ -214,6 +214,261 @@ fn batched_tool_deltas_stop_before_repeated_ids_fill_the_wire_buffer() {
     assert!(out.is_empty(), "the offending callback must not expose partial deltas");
 }
 
+#[tokio::test]
+async fn committed_chat_stream_without_finalizer_emits_budget_error_in_band() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        context.get_metadata(RESPONSE_TRANSFORM_KEY),
+        Some(RESPONSE_TRANSFORM_STREAM)
+    );
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_budget", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": null}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        body.as_ref().is_some_and(|bytes| bytes
+            .windows(b"event: response.created".len())
+            .any(|part| part == b"event: response.created")),
+        "the first translated SSE chunk must commit before the overflow: {body:?}"
+    );
+    let emitted_sequences = body
+        .as_ref()
+        .unwrap()
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"data: "))
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter_map(|event| event.get("sequence_number")?.as_u64())
+        .collect::<Vec<_>>();
+    assert!(!emitted_sequences.is_empty());
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_budget", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let error = body.expect("a committed stream without a finalizer must emit its own SSE error");
+    let error = std::str::from_utf8(&error).unwrap();
+    assert!(error.starts_with("event: error\n"), "{error}");
+    assert!(error.contains("server_error"), "{error}");
+    assert!(!error.contains("response.completed"), "{error}");
+    let error_data = error.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+    let error_event: serde_json::Value = serde_json::from_str(error_data).unwrap();
+    assert_eq!(
+        error_event["sequence_number"].as_u64(),
+        emitted_sequences.last().and_then(|sequence| sequence.checked_add(1)),
+        "the fallback terminal must continue the delivered SSE sequence"
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+
+    body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none(), "later provider frames cannot follow the terminal error");
+}
+
+#[tokio::test]
+async fn failed_chat_stream_drops_later_over_budget_provider_chunk() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(
+        &serde_yaml::from_str::<serde_yaml::Value>("max_stream_events: 2").unwrap(),
+    )
+    .unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_failed_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_failed", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": null}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let first = body.expect("event cap must emit a failed terminal");
+    assert!(
+        first
+            .windows(b"event: response.failed".len())
+            .any(|window| window == b"event: response.failed")
+    );
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_failed", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        body.is_none(),
+        "no second terminal may follow response.failed: {body:?}"
+    );
+
+    body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none());
+}
+
+#[tokio::test]
+async fn completed_chat_stream_rejects_later_over_budget_provider_chunk() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_complete_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        body.as_ref().is_some_and(|chunk| chunk
+            .windows(b"event: response.completed".len())
+            .any(|window| window == b"event: response.completed")),
+        "the successful terminal must already be on the wire"
+    );
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(
+        filter.on_response_body(&mut context, &mut body, false).is_err(),
+        "post-terminal provider data must fail the transport without a second SSE terminal"
+    );
+    assert!(body.is_none(), "the offending provider bytes must be discarded");
+}
+
+#[test]
+fn committed_chat_stream_with_finalizer_leaves_terminal_error_to_parser() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(super::super::STREAM_ERROR_FINALIZER_ARMED_KEY, "true");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true
+    })));
+    let mut body = Some(Bytes::from_static(b"provider bytes"));
+
+    super::record_converter_budget_failure(&mut context, &mut body);
+
+    assert!(body.is_none(), "the armed logical parser emits the recorded error once");
+    assert_eq!(
+        context.get_metadata("responses.stream_error_code"),
+        Some("server_error")
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
 #[test]
 fn chat_translation_admits_small_and_rejects_oversized_owners() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -2371,6 +2626,58 @@ async fn finite_provider_error_rejects_over_budget_body_before_normalization() {
     );
     assert_eq!(body, None, "rejected provider body must be discarded");
     assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn committed_stream_finite_provider_error_without_finalizer_emits_in_band_budget_failure() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi", "stream":true, "store":false}));
+    state.iteration = 1;
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    context.extensions.insert(super::ObservedResponsesSse);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut body = Some(Bytes::from(json!({"error":{"message":"x".repeat(8192)}}).to_string()));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let error = body.expect("without a finalizer, the committed stream must emit the error directly");
+    let error = std::str::from_utf8(&error).unwrap();
+    assert!(error.starts_with("event: error\n"), "{error}");
+    assert!(error.contains("server_error"), "{error}");
+    assert!(!error.contains("response.completed"), "{error}");
+    assert_eq!(
+        context.get_metadata("responses.stream_error_code"),
+        Some("server_error")
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        context.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "later iterative rounds must stop after the terminal error"
+    );
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
 }
 
 #[tokio::test]

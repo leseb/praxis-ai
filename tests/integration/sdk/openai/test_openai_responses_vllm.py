@@ -5645,6 +5645,8 @@ def retained_tool_search_client(tmp_path, request):
         "  allow_private_upstreams: true # stubbed Files API callouts",
         1,
     )
+    if getattr(request, "param", None) == "file_metadata":
+        config = config.replace("max_retained_bytes: 16384", "max_retained_bytes: 196608", 1)
     config_path = _persist_config(config)
     log_path = str(tmp_path / "praxis.log")
     log_file = open(log_path, "w")
@@ -5779,7 +5781,7 @@ filter_chains:
               - filter: openai_stream_events
               - filter: openai_agentic_loop
                 max_infer_iters: 1
-                max_retained_bytes: 4096
+                max_retained_bytes: 196608
               - filter: openai_responses_proxy
               - filter: router
                 routes:
@@ -5803,7 +5805,6 @@ insecure_options:
             "              - filter: responses_to_chat_completions\n",
             1,
         )
-        config = config.replace("max_retained_bytes: 4096", "max_retained_bytes: 65536")
     if scenario.endswith("header_suppressed"):
         first = config.index("          - name: first\n")
         transition = config.index("            on_result:\n", first)
@@ -5912,6 +5913,132 @@ insecure_options:
                 print(_read_log_tail(str(log_path)), file=sys.stderr)
 
 
+def test_chat_budget_failure_without_logical_finalizer_is_terminal_sdk_sse(tmp_path):
+    """A skipped logical finalizer cannot turn a committed Chat stream into truncated 200."""
+
+    class ChatSseHandler(BaseHTTPRequestHandler):
+        requests: ClassVar[int] = 0
+
+        def do_POST(self):
+            type(self).requests += 1
+            self.rfile.read(int(self.headers["Content-Length"]))
+            first = (
+                b'data: {"id":"chatcmpl-budget","object":"chat.completion.chunk",'
+                b'"created":1,"model":"m","choices":[{"index":0,'
+                b'"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
+            )
+            second = (
+                "data: "
+                + json.dumps(
+                    {
+                        "id": "chatcmpl-budget",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "m",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "x" * 16_384},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                + "\n\n"
+            ).encode()
+            done = b"data: [DONE]\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(first) + len(second) + len(done)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            time.sleep(0.1)
+            self.wfile.write(second)
+            self.wfile.write(done)
+
+        def log_message(self, *_args):
+            pass
+
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), ChatSseHandler)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    proxy_port = _free_port()
+    config = f"""
+listeners:
+  - name: chat-budget-no-finalizer
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [chat-budget-no-finalizer]
+filter_chains:
+  - name: chat-budget-no-finalizer
+    filters:
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+                conditions:
+                  - when:
+                      path_prefix: "/never"
+              - filter: openai_agentic_loop
+                max_infer_iters: 1
+                max_retained_bytes: 65536
+                conditions:
+                  - when:
+                      path_prefix: "/never"
+              - filter: responses_to_chat_completions
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{backend.server_port}"]
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+"""
+    config_path = _persist_config(config)
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, str(log_path))
+            client = _make_openai_client(proxy_port)
+            events = list(
+                client.responses.create(model="m", input="hi", stream=True, store=False)
+            )
+            event_types = [event.type for event in events]
+            assert ChatSseHandler.requests == 1
+            assert event_types[0] == "response.created", event_types
+            assert event_types[-1] == "error", event_types
+            assert "response.completed" not in event_types, event_types
+            sequences = [event.sequence_number for event in events]
+            assert sequences == list(range(len(sequences))), sequences
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            backend.shutdown()
+            backend.server_close()
+            os.unlink(config_path)
+            if proc.returncode not in (0, -2):
+                print(_read_log_tail(str(log_path)), file=sys.stderr)
+
+
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 
@@ -5972,7 +6099,30 @@ class TestAgenticLoopVLLM:
     def test_initial_file_resolution_budget_rejects_through_sdk(
         self, retained_tool_search_client
     ):
-        """A declared oversized file is rejected before content or inference."""
+        """A small budget rejects before staging a Files API transport read."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file-budget"}],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedFileMetadataHandler.metadata_requests == 0
+        assert RetainedFileMetadataHandler.content_requests == 0
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    @pytest.mark.parametrize("retained_tool_search_client", ["file_metadata"], indirect=True)
+    def test_file_metadata_budget_rejects_before_content_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A larger budget admits metadata, then blocks oversized content."""
         with pytest.raises(APIStatusError) as exc_info:
             retained_tool_search_client.responses.create(
                 model=VLLM_MODEL,
@@ -6019,6 +6169,7 @@ class TestAgenticLoopVLLM:
         assert "during document extraction" in exc_info.value.response.text
         assert RetainedToolSearchBackendHandler.requests == 0
 
+    @requires_real_inference
     def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
         """The example's explicit 64 MiB aggregate budget admits an ordinary response."""
         response = agentic_client.responses.create(
@@ -6031,6 +6182,7 @@ class TestAgenticLoopVLLM:
         assert response.status in ("completed", "incomplete")
         assert response.output
 
+    @requires_real_inference
     def test_explicit_retained_budget_streaming_happy_path(self, agentic_client):
         """The same explicit budget preserves the normal logical SSE lifecycle."""
         stream = agentic_client.responses.create(

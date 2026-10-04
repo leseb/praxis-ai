@@ -377,9 +377,25 @@ impl ResponsesToChatCompletionsFilter {
         let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
             return Ok(FilterAction::Continue);
         };
+        if converter.failed_terminal_emitted() {
+            *body = None;
+            if end_of_stream {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.retained_chat_converter_bytes = 0;
+                }
+            } else {
+                ctx.insert_filter_state(converter);
+            }
+            return Ok(FilterAction::Continue);
+        }
+        // stream_events may have accepted the converter's terminal but still
+        // hold it for logical-stream finalization. Only the unarmed path has
+        // actually delivered that terminal to the client.
+        let completed_terminal_already_delivered = converter.successful_terminal_emitted()
+            && ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true");
         let incoming_bytes = body.as_ref().map_or(0, Bytes::len);
         if !converter_construction_fits(ctx, &mut converter, incoming_bytes) {
-            return record_converter_budget_failure(ctx, body, &converter);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
         }
         let now = ctx.time_source.now().as_secs();
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -400,13 +416,13 @@ impl ResponsesToChatCompletionsFilter {
         if let Some(chunk) = body.take() {
             converter.push_into(&chunk, &inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                return record_converter_budget_failure(ctx, body, &converter);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
             }
         }
         if end_of_stream {
             converter.finish_into(&inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                return record_converter_budget_failure(ctx, body, &converter);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
             }
         }
 
@@ -420,15 +436,41 @@ impl ResponsesToChatCompletionsFilter {
             })
         });
         if !admitted {
-            return record_converter_budget_failure(ctx, body, &converter);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
         }
 
+        if ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true") {
+            // When stream_events is skipped, this converter owns the wire SSE
+            // sequence. Save only successfully admitted events so a later
+            // bounded fallback error continues the delivered sequence.
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.logical_stream_sequence = converter.next_sequence_number();
+            }
+        }
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
             ctx.insert_filter_state(converter);
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Once a successful terminal was delivered, an oversized later callback can
+/// only fail the transport. Emitting an SSE error would create a second terminal.
+fn stream_converter_budget_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    completed_terminal_already_delivered: bool,
+) -> Result<FilterAction, FilterError> {
+    if completed_terminal_already_delivered {
+        *body = None;
+        return Err(
+            "responses_to_chat_completions: provider bytes after a terminal exceeded the retained payload budget"
+                .into(),
+        );
+    }
+    record_converter_budget_failure(ctx, body);
+    Ok(FilterAction::Continue)
 }
 
 /// Reserve independently retained converter state and the peak produced by a
@@ -535,14 +577,8 @@ fn converter_budget_remaining(
 
 /// A translated stream has committed HTTP 200. Keep only the bounded logical
 /// error path; later provider chunks are dropped by `transform_stream_response`.
-fn record_converter_budget_failure(
-    ctx: &mut HttpFilterContext<'_>,
-    body: &mut Option<Bytes>,
-    converter: &StreamConverter,
-) -> Result<FilterAction, FilterError> {
-    let client_terminal_already_sent = converter.successful_terminal_emitted()
-        && ctx.extensions.get::<ObservedResponsesSse>().is_some()
-        && ctx.get_metadata("responses.stream_completion").is_none();
+fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+    let finalizer_armed = ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) == Some("true");
     *body = None;
     ctx.set_metadata("responses.skip_persist", "true");
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -552,15 +588,13 @@ fn record_converter_budget_failure(
     }
     #[cfg(feature = "store")]
     super::store::discard_retained_request_payload(ctx);
-    if client_terminal_already_sent {
-        return Err("responses_to_chat_completions: budget overflow after SSE terminal".into());
-    }
     super::fs_end_stream_with_error_ctx(ctx, "server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
-    if ctx.get_metadata("responses.stream_completion").is_none() {
+    if !finalizer_armed {
+        // Conditional pipelines can translate a committed Chat SSE stream
+        // without stream_events. There is then no later callback to turn the
+        // recorded error into wire bytes, so emit its fixed-size terminal now.
         *body = Some(super::stream_events::encode_retained_payload_error(ctx));
-        ctx.extensions.insert(ObservedResponsesSse);
     }
-    Ok(FilterAction::Continue)
 }
 
 /// Admission before `responses_state_to_chat_request` allocates messages and
@@ -716,9 +750,20 @@ fn json_structure_counts(body: &[u8]) -> Option<(usize, usize, usize, usize)> {
     Some((objects, arrays, strings, numbers))
 }
 
-/// A finite response has not committed its translated wire body; reject it and
-/// prevent the outer response store from recording a successful completion.
-fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+/// A finite provider response can arrive after an earlier streamed round has
+/// committed the client response. End that stream in band; otherwise reject
+/// the uncommitted response as a server error.
+fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> FilterAction {
+    if ctx.extensions.get::<ObservedResponsesSse>().is_some()
+        || ctx
+            .extensions
+            .get::<praxis_filter::ClientResponseHeadersCommitted>()
+            .is_some()
+    {
+        record_converter_budget_failure(ctx, body);
+        return FilterAction::Continue;
+    }
+    *body = None;
     FilterAction::Reject(super::budget_error::response_rejection(
         ctx,
         FINITE_TRANSLATION_OVERFLOW_MESSAGE,
@@ -854,8 +899,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(_) => {
                 if end_of_stream {
                     if !finite_translation_fits(ctx, body.as_deref().unwrap_or_default()) {
-                        *body = None;
-                        return Ok(finite_translation_budget_failure(ctx));
+                        return Ok(finite_translation_budget_failure(ctx, body));
                     }
                     self.transform_finite_response(ctx, body)?;
                 }

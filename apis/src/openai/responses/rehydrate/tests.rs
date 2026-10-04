@@ -2465,6 +2465,22 @@ fn streaming_restore_remeasures_same_length_completed_output_rewrite() {
     assert!(!streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
 }
 
+#[test]
+fn streaming_restore_reuses_history_when_only_current_output_changes() {
+    let mut state = rehydrated_state("resp_prev");
+    state.messages.push(json!("h".repeat(1_048_576)));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 128);
+    let mut stable_budget = None;
+    assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
+    stable_budget.as_mut().unwrap().bytes += 32;
+    let charged_baseline = stable_budget.unwrap().bytes;
+    state.response_object = json!({"output": [{"text": "delta"}]});
+    state.mark_current_output_changed();
+    assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
+    assert_eq!(stable_budget.unwrap().bytes, charged_baseline);
+}
+
 #[tokio::test]
 async fn restores_streaming_across_chunk_boundary() {
     let filter = default_filter();

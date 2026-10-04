@@ -77,8 +77,6 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
-/// Pingora may hold and copy a full 64 KiB chunk before the response limit is checked.
-const CALLOUT_TRANSPORT_STAGING_BYTES: usize = 131_072;
 /// Conservative live-owner reserve for the pinned tiktoken fallback. Its
 /// large-piece BPE path holds 32-byte states, a growable merge heap, token
 /// vectors, and regex workspace alongside both formatted conversation strings.
@@ -310,7 +308,7 @@ impl CompactFilter {
                     .and_then(|bytes| bytes.checked_sub(conversation_text.len()))
                     .and_then(|bytes| bytes.checked_sub(system.len()))
                     .and_then(|bytes| bytes.checked_sub(request_bytes.checked_mul(2)?))
-                    .and_then(|bytes| bytes.checked_sub(CALLOUT_TRANSPORT_STAGING_BYTES))
+                    .and_then(|bytes| bytes.checked_sub(subrequest::MAX_TRANSPORT_STAGING_BYTES))
                     .ok_or(ReactiveCompactionError::RetainedBudget)?;
                 // The buffered client can hold its Vec and old capacity during
                 // growth while Pingora still owns a full transport chunk.
@@ -706,7 +704,7 @@ fn reactive_compaction_response_limit(
         .ok_or(())?;
     let staging = request
         .checked_add(conversation_text.len())
-        .and_then(|bytes| bytes.checked_add(CALLOUT_TRANSPORT_STAGING_BYTES))
+        .and_then(|bytes| bytes.checked_add(subrequest::MAX_TRANSPORT_STAGING_BYTES))
         .ok_or(())?;
     let remaining = limit
         .checked_sub(current)

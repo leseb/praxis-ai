@@ -367,6 +367,7 @@ impl OpenaiStreamEventsFilter {
             state.retained_stream_parser_bytes = 0;
         }
         ctx.insert_filter_state(self.new_round_state(iteration, output_index_offset));
+        ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "true");
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
         // consumes) to confirm this typed-streaming round can surface
@@ -578,6 +579,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         if !is_success_sse_response(ctx) {
             debug!("disarming stream_events: response is not 2xx text/event-stream");
             ctx.remove_filter_state::<StreamEventsState>();
+            ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "false");
             return Ok(FilterAction::Continue);
         }
 
@@ -589,6 +591,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         if response_is_encoded(ctx) {
             debug!("disarming stream_events: response carries Content-Encoding");
             ctx.remove_filter_state::<StreamEventsState>();
+            ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "false");
             return Ok(FilterAction::Continue);
         }
 
@@ -1496,6 +1499,32 @@ fn canonical_logical_output_bytes(state: &ResponsesState) -> Option<usize> {
     }
 }
 
+/// Reserve names copied into each restored client-tool output item. A single
+/// namespace in the reverse map can expand into many public call items while
+/// the canonical response and returned terminal output both remain live.
+fn terminal_restored_name_staging_bytes(state: &ResponsesState, output: &[Value]) -> Option<usize> {
+    let mut names = 0_usize;
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let Some(lowered) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| state.client_tool_lowering.get(name))
+        else {
+            continue;
+        };
+        names = names
+            .checked_add(retained_json_bytes(&lowered.original_name)?)?
+            .checked_add(lowered.namespace.as_deref().map_or(Some(0), retained_json_bytes)?)?
+            .checked_add(128)?;
+    }
+    // One name can be temporarily owned by the retyped item as well as both
+    // completed output trees during restoration.
+    names.checked_mul(3)
+}
+
 /// Reserve the transient owners created before a logical terminal is emitted.
 ///
 /// `canonicalize_logical_response` keeps one output in the returned terminal
@@ -1519,9 +1548,20 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
         &state.citation_files,
     )
     .ok()?;
+    // Client-tool restoration copies the echoed declarations into the
+    // canonical response and the deferred terminal before the final wire
+    // preflight. Admit those owners before either response is mutated.
+    let echoed_tools_bytes = state.client_tool_echo.as_ref().map_or(Some(0), |echo| {
+        retained_json_bytes(&echo.tools)?
+            .checked_add(retained_json_bytes(&echo.tool_choice)?)?
+            .checked_add(64)
+    })?;
+    let restored_names_bytes = terminal_restored_name_staging_bytes(state, output)?;
     output_bytes
         .checked_mul(2)?
         .checked_add(annotation_bytes.checked_mul(3)?)?
+        .checked_add(echoed_tools_bytes.checked_mul(2)?)?
+        .checked_add(restored_names_bytes)?
         .checked_add(existing_output_bytes)
 }
 
@@ -3435,6 +3475,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
     };
+    ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "false");
 
     // Preserve any non-terminal logical events `process_chunk` already emitted
     // for this final chunk, then append synthesized local-tool events and the
@@ -3645,8 +3686,20 @@ fn emit_deferred_terminal(
     if let Some(response) = terminal.payload.get_mut("response") {
         restore_snapshot_tools(response, state.client_tool_echo.as_ref());
     }
-    let terminal_bytes = retained_json_bytes(&terminal.payload);
-    let staging = terminal_bytes.and_then(|bytes| output.len().checked_add(bytes));
+    // The held JSON terminal remains live while its independently owned SSE
+    // serialization is appended. Reserve both owners, including normalization
+    // and the optional [DONE] frame, before writing to the output buffer.
+    let staging = normalized_sse_event_upper_bound(ctx, &terminal.event_type, &terminal.payload)
+        // Normalization can grow the held JSON owner as well as the wire copy.
+        .and_then(|event_bytes| event_bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(output.len()))
+        .and_then(|bytes| {
+            bytes.checked_add(if parser_state.deferred_done {
+                b"data: [DONE]\n\n".len()
+            } else {
+                0
+            })
+        });
     if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
         output.clear();
         record_retained_payload_overflow(ctx, parser_state);

@@ -2358,12 +2358,24 @@ fn web_search_response_limit_is_derived_before_dispatch() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
     let current = state.retained_payload_bytes().unwrap();
-    state.apply_retained_payload_limit(current + 32_768);
+    state.apply_retained_payload_limit(current + crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 32_768);
     ctx.extensions.insert(state);
 
     let limit = web_search_response_limit(&ctx, "query", &[]).unwrap();
     assert!(limit < MAX_SEARCH_RESPONSE_BYTES);
     assert!(limit <= (32_768 - 4_096 - "query".len() * 8) / 32);
+}
+
+#[test]
+fn web_search_rejects_before_dispatch_without_transport_staging_headroom() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + crate::subrequest::MAX_TRANSPORT_STAGING_BYTES - 1);
+    ctx.extensions.insert(state);
+
+    assert_eq!(web_search_response_limit(&ctx, "query", &[]), None);
 }
 
 #[test]
@@ -2379,6 +2391,7 @@ fn moving_pending_search_calls_reserves_the_parsed_action_owner() {
     };
     let before = state.retained_payload_bytes().unwrap();
     let call_bytes = retained_json_bytes(&state.web_search_calls[0]).unwrap();
+    state.apply_retained_payload_limit(before + call_bytes);
 
     let (calls, bytes) = take_pending_search_calls(&mut state).unwrap();
 
@@ -2391,4 +2404,32 @@ fn moving_pending_search_calls_reserves_the_parsed_action_owner() {
         before - call_bytes,
         "the charge is released only after the local owner is dropped"
     );
+}
+
+#[test]
+fn rejected_pending_search_transfer_restores_queue_without_external_charge() {
+    let call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "x".repeat(4_096)}
+    });
+    let mut state = ResponsesState {
+        web_search_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let before = state.retained_payload_bytes().unwrap();
+    let call_bytes = retained_json_bytes(&state.web_search_calls[0]).unwrap();
+    state.apply_retained_payload_limit(before + call_bytes - 1);
+
+    assert!(take_pending_search_calls(&mut state).is_none());
+    assert_eq!(
+        state.web_search_calls.len(),
+        1,
+        "rejected queue must remain with the caller"
+    );
+    assert_eq!(
+        state.retained_external_payload_bytes, 0,
+        "rejected charge must be rolled back"
+    );
+    assert_eq!(state.retained_payload_bytes(), Some(before));
 }

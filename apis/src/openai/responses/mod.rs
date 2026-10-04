@@ -83,6 +83,10 @@ pub use agentic_loop::AgenticBudgetPolicy;
 /// alone do not establish a committed response.
 #[cfg(feature = "openai-responses")]
 pub(crate) struct ObservedResponsesSse;
+/// Request-shared marker for a stream-events parser that can emit a recorded
+/// terminal error after a translated provider callback drops its body.
+#[cfg(feature = "openai-responses")]
+pub(crate) const STREAM_ERROR_FINALIZER_ARMED_KEY: &str = "responses.stream_error_finalizer_armed";
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
@@ -556,7 +560,7 @@ pub(crate) fn insert_budgeted_responses_state(
             return Err(FilterAction::Reject(error::responses_error_rejection(
                 413,
                 "invalid_request_error",
-                "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+                "initial request state exceeds openai_agentic_loop.max_retained_bytes",
             )));
         }
     }

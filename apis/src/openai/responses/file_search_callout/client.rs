@@ -64,9 +64,6 @@ const RESPONSE_BODY_BUDGET_UNIT_BYTES: usize = 1_048_576; // 1 MiB
 /// Charge wire bodies, parser scratch, and retained decoded storage.
 const RESPONSE_ADMISSION_WIRE_MULTIPLIER: usize = 4;
 
-/// Charge both the collected body and its decoded representation.
-const RESPONSE_DECODE_MEMORY_MULTIPLIER: usize = 2;
-
 /// Decoded-storage headroom reserved for each response in one execution.
 const RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES: usize = 65_536; // 64 KiB
 
@@ -582,8 +579,9 @@ impl FileSearchClient {
     }
 
     /// Search with a request-scoped ceiling for decoded result payload.
-    /// The collected body and decoded values coexist, so half of the available
-    /// bytes are reserved for each owner before a callout is scheduled.
+    /// Collected bodies, parser scratch, and decoded values coexist. Reserve
+    /// the same worst-case amount used by process-wide response admission
+    /// before a callout is scheduled.
     #[expect(
         clippy::too_many_lines,
         clippy::too_many_arguments,
@@ -603,7 +601,7 @@ impl FileSearchClient {
         let mut next_spec = 0_usize;
         let execution_started = Instant::now();
         let (total_response_limit, retained_payload_controls_limit) =
-            retained_response_body_limit(self.max_total_response_bytes, max_decoded_bytes);
+            retained_response_body_limit(self.max_total_response_bytes, max_decoded_bytes, specs.len());
         if total_response_limit == 0 {
             append_budget_failures(
                 &mut batch.failures,
@@ -613,15 +611,7 @@ impl FileSearchClient {
             );
             return batch;
         }
-        let per_response_limit = self.max_response_bytes.min(total_response_limit);
-        // A retained aggregate cap can tighten the total without changing the
-        // configured per-call ceiling. Only a tightened per-call ceiling makes
-        // `ResponseTooLarge` an aggregate-budget failure.
-        let retained_payload_controls_per_response_limit = retained_payload_controls_per_call(
-            self.max_response_bytes,
-            total_response_limit,
-            retained_payload_controls_limit,
-        );
+        let admission_per_response_limit = self.max_response_bytes.min(total_response_limit);
         let execution_timeout = transport
             .identity
             .deadline(execution_started, self.timeout)
@@ -631,24 +621,16 @@ impl FileSearchClient {
         // re-runs the private-IP check (literal targets bypass it), making the
         // `prepare_url_target` validation hook the sole runtime SSRF gate.
         let allow_private = transport.outbound.allow_private_upstreams();
-        // One executor drives the whole fan-out: `run` takes `&self`, so the
-        // concurrent sub-requests share a single transport and downstream
-        // projection. Outbound headers are identical across specs, so they are
-        // built once and cloned only at each owned `SubRequest` boundary.
-        let executor = FilteredSubrequestExecutor::for_callout(
-            self.subrequest_client.clone(),
-            transport.downstream.clone(),
-            0,
-            per_response_limit,
-            execution_timeout,
-        );
+        // Outbound headers are identical across specs, so build them once and
+        // clone only at each owned `SubRequest` boundary. Each chunk gets an
+        // executor whose body cap fits the remaining retained allowance.
         let outbound_headers = self.build_outbound_headers(request_headers);
         let admission = match self
             .acquire_execution_admission(
                 specs.len(),
                 execution_started,
                 execution_timeout,
-                per_response_limit,
+                admission_per_response_limit,
                 total_response_limit,
             )
             .await
@@ -668,8 +650,18 @@ impl FileSearchClient {
                 break;
             }
 
-            let chunk_len =
-                self.reserved_chunk_len(consumed_response_bytes, specs.len() - next_spec, total_response_limit);
+            let remaining_bytes = total_response_limit.saturating_sub(consumed_response_bytes);
+            let per_response_limit = if retained_payload_controls_limit {
+                self.max_response_bytes.min(remaining_bytes)
+            } else {
+                admission_per_response_limit
+            };
+            let chunk_len = self.reserved_chunk_len(
+                consumed_response_bytes,
+                specs.len() - next_spec,
+                total_response_limit,
+                retained_payload_controls_limit,
+            );
             if chunk_len == 0 {
                 if let Some(remaining_specs) = specs.get(next_spec..) {
                     append_budget_failures(
@@ -685,6 +677,21 @@ impl FileSearchClient {
             let Some(chunk) = specs.get(next_spec..next_spec.saturating_add(chunk_len)) else {
                 break;
             };
+            let retained_payload_controls_per_response_limit = retained_payload_controls_per_call(
+                self.max_response_bytes,
+                per_response_limit,
+                retained_payload_controls_limit,
+            );
+            // All callouts in this chunk share one executor and its bounded
+            // response cap. A later retained-budget chunk can use a smaller
+            // cap after earlier successful bodies consume some allowance.
+            let executor = FilteredSubrequestExecutor::for_callout(
+                self.subrequest_client.clone(),
+                transport.downstream.clone(),
+                0,
+                per_response_limit,
+                execution_timeout,
+            );
             let futures = chunk.iter().map(|spec| {
                 self.search_one(
                     spec,
@@ -1030,12 +1037,23 @@ impl FileSearchClient {
     }
 
     /// Calculate a chunk whose worst-case bodies fit the remaining budget.
-    fn reserved_chunk_len(&self, consumed_bytes: usize, remaining_specs: usize, total_limit: usize) -> usize {
+    fn reserved_chunk_len(
+        &self,
+        consumed_bytes: usize,
+        remaining_specs: usize,
+        total_limit: usize,
+        retained_payload_controls_limit: bool,
+    ) -> usize {
         let remaining_bytes = total_limit.saturating_sub(consumed_bytes);
-        if remaining_bytes == 0 {
+        if remaining_bytes == 0 || self.max_response_bytes == 0 {
             return 0;
         }
-        let reserved = if total_limit < self.max_response_bytes {
+        let reserved = if retained_payload_controls_limit {
+            // Once a retained cap controls the aggregate, run another store
+            // sequentially against the unspent bytes rather than failing it
+            // just because the configured per-call ceiling is larger.
+            remaining_bytes / self.max_response_bytes.min(remaining_bytes)
+        } else if total_limit < self.max_response_bytes {
             usize::from(consumed_bytes == 0)
         } else {
             remaining_bytes / self.max_response_bytes
@@ -2323,11 +2341,16 @@ fn aggregate_limit_error(store_id: &str, limit: usize, retained_payload: bool) -
 }
 
 /// Intersect the configured response ceiling with the request-wide allowance.
-fn retained_response_body_limit(configured_limit: usize, available_bytes: usize) -> (usize, bool) {
+/// The decoder may retain up to one body-sized allocation plus fixed per-page
+/// storage while the wire body and parser-owned values are still live.
+fn retained_response_body_limit(configured_limit: usize, available_bytes: usize, spec_count: usize) -> (usize, bool) {
     if available_bytes == usize::MAX {
         return (configured_limit, false);
     }
-    let retained_limit = available_bytes / RESPONSE_DECODE_MEMORY_MULTIPLIER;
+    let retained_limit = RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES
+        .checked_mul(spec_count)
+        .and_then(|overhead| available_bytes.checked_sub(overhead))
+        .map_or(0, |remaining| remaining / RESPONSE_ADMISSION_WIRE_MULTIPLIER);
     (configured_limit.min(retained_limit), retained_limit < configured_limit)
 }
 
@@ -2390,11 +2413,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_BODY_BUDGET_UNIT_BYTES,
-        RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchFailure, SearchResult, SearchSpec,
-        VectorStoreSearchRequest, append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results,
-        parse_response_body, response_admission_units, retained_payload_controls_per_call,
-        retained_response_body_limit,
+        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_ADMISSION_WIRE_MULTIPLIER,
+        RESPONSE_BODY_BUDGET_UNIT_BYTES, RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchFailure,
+        SearchResult, SearchSpec, VectorStoreSearchRequest, append_unprocessed_deadline_failures,
+        deserialize_search_results, merge_top_results, parse_response_body, response_admission_units,
+        retained_payload_controls_per_call, retained_response_body_limit,
     };
 
     const MINIMAL_RESULT: &[u8] = br#"{"content":[],"file_id":"","filename":"","score":0}"#;
@@ -2458,13 +2481,33 @@ mod tests {
 
     #[test]
     fn retained_budget_reserves_raw_and_decoded_response_owners() {
-        assert_eq!(retained_response_body_limit(8_192, usize::MAX), (8_192, false));
-        assert_eq!(retained_response_body_limit(8_192, 4_096), (2_048, true));
-        assert_eq!(retained_response_body_limit(1_024, 4_096), (1_024, false));
-        assert_eq!(retained_response_body_limit(1_024, 2_048), (1_024, false));
+        assert_eq!(retained_response_body_limit(8_192, usize::MAX, 1), (8_192, false));
+        assert_eq!(retained_response_body_limit(8_192, 4_096, 1), (0, true));
+        assert_eq!(retained_response_body_limit(1_024, 100_000, 1), (1_024, false));
+        assert_eq!(retained_response_body_limit(1_024, 68_000, 1), (616, true));
         assert!(!retained_payload_controls_per_call(512, 1_024, true));
         assert!(retained_payload_controls_per_call(2_048, 1_024, true));
         assert!(!retained_payload_controls_per_call(2_048, 1_024, false));
+    }
+
+    #[test]
+    fn retained_budget_reserves_numeric_decode_expansion_across_pages() {
+        let body = format!(
+            r#"{{"data":[{{"file_id":"f","filename":"f","score":1,"content":[],"attributes":{{"a":[{}]}}}}]}}"#,
+            std::iter::repeat_n("1e15", 300).collect::<Vec<_>>().join(",")
+        );
+        let available = 4_000;
+        let decoded = parse_response_body(body.as_bytes(), "store", 10).expect("valid compact numeric result");
+        let decoded_bytes =
+            crate::openai::responses::state::retained_json_bytes(&decoded.data).expect("decoded size is representable");
+        assert!(body.len() < available);
+        assert!(body.len() + decoded_bytes > available);
+        assert_eq!(retained_response_body_limit(1_048_576, available, 1), (0, true));
+
+        let available = 300_000;
+        let (limit, retained_controls) = retained_response_body_limit(1_048_576, available, 3);
+        assert!(retained_controls);
+        assert!(limit * RESPONSE_ADMISSION_WIRE_MULTIPLIER + 3 * RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES <= available);
     }
 
     #[test]
