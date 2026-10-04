@@ -1992,6 +1992,38 @@ async fn call_tool_timeout() {
 // Session pooling / reuse (#1019)
 // =========================================================================
 
+/// A legal minimum result limit must still reach the tool call after initialize.
+/// This server's tool reply exceeds the separate 2 KiB result parse allowance.
+#[tokio::test]
+async fn budgeted_minimum_result_limit_reaches_tool_after_initialize() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let callout = McpCallout::fabricated(true).unwrap();
+    let result = call_tool_with_forwarded_headers_with_budget(
+        None,
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "ok"}),
+        INTEGRATION_TIMEOUT,
+        1_024,
+        1_024,
+        Some(2_048),
+        &callout,
+    )
+    .await;
+    ct.cancel();
+    assert_eq!(method_count(&methods, "initialize"), 1);
+    assert_eq!(method_count(&methods, "tools/call"), 1);
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
+}
+
 /// Two `tools/call`s for the same identity across consecutive rounds share one
 /// initialized session: exactly one `initialize` handshake, two `tools/call`s.
 #[tokio::test]

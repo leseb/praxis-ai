@@ -1777,9 +1777,6 @@ struct McpResultAdmission {
     retain_session: bool,
 }
 
-/// Parsed JSON metadata, the raw initialize body, and rmcp's peer-info owner
-/// can coexist. This also covers pathological tiny-object/array node overhead.
-const MCP_INITIALIZE_PEAK_MULTIPLIER: usize = 256;
 /// A smaller response cap cannot reliably admit a normal MCP handshake.
 const MIN_BUDGETED_INITIALIZE_BYTES: usize = 1_024;
 
@@ -1834,7 +1831,7 @@ fn aggregate_mcp_result_limit(
     // already completed results may coexist with later handshakes.
     let control_divisor = mcp_calls
         .len()
-        .checked_mul(MCP_INITIALIZE_PEAK_MULTIPLIER)?
+        .checked_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)?
         .checked_mul(4)?;
     let control_response_bytes = available
         .checked_sub(result_floor)?
@@ -1844,7 +1841,7 @@ fn aggregate_mcp_result_limit(
         return None;
     }
     let control_peak = control_response_bytes
-        .checked_mul(MCP_INITIALIZE_PEAK_MULTIPLIER)?
+        .checked_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)?
         .checked_mul(mcp_calls.len())?;
     let result_limit = configured_limit.min(available.checked_sub(control_peak)? / 3);
     (result_limit >= minimum).then_some(McpResultAdmission {
