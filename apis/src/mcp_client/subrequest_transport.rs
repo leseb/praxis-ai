@@ -112,14 +112,17 @@ pub(crate) fn tool_stream_cumulative_cap(tool_wire_cap: usize, initialize_limit:
     tool_wire_cap.saturating_add(initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES))
 }
 
-/// Reserve the parser's unfinished line, decoded event, and source chunk that
-/// can coexist while a standalone GET remains polled by a parked rmcp session.
+/// Reserve a parked GET stream's parser, transport, and rmcp message queues.
+/// The cumulative cap bounds all raw events across both queues. JSON number
+/// normalization can grow a three-byte exponent token to 24 bytes, so decoded
+/// JSON-RPC messages need up to eight raw-byte owners. Four more cover the raw
+/// SSE event, unfinished parser line, streaming body, and executor chunk.
 pub(crate) fn tool_stream_retained_reserve(result_payload_limit: usize, initialize_limit: usize) -> Option<usize> {
     let wire = result_payload_limit
         .checked_mul(MAX_JSON_STRING_EXPANSION)?
         .checked_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)?;
     wire.checked_add(initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES))?
-        .checked_mul(3)
+        .checked_mul(12)
 }
 
 /// The `mcp-session-id` header carrying the Streamable-HTTP session token.
@@ -2011,6 +2014,26 @@ mod tests {
         );
         // Overflow saturates rather than wrapping to a tiny ceiling.
         assert_eq!(tool_result_wire_cap(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn parked_get_reserve_covers_numeric_message_normalization() {
+        let raw = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"values\":[{}]}}}}",
+            vec!["1e15"; 10_000].join(",")
+        );
+        let decoded: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON-RPC notification");
+        let decoded_bytes = crate::openai::responses::state::retained_json_bytes(&decoded).expect("decoded size");
+        let cap = tool_stream_cumulative_cap(tool_result_wire_cap(2_048), 2_048);
+        assert!(raw.len() < cap, "notification fits the admitted GET stream");
+        let reserve = tool_stream_retained_reserve(2_048, 2_048).expect("stream reserve");
+        assert!(
+            reserve >= raw.len() * 2 + decoded_bytes,
+            "source and parser bytes can coexist with a normalized rmcp message: raw {}, decoded {}, reserve {}",
+            raw.len(),
+            decoded_bytes,
+            reserve
+        );
     }
 
     #[test]

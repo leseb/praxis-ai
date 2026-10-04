@@ -1967,8 +1967,9 @@ fn result_payload_limit(retained_result_limit: usize) -> usize {
 /// Bound the wire body alongside parsed and retained result owners. The
 /// transport accepts a JSON-RPC envelope in addition to the decoded payload;
 /// its streaming executor can temporarily hold twice that wire ceiling while
-/// the adapter classifies an overflowing chunk. Charge every call in the batch
-/// because their futures may run concurrently.
+/// the adapter classifies an overflowing chunk. A session-ID server can also
+/// leave a standalone GET parser and rmcp messages live after each call.
+/// Charge every call in the batch because their futures may run concurrently.
 fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<usize> {
     if call_count == 0 {
         return (admitted_results == 0).then_some(0);

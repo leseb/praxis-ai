@@ -671,7 +671,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    let headroom = 400_000;
+    let headroom = 1_100_000;
     state.apply_retained_payload_limit(current + result_id_bytes + headroom);
     let calls = call_refs(&state.tool_calls);
 

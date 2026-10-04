@@ -204,7 +204,9 @@ fn aggregate_mcp_transport_overflow_stops_remaining_calls_and_persistence() {
         ..McpMockConfig::default()
     });
     let db = TempSqlite::new("agentic_mcp_transport_budget");
-    let config = load_retained_budget_config_with_limit(free_port(), model.port(), db.url(), 1_048_576);
+    // Reserve two possible parked GET streams, then trip the admitted wire
+    // ceiling on the first result before the second call executes.
+    let config = load_retained_budget_config_with_limit(free_port(), model.port(), db.url(), 4_194_304);
     let proxy = start_proxy(&config);
     let request = serde_json::json!({
         "model": "gpt-4.1",
