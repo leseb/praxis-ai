@@ -1101,6 +1101,10 @@ impl ResponsesState {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
         }
+        meter.json(&self.tool_choice)?;
+        if let Some(original_tool_choice) = &self.original_tool_choice {
+            meter.json(original_tool_choice)?;
+        }
         for ((server, tool), value) in &self.mcp_tool_map {
             meter.raw(server.len())?;
             meter.raw(tool.len())?;
@@ -1249,6 +1253,10 @@ impl ResponsesState {
                 meter.json_values(&echo.tools)?;
                 meter.json(&echo.tool_choice)?;
             }
+            meter.json(&self.tool_choice)?;
+            if let Some(original_tool_choice) = &self.original_tool_choice {
+                meter.json(original_tool_choice)?;
+            }
             for ((server, tool), value) in &self.mcp_tool_map {
                 meter.raw(server.len())?;
                 meter.raw(tool.len())?;
@@ -1263,9 +1271,7 @@ impl ResponsesState {
             meter.json(&self.local_completion_response_template)?;
             meter.json_values(&self.tool_calls)?;
         }
-        for value in [&self.tool_choice, &self.usage] {
-            meter.json(value)?;
-        }
+        meter.json(&self.usage)?;
         if !skip_accumulated_output {
             meter.json_values(&self.accumulated_output)?;
         }
@@ -1275,7 +1281,6 @@ impl ResponsesState {
         for value in [
             self.context_management.as_ref(),
             self.conversation.as_ref(),
-            self.original_tool_choice.as_ref(),
             self.previous_usage.as_ref(),
         ]
         .into_iter()
@@ -2052,6 +2057,34 @@ mod tests {
         assert!(!state.can_retain_payload(0));
         state.discard_payload_for_budget_error();
         assert!(state.provider_compaction_ids.is_empty());
+    }
+
+    #[test]
+    fn tool_choice_copies_are_charged_once_in_stream_stable_baseline() {
+        let mut state = ResponsesState::default();
+        let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing_before = state
+            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
+            .unwrap();
+        let large_choice = json!({"type":"allowed_tools","tools":["x".repeat(32_000)]});
+        state.tool_choice = large_choice.clone();
+        state.original_tool_choice = Some(large_choice);
+        state.mark_replay_stable_payload_changed();
+
+        let stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing = state
+            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
+            .unwrap();
+        assert!(
+            stable > stable_before + 64_000,
+            "both owned tool-choice values join the stable charge"
+        );
+        assert_eq!(
+            changing, changing_before,
+            "per-chunk accounting does not rescan stable tool choices"
+        );
+        assert_eq!(state.retained_payload_bytes().unwrap(), stable + changing);
+        assert_eq!(state.replay_stable_payload_revision, Some(1));
     }
 
     #[test]

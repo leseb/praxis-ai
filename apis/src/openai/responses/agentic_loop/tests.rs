@@ -426,6 +426,22 @@ async fn tool_choice_reset_after_first_iteration() {
     );
 }
 
+#[test]
+fn explicit_auto_tool_choice_invalidates_stable_charge_on_reentry() {
+    let mut state = ResponsesState::from_request_body(json!({"input":[], "tool_choice":"auto"}));
+    state.iteration = 1;
+    let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+    let revision_before = state.replay_stable_payload_revision;
+
+    super::prepare_iteration(&mut state);
+
+    assert_eq!(state.tool_choice, json!("auto"));
+    assert_eq!(state.original_tool_choice, Some(json!("auto")));
+    assert_eq!(state.request_body["tool_choice"], "auto");
+    assert!(state.replay_stable_payload_revision > revision_before);
+    assert!(state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap() > stable_before);
+}
+
 // -----------------------------------------------------------------------------
 // on_request_body: Content-Type on Re-entry
 // -----------------------------------------------------------------------------

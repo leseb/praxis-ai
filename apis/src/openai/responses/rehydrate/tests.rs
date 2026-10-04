@@ -1936,6 +1936,38 @@ async fn finite_restore_rejects_before_copying_a_near_limit_response() {
 }
 
 #[tokio::test]
+async fn finite_restore_reserves_numeric_normalization_before_parsing() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    let numeric_values = vec!["1e9"; 10_000].join(",");
+    let body_bytes = format!(
+        "{{\"id\":\"resp_new\",\"object\":\"response\",\"previous_response_id\":null,\"output\":[{numeric_values}]}}"
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    let raw_only_reservation = body_bytes.len() * 5 + "resp_prev".len() * 12 + 128;
+    state.apply_retained_payload_limit(baseline + raw_only_reservation);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::from(body_bytes.clone()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 502),
+        other => panic!("expected normalization budget rejection, got {other:?}"),
+    }
+    assert_eq!(body.as_deref(), Some(body_bytes.as_bytes()));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn does_not_restore_without_rehydration() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");

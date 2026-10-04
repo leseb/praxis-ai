@@ -863,7 +863,12 @@ fn prepare_iteration(state: &mut ResponsesState) {
 
     if state.iteration > 0 {
         let original = std::mem::replace(&mut state.tool_choice, json!("auto"));
-        state.original_tool_choice.get_or_insert(original);
+        if state.original_tool_choice.is_none() {
+            state.original_tool_choice = Some(original);
+            // An explicit `"auto"` leaves request_body unchanged, but the
+            // preserved original is a new owner in the stable stream charge.
+            state.mark_replay_stable_payload_changed();
+        }
         set_request_body_field(state, "tool_choice", json!("auto"));
     }
 }
