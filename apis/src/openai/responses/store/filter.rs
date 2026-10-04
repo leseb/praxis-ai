@@ -16,8 +16,8 @@
 //!   provisioned. `GET` and `DELETE` endpoints owned by the store also reject rather than falling through to the
 //!   upstream.
 //!
-//! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
-//!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
+//! - **`on_response`**: re-checks skip conditions, then inspects the response status and headers. Non-2xx responses,
+//!   content-encoded bodies, or content types other than JSON or event-stream set `responses.skip_persist` and bail
 //!   early.
 //!
 //! - **`on_response_body`**: at the terminal chunk for streams or at end-of-stream for buffered responses, extracts the
@@ -1908,6 +1908,14 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
         return false;
     }
 
+    // An encoded representation is opaque here. Rehydrate also declines it,
+    // and Store cannot safely parse or preflight its decoded JSON size.
+    if resp.headers.contains_key(http::header::CONTENT_ENCODING) {
+        trace!("skipping persistence for content-encoded response");
+        ctx.set_metadata("responses.skip_persist", "true");
+        return false;
+    }
+
     let content_type = resp
         .headers
         .get(http::header::CONTENT_TYPE)
@@ -3091,6 +3099,30 @@ mod encode_replay_event_tests {
         persistence_construction_fits,
     };
     use crate::openai::responses::{ObservedResponsesSse, state::ResponsesState};
+
+    #[test]
+    fn encoded_responses_are_not_persistable() {
+        for (content_type, streaming) in [("application/json", "false"), ("text/event-stream", "true")] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.stream", streaming);
+            let mut response = crate::test_utils::make_response();
+            response
+                .headers
+                .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static(content_type));
+            response
+                .headers
+                .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+            ctx.response_header = Some(&mut response);
+
+            assert!(!super::response_is_persistable(&mut ctx), "{content_type}");
+            assert_eq!(
+                ctx.get_metadata("responses.skip_persist"),
+                Some("true"),
+                "{content_type}"
+            );
+        }
+    }
 
     #[test]
     fn streaming_persistence_without_response_state_keeps_final_chunk() {
