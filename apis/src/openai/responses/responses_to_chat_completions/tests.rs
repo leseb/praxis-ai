@@ -158,6 +158,25 @@ fn chat_translation_admits_small_and_rejects_oversized_owners() {
     assert!(!finite_translation_fits(&context, &vec![b'x'; 4_096]));
 }
 
+#[test]
+fn finite_chat_preflight_reserves_expanded_function_tool_echo() {
+    let tools: Vec<_> = (0..14_000)
+        .map(|index| json!({"type": "function", "name": format!("t{index}")}))
+        .collect();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "x", "stream": false, "tools": tools
+    }));
+    state.apply_retained_payload_limit(4_000_000);
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.extensions.insert(state);
+
+    assert!(
+        !finite_translation_fits(&context, br#"{"choices":[]}"#),
+        "expanded response tool schemas and simultaneous wire copies exceed the budget"
+    );
+}
+
 #[tokio::test]
 async fn finite_chat_buffer_uses_remaining_aggregate_headroom() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();

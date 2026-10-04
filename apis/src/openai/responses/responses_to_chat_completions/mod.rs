@@ -642,7 +642,9 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
             .checked_add(array_expansion)?
             .checked_add(string_expansion)?
             .checked_add(number_expansion)?
-            .checked_add(echo.checked_mul(3)?)?
+            // Compact function tools gain response-side fields when echoed;
+            // reserve that expansion across the tree and wire copies.
+            .checked_add(echo.checked_mul(4)?)?
             .checked_add(response_id_bytes.checked_mul(12)?)?
             // The fixed Responses resource fields exist even for a minimal
             // provider object; reserve them in the tree and wire buffer.
