@@ -72,11 +72,11 @@ use self::{
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
 use super::{
-    DEFAULT_STORE_NAME,
+    DEFAULT_STORE_NAME, budget_error,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
+        McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
@@ -1316,6 +1316,9 @@ async fn discover_pending_connectors(
     {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
+            if matches!(err, ResolveError::RetainedBudget) {
+                return Ok(budget_error::reject_request(ctx, &err.to_string()));
+            }
             let streaming = ctx
                 .get_metadata("openai_responses_format.stream")
                 .is_some_and(|v| v == "true");

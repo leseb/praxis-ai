@@ -3875,6 +3875,7 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
         tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
         ..ResponsesState::default()
     };
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
 
     discover_deferred_connectors(&mut state).await.unwrap();
     ct.cancel();
@@ -4188,6 +4189,35 @@ async fn discover_deferred_connectors_skips_tools_list_when_budget_exhausted() {
         state.mcp_tool_map.is_empty(),
         "exhausted budget must not rewrite deferred MCP tools"
     );
+}
+
+#[tokio::test]
+async fn deferred_discovery_rejects_before_tools_list_when_retained_budget_is_exhausted() {
+    let mut state = ResponsesState {
+        deferred_mcp: vec![deferred_connector("http://127.0.0.1:9/mcp", None, None)],
+        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(
+        state.deferred_mcp.len(),
+        1,
+        "failed discovery must preserve the pending connector"
+    );
+    assert!(state.mcp_tool_map.is_empty());
+}
+
+#[test]
+fn deferred_listing_peak_admits_exact_boundary() {
+    let reserved = mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION;
+    let limit = 100 + 50 + 25 + reserved;
+    assert!(deferred_listing_batch_fits(100, 50, 25, 1, limit));
+    assert!(!deferred_listing_batch_fits(100, 50, 25, 1, limit - 1));
+    assert!(!deferred_listing_batch_fits(100, 50, 25, 2, limit));
 }
 
 #[tokio::test]
