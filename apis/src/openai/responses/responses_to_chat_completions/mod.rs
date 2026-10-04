@@ -640,11 +640,11 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
         let string_expansion = strings.checked_mul(FINITE_TRANSLATION_STRING_EXPANSION_BYTES)?;
         let number_expansion = numbers.checked_mul(FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES)?;
         // Function-call IDs can be emitted as both `id` and `call_id`.
-        // During serialization, the wire Vec can also hold a new capacity
-        // alongside its previous allocation. Seven raw-sized owners cover the
-        // parsed provider tree, both translated ID copies, and that Vec peak.
+        // At a growth boundary, the serialized wire Vec can retain both its
+        // old and new capacities alongside the raw body and both JSON trees.
+        // Ten raw-sized owners cover that simultaneous peak.
         body.len()
-            .checked_mul(7)?
+            .checked_mul(10)?
             .checked_add(object_expansion)?
             .checked_add(array_expansion)?
             .checked_add(string_expansion)?
@@ -655,7 +655,7 @@ fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
             .checked_add(response_id_bytes.checked_mul(12)?)?
             // The fixed Responses resource fields exist even for a minimal
             // provider object; reserve them in the tree and wire buffer.
-            .checked_add(1024)
+            .checked_add(3_072)
     })();
     staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }

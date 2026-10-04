@@ -177,6 +177,41 @@ fn finite_chat_preflight_reserves_expanded_function_tool_echo() {
     );
 }
 
+#[test]
+fn finite_chat_preflight_reserves_duplicated_tool_call_id_and_wire_growth() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "x", "stream": false
+    }));
+    state.apply_retained_payload_limit(850_000);
+    context.extensions.insert(state);
+    let body = json!({
+        "id": "chatcmpl_test",
+        "object": "chat.completion",
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "x".repeat(100_000),
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+    .to_string();
+    assert!(body.len() < 101_000);
+    assert!(
+        !finite_translation_fits(&context, body.as_bytes()),
+        "the duplicated ID and old/new serialized Vec capacities exceed the budget"
+    );
+}
+
 #[tokio::test]
 async fn finite_chat_buffer_uses_remaining_aggregate_headroom() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
