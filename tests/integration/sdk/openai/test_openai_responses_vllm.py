@@ -1142,6 +1142,7 @@ class NativeCompactionBackendHandler(BaseHTTPRequestHandler):
     """Deterministic native Responses backend for SDK rehydration coverage."""
 
     requests: ClassVar[list[dict]] = []
+    response_id_prefix: ClassVar[str] = "resp_provider_compaction_sdk_"
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1160,7 +1161,7 @@ class NativeCompactionBackendHandler(BaseHTTPRequestHandler):
             ]
         payload = json.dumps(
             {
-                "id": f"resp_provider_compaction_sdk_{request_number}",
+                "id": f"{type(self).response_id_prefix}{request_number}",
                 "object": "response",
                 "created_at": 1,
                 "model": VLLM_MODEL,
@@ -2300,6 +2301,7 @@ def test_direct_store_stream_budget_error_follows_provider_sequence(direct_budge
 def provider_compaction_client(tmp_path_factory, request):
     """Function-scoped native Responses backend with a provider compaction."""
     NativeCompactionBackendHandler.requests = []
+    NativeCompactionBackendHandler.response_id_prefix = "resp_provider_compaction_sdk_"
     requests = NativeCompactionBackendHandler.requests
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), NativeCompactionBackendHandler)
@@ -2349,6 +2351,8 @@ def provider_compaction_client(tmp_path_factory, request):
 def usage_less_compact_client(tmp_path_factory, request, compaction_server):
     """Native Responses continuation with no stored usage and an armed budget."""
     NativeCompactionBackendHandler.requests = []
+    # PostgreSQL SDK runs share one database across these two fixtures.
+    NativeCompactionBackendHandler.response_id_prefix = "resp_usage_less_compaction_sdk_"
     CompactionHandler.requests = []
     backend_port = _free_port()
     backend = HTTPServer(("127.0.0.1", backend_port), NativeCompactionBackendHandler)
