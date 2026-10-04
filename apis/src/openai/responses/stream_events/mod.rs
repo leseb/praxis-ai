@@ -168,13 +168,18 @@ pub(super) struct StreamEventsState {
 /// A prior-output measurement and the state shape it describes.
 #[derive(Clone, Copy)]
 struct PriorOutputCache {
+    /// Logical loop iteration that owns the prior output.
     iteration: u32,
+    /// Stable payload revision for in-place replacements.
     revision: u64,
+    /// Prior output item count used to detect shape changes.
     output_len: usize,
+    /// Cached compact JSON size of prior output items.
     bytes: usize,
 }
 
 impl PriorOutputCache {
+    /// Check that the cached charge still describes the shared state.
     fn matches(self, state: &ResponsesState) -> bool {
         self.iteration == state.iteration
             && Some(self.revision) == state.replay_stable_payload_revision
@@ -1131,14 +1136,6 @@ fn retained_frame_payload_bytes(frames: &[SseFrame]) -> Option<usize> {
     })
 }
 
-/// Bound compact JSON growth when `serde_json` normalizes exponent notation.
-///
-/// This build does not enable `serde_json`'s arbitrary-precision feature, so a
-/// parsed number is an i64/u64/f64; 32 extra bytes per lexical number cover
-/// its longest compact output. Strings and escaped quotes are skipped, and the
-/// source length is already charged separately by the caller. Invalid JSON
-/// may overcount but is rejected by the parser without committing any event.
-
 /// Count one parsed event's independently owned payloads.
 fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
     let payload_bytes = retained_json_bytes(event.payload())?;
@@ -1397,6 +1394,10 @@ fn stream_payload_fits(ctx: &HttpFilterContext<'_>, state: &mut StreamEventsStat
 /// Snapshot request, history, prior output, and tool snapshots once per round.
 /// `None` means no aggregate budget is active; the inner `None` signals that
 /// the current retained state already exceeds the limit.
+#[expect(
+    clippy::too_many_lines,
+    reason = "shared stream admission combines stable and changing owner charges"
+)]
 fn shared_retained_budget(
     ctx: &HttpFilterContext<'_>,
     stream: &mut StreamEventsState,

@@ -309,8 +309,6 @@ struct ResolutionRequest<'a> {
     source: ReferenceSource<'a>,
     /// Maximum resolved bytes remaining for this item collection.
     max_resolved_bytes: usize,
-    /// Metadata is also bounded by the shared budget when it constrains us.
-    metadata_limit: Option<usize>,
     /// Responses content part type.
     part_type: &'static str,
     /// Original request headers available for forwarding.
@@ -382,7 +380,6 @@ impl ResolutionBudget {
             client,
             source,
             max_resolved_bytes,
-            metadata_limit,
             part_type,
             request_headers,
             url_resolver,
@@ -402,12 +399,18 @@ impl ResolutionBudget {
 
         // A new cache entry owns a key even when it came from rehydrated history.
         self.consume_aggregate_bytes(source.value().len())?;
+        if self.aggregate_remaining_bytes == Some(0) {
+            return Err(ResolveError::RetainedBudget);
+        }
         self.register_reference()?;
 
         let max_resolved_bytes = self
             .aggregate_remaining_bytes
             .map_or(max_resolved_bytes, |remaining| max_resolved_bytes.min(remaining));
         let aggregate_remaining_bytes = self.aggregate_remaining_bytes;
+        // Metadata has its own transport cap; the inline-content cap can be
+        // equal to or lower than the shared allowance without bounding it.
+        let metadata_limit = aggregate_remaining_bytes;
         let aggregate_binding =
             aggregate_remaining_bytes.is_some_and(|remaining| remaining <= self.remaining_resolved_bytes);
         let outbound = self.outbound.as_ref();
@@ -564,6 +567,10 @@ impl FilesApiClient {
     ///
     /// When `outbound` is present the callout routes through the bound
     /// outbound filter chain; otherwise it uses the direct client transport.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "metadata transport and admission share one boundary"
+    )]
     async fn fetch_metadata(
         &self,
         file_id: &str,
@@ -585,6 +592,9 @@ impl FilesApiClient {
             None => Box::pin(self.client.get(&url, request_headers, max_bytes)).await,
         }
         .map_err(|e| match e {
+            ApiClientError::ResponseTooLarge { .. } if metadata_limit.is_some_and(|limit| limit <= client_limit) => {
+                ResolveError::RetainedBudget
+            },
             ApiClientError::ResponseTooLarge { .. } => ResolveError::TooLarge {
                 reference: file_id.to_owned(),
                 limit: max_bytes,
@@ -854,11 +864,6 @@ async fn resolve_content_part(
 
     debug!(source = %source, part_type = %part_type, "resolving file reference");
 
-    // Charge the structural JSON growth for every occurrence, including
-    // cache hits with empty content. Do this before the callout or cache
-    // clone, so a tight budget cannot perform another resolution first.
-    resolver.budget.consume_aggregate_bytes(REWRITE_FIELD_FRAMING_BYTES)?;
-
     let max_resolved_bytes = resolver
         .budget
         .aggregate_remaining_bytes
@@ -868,6 +873,9 @@ async fn resolve_content_part(
     let Some(resolved) = resolve_reference(source, part_type, max_resolved_bytes, resolver).await? else {
         return Ok(None);
     };
+    // A missing file left the original part untouched. Charge this only for
+    // a successful resolution, before constructing its replacement fields.
+    resolver.budget.consume_aggregate_bytes(REWRITE_FIELD_FRAMING_BYTES)?;
     let len = output_len_for_part(part_type, source, &resolved);
     let aggregate_bytes = retained_resolved_bytes(part_type, source, &resolved).ok_or(ResolveError::RetainedBudget)?;
     if resolver
@@ -897,24 +905,18 @@ async fn resolve_content_part(
 /// it must never be downgraded into an implicit passthrough that
 /// hands the original URL to a backend that might fetch it itself
 /// without the same protections.
-#[expect(clippy::too_many_lines, reason = "keeps each file failure policy explicit")]
 async fn resolve_reference(
     source: ReferenceSource<'_>,
     part_type: &'static str,
     remaining_resolved_bytes: usize,
     resolver: &mut ContentResolver<'_>,
 ) -> Result<Option<ResolvedFile>, ResolveError> {
-    let metadata_limit = resolver
-        .budget
-        .aggregate_constrained
-        .then_some(remaining_resolved_bytes);
     match resolver
         .budget
         .resolve(ResolutionRequest {
             client: resolver.client,
             source,
             max_resolved_bytes: remaining_resolved_bytes,
-            metadata_limit,
             part_type,
             request_headers: resolver.request_headers,
             url_resolver: resolver.url_resolver,
@@ -1335,6 +1337,87 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "HTTP stub demonstrates the equal-cap transport boundary"
+    )]
+    async fn equal_inline_cap_still_bounds_metadata_before_parse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            let body = "x".repeat(1536);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let client = test_client_with_limits(&url, 1024, 1_000);
+        let mut budget = client.resolution_budget(None);
+        budget.apply_aggregate_headroom(16 * 1024);
+        assert!(!budget.aggregate_constrained, "inline limit ties shared allowance");
+        let mut items = vec![serde_json::json!({
+            "role": "user", "content": [{"type": "input_file", "file_id": "file-a"}]
+        })];
+        let result = resolve_items(
+            &mut items,
+            &client,
+            OnMissing::Continue,
+            &http::HeaderMap::new(),
+            None,
+            &mut budget,
+        )
+        .await;
+        assert!(matches!(result, Err(ResolveError::RetainedBudget)));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cache setup and two-part assertion stay in one regression"
+    )]
+    async fn cached_missing_file_does_not_spend_rewrite_framing() {
+        let client = test_client("http://127.0.0.1:1");
+        let mut budget = client.resolution_budget(None);
+        budget.apply_aggregate_headroom(320);
+        budget
+            .cache
+            .entry(("input_file", ReferenceKind::FileId))
+            .or_default()
+            .insert(
+                ".".to_owned(),
+                Err(ResolveError::InvalidFileId {
+                    file_id: ".".to_owned(),
+                    detail: "invalid".to_owned(),
+                }),
+            );
+        let original = serde_json::json!({
+            "role": "user", "content": [
+                {"type": "input_file", "file_id": "."},
+                {"type": "input_file", "file_id": "."}
+            ]
+        });
+        let mut items = vec![original.clone()];
+        let result = resolve_items(
+            &mut items,
+            &client,
+            OnMissing::Continue,
+            &http::HeaderMap::new(),
+            None,
+            &mut budget,
+        )
+        .await;
+        assert!(matches!(result, Ok(0)));
+        assert_eq!(items, vec![original]);
+        assert_eq!(budget.aggregate_remaining_bytes, Some(20));
+    }
+
+    #[tokio::test]
     async fn failed_resolution_cache_cannot_exceed_aggregate_headroom() {
         let client = test_client("http://127.0.0.1:1");
         let mut budget = client.resolution_budget(None);
@@ -1390,7 +1473,9 @@ mod tests {
             }
         });
         let mut budget = client.resolution_budget(None);
-        budget.apply_aggregate_headroom(512);
+        // Admit the two small Files API replies, then exhaust the allowance
+        // through repeated cached rewrites of the same empty value.
+        budget.apply_aggregate_headroom(2048);
         let content: Vec<_> = (0..64)
             .map(|_| serde_json::json!({"type":"input_file","file_id":"a"}))
             .collect();

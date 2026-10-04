@@ -72,7 +72,7 @@ use self::{
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
 use super::{
-    DEFAULT_STORE_NAME, budget_error,
+    DEFAULT_STORE_NAME,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{

@@ -1824,9 +1824,17 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        None,
+        usize::MAX,
+    )
+    .expect("rewrite must not error")
+    .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     assert_eq!(
@@ -1884,9 +1892,17 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("mixed request must be rewritten");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        None,
+        usize::MAX,
+    )
+    .expect("rewrite must not error")
+    .expect("mixed request must be rewritten");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     let tools = rewritten["tools"].as_array().expect("tools array");
@@ -1935,9 +1951,17 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("resolved-empty entry must trigger a rewrite");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        None,
+        usize::MAX,
+    )
+    .expect("rewrite must not error")
+    .expect("resolved-empty entry must trigger a rewrite");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     assert_eq!(
@@ -5674,7 +5698,7 @@ async fn eager_listing_rejects_exhausted_shared_budget_before_rewrite() {
     let FilterAction::Reject(rejection) = action else {
         panic!("exhausted budget must reject before tools/list");
     };
-    assert_eq!(rejection.status, 502);
+    assert_eq!(rejection.status, 413);
     assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default()).contains("retained payload"));
     assert_eq!(
         body.as_deref(),
@@ -5741,7 +5765,7 @@ async fn eager_listing_with_policy_rejects_missing_shared_state() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().is_none());
@@ -6168,4 +6192,43 @@ fn aggregate_budget_rejects_repeated_mcp_selectors_before_expansion() {
     assert!(state.retained_payload_failed);
     assert!(state.mcp_tool_map.is_empty());
     assert!(state.accumulated_output.is_empty());
+}
+
+#[tokio::test]
+async fn aggregate_budget_admits_small_repeated_mcp_selectors() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "weather", "server_url": server_url,
+            "allowed_tools": ["forecast", "temperature"]}],
+        "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [
+            {"type": "mcp", "server_label": "weather"},
+            {"type": "mcp", "server_label": "weather"}
+        ]}
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": [
+            {"name": "forecast", "inputSchema": {"type": "object"}},
+            {"name": "temperature", "inputSchema": {"type": "object"}}
+        ]
+    })];
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "small selector expansion: {action:?}"
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(rewritten["tool_choice"]["tools"].as_array().unwrap().len(), 4);
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(0));
 }

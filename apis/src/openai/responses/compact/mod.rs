@@ -358,7 +358,7 @@ impl CompactFilter {
             }
         }
         Ok(self
-            .handle_reactive_subrequest_result(result, response_limit)?
+            .handle_reactive_subrequest_result(result, state.retained_payload_limit().map(|_| response_limit))?
             .map(|s| s.content))
     }
 
@@ -535,10 +535,6 @@ impl CompactFilter {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "reactive budget cleanup belongs in the same request-body lifecycle"
-)]
 #[async_trait]
 impl HttpFilter for CompactFilter {
     fn name(&self) -> &'static str {
@@ -721,7 +717,7 @@ fn reactive_compaction_response_limit(
 /// out of that tree before it is dropped. Their individual compact sizes are
 /// each bounded by the normalized size of the whole tree.
 fn reactive_summarization_response_fits(body: &[u8], response_limit: usize) -> bool {
-    super::agentic_loop::buffered_parsed_json_bytes_upper_bound(body)
+    buffered_parsed_json_bytes_upper_bound(body)
         .and_then(|normalized| normalized.checked_mul(3))
         .and_then(|owners| owners.checked_add(body.len()))
         .zip(response_limit.checked_mul(4))

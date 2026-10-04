@@ -2034,6 +2034,7 @@ fn current_round_tool_call_admissions_by<'a>(
 /// `max_tool_calls` is exhausted. An omitted limit leaves discovery allowed.
 /// When the current round's output is not yet replayable, remaining prior-round
 /// budget is the admission signal.
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
     let Some(max) = state.max_tool_calls else {
         return true;
@@ -2777,6 +2778,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "openai-mcp-tools")]
     fn tool_search_discovery_rejects_exhausted_budget() {
         let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
         let exhausted = ResponsesState {
@@ -2801,6 +2803,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "openai-mcp-tools")]
     fn tool_search_discovery_follows_current_round_admission_order() {
         let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
         let web = json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});

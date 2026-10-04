@@ -777,8 +777,9 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     ctx.extensions.insert(responses);
     let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     let cached = stream.shared_stable_bytes.get().copied().unwrap();
+    let prior = stream.shared_prior_output_bytes.get().copied().flatten().unwrap();
     assert!(
-        cached > 1_048_576,
+        prior.bytes > 1_048_576,
         "the large prior-round output must be in the per-round cache"
     );
     assert_eq!(
@@ -802,6 +803,10 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     for _ in 0..100 {
         assert_eq!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1, Some(next));
         assert_eq!(stream.shared_stable_bytes.get().copied(), Some(cached));
+        assert_eq!(
+            stream.shared_prior_output_bytes.get().copied().flatten().unwrap().bytes,
+            prior.bytes
+        );
     }
     // The owner may append output at EOS; the next round must charge it again.
     stream.clear_shared_budget_cache();
@@ -824,7 +829,7 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .retained_payload_bytes()
             .unwrap()
     );
-    assert!(stream.shared_stable_bytes.get().copied().unwrap() > cached);
+    assert!(stream.shared_prior_output_bytes.get().copied().flatten().unwrap().bytes > prior.bytes);
     ctx.insert_filter_state(stream);
     filter.arm(&mut ctx);
     let mut rearmed = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -5951,6 +5956,7 @@ fn parse_error_sets_metadata() {
         client_tool_items: Vec::new(),
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        shared_prior_output_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
         tool_calls_bytes: None,
     });
@@ -6007,6 +6013,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         }],
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        shared_prior_output_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
         tool_calls_bytes: None,
     });

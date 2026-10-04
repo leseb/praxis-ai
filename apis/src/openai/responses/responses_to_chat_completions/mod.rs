@@ -625,10 +625,6 @@ fn chat_request_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstr
 /// and request fields echoed into the resource before creating any of them.
 /// The same bound protects finite provider-error normalization, which also
 /// parses the full provider body before building a replacement wire response.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one finite translation admission counts old wire and new JSON owners"
-)]
 fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
