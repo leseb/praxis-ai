@@ -339,6 +339,7 @@ impl ClientToolCompatFilter {
             return Err(reject_bad_request("tools must be a JSON array"));
         }
         let has_rich = request_has_rich_client_tool(state);
+        preflight_lowering_payload(state, has_rich)?;
         // Discovered tools are always collected (even for a streaming request) so
         // an ambiguous discovery — a conflicting redefinition of the same tool — is
         // caught before any upstream call rather than being silently ignored on the
@@ -368,7 +369,6 @@ impl ClientToolCompatFilter {
         state: &mut ResponsesState,
         discovered: &[Value],
     ) -> Result<(), FilterAction> {
-        preflight_namespace_expansion(state, discovered)?;
         // Defense-in-depth idempotency invariant: if a prior lowering already
         // captured the canonical `tools`/`tool_choice` snapshot in `client_tool_echo`,
         // rebuild this lowering from that echo rather than from the request body. The
@@ -580,18 +580,72 @@ impl ClientToolCompatFilter {
     }
 }
 
-/// Bound the repeated namespace description before lowering allocates one copy
-/// for each member. The request JSON contains that description only once, while
-/// the lowered tree, outbound serialization, and rewrite staging can coexist.
-/// Check both declared and discovered namespaces while the original tools still
-/// belong to `state`, so the shared budget includes their live ownership too.
+/// Admit the copies made by discovery and typed-history lowering before either
+/// path allocates them. A discovered definition can coexist in the original
+/// history, conflict map, hoisted list, lowered declarations, rewritten history,
+/// and serialized outbound body. The compact JSON charge also covers escaping
+/// when a typed output becomes a string. Namespace descriptions need an extra
+/// per-member charge because one source field is repeated across every member.
+/// Keep the charges in one check: separate successful checks would not reserve
+/// their sum. This sizing pass does not validate tools; the normal lowering path
+/// retains its existing validation and client/server ownership behavior.
 #[expect(
     clippy::too_many_lines,
-    reason = "one checked preflight covers declared and discovered namespace members before allocation"
+    reason = "one checked preflight covers all client-tool sources before allocation"
 )]
-fn preflight_namespace_expansion(state: &ResponsesState, discovered: &[Value]) -> Result<(), FilterAction> {
+fn preflight_lowering_payload(state: &ResponsesState, has_rich: bool) -> Result<(), FilterAction> {
     if state.retained_payload_limit().is_none() {
         return Ok(());
+    }
+    // Borrow IDs here. The normal collector builds owned IDs only after the
+    // budget check; this temporary index holds no copies of their strings.
+    let client_call_ids: HashSet<&str> = state
+        .messages
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("shell_call" | "tool_search_call")
+            ) && is_client_executed_tool_call(item)
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str).filter(|id| !id.is_empty()))
+        .collect();
+    let mut source_bytes = Some(0_usize);
+    let mut expansion_bytes = Some(0_usize);
+    let mut entries = Some(client_call_ids.len());
+    let mut has_discovered = false;
+    for item in &state.messages {
+        let item_type = item.get("type").and_then(Value::as_str);
+        let matched_output = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| client_call_ids.contains(id));
+        let rewrites = match item_type {
+            Some("custom_tool_call" | "custom_tool_call_output") => true,
+            Some("shell_call" | "tool_search_call") => is_client_executed_tool_call(item),
+            Some("shell_call_output" | "tool_search_output") => matched_output,
+            Some("function_call") => item.get("namespace").is_some_and(|value| !value.is_null()),
+            _ => false,
+        };
+        if rewrites {
+            add_lowering_source(&mut source_bytes, &mut entries, item);
+        }
+        if item_type != Some("tool_search_output") || !matched_output {
+            continue;
+        }
+        // Nonterminal listings and invalid statuses are not hoisted. The
+        // existing collector handles status validation after this preflight.
+        if !matches!(item.get("status"), None | Some(Value::Null))
+            && item.get("status").and_then(Value::as_str) != Some("completed")
+        {
+            continue;
+        }
+        if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+            has_discovered |= !tools.is_empty();
+            for tool in tools {
+                add_namespace_expansion(&mut expansion_bytes, &mut entries, tool, LoweringSource::Discovery);
+            }
+        }
     }
     let declared = state
         .client_tool_echo
@@ -604,46 +658,68 @@ fn preflight_namespace_expansion(state: &ResponsesState, discovered: &[Value]) -
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
         });
-    let declared = declared
-        .into_iter()
-        .flat_map(|tools| tools.iter().map(|tool| (tool, LoweringSource::Declaration)));
-    let discovered = discovered.iter().map(|tool| (tool, LoweringSource::Discovery));
-    let mut additional = Some(0_usize);
-    for (tool, source) in declared.chain(discovered) {
-        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
-            continue;
+    if has_rich || has_discovered {
+        for tool in declared.into_iter().flatten() {
+            add_lowering_source(&mut source_bytes, &mut entries, tool);
+            add_namespace_expansion(&mut expansion_bytes, &mut entries, tool, LoweringSource::Declaration);
         }
-        let (namespace, members) = namespace_header(tool)?;
-        // The outbound wire escapes control characters in the repeated text.
-        // Count that form before building any member description, so a compact
-        // parsed string cannot fan out into a much larger serialized body.
-        let prefix = retained_json_bytes(namespace.name)
-            .and_then(|name_bytes| "Belongs to the `` tool namespace: ".len().checked_add(name_bytes))
-            .and_then(|bytes| bytes.checked_add(retained_json_bytes(namespace.description)?));
-        for member in members {
-            if source == LoweringSource::Declaration && is_deferred_declaration(member) {
-                continue;
-            }
-            // The folded description has three simultaneous owners during the
-            // rewrite: the lowered JSON string, serializer output, and staging.
-            // Reserve a small entry allowance for the flat name/reverse recipe.
-            let member_description = member.get("description").and_then(Value::as_str).unwrap_or_default();
-            let per_member = prefix
-                .and_then(|bytes| bytes.checked_add(retained_json_bytes(member_description)?))
-                .and_then(|bytes| bytes.checked_add(2 + 512))
-                .and_then(|bytes| bytes.checked_mul(3));
-            additional =
-                additional.and_then(|bytes| per_member.and_then(|member_bytes| bytes.checked_add(member_bytes)));
+        if let Some(choice) = state.request_body.get("tool_choice").filter(|choice| !choice.is_null()) {
+            add_lowering_source(&mut source_bytes, &mut entries, choice);
         }
     }
+    // Sixteen compact copies cover the conflict identity, hoisted definition,
+    // lowered declaration, typed-history string, and intermediate serializers.
+    // The fixed entry charge includes temporary indexes and reverse-map nodes.
+    let additional = source_bytes
+        .and_then(|bytes| bytes.checked_mul(16))
+        .and_then(|bytes| bytes.checked_add(expansion_bytes?))
+        .and_then(|bytes| bytes.checked_add(entries?.checked_mul(1024)?));
     if additional.is_none_or(|bytes| !state.can_retain_payload(bytes)) {
         return Err(FilterAction::Reject(responses_error_rejection(
             413,
             "invalid_request_error",
-            "client-tool namespace expansion exceeds openai_agentic_loop.max_retained_bytes",
+            "client-tool lowering exceeds openai_agentic_loop.max_retained_bytes",
         )));
     }
     Ok(())
+}
+
+/// Add one independently rewritten source and its fixed staging allowance.
+fn add_lowering_source(source_bytes: &mut Option<usize>, entries: &mut Option<usize>, value: &Value) {
+    *source_bytes = source_bytes.and_then(|bytes| bytes.checked_add(retained_json_bytes(value)?));
+    *entries = entries.and_then(|count| count.checked_add(1));
+}
+
+/// Charge the repeated model-visible description of a namespace's active members.
+fn add_namespace_expansion(
+    expansion_bytes: &mut Option<usize>,
+    entries: &mut Option<usize>,
+    tool: &Value,
+    source: LoweringSource,
+) {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return;
+    }
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+    let description = tool.get("description").and_then(Value::as_str).unwrap_or_default();
+    let Some(members) = tool.get("tools").and_then(Value::as_array) else {
+        return;
+    };
+    let prefix = retained_json_bytes(name)
+        .and_then(|bytes| bytes.checked_add("Belongs to the `` tool namespace: ".len()))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(description)?));
+    for member in members {
+        if source == LoweringSource::Declaration && is_deferred_declaration(member) {
+            continue;
+        }
+        let member_description = member.get("description").and_then(Value::as_str).unwrap_or_default();
+        let per_member = prefix
+            .and_then(|bytes| bytes.checked_add(retained_json_bytes(member_description)?))
+            .and_then(|bytes| bytes.checked_add(2 + 512))
+            .and_then(|bytes| bytes.checked_mul(3));
+        *expansion_bytes = expansion_bytes.and_then(|bytes| bytes.checked_add(per_member?));
+        *entries = entries.and_then(|count| count.checked_add(1));
+    }
 }
 
 /// A provider error cannot contain a successful Responses resource to restore;
