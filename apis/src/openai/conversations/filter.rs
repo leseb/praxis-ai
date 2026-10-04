@@ -111,8 +111,20 @@ struct ConversationResponseState {
     append_attempted: bool,
     /// Owner captured before response body buffering is armed.
     append_owner: Option<StateOwner>,
-    /// The response uses the composed SSE terminal instead of buffered JSON.
-    streaming: bool,
+    /// Whether this is buffered JSON or an SSE header selected by a branch or
+    /// by the outer response pipeline.
+    delivery: ResponseDelivery,
+}
+
+/// Response lifecycle that controls how long the selected append remains live.
+#[derive(Clone, Copy)]
+enum ResponseDelivery {
+    /// Buffered JSON must match the current response round.
+    Buffered,
+    /// A branch SSE selection must match the current response round.
+    BranchStream,
+    /// The committed outer SSE header remains selected through tool rounds.
+    OuterStream,
 }
 
 /// A configured response store must write its record before conversation
@@ -159,9 +171,17 @@ pub(crate) fn conversation_response_selected(ctx: &HttpFilterContext<'_>) -> boo
 /// An outer SSE header is selected once and remains live while inner agentic
 /// continuations advance their own iteration and detach IRR's iteration state.
 fn conversation_body_selected(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.extensions
-        .get::<ConversationResponseState>()
-        .is_some_and(|state| state.streaming || state.round == response_round(ctx))
+    ctx.extensions.get::<ConversationResponseState>().is_some_and(|state| {
+        matches!(state.delivery, ResponseDelivery::OuterStream) || state.round == response_round(ctx)
+    })
+}
+
+/// Core records branch filter IDs when their request hooks execute. A
+/// top-level Conversations hook owns the one committed SSE header; a branch
+/// hook can be selected on one IRR response and skipped on a later response.
+fn is_outer_response_filter(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.current_filter_id
+        .is_none_or(|id| ctx.executed_branch_filters.get(id) != Some(&true))
 }
 
 /// Owner captured on the request path before inference begins.
@@ -573,7 +593,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                 round: response_round(ctx),
                 append_attempted: false,
                 append_owner: None,
-                streaming: false,
+                delivery: ResponseDelivery::Buffered,
             });
             return Ok(FilterAction::Continue);
         }
@@ -602,11 +622,29 @@ impl HttpFilter for OpenaiConversationsFilter {
                 .get::<CapturedAppendOwner>()
                 .map(|captured| captured.0.clone())
                 .ok_or_else(|| FilterError::from("openai_conversations: append-back owner was not captured"))?;
+            // A delegated retry runs under Store or readiness's filter ID.
+            // Keep the originating Conversations hook's placement for this
+            // round rather than classifying the delegating filter.
+            let delivery = if !is_stream {
+                ResponseDelivery::Buffered
+            } else if ctx
+                .extensions
+                .get::<ConversationResponseState>()
+                .filter(|state| state.round == response_round(ctx))
+                .map_or_else(
+                    || is_outer_response_filter(ctx),
+                    |state| matches!(state.delivery, ResponseDelivery::OuterStream),
+                )
+            {
+                ResponseDelivery::OuterStream
+            } else {
+                ResponseDelivery::BranchStream
+            };
             ctx.extensions.insert(ConversationResponseState {
                 round: response_round(ctx),
                 append_attempted: false,
                 append_owner: Some(owner),
-                streaming: is_stream,
+                delivery,
             });
             if is_json {
                 // An agentic terminal has already been canonicalized by the
@@ -699,7 +737,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                 round: response_round(ctx),
                 append_attempted: false,
                 append_owner: None,
-                streaming: false,
+                delivery: ResponseDelivery::Buffered,
             });
         }
 
@@ -728,7 +766,7 @@ impl HttpFilter for OpenaiConversationsFilter {
             // leave release ownership to the pipeline as a whole.
             return Ok(FilterAction::Continue);
         }
-        let streaming = response_state.is_some_and(|state| state.streaming);
+        let streaming = response_state.is_some_and(|state| !matches!(state.delivery, ResponseDelivery::Buffered));
 
         if awaiting_response_store(ctx) {
             return Ok(FilterAction::Continue);
