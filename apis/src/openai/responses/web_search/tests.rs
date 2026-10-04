@@ -2391,6 +2391,7 @@ fn moving_pending_search_calls_reserves_the_parsed_action_owner() {
     };
     let before = state.retained_payload_bytes().unwrap();
     let call_bytes = retained_json_bytes(&state.web_search_calls[0]).unwrap();
+    state.apply_retained_payload_limit(before + call_bytes);
 
     let (calls, bytes) = take_pending_search_calls(&mut state).unwrap();
 
@@ -2403,4 +2404,32 @@ fn moving_pending_search_calls_reserves_the_parsed_action_owner() {
         before - call_bytes,
         "the charge is released only after the local owner is dropped"
     );
+}
+
+#[test]
+fn rejected_pending_search_transfer_restores_queue_without_external_charge() {
+    let call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "x".repeat(4_096)}
+    });
+    let mut state = ResponsesState {
+        web_search_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let before = state.retained_payload_bytes().unwrap();
+    let call_bytes = retained_json_bytes(&state.web_search_calls[0]).unwrap();
+    state.apply_retained_payload_limit(before + call_bytes - 1);
+
+    assert!(take_pending_search_calls(&mut state).is_none());
+    assert_eq!(
+        state.web_search_calls.len(),
+        1,
+        "rejected queue must remain with the caller"
+    );
+    assert_eq!(
+        state.retained_external_payload_bytes, 0,
+        "rejected charge must be rolled back"
+    );
+    assert_eq!(state.retained_payload_bytes(), Some(before));
 }
