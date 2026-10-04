@@ -5913,6 +5913,132 @@ insecure_options:
                 print(_read_log_tail(str(log_path)), file=sys.stderr)
 
 
+def test_chat_budget_failure_without_logical_finalizer_is_terminal_sdk_sse(tmp_path):
+    """A skipped logical finalizer cannot turn a committed Chat stream into truncated 200."""
+
+    class ChatSseHandler(BaseHTTPRequestHandler):
+        requests: ClassVar[int] = 0
+
+        def do_POST(self):
+            type(self).requests += 1
+            self.rfile.read(int(self.headers["Content-Length"]))
+            first = (
+                b'data: {"id":"chatcmpl-budget","object":"chat.completion.chunk",'
+                b'"created":1,"model":"m","choices":[{"index":0,'
+                b'"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
+            )
+            second = (
+                "data: "
+                + json.dumps(
+                    {
+                        "id": "chatcmpl-budget",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "m",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "x" * 16_384},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                + "\n\n"
+            ).encode()
+            done = b"data: [DONE]\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(first) + len(second) + len(done)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            time.sleep(0.1)
+            self.wfile.write(second)
+            self.wfile.write(done)
+
+        def log_message(self, *_args):
+            pass
+
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), ChatSseHandler)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    proxy_port = _free_port()
+    config = f"""
+listeners:
+  - name: chat-budget-no-finalizer
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [chat-budget-no-finalizer]
+filter_chains:
+  - name: chat-budget-no-finalizer
+    filters:
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+                conditions:
+                  - when:
+                      path_prefix: "/never"
+              - filter: openai_agentic_loop
+                max_infer_iters: 1
+                max_retained_bytes: 65536
+                conditions:
+                  - when:
+                      path_prefix: "/never"
+              - filter: responses_to_chat_completions
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{backend.server_port}"]
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+"""
+    config_path = _persist_config(config)
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, str(log_path))
+            client = _make_openai_client(proxy_port)
+            event_types = [
+                event.type
+                for event in client.responses.create(
+                    model="m", input="hi", stream=True, store=False
+                )
+            ]
+            assert ChatSseHandler.requests == 1
+            assert event_types[0] == "response.created", event_types
+            assert event_types[-1] == "error", event_types
+            assert "response.completed" not in event_types, event_types
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            backend.shutdown()
+            backend.server_close()
+            os.unlink(config_path)
+            if proc.returncode not in (0, -2):
+                print(_read_log_tail(str(log_path)), file=sys.stderr)
+
+
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 

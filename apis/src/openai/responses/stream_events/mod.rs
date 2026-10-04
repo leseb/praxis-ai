@@ -370,6 +370,7 @@ impl OpenaiStreamEventsFilter {
             state.retained_stream_parser_bytes = 0;
         }
         ctx.insert_filter_state(self.new_round_state(iteration, output_index_offset));
+        ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "true");
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
         // consumes) to confirm this typed-streaming round can surface
@@ -581,6 +582,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         if !is_success_sse_response(ctx) {
             debug!("disarming stream_events: response is not 2xx text/event-stream");
             ctx.remove_filter_state::<StreamEventsState>();
+            ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "false");
             return Ok(FilterAction::Continue);
         }
 
@@ -592,6 +594,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         if response_is_encoded(ctx) {
             debug!("disarming stream_events: response carries Content-Encoding");
             ctx.remove_filter_state::<StreamEventsState>();
+            ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "false");
             return Ok(FilterAction::Continue);
         }
 
@@ -3474,6 +3477,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
     };
+    ctx.set_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY, "false");
 
     // Preserve any non-terminal logical events `process_chunk` already emitted
     // for this final chunk, then append synthesized local-tool events and the

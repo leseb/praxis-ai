@@ -539,6 +539,7 @@ fn converter_budget_remaining(
 /// A translated stream has committed HTTP 200. Keep only the bounded logical
 /// error path; later provider chunks are dropped by `transform_stream_response`.
 fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+    let finalizer_armed = ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) == Some("true");
     *body = None;
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.discard_payload_for_budget_error();
@@ -548,6 +549,12 @@ fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut O
     #[cfg(feature = "store")]
     super::store::discard_retained_request_payload(ctx);
     super::fs_end_stream_with_error_ctx(ctx, "server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    if !finalizer_armed {
+        // Conditional pipelines can translate a committed Chat SSE stream
+        // without stream_events. There is then no later callback to turn the
+        // recorded error into wire bytes, so emit its fixed-size terminal now.
+        *body = Some(super::stream_events::encode_retained_payload_error(ctx));
+    }
 }
 
 /// Reserve the provider parse tree, translated resource, serialized wire body,

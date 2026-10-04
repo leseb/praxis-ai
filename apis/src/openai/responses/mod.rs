@@ -82,6 +82,10 @@ pub use agentic_loop::AgenticBudgetPolicy;
 /// buffered IRR steps, unlike `IterationState.previous_response`.
 #[cfg(feature = "openai-responses")]
 pub(crate) struct ObservedResponsesSse;
+/// Request-shared marker for a stream-events parser that can emit a recorded
+/// terminal error after a translated provider callback drops its body.
+#[cfg(feature = "openai-responses")]
+pub(crate) const STREAM_ERROR_FINALIZER_ARMED_KEY: &str = "responses.stream_error_finalizer_armed";
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]

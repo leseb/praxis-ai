@@ -1885,6 +1885,11 @@ fn arm_publishes_logical_stream_marker() {
         Some("true"),
         "arming must publish the per-round marker openai_agentic_loop consumes"
     );
+    assert_eq!(
+        ctx.get_metadata(super::super::STREAM_ERROR_FINALIZER_ARMED_KEY),
+        Some("true"),
+        "the translator can leave overflow emission to this armed parser"
+    );
 }
 
 #[tokio::test]
