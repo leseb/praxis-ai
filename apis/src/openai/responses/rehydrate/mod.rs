@@ -375,6 +375,7 @@ impl HttpFilter for RehydrateFilter {
                     ctx.set_metadata("responses.skip_persist", "true");
                     super::fs_arm_stream_stop(ctx);
                     *body = None;
+                    ctx.insert_filter_state(RestoreBudgetFailed);
                     return Err(
                         "response restoration exceeded retained payload budget after terminal SSE event".into(),
                     );

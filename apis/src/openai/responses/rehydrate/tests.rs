@@ -2406,6 +2406,14 @@ async fn direct_stream_restore_overflow_after_forwarded_terminal_tears_down_tran
             "{terminal}: overflow after the forwarded terminal must tear down the transport"
         );
         assert!(later.is_none(), "{terminal}: no budget error may enter the body");
+        // Praxis may be configured to continue after a filter error. Even then,
+        // no later provider chunk may escape once this response was aborted.
+        later = Some(Bytes::from_static(b"data: {\"provider_private\":true}\n\n"));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut later, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(later.is_none(), "{terminal}: later chunks must remain suppressed");
         assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
         assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
     }
