@@ -158,6 +158,9 @@ pub(super) struct StreamEventsState {
     /// Exact compact-JSON sizes of unchanged current-round output items.
     /// A `None` slot is recomputed after the corresponding item changes.
     output_item_bytes: Vec<Option<usize>>,
+    /// Exact total for completed tool calls. They stay unchanged across text
+    /// deltas; arguments.done and authoritative terminal events invalidate it.
+    tool_calls_bytes: Option<usize>,
 }
 
 impl StreamEventsState {
@@ -165,6 +168,32 @@ impl StreamEventsState {
     fn clear_shared_budget_cache(&mut self) {
         self.shared_stable_bytes = OnceLock::new();
         self.output_item_bytes.clear();
+        self.tool_calls_bytes = None;
+    }
+
+    /// Measure completed calls once until the stream accumulator changes them.
+    fn completed_tool_calls_bytes(&mut self, calls: &[Value]) -> Option<usize> {
+        if let Some(bytes) = self.tool_calls_bytes {
+            return Some(bytes);
+        }
+        let bytes = retained_json_values_bytes(calls)?;
+        self.tool_calls_bytes = Some(bytes);
+        Some(bytes)
+    }
+
+    /// These are the only event families that write `ResponsesState.tool_calls`
+    /// during an upstream round. Request-side dispatch runs after EOS, which
+    /// clears this entire parser-local cache before a resumed round is armed.
+    fn invalidate_tool_calls_for_event(&mut self, event: &ResponsesEvent) {
+        if matches!(
+            event,
+            ResponsesEvent::FunctionCallArgumentsDone(_)
+                | ResponsesEvent::ResponseCompleted(_)
+                | ResponsesEvent::ResponseIncomplete(_)
+                | ResponsesEvent::ResponseFailed(_)
+        ) {
+            self.tool_calls_bytes = None;
+        }
     }
 
     /// Measure the response object's changing top-level fields on each check,
@@ -428,6 +457,7 @@ impl OpenaiStreamEventsFilter {
             stream_failed: false,
             shared_stable_bytes: OnceLock::new(),
             output_item_bytes: Vec::new(),
+            tool_calls_bytes: None,
         }
     }
 
@@ -1260,7 +1290,12 @@ fn shared_retained_budget(
         .checked_sub(stable)
         .and_then(|remaining| {
             let response_bytes = stream.response_object_bytes(&responses.response_object, remaining)?;
-            responses.stream_changing_payload_bytes_bounded_with_response_object_size(remaining, response_bytes)
+            let tool_calls_bytes = stream.completed_tool_calls_bytes(&responses.tool_calls)?;
+            responses.stream_changing_payload_bytes_bounded_with_response_object_size(
+                remaining,
+                response_bytes,
+                Some(tool_calls_bytes),
+            )
         })
         .and_then(|changing| stable.checked_add(changing));
     Some((limit, current))
@@ -1443,6 +1478,7 @@ fn record_retained_payload_overflow(ctx: &mut HttpFilterContext<'_>, state: &mut
     }
     state.tool_call_args.clear();
     state.rejected_tool_call_args.clear();
+    state.tool_calls_bytes = None;
     state.frame_parser.clear();
     state.deferred_terminal = None;
     state.deferred_done = false;
@@ -1698,6 +1734,7 @@ fn accumulate_chunk(
     let mut completions: Vec<client_tools::ClientToolCompletion> = Vec::new();
     for event in events {
         let retained_clone_bytes = accumulate_event(ctx, state, event);
+        state.invalidate_tool_calls_for_event(event);
         if let Some(responses) = ctx.extensions.get::<ResponsesState>() {
             state.invalidate_output_item_for_event(responses, event);
         }

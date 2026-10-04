@@ -495,7 +495,7 @@ fn deferred_terminal_rejects_echo_before_restoring_canonical_response() {
 
 #[test]
 fn streaming_budget_cache_counts_stable_owners_once_per_round() {
-    let (_filter, mut ctx) = make_armed_context();
+    let (filter, mut ctx) = make_armed_context();
     let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState {
         request_body: json!({"input": "p".repeat(32_768)}),
@@ -541,6 +541,11 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
         .unwrap()
         .accumulated_output
         .push(json!({"type": "message", "content": "next round"}));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .tool_calls
+        .push(json!({"type": "function_call", "arguments": "next round"}));
     let after_eos = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     assert_eq!(
         after_eos,
@@ -551,6 +556,17 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .unwrap()
     );
     assert!(stream.shared_stable_bytes.get().copied().unwrap() > cached);
+    ctx.insert_filter_state(stream);
+    filter.arm(&mut ctx);
+    let mut rearmed = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        rearmed.tool_calls_bytes.is_none(),
+        "a resumed round must remeasure completed calls"
+    );
+    assert_eq!(
+        super::shared_retained_budget(&ctx, &mut rearmed).unwrap().1,
+        ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_bytes()
+    );
 }
 
 #[test]
@@ -1342,10 +1358,15 @@ fn assert_cached_response_charge_matches_uncached(ctx: &mut praxis_filter::HttpF
     let cached = parser
         .response_object_bytes(&responses.response_object, usize::MAX)
         .unwrap();
+    let cached_tool_calls = parser.completed_tool_calls_bytes(&responses.tool_calls).unwrap();
     assert_eq!(cached, super::retained_json_bytes(&responses.response_object).unwrap());
     assert_eq!(
         responses
-            .stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, cached)
+            .stream_changing_payload_bytes_bounded_with_response_object_size(
+                usize::MAX,
+                cached,
+                Some(cached_tool_calls)
+            )
             .unwrap(),
         responses.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
         "cached response charge must preserve all other independent owners, including tool_calls"
@@ -1370,25 +1391,57 @@ fn stream_response_object_cache_tracks_item_and_top_level_mutations() {
             json!({"output_index":0,"item_id":"call_1","arguments":"abc"}),
         ),
         (
+            "response.function_call_arguments.done",
+            json!({"output_index":0,"item_id":"call_1","arguments":"abcde"}),
+        ),
+        (
             "response.output_item.done",
-            json!({"output_index":0,"item":{"id":"call_1","type":"function_call","name":"f","arguments":"abcd","status":"completed"}}),
+            json!({"output_index":0,"item":{"id":"call_1","type":"function_call","name":"f","arguments":"abcde","status":"completed"}}),
         ),
         (
             "response.completed",
-            json!({"response":{"id":"resp_1","status":"completed","output":[{"id":"call_1","type":"function_call","name":"f","arguments":"abcd","status":"completed"}],"usage":{"input_tokens":1}}}),
+            json!({"response":{"id":"resp_1","status":"completed","output":[{"id":"call_1","type":"function_call","name":"f","arguments":"abcdef","status":"completed"}],"usage":{"input_tokens":1}}}),
         ),
     ] {
+        let prior_tool_call_bytes =
+            super::retained_json_values_bytes(&ctx.extensions.get::<ResponsesState>().unwrap().tool_calls).unwrap();
         let mut chunk = Some(make_sse_chunk(event, &payload));
         filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
         assert!(
             !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
             "{event} unexpectedly failed admission"
         );
+        if event == "response.function_call_arguments.done" && prior_tool_call_bytes > 0 {
+            let calls = &ctx.extensions.get::<ResponsesState>().unwrap().tool_calls;
+            assert_eq!(calls.len(), 1, "arguments.done replaces the call at the same index");
+            assert!(super::retained_json_values_bytes(calls).unwrap() > prior_tool_call_bytes);
+        }
+        if event == "response.completed" {
+            let calls = &ctx.extensions.get::<ResponsesState>().unwrap().tool_calls;
+            assert_eq!(
+                calls.len(),
+                1,
+                "terminal replaces the call without changing vector length"
+            );
+            assert!(super::retained_json_values_bytes(calls).unwrap() > prior_tool_call_bytes);
+        }
         assert_cached_response_charge_matches_uncached(&mut ctx);
     }
     ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object["status"] =
         json!("completed-with-longer-status");
     assert_cached_response_charge_matches_uncached(&mut ctx);
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    // The shared view excludes this filter's separately published parser
+    // charge, so tighten the limit against that view itself.
+    let exact = super::shared_retained_budget(&ctx, &mut parser).unwrap().1.unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(exact - 1);
+    assert!(
+        super::shared_retained_budget(&ctx, &mut parser).unwrap().1.is_none(),
+        "cached call sizes must still honor a smaller shared limit"
+    );
 }
 
 #[test]
@@ -1420,6 +1473,49 @@ fn completed_stream_item_is_charged_across_later_small_deltas() {
     eprintln!("completed-item 100-delta budget scan: {:?}", start.elapsed());
     assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
     assert_cached_response_charge_matches_uncached(&mut ctx);
+}
+
+#[test]
+#[expect(clippy::print_stderr, reason = "matched before/after budget-meter timing probe")]
+fn completed_tool_call_budget_checks_reuse_exact_charge() {
+    fn timed_checks(retain_call: bool) -> std::time::Duration {
+        let (_filter, mut ctx) = make_armed_context();
+        let mut responses = ResponsesState::from_request_body(json!({"input":"hi", "stream":true}));
+        let call = json!({
+            "type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"tool",
+            "arguments":"x".repeat(262_144), "status":"completed"
+        });
+        responses.replace_response_object(json!({"output":[call.clone()]}));
+        if retain_call {
+            responses.tool_calls.push(call);
+        }
+        responses.apply_retained_payload_limit(64 * 1024 * 1024);
+        ctx.extensions.insert(responses);
+        let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+        let expected = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        assert_eq!(
+            super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+            Some(expected)
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(super::shared_retained_budget(&ctx, &mut stream));
+        }
+        assert_eq!(
+            super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+            Some(expected)
+        );
+        start.elapsed()
+    }
+
+    let output_only = timed_checks(false);
+    let completed_call = timed_checks(true);
+    eprintln!("200 unchanged budget checks: output_only={output_only:?}; with_completed_tool_call={completed_call:?}");
 }
 
 #[tokio::test]
@@ -5376,6 +5472,7 @@ fn parse_error_sets_metadata() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
+        tool_calls_bytes: None,
     });
 
     let large_chunk =
@@ -5431,6 +5528,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
+        tool_calls_bytes: None,
     });
 
     validate_stream_end(&mut ctx);
