@@ -679,6 +679,8 @@ fn round_trip_captures_tool_and_model_requests() {
     let first_response = serde_json::json!({
         "id": "resp_1",
         "object": "response",
+        "created_at": 1_000,
+        "model": "gpt-4.1",
         "status": "completed",
         "output": [{
             "type": "function_call",
@@ -692,6 +694,8 @@ fn round_trip_captures_tool_and_model_requests() {
     let second_response = serde_json::json!({
         "id": "resp_2",
         "object": "response",
+        "created_at": 1_001,
+        "model": "gpt-4.1",
         "status": "completed",
         "output": [{
             "type": "message",
@@ -721,7 +725,8 @@ fn round_trip_captures_tool_and_model_requests() {
     });
 
     let proxy_port = free_port();
-    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port());
+    let db = TempSqlite::new("round_trip_captures_tool_and_model_requests");
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
@@ -1458,7 +1463,8 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         ..McpMockConfig::default()
     });
     let proxy_port = free_port();
-    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model_port);
+    let db = TempSqlite::new("streaming_mcp_round_trip");
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model_port, db.url());
     let proxy = start_proxy(&config);
     let request = serde_json::json!({
         "model": "gpt-4.1",
@@ -8001,11 +8007,16 @@ fn load_loopback_mcp_config_with_connectors(
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP connector config")
 }
 
-fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+fn load_loopback_mcp_config_without_rehydrate(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = yaml.replacen("      - filter: openai_responses_rehydrate\n", "", 1);
     assert!(
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
