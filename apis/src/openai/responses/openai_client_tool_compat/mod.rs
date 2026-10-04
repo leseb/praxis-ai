@@ -636,9 +636,9 @@ impl HttpFilter for ClientToolCompatFilter {
         // Stream by default so a request that lowers nothing never pays to buffer
         // the response. When lowering records an echo, `on_response` selects a
         // bounded `StreamBuffer` after upstream headers arrive so the whole
-        // response is restored before any bytes reach the client. A streaming
-        // response is never armed (an echo is only set on a buffered, non-streaming
-        // request) and is handled by `openai_stream_events`.
+        // response is restored before any bytes reach the client. Streaming
+        // requests may record an echo for `openai_stream_events`, but this filter
+        // leaves their response chunks to that stream owner.
         BodyMode::Stream
     }
 
@@ -674,6 +674,10 @@ impl HttpFilter for ClientToolCompatFilter {
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !restoration_armed(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+        if request_is_streaming(ctx) {
+            ctx.insert_filter_state(ClientToolRestoreBypass);
             return Ok(FilterAction::Continue);
         }
         if !eligible_restore_response(ctx) {

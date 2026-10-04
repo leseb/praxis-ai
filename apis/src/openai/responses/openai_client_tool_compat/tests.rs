@@ -5892,6 +5892,54 @@ async fn passthrough_request_does_not_arm_buffering_or_strip_encoding() {
 }
 
 #[tokio::test]
+async fn budgeted_streaming_rich_tool_response_stays_unbuffered() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("responses.client_tool_stream_restoration", "true".to_owned());
+    let mut state = ResponsesState::from_request_body(json!({
+        "stream": true,
+        "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
+    }));
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    ctx.extensions.insert(state);
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut None, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .client_tool_echo
+            .is_some()
+    );
+
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+
+    let chunk = Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
+    let mut body = Some(chunk.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(body, Some(chunk), "SSE bytes belong to the stream restoration owner");
+}
+
+#[tokio::test]
 async fn streaming_rich_request_rejects_without_arming() {
     // A streaming request with rich client tools fails closed before any upstream
     // call and must never arm response buffering.
