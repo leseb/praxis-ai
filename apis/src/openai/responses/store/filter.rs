@@ -3906,6 +3906,10 @@ mod encode_replay_event_tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the final response guard needs a complete store context"
+    )]
     async fn incomplete_canonical_body_needs_no_direct_content_length() {
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
