@@ -783,6 +783,88 @@ fn make_filter(on_failure: &str) -> CompactFilter {
     }
 }
 
+#[tokio::test]
+async fn reactive_budget_rejects_before_summarization_even_with_fail_open() {
+    let filter = make_filter("open");
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.history_rehydrated = true;
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    state.apply_retained_payload_limit(4096);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"input":"hello"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("aggregate exhaustion must reject before the callout");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn reactive_noop_does_not_reserve_a_callout() {
+    let filter = make_filter("open");
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.history_rehydrated = true;
+    state.previous_usage = Some(json!({"total_tokens": 10}));
+    state.apply_retained_payload_limit(4096);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"input":"hello"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Release
+    ));
+}
+
+#[test]
+fn reactive_budget_allows_a_bounded_small_callout() {
+    let filter = make_filter("closed");
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "hello"}));
+    state.apply_retained_payload_limit(2 * 1024 * 1024);
+    let params = CompactionParams {
+        compact_threshold: 1000,
+        compaction_model: None,
+    };
+
+    assert!(
+        reactive_compaction_text_fits(&state),
+        "small conversation should fit before formatting"
+    );
+    let response_limit = reactive_compaction_response_limit(&state, "hello", &params, &filter.config)
+        .expect("small request should fit")
+        .expect("configured budget should cap the response");
+    assert!(
+        response_limit > 0,
+        "bounded callout should retain a usable response allowance"
+    );
+    assert!(
+        response_limit <= MAX_SUMMARIZATION_RESPONSE_BYTES,
+        "aggregate allowance must preserve the existing callout cap"
+    );
+}
+
 #[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");

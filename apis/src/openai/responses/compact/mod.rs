@@ -59,7 +59,7 @@ use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
     error::responses_error_rejection,
     is_explicit_compact_request,
-    state::{ResponsesState, mark_local_compaction_item},
+    state::{ResponsesState, mark_local_compaction_item, retained_json_bytes, retained_json_values_bytes},
 };
 use crate::{
     callout_policy::OnFailure,
@@ -74,6 +74,14 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
+/// The buffered transport can briefly hold a just-read chunk twice.
+const CALLOUT_TRANSPORT_STAGING_BYTES: usize = 131_072;
+
+/// Budget exhaustion must bypass the configured ordinary callout fail-open policy.
+enum ReactiveCompactionError {
+    RetainedBudget,
+    Rejection(FilterAction),
+}
 
 /// Minimum allowed `compact_threshold` for compaction (1,000 tokens).
 const MIN_COMPACT_THRESHOLD: u64 = 1_000; // 1,000 tokens
@@ -209,7 +217,8 @@ impl CompactFilter {
         state: &ResponsesState,
         params: &CompactionParams,
         conversation_text: &str,
-    ) -> Result<Option<String>, FilterAction> {
+        response_limit: Option<usize>,
+    ) -> Result<Option<String>, ReactiveCompactionError> {
         let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let request = build_summarization_request(conversation_text, instructions, model);
@@ -218,12 +227,20 @@ impl CompactFilter {
             &self.client,
             &self.config.inference_url,
             request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
+            response_limit.unwrap_or(MAX_SUMMARIZATION_RESPONSE_BYTES),
             timeout,
             self.config.address_policy,
         )
         .await;
-        Ok(self.handle_subrequest_result(result)?.map(|s| s.content))
+        if let Err(subrequest::SubRequestError::ResponseTooLarge { .. }) = &result
+            && response_limit.is_some_and(|limit| limit < MAX_SUMMARIZATION_RESPONSE_BYTES)
+        {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
+        Ok(self
+            .handle_subrequest_result(result)
+            .map_err(ReactiveCompactionError::Rejection)?
+            .map(|s| s.content))
     }
 
     /// Map a subrequest result to a parsed summarization or a filter action.
@@ -285,29 +302,29 @@ impl CompactFilter {
     /// Apply compaction results: replace the conversation history with
     /// the compaction item. The compacted messages are persisted by the
     /// normal response store filter as part of the eventual response.
-    fn apply_compaction(&self, ctx: &mut HttpFilterContext<'_>, summary: &str) {
+    fn apply_compaction(&self, ctx: &mut HttpFilterContext<'_>, summary: &str) -> bool {
         let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             warn!("ResponsesState missing in apply_compaction");
-            return;
+            return false;
         };
+        let Some(staging) = summary
+            .len()
+            .checked_add(self.config.summary_prefix.len())
+            .and_then(|bytes| bytes.checked_mul(8))
+            .and_then(|bytes| bytes.checked_add(compaction_id.len().saturating_mul(8)))
+            .and_then(|bytes| bytes.checked_add(512))
+        else {
+            return false;
+        };
+        if !state.can_retain_payload(staging) {
+            return false;
+        }
         replace_messages(
             state,
             &build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
         );
-    }
-
-    /// Check the threshold and run summarization if it is exceeded.
-    async fn check_and_summarize(&self, state: &ResponsesState) -> Result<Option<String>, FilterAction> {
-        let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return Ok(None),
-            Err(msg) => {
-                let rej = responses_error_rejection(400, "invalid_request_error", &msg);
-                return Err(FilterAction::Reject(rej));
-            },
-        };
-        self.execute_compaction(state, &params, &conversation_text).await
+        state.can_retain_payload(0)
     }
 
     /// Handle an explicit `POST /v1/responses/compact` request.
@@ -402,15 +419,138 @@ impl HttpFilter for CompactFilter {
             warn!("ResponsesState missing after ensure_compactable_state");
             return Ok(FilterAction::Release);
         };
-        let summary = match self.check_and_summarize(state).await {
-            Ok(Some(summary)) => summary,
-            Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
-            Err(action) => return Ok(action),
+        let params = match extract_compaction_config(&state.context_management) {
+            Ok(Some(params)) => params,
+            Ok(None) => return Ok(FilterAction::Release),
+            Err(message) => {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    400,
+                    "invalid_request_error",
+                    &message,
+                )));
+            },
         };
-        self.apply_compaction(ctx, &summary);
+        if previous_usage_total(state).is_some_and(|total| total <= params.compact_threshold) {
+            return Ok(FilterAction::Release);
+        }
+        if !reactive_compaction_text_fits(state) {
+            return Ok(reject_compaction_budget(ctx));
+        }
+        let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return Ok(FilterAction::Release),
+            Err(message) => {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    400,
+                    "invalid_request_error",
+                    &message,
+                )));
+            },
+        };
+        let response_limit = match reactive_compaction_response_limit(state, &conversation_text, &params, &self.config)
+        {
+            Ok(limit) => limit,
+            Err(()) => return Ok(reject_compaction_budget(ctx)),
+        };
+        let summary = match self
+            .execute_compaction(state, &params, &conversation_text, response_limit)
+            .await
+        {
+            Ok(Some(summary)) => summary,
+            Ok(None) | Err(ReactiveCompactionError::Rejection(FilterAction::Release)) => {
+                return Ok(FilterAction::Release);
+            },
+            Err(ReactiveCompactionError::RetainedBudget) => return Ok(reject_compaction_budget(ctx)),
+            Err(ReactiveCompactionError::Rejection(action)) => return Ok(action),
+        };
+        if !self.apply_compaction(ctx, &summary) {
+            return Ok(reject_compaction_budget(ctx));
+        }
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
+}
+
+/// Reserve formatted conversation, joined content parts, and the worst-case
+/// token vector before formatting or tokenizing. A no-op threshold check does
+/// not reserve a callout response it will never receive.
+fn reactive_compaction_text_fits(state: &ResponsesState) -> bool {
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let Some(history) = retained_json_values_bytes(&state.messages) else {
+        return false;
+    };
+    let Some(request) = retained_json_bytes(&state.request_body) else {
+        return false;
+    };
+    let text = history
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(state.messages.len().checked_mul(64)?))
+        .and_then(|bytes| bytes.checked_add(512));
+    // A token vector can contain one machine word per input byte. Other copies
+    // cover conversation text, joined parts, and context overhead.
+    let staging = text.and_then(|text| {
+        text.checked_mul(16)
+            .and_then(|bytes| bytes.checked_add(request.checked_mul(16)?))
+    });
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Reserve escaped JSON request copies and buffered response parsing before
+/// dispatching the summarizer. A smaller response limit is safe to use because
+/// the summarizer has no externally visible effect until its result is stored.
+fn reactive_compaction_response_limit(
+    state: &ResponsesState,
+    conversation_text: &str,
+    params: &CompactionParams,
+    config: &ValidatedConfig,
+) -> Result<Option<usize>, ()> {
+    let Some(limit) = state.retained_payload_limit() else {
+        return Ok(None);
+    };
+    let current = state.retained_payload_bytes_bounded(limit).ok_or(())?;
+    let model = params.compaction_model.as_deref().unwrap_or(&config.default_model);
+    let instructions = state
+        .request_body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    let request = conversation_text
+        .len()
+        .checked_add(instructions)
+        .and_then(|bytes| bytes.checked_add(model.len()))
+        .and_then(|bytes| bytes.checked_add(SUMMARIZATION_SYSTEM_PROMPT.len()))
+        .and_then(|bytes| bytes.checked_mul(12))
+        .and_then(|bytes| bytes.checked_add(1_024))
+        .ok_or(())?;
+    let staging = request
+        .checked_add(conversation_text.len())
+        .and_then(|bytes| bytes.checked_add(CALLOUT_TRANSPORT_STAGING_BYTES))
+        .ok_or(())?;
+    let remaining = limit
+        .checked_sub(current)
+        .and_then(|bytes| bytes.checked_sub(staging))
+        .ok_or(())?;
+    let response_limit = (remaining / 4).min(MAX_SUMMARIZATION_RESPONSE_BYTES);
+    if response_limit == 0 {
+        return Err(());
+    }
+    Ok(Some(response_limit))
+}
+
+fn reject_compaction_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during compaction",
+    ))
 }
 
 // -----------------------------------------------------------------------------
