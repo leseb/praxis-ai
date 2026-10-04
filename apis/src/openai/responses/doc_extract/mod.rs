@@ -203,15 +203,20 @@ fn parsed_body_fits(ctx: &HttpFilterContext<'_>, raw: &[u8]) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
     };
-    if state.retained_payload_limit().is_none() {
+    let Some(limit) = state.retained_payload_limit().or_else(|| {
+        ctx.extensions
+            .get::<AgenticBudgetPolicy>()
+            .map(|policy| policy.max_retained_bytes())
+    }) else {
         return true;
-    }
+    };
     let Some(parsed_bytes) = super::buffered_parsed_json_bytes_upper_bound(raw) else {
         return false;
     };
     raw.len()
         .checked_add(parsed_bytes)
-        .is_some_and(|peak| state.can_retain_payload(peak))
+        .and_then(|additional| state.retained_payload_bytes_bounded(limit)?.checked_add(additional))
+        .is_some_and(|peak| peak <= limit)
 }
 
 /// Run extraction on the current input and history, then rewrite
