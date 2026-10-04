@@ -1516,10 +1516,11 @@ fn charge_pooled_mcp_sessions(ctx: &mut HttpFilterContext<'_>, pool: &mcp_client
     if state.retained_payload_limit().is_none() {
         return true;
     }
-    let Some(bytes) = pool.retained_payload_bytes() else {
+    let Some((parked, _closing)) = pool.retained_payload_parts() else {
         return false;
     };
-    state.retained_mcp_session_bytes = bytes;
+    state.retained_mcp_session_bytes = parked;
+    state.retained_mcp_closing_pool = Some(pool.clone());
     true
 }
 

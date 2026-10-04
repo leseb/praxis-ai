@@ -348,9 +348,13 @@ pub(crate) struct ResponsesState {
     pub(crate) retained_rehydrate_stream_bytes: usize,
     /// Semantic and framing payload published by the Chat stream translator.
     pub(crate) retained_chat_converter_bytes: usize,
-    /// Initialized MCP peer metadata retained in the request-scoped session pool.
+    /// Parked MCP session payload last published by the dispatcher.
     #[cfg(feature = "openai-mcp-tools")]
     pub(crate) retained_mcp_session_bytes: usize,
+    /// Closing sessions release asynchronously, so read their live charge at
+    /// each admission instead of keeping a stale dispatcher snapshot.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub(crate) retained_mcp_closing_pool: Option<crate::mcp_client::McpSessionPool>,
 
     /// Revision of request, history, prior output, and resolved MCP definitions
     /// cached by streaming admission. In-place changes do not alter lengths.
@@ -932,6 +936,8 @@ impl Default for ResponsesState {
             retained_chat_converter_bytes: 0,
             #[cfg(feature = "openai-mcp-tools")]
             retained_mcp_session_bytes: 0,
+            #[cfg(feature = "openai-mcp-tools")]
+            retained_mcp_closing_pool: None,
             replay_stable_payload_revision: Some(0),
             current_output_revision: Some(0),
             retained_payload_failed: false,
@@ -1181,6 +1187,9 @@ impl ResponsesState {
         #[cfg(feature = "openai-mcp-tools")]
         if include_external {
             meter.raw(self.retained_mcp_session_bytes)?;
+            if let Some(pool) = &self.retained_mcp_closing_pool {
+                meter.raw(pool.retained_closing_payload_bytes()?)?;
+            }
         }
 
         if !skip_stream_stable {
@@ -1386,6 +1395,7 @@ impl ResponsesState {
         #[cfg(feature = "openai-mcp-tools")]
         {
             self.retained_mcp_session_bytes = 0;
+            self.retained_mcp_closing_pool = None;
         }
         self.messages.clear();
         self.persisted_messages.clear();

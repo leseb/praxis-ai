@@ -2707,6 +2707,14 @@ async fn background_closing_session_remains_charged_until_delete_finishes() {
     tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
         .await
         .expect("background DELETE must start");
+    let mut state = crate::openai::responses::state::ResponsesState::default();
+    let (parked, closing) = pool.retained_payload_parts().unwrap();
+    assert_eq!(parked, 0);
+    assert!(closing > 0);
+    state.retained_mcp_session_bytes = parked;
+    state.retained_mcp_closing_pool = Some(pool.clone());
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 16);
+    assert!(!state.can_retain_payload(32), "live closing owner must block admission");
     assert!(
         pool.retained_payload_bytes().unwrap() >= parked_bytes - "closing-owner".len(),
         "closing peer info and GET stream remain live until DELETE completes"
@@ -2719,6 +2727,10 @@ async fn background_closing_session_remains_charged_until_delete_finishes() {
     })
     .await
     .expect("closing charge must clear after DELETE completes");
+    assert!(
+        state.can_retain_payload(32),
+        "released closing owner must free request-wide admission"
+    );
     ct.cancel();
 }
 

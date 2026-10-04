@@ -239,6 +239,13 @@ impl PooledSession {
         self.close_with_timeout(MAX_CLOSE_WAIT).await;
     }
 
+    /// A detached pool close keeps its charge until rmcp's cleanup task exits.
+    /// `close_with_timeout` can return while rmcp still owns peer information.
+    async fn close_fully(mut self) {
+        let _claimed_before_idle_timeout = self.unpark();
+        drop(self.service.close().await);
+    }
+
     /// Close without waiting past an active tool call's absolute deadline.
     pub(crate) async fn close_before(self, deadline: tokio::time::Instant) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -338,23 +345,46 @@ impl McpSessionPool {
     /// a possible incomplete standalone GET SSE event.
     /// rmcp keeps initialize `instructions` and `_meta` in `peer_info`; read the
     /// live value so a transparent reinitialization cannot leave a stale charge.
-    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
+    pub(crate) fn retained_payload_parts(&self) -> Option<(usize, usize)> {
         let parked = self.lock().iter().try_fold(0_usize, |used, (key, sessions)| {
             let used = used.checked_add(key.target_fingerprint.len())?;
             sessions.iter().try_fold(used, |used, session| {
                 used.checked_add(session.retained_payload_bytes()?)
             })
         })?;
+        let mut closing_entries = self
+            .inner
+            .closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        closing_entries.retain(|charge| charge.strong_count() > 0);
+        let closing = closing_entries.iter().try_fold(0_usize, |used, weak| {
+            weak.upgrade()
+                .map_or(Some(used), |charge| used.checked_add(charge.bytes?))
+        })?;
+        drop(closing_entries);
+        Some((parked, closing))
+    }
+
+    /// Payload retained by sessions waiting for background cleanup.
+    pub(crate) fn retained_closing_payload_bytes(&self) -> Option<usize> {
         let mut closing = self
             .inner
             .closing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         closing.retain(|charge| charge.strong_count() > 0);
-        closing.iter().try_fold(parked, |used, weak| {
+        closing.iter().try_fold(0_usize, |used, weak| {
             weak.upgrade()
                 .map_or(Some(used), |charge| used.checked_add(charge.bytes?))
         })
+    }
+
+    /// Payload retained by parked and closing sessions.
+    #[cfg(test)]
+    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
+        let (parked, closing) = self.retained_payload_parts()?;
+        parked.checked_add(closing)
     }
 
     /// Take one compatible session and return all unusable entries separately
@@ -475,7 +505,7 @@ impl McpSessionPool {
         }
         drop(tokio::spawn(async move {
             join_all(tracked.into_iter().map(|(session, charge)| async move {
-                session.close().await;
+                session.close_fully().await;
                 drop(charge);
             }))
             .await;
@@ -528,7 +558,84 @@ pub(crate) async fn close_sessions(sessions: Vec<PooledSession>) {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
+    use rmcp::{
+        service::{RxJsonRpcMessage, TxJsonRpcMessage},
+        transport::Transport,
+    };
+
     use super::*;
+
+    /// A close that outlives the outer five-second wait in rmcp's timed API.
+    struct GatedClose {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Transport<RoleClient> for GatedClose {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            _: TxJsonRpcMessage<RoleClient>,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            std::future::ready(Ok(()))
+        }
+
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test keeps rmcp cleanup gated past the timed-close boundary"
+    )]
+    async fn closing_charge_waits_for_rmcp_task_past_outer_close_timeout() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let service = rmcp::service::serve_directly::<RoleClient, _, _, _, _>(
+            (),
+            GatedClose {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            },
+            Some(rmcp::model::ServerConfig::default().into()),
+        );
+        let session = PooledSession::new(service, Arc::new(TransportSignalState::new(None)), 1_024, 1_024);
+        let pool = McpSessionPool::new();
+        pool.close_sessions_in_background(vec![session]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .is_ok(),
+            "rmcp transport close must begin"
+        );
+
+        // rmcp's close_with_timeout would detach its JoinHandle after five
+        // seconds even though this transport still owns the initialized peer.
+        tokio::time::sleep(MAX_CLOSE_WAIT + Duration::from_millis(250)).await;
+        assert!(pool.retained_payload_bytes().is_some_and(|bytes| bytes > 0));
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pool.retained_payload_bytes() != Some(0) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok(),
+            "charge must clear when the rmcp cleanup task exits"
+        );
+    }
 
     #[test]
     fn empty_fingerprint_has_no_pool_key() {
