@@ -3173,6 +3173,8 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     parser_state.deferred_terminal = None;
     parser_state.local_tool_items.clear();
     parser_state.client_tool_items.clear();
+    // The cache meters its capacity, which Vec::clear would keep allocated.
+    parser_state.output_item_bytes = Vec::new();
     debug_assert_eq!(
         parser_state.retained_payload_bytes(),
         Some(0),

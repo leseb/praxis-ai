@@ -2677,26 +2677,31 @@ async fn streaming_restore_forwards_nested_response_with_no_rewrite_headroom() {
 
 #[test]
 fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
+    fn fits(armed: &mut RestorePreviousResponseIdStream, state: &ResponsesState) -> bool {
+        streaming_restore_budget(armed, Some(state))
+            .is_ok_and(|budget| streaming_restore_fits(budget, 0, 16))
+    }
+
     let mut state = rehydrated_state("resp_prev");
     state.messages.push(json!("h".repeat(32_000)));
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(baseline + 128);
-    let mut stable_budget = None;
-    assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
-    let cached = stable_budget.unwrap();
+    let mut armed = armed_stream(MAX_JSON_BODY_BYTES, "resp_prev");
+    assert!(fits(&mut armed, &state));
+    let cached = armed.stable_payload.unwrap();
 
     // Dispatch can append history after a round has already advanced. The
     // cache must refresh even when the logical iteration did not change.
     state.messages.push(json!("new".repeat(80)));
-    assert!(!cached.matches(&state));
-    assert!(!streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
+    assert!(!cached.matches(&state, state.retained_payload_limit().unwrap()));
+    assert!(!fits(&mut armed, &state));
 
     state.messages.pop();
     state.retained_stream_parser_bytes = 80;
     state.accumulated_output.push(json!("o".repeat(80)));
-    assert!(cached.matches(&state));
+    assert!(cached.matches(&state, state.retained_payload_limit().unwrap()));
     assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        !fits(&mut armed, &state),
         "the changing meter must include parser bytes and canonical output"
     );
 
@@ -2704,17 +2709,18 @@ fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
     state.accumulated_output.clear();
     state.messages[0] = json!("h".repeat(33_000));
     state.mark_replay_stable_payload_changed();
-    assert!(!cached.matches(&state));
+    assert!(!cached.matches(&state, state.retained_payload_limit().unwrap()));
     assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        !fits(&mut armed, &state),
         "an in-place history replacement must invalidate the cached charge"
     );
 
     state.messages[0] = json!("h".repeat(32_000));
     state.replay_stable_payload_revision = None;
+    assert!(!fits(&mut armed, &state), "an exhausted revision must fail closed");
     assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
-        "an exhausted revision must fail closed"
+        !cached.matches(&state, state.retained_payload_limit().unwrap()),
+        "an exhausted revision must invalidate the earlier charge"
     );
 }
 

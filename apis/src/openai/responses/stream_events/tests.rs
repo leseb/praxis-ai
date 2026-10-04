@@ -714,12 +714,12 @@ fn ordinary_delta_skips_already_flushed_local_output_bound() {
 #[test]
 fn eos_remeasures_history_appended_after_the_first_stream_chunk() {
     let (filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
     let baseline = responses.retained_payload_bytes().unwrap();
     responses.apply_retained_payload_limit(baseline + 2_000);
     ctx.extensions.insert(responses);
-    assert!(super::shared_retained_budget(&ctx, &stream).unwrap().1.is_some());
+    assert!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1.is_some());
     ctx.insert_filter_state(stream);
 
     // Agentic collection runs before the stream-events EOS callback and copies
@@ -753,12 +753,15 @@ fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
         output_index: 0,
         item_id: Some("call_done".to_owned()),
     });
+    // A completed output item leaves an allocated size-cache slot after the
+    // round's cache invalidation; finalization must release that capacity too.
+    stream.output_item_bytes = vec![Some(32); 16];
     let parser_bytes = stream.retained_payload_bytes().unwrap();
     let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
     let baseline = responses.retained_payload_bytes().unwrap();
-    responses.apply_retained_payload_limit(baseline + parser_bytes + 128);
+    responses.apply_retained_payload_limit(baseline + parser_bytes * 2 + 128);
     ctx.extensions.insert(responses);
-    assert!(super::publish_stream_payload(&mut ctx, &stream));
+    assert!(super::publish_stream_payload(&mut ctx, &mut stream));
     ctx.insert_filter_state(stream);
     ctx.filter_results
         .entry("openai_agentic_loop")
@@ -775,6 +778,7 @@ fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
     );
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(responses.retained_stream_parser_bytes, 0);
+    assert!(!responses.retained_payload_failed);
     assert!(
         responses.can_retain_payload(parser_bytes + 128),
         "the next IRR step must have room for payload that the old parser released"
