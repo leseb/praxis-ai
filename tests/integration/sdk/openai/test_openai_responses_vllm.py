@@ -6015,16 +6015,16 @@ insecure_options:
         try:
             _wait_for_proxy(proxy_port, proc, str(log_path))
             client = _make_openai_client(proxy_port)
-            event_types = [
-                event.type
-                for event in client.responses.create(
-                    model="m", input="hi", stream=True, store=False
-                )
-            ]
+            events = list(
+                client.responses.create(model="m", input="hi", stream=True, store=False)
+            )
+            event_types = [event.type for event in events]
             assert ChatSseHandler.requests == 1
             assert event_types[0] == "response.created", event_types
             assert event_types[-1] == "error", event_types
             assert "response.completed" not in event_types, event_types
+            sequences = [event.sequence_number for event in events]
+            assert sequences == list(range(len(sequences))), sequences
         finally:
             proc.send_signal(signal.SIGINT)
             try:

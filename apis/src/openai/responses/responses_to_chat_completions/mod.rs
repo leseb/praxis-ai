@@ -376,6 +376,17 @@ impl ResponsesToChatCompletionsFilter {
         let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
             return Ok(FilterAction::Continue);
         };
+        if converter.failed_terminal_emitted() {
+            *body = None;
+            if end_of_stream {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.retained_chat_converter_bytes = 0;
+                }
+            } else {
+                ctx.insert_filter_state(converter);
+            }
+            return Ok(FilterAction::Continue);
+        }
         let incoming_bytes = body.as_ref().map_or(0, Bytes::len);
         if !converter_construction_fits(ctx, &mut converter, incoming_bytes) {
             record_converter_budget_failure(ctx, body);
@@ -426,6 +437,14 @@ impl ResponsesToChatCompletionsFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true") {
+            // When stream_events is skipped, this converter owns the wire SSE
+            // sequence. Save only successfully admitted events so a later
+            // bounded fallback error continues the delivered sequence.
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.logical_stream_sequence = converter.next_sequence_number();
+            }
+        }
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
             ctx.insert_filter_state(converter);
