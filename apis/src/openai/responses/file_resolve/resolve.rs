@@ -520,9 +520,8 @@ impl FilesApiClient {
             .resource_url(FILES_PATH_PREFIX, file_id, None)
             .map_err(|e| map_api_error(e, file_id))?;
 
-        let max_bytes = metadata_limit.map_or(self.client.max_response_bytes(), |limit| {
-            self.client.max_response_bytes().min(limit)
-        });
+        let client_limit = self.client.max_response_bytes();
+        let max_bytes = metadata_limit.map_or(client_limit, |limit| client_limit.min(limit));
         // Box the callout future so the large transport frame is not inlined
         // into this and every ancestor resolve future (clippy::large_futures).
         let response = match outbound {
@@ -819,6 +818,7 @@ async fn resolve_content_part(
 /// it must never be downgraded into an implicit passthrough that
 /// hands the original URL to a backend that might fetch it itself
 /// without the same protections.
+#[expect(clippy::too_many_lines, reason = "keeps each file failure policy explicit")]
 async fn resolve_reference(
     source: ReferenceSource<'_>,
     part_type: &'static str,
@@ -843,11 +843,10 @@ async fn resolve_reference(
         .await
     {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
+        Err(e @ (ResolveError::TooManyReferences { .. } | ResolveError::RetainedBudget)) => Err(e),
         Err(ResolveError::TooLarge { .. }) if resolver.budget.aggregate_constrained => {
             Err(ResolveError::RetainedBudget)
         },
-        Err(e @ ResolveError::RetainedBudget) => Err(e),
         Err(e) if matches!(source, ReferenceSource::FileUrl(_)) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
             warn!(source = %source, error = %e, "file resolution failed, passing through");

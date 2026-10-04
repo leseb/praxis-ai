@@ -2762,6 +2762,10 @@ pub(crate) fn encode_retained_payload_error(ctx: &mut HttpFilterContext<'_>) -> 
 }
 
 /// Emit the held terminal event only when the current IRR step is terminal.
+#[expect(
+    clippy::too_many_lines,
+    reason = "finalizes deferred output and terminal accounting together"
+)]
 fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;

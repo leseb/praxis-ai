@@ -359,6 +359,7 @@ impl HttpFilter for FileResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(clippy::too_many_lines, reason = "preflights the live wire body before JSON parsing")]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -469,9 +470,8 @@ async fn resolve_and_rewrite(
     let Some(parsed_bytes) = retained_json_bytes(&parsed) else {
         return Ok(reject_retained_resolution_budget(ctx));
     };
-    let headroom = match aggregate_resolution_headroom(ctx, raw_len, parsed_bytes) {
-        Ok(headroom) => headroom,
-        Err(()) => return Ok(reject_retained_resolution_budget(ctx)),
+    let Ok(headroom) = aggregate_resolution_headroom(ctx, raw_len, parsed_bytes) else {
+        return Ok(reject_retained_resolution_budget(ctx));
     };
     let needs_files_api = body_has_file_id_reference(&parsed)
         || ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
@@ -588,12 +588,14 @@ fn file_rewrite_fits_budget(ctx: &HttpFilterContext<'_>, parsed: &serde_json::Va
     file_parse_fits_budget(ctx, bytes)
 }
 
+/// Check the rewritten file body against request-scoped state when present.
 fn file_state_fits_budget(ctx: &HttpFilterContext<'_>, body_bytes: usize) -> bool {
     ctx.extensions
         .get::<ResponsesState>()
         .is_none_or(|state| state.can_retain_payload(body_bytes))
 }
 
+/// Report file-resolution budget failure using the shared request phase.
 fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
     super::budget_error::reject_request(
         ctx,
@@ -601,6 +603,7 @@ fn reject_retained_resolution_budget(ctx: &mut HttpFilterContext<'_>) -> FilterA
     )
 }
 
+/// Keep aggregate budget failures terminal even with fail-open file policy.
 fn reject_resolution_failure(ctx: &mut HttpFilterContext<'_>, error: &ResolveError) -> FilterAction {
     if matches!(error, ResolveError::RetainedBudget) {
         reject_retained_resolution_budget(ctx)

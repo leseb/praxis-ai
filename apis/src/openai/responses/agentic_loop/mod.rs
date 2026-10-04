@@ -718,14 +718,16 @@ fn convert_dispatch_failure(
         // `encode_local_error`). Only skip persistence of the failed round.
         ctx.set_metadata("responses.skip_persist", "true");
     }
-    #[cfg(feature = "store")]
     let retained_budget_failure = state.retained_payload_failed;
     ctx.extensions.insert(state);
-    #[cfg(feature = "store")]
-    if retained_budget_failure {
-        super::store::discard_retained_request_payload(ctx);
-    }
     set_action(ctx, ACTION_DONE)?;
+
+    if retained_budget_failure {
+        return Ok(FilterAction::Reject(super::budget_error::request_rejection(
+            ctx,
+            &failure.message,
+        )));
+    }
 
     if streaming {
         let body = encode_local_error(ctx, failure.code, &failure.message);
@@ -1126,6 +1128,59 @@ fn end_at_iteration_limit(
 // Body Parsing
 // -----------------------------------------------------------------------------
 
+/// Upper bound on compact JSON bytes after parsing a native response.
+///
+/// Serde can expand exponent-form numbers while serializing a parsed `Value`.
+/// Scan numeric tokens outside strings without allocating so that growth is
+/// admitted before the parsed tree is created.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass lexical bound skips quoted number-like text"
+)]
+pub(super) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+    const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
+    let mut extra = 0_usize;
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(&byte) = body.get(index) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte != b'-' && !byte.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut has_exponent = false;
+        while let Some(&number_byte) = body.get(index) {
+            if !matches!(number_byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+                break;
+            }
+            has_exponent |= matches!(number_byte, b'e' | b'E');
+            index += 1;
+        }
+        let token = body.get(start..index)?;
+        if has_exponent || token.len() >= 20 || token == b"-0" {
+            extra = extra.checked_add(MAX_FORMATTED_NUMBER_BYTES.saturating_sub(token.len()))?;
+        }
+    }
+    body.len().checked_add(extra)
+}
+
 /// Extract completed function-call items from a non-streaming response body
 /// and populate `state.tool_calls` and `state.messages`.
 #[expect(
@@ -1134,12 +1189,15 @@ fn end_at_iteration_limit(
 )]
 fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     // The framework owns and separately bounds the raw response body. Only the
-    // parsed response and the copies retained by agentic-loop state belong in
-    // this aggregate budget. The body length is an allocation-free upper bound
-    // for the parsed value's compact JSON payload, so reserve that projection
-    // before serde allocates it. The exact retained-owner accounting below runs
-    // after normalization and ID insertion without charging the framework body.
-    if !state.can_retain_payload(body.len()) {
+    // parsed response and copies retained by agentic-loop state belong in this
+    // aggregate budget. Numeric normalization can expand compact JSON beyond
+    // the wire length, so reserve a checked upper bound before serde allocates.
+    let parsed_bound = if state.retained_payload_limit().is_some() {
+        buffered_parsed_json_bytes_upper_bound(body).ok_or_else(retained_payload_failure)?
+    } else {
+        body.len()
+    };
+    if !state.can_retain_payload(parsed_bound) {
         return Err(retained_payload_failure());
     }
     let response = serde_json::from_slice::<Value>(body)
@@ -1152,8 +1210,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
     };
     let normalization_staging = output_normalization_staging_bytes(&response, has_file_search_tool(state))
         .ok_or_else(retained_payload_failure)?;
-    if !body
-        .len()
+    if !parsed_bound
         .checked_add(normalization_staging)
         .is_some_and(|bytes| state.can_retain_payload(bytes))
     {

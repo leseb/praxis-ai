@@ -3128,6 +3128,29 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     );
 }
 
+/// An approval admission failure on the first request has not committed SSE
+/// headers, even when the client asked for a stream.
+#[tokio::test]
+async fn initial_retained_dispatch_failure_uses_http_413() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "test", "stream": true}));
+    state.fail_retained_payload_budget();
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "approval exceeds retained budget".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let FilterAction::Reject(response) = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap() else {
+        panic!("budget failure must reject before inference");
+    };
+    assert_eq!(response.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
 /// A locally-detected security-context failure preempts a generic dispatch failure:
 /// the loop owner converts `security_failure` BEFORE `dispatch_failure`, so the client
 /// sees the 401 security terminal, never the 502 dispatch terminal.
@@ -3507,6 +3530,47 @@ fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
     super::extract_tool_calls_from_body(&body, &mut state).unwrap();
 
     assert!(state.retained_payload_bytes().unwrap() <= exact_peak);
+}
+
+#[test]
+fn buffered_numeric_projection_counts_normalization_only_outside_strings() {
+    let ordinary = br#"{"quoted":"1e15","escaped":"\\\"1e15","numbers":[1,2,3,1.0]}"#;
+    assert_eq!(
+        super::buffered_parsed_json_bytes_upper_bound(ordinary),
+        Some(ordinary.len())
+    );
+
+    let scientific = br#"{"object":"response","output":[],"numbers":[1e15,-0,18446744073709551616]}"#;
+    let parsed: Value = serde_json::from_slice(scientific).unwrap();
+    let exact = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let bound = super::buffered_parsed_json_bytes_upper_bound(scientific).unwrap();
+    assert!(bound >= exact);
+    assert!(bound > scientific.len());
+}
+
+#[test]
+fn buffered_numeric_expansion_rejects_before_parsed_tree_allocation() {
+    let numbers = vec!["1e15"; 1_024].join(",");
+    let body = Bytes::from(format!(r#"{{"object":"response","output":[],"numbers":[{numbers}]}}"#));
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let parsed_bytes = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+    let limit = baseline + body.len() + 1;
+    assert!(parsed_bytes > body.len() + 1);
+
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(limit);
+    assert!(state.can_retain_payload(body.len()));
+    let mut rejected = false;
+    let allocation = allocation_counter::measure(|| {
+        rejected = super::extract_tool_calls_from_body(&body, &mut state).is_err();
+    });
+    assert!(rejected);
+    assert!(
+        allocation.bytes_total < 1_024,
+        "parsed numeric tree was allocated: {allocation:?}"
+    );
+    assert!(state.response_object.is_null());
 }
 
 #[test]

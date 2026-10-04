@@ -363,6 +363,7 @@ pub(super) struct StreamConverter {
 impl StreamConverter {
     /// Conservative size of independently owned converter state. The caller
     /// reserves further callback staging before parsing the next chunk.
+    #[expect(clippy::too_many_lines, reason = "counts each independently owned converter field")]
     pub(super) fn retained_budget_bytes(&self) -> Option<usize> {
         let mut bytes = self.framing.retained_bytes().checked_add(self.accumulated_bytes)?;
         for value in [
@@ -398,6 +399,7 @@ impl StreamConverter {
         Some(bytes)
     }
 
+    /// Return whether a successful terminal frame has reached the client path.
     pub(super) fn successful_terminal_emitted(&self) -> bool {
         self.phase == Phase::EmittedTerminal
     }
@@ -431,10 +433,12 @@ impl StreamConverter {
         }
     }
 
+    /// Store the admitted cap for stable request fields echoed into SSE output.
     pub(super) fn set_echo_budget_bytes(&mut self, bytes: Option<usize>) {
         self.echo_budget_bytes = bytes;
     }
 
+    /// Return the admitted cap for echoed request fields, if available.
     pub(super) fn echo_budget_bytes(&self) -> Option<usize> {
         self.echo_budget_bytes
     }

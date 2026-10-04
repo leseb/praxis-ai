@@ -79,7 +79,9 @@ const CALLOUT_TRANSPORT_STAGING_BYTES: usize = 131_072;
 
 /// Budget exhaustion must bypass the configured ordinary callout fail-open policy.
 enum ReactiveCompactionError {
+    /// The aggregate retained-payload admission failed.
     RetainedBudget,
+    /// The ordinary callout policy returned a filter action.
     Rejection(FilterAction),
 }
 
@@ -394,6 +396,10 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential reactive compaction admission and dispatch"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -447,10 +453,9 @@ impl HttpFilter for CompactFilter {
                 )));
             },
         };
-        let response_limit = match reactive_compaction_response_limit(state, &conversation_text, &params, &self.config)
-        {
-            Ok(limit) => limit,
-            Err(()) => return Ok(reject_compaction_budget(ctx)),
+        let Ok(response_limit) = reactive_compaction_response_limit(state, &conversation_text, &params, &self.config)
+        else {
+            return Ok(reject_compaction_budget(ctx));
         };
         let summary = match self
             .execute_compaction(state, &params, &conversation_text, response_limit)
@@ -500,6 +505,7 @@ fn reactive_compaction_text_fits(state: &ResponsesState) -> bool {
 /// Reserve escaped JSON request copies and buffered response parsing before
 /// dispatching the summarizer. A smaller response limit is safe to use because
 /// the summarizer has no externally visible effect until its result is stored.
+#[expect(clippy::too_many_lines, reason = "checked reservation accounts for each live owner")]
 fn reactive_compaction_response_limit(
     state: &ResponsesState,
     conversation_text: &str,
@@ -539,6 +545,7 @@ fn reactive_compaction_response_limit(
     Ok(Some(response_limit))
 }
 
+/// Use the shared request-phase rejection for a compaction admission failure.
 fn reject_compaction_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
     super::budget_error::reject_request(
         ctx,

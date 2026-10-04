@@ -1417,6 +1417,66 @@ async fn an_explicit_null_conversation_is_treated_as_absent() {
 }
 
 #[tokio::test]
+async fn input_tokens_history_with_budget_rehydrates_without_create_state() {
+    let registry = setup_registry(MockStore::with_conversation("conv_count", json!([])));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"m","input":"count me","conversation":"conv_count"}"#,
+    ));
+
+    let request_filter =
+        crate::openai::responses::request::OpenaiResponsesRequestFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    assert!(matches!(
+        request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Release
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "unexpected rehydrate action: {action:?}"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.history_rehydrated)
+    );
+}
+
+#[tokio::test]
+async fn input_tokens_history_with_budget_rejects_oversized_store_row() {
+    let registry = setup_registry(MockStore::with_conversation(
+        "conv_large",
+        json!([{"role": "user", "content": "x".repeat(8_000)}]),
+    ));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"m","input":"count me","conversation":"conv_large"}"#,
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
 async fn rehydrates_from_conversation_string_id() {
     let messages = json!([
         {"role": "user", "content": "turn one"},
