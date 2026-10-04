@@ -598,7 +598,8 @@ impl StreamConverter {
         matches!(self.phase, Phase::Failed)
     }
 
-    /// A successful terminal already went to the client in an earlier callback.
+    /// A successful terminal was produced in an earlier callback. The logical
+    /// stream parser may still be holding it until finalization.
     pub(super) const fn successful_terminal_emitted(&self) -> bool {
         matches!(self.phase, Phase::EmittedTerminal)
     }

@@ -387,10 +387,14 @@ impl ResponsesToChatCompletionsFilter {
             }
             return Ok(FilterAction::Continue);
         }
-        let completed_terminal_already_emitted = converter.successful_terminal_emitted();
+        // stream_events may have accepted the converter's terminal but still
+        // hold it for logical-stream finalization. Only the unarmed path has
+        // actually delivered that terminal to the client.
+        let completed_terminal_already_delivered = converter.successful_terminal_emitted()
+            && ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true");
         let incoming_bytes = body.as_ref().map_or(0, Bytes::len);
         if !converter_construction_fits(ctx, &mut converter, incoming_bytes) {
-            return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
         }
         let now = ctx.time_source.now().as_secs();
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -411,13 +415,13 @@ impl ResponsesToChatCompletionsFilter {
         if let Some(chunk) = body.take() {
             converter.push_into(&chunk, &inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
             }
         }
         if end_of_stream {
             converter.finish_into(&inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
             }
         }
 
@@ -431,7 +435,7 @@ impl ResponsesToChatCompletionsFilter {
             })
         });
         if !admitted {
-            return stream_converter_budget_failure(ctx, body, completed_terminal_already_emitted);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
         }
 
         if ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true") {
@@ -455,9 +459,9 @@ impl ResponsesToChatCompletionsFilter {
 fn stream_converter_budget_failure(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
-    completed_terminal_already_emitted: bool,
+    completed_terminal_already_delivered: bool,
 ) -> Result<FilterAction, FilterError> {
-    if completed_terminal_already_emitted {
+    if completed_terminal_already_delivered {
         *body = None;
         return Err(
             "responses_to_chat_completions: provider bytes after a terminal exceeded the retained payload budget"

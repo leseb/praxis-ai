@@ -8421,3 +8421,72 @@ fn make_armed_context_with_filter(
     filter.arm(&mut ctx);
     (filter, ctx)
 }
+
+#[tokio::test]
+async fn chat_budget_failure_replaces_deferred_terminal_with_error() {
+    use crate::openai::responses::responses_to_chat_completions::ResponsesToChatCompletionsFilter;
+
+    let (parser, mut ctx) = make_armed_context();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    ctx.extensions.insert(state);
+    ctx.current_filter_id = Some(1);
+    ctx.set_metadata("responses_to_chat_completions.armed", "true");
+    ctx.set_metadata("responses.response_id", "resp_deferred_budget");
+    ctx.set_metadata("responses_to_chat_completions.created_at", "1700000000");
+    let translator = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        translator.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.current_filter_id = Some(0);
+    parser.on_response(&mut ctx).await.unwrap();
+    ctx.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chatcmpl_deferred", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    ctx.current_filter_id = Some(1);
+    translator.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        std::str::from_utf8(body.as_ref().unwrap())
+            .unwrap()
+            .contains("event: response.completed")
+    );
+    ctx.current_filter_id = Some(0);
+    parser.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let wire = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+    assert!(wire.contains("event: response.created"));
+    assert!(!wire.contains("event: response.completed"));
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .deferred_terminal
+            .is_some()
+    );
+
+    ctx.current_filter_id = Some(1);
+    body = Some(Bytes::from(format!(": {}\n\n", "x".repeat(16_384))));
+    assert!(
+        translator.on_response_body(&mut ctx, &mut body, false).is_ok(),
+        "the parser still owns the terminal, so a budget error must remain in band"
+    );
+    ctx.current_filter_id = Some(0);
+    parser.on_response_body(&mut ctx, &mut body, true).unwrap();
+    let final_wire = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+    assert!(final_wire.contains("event: error"), "{final_wire}");
+    assert!(!final_wire.contains("event: response.completed"), "{final_wire}");
+}
