@@ -6003,6 +6003,37 @@ async fn listener_budget_applies_to_no_state_mcp_discovery_commit() {
 }
 
 #[tokio::test]
+async fn aggregate_budget_mcp_listing_uses_response_commitment_phase() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    for (iteration, committed, expected_status) in [(0, false, 413), (1, false, 502), (1, true, 200)] {
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+        let mut body_json = mcp_body("https://example.com/mcp");
+        body_json["stream"] = serde_json::json!(true);
+        let mut state = ResponsesState::from_request_body(body_json.clone());
+        state.iteration = iteration;
+        state.apply_retained_payload_limit(8_192);
+        ctx.extensions.insert(state);
+        if committed {
+            ctx.extensions.insert(praxis_filter::ClientResponseHeadersCommitted);
+        }
+        let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("budget failure must reject the current MCP discovery");
+        };
+        assert_eq!(rejection.status, expected_status);
+        let text = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(text.contains("event: error"), committed);
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    }
+}
+
+#[tokio::test]
 async fn aggregate_budget_rejects_deferred_mcp_listing_before_callout() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());

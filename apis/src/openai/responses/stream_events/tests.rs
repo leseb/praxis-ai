@@ -165,6 +165,34 @@ fn native_item_done_does_not_reserve_an_unused_lowered_namespace() {
 }
 
 #[test]
+fn lowered_heartbeat_does_not_reserve_unused_tool_echo_copies() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter());
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    responses.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "public", "description": "x".repeat(256_000)})],
+        tool_choice: json!("auto"),
+    });
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + 8_192);
+    ctx.extensions.insert(responses);
+
+    for _ in 0..8 {
+        let mut body = Some(Bytes::from_static(b": ping\n\n"));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(ctx.get_metadata("responses.stream_error_message").is_none());
+    }
+    assert!(!ctx.get_filter_state::<StreamEventsState>().unwrap().stream_failed);
+}
+
+#[test]
 fn native_terminal_avoids_duplicate_restoration_staging() {
     assert_terminal_avoids_duplicate_staging(false);
 }
