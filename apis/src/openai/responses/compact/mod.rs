@@ -675,9 +675,9 @@ fn reactive_compaction_text_fits(state: &ResponsesState) -> bool {
     staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
-/// Reserve escaped JSON request copies and buffered response parsing before
-/// dispatching the summarizer. A smaller response limit is safe to use because
-/// the summarizer has no externally visible effect until its result is stored.
+/// Reserve escaped JSON request copies and buffered transport owners before
+/// dispatching the summarizer. Successful bodies are separately admitted for
+/// parsed-tree staging before they are decoded.
 fn reactive_compaction_response_limit(
     state: &ResponsesState,
     conversation_text: &str,
@@ -710,7 +710,7 @@ fn reactive_compaction_response_limit(
         .checked_sub(current)
         .and_then(|bytes| bytes.checked_sub(staging))
         .ok_or(())?;
-    let response_limit = (remaining / 4).min(MAX_SUMMARIZATION_RESPONSE_BYTES);
+    let response_limit = (remaining / 3).min(MAX_SUMMARIZATION_RESPONSE_BYTES);
     if response_limit == 0 {
         return Err(());
     }
