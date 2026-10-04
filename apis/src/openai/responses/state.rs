@@ -1068,7 +1068,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false, None)?
             .checked_add(stream_bytes)
     }
 
@@ -1105,9 +1105,22 @@ impl ResponsesState {
     /// Count the owners which may change during a streaming response. The
     /// stream-local meter adds the cached request/history and prior-round
     /// output and tool-snapshot charges separately; all are fixed until EOS.
+    #[cfg(test)]
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, None)?
+            .checked_add(self.retained_rehydrate_stream_bytes)
+    }
+
+    /// Use the stream parser's exact per-item response-object charge. Its
+    /// unchanged output items need not be serialized again for every SSE delta.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: usize,
+    ) -> Option<usize> {
+        let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, Some(response_object_bytes))?
             .checked_add(self.retained_rehydrate_stream_bytes)
     }
 
@@ -1119,7 +1132,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, None)?
             .checked_add(stream_bytes)
     }
 
@@ -1132,7 +1145,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, true)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, true, None)?
             .checked_add(stream_bytes)
     }
 
@@ -1144,7 +1157,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, None)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1162,6 +1175,7 @@ impl ResponsesState {
         skip_stream_stable: bool,
         skip_accumulated_output: bool,
         skip_stream_fixed_tools: bool,
+        response_object_bytes: Option<usize>,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
@@ -1184,12 +1198,12 @@ impl ResponsesState {
                 meter.raw(id.len())?;
             }
         }
-        for value in [
-            &self.response_object,
-            &self.local_completion_response_template,
-            &self.tool_choice,
-            &self.usage,
-        ] {
+        if let Some(bytes) = response_object_bytes {
+            meter.raw(bytes)?;
+        } else {
+            meter.json(&self.response_object)?;
+        }
+        for value in [&self.local_completion_response_template, &self.tool_choice, &self.usage] {
             meter.json(value)?;
         }
         if !skip_accumulated_output {

@@ -117,12 +117,12 @@ async fn parser_payload_is_visible_to_a_different_agentic_filter_id() {
 #[test]
 fn eos_remeasures_history_appended_after_first_stream_chunk() {
     let (filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
     let baseline = responses.retained_payload_bytes().unwrap();
     responses.apply_retained_payload_limit(baseline + 2_000);
     ctx.extensions.insert(responses);
-    assert!(super::shared_retained_budget(&ctx, &stream).unwrap().1.is_some());
+    assert!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1.is_some());
     ctx.insert_filter_state(stream);
 
     let item = json!({"type": "reasoning", "id": "rs_eos", "summary": "x".repeat(3_000)});
@@ -470,7 +470,7 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     };
     responses.apply_retained_payload_limit(2_000_000);
     ctx.extensions.insert(responses);
-    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     let cached = stream.shared_stable_bytes.get().copied().unwrap();
     assert!(
         cached > 1_048_576,
@@ -485,7 +485,7 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .unwrap()
     );
     ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object = json!({"output": [{"text": "new"}]});
-    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let next = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     assert_eq!(
         next,
         ctx.extensions
@@ -495,7 +495,7 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .unwrap()
     );
     for _ in 0..100 {
-        assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(next));
+        assert_eq!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1, Some(next));
         assert_eq!(stream.shared_stable_bytes.get().copied(), Some(cached));
     }
     // The owner may append output at EOS; the next round must charge it again.
@@ -505,7 +505,7 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
         .unwrap()
         .accumulated_output
         .push(json!({"type": "message", "content": "next round"}));
-    let after_eos = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let after_eos = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     assert_eq!(
         after_eos,
         ctx.extensions
@@ -538,7 +538,7 @@ fn streaming_budget_cache_counts_tool_snapshots_once_per_round() {
     responses.apply_retained_payload_limit(3_000_000);
     ctx.extensions.insert(responses);
 
-    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     let stable = stream.shared_stable_bytes.get().copied().unwrap();
     assert!(
         stable > 2_097_152,
@@ -553,7 +553,10 @@ fn streaming_budget_cache_counts_tool_snapshots_once_per_round() {
             .unwrap()
     );
     for _ in 0..100 {
-        assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(initial));
+        assert_eq!(
+            super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+            Some(initial)
+        );
     }
 
     // A newly armed round remeasures the stable owners after prior state was
@@ -561,7 +564,7 @@ fn streaming_budget_cache_counts_tool_snapshots_once_per_round() {
     stream.clear_shared_budget_cache();
     ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_echo = None;
     ctx.extensions.get_mut::<ResponsesState>().unwrap().mcp_tool_map.clear();
-    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let next = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     assert_eq!(
         next,
         ctx.extensions
@@ -1295,6 +1298,92 @@ fn make_sse_chunk(event_type: &str, data: &serde_json::Value) -> Bytes {
         .or_insert_with(|| serde_json::Value::String(event_type.to_owned()));
     let data_str = serde_json::to_string(&obj).unwrap();
     Bytes::from(format!("event: {event_type}\ndata: {data_str}\n\n"))
+}
+
+fn assert_cached_response_charge_matches_uncached(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    let cached = parser
+        .response_object_bytes(&responses.response_object, usize::MAX)
+        .unwrap();
+    assert_eq!(cached, super::retained_json_bytes(&responses.response_object).unwrap());
+    assert_eq!(
+        responses
+            .stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, cached)
+            .unwrap(),
+        responses.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
+        "cached response charge must preserve all other independent owners, including tool_calls"
+    );
+    ctx.insert_filter_state(parser);
+}
+
+#[test]
+fn stream_response_object_cache_tracks_item_and_top_level_mutations() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true, "input": "hello"}));
+    responses.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(responses);
+
+    for (event, payload) in [
+        (
+            "response.output_item.added",
+            json!({"output_index":0,"item":{"id":"call_1","type":"function_call","name":"f","arguments":""}}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            json!({"output_index":0,"item_id":"call_1","arguments":"abc"}),
+        ),
+        (
+            "response.output_item.done",
+            json!({"output_index":0,"item":{"id":"call_1","type":"function_call","name":"f","arguments":"abcd","status":"completed"}}),
+        ),
+        (
+            "response.completed",
+            json!({"response":{"id":"resp_1","status":"completed","output":[{"id":"call_1","type":"function_call","name":"f","arguments":"abcd","status":"completed"}],"usage":{"input_tokens":1}}}),
+        ),
+    ] {
+        let mut chunk = Some(make_sse_chunk(event, &payload));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(
+            !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "{event} unexpectedly failed admission"
+        );
+        assert_cached_response_charge_matches_uncached(&mut ctx);
+    }
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object["status"] =
+        json!("completed-with-longer-status");
+    assert_cached_response_charge_matches_uncached(&mut ctx);
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the timed regression reports a before/after comparison when run with --nocapture"
+)]
+fn completed_stream_item_is_charged_across_later_small_deltas() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true, "input": "hello"}));
+    responses.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(responses);
+    let item = json!({"output_index":0,"item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[],"encrypted_content":"x".repeat(1_048_576)}});
+    for event in ["response.output_item.added", "response.output_item.done"] {
+        let mut chunk = Some(make_sse_chunk(event, &item));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some());
+    }
+    let frame = make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"item_id":"msg_1","output_index":1,"content_index":0,"delta":"hi"}),
+    );
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let mut chunk = Some(frame.clone());
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some());
+    }
+    eprintln!("completed-item 100-delta budget scan: {:?}", start.elapsed());
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_cached_response_charge_matches_uncached(&mut ctx);
 }
 
 #[tokio::test]
@@ -5147,6 +5236,7 @@ fn parse_error_sets_metadata() {
         client_tool_items: Vec::new(),
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        output_item_bytes: Vec::new(),
     });
 
     let large_chunk =
@@ -5201,6 +5291,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         }],
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        output_item_bytes: Vec::new(),
     });
 
     validate_stream_end(&mut ctx);
