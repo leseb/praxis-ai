@@ -1969,7 +1969,8 @@ fn result_payload_limit(retained_result_limit: usize) -> usize {
 /// transport accepts a JSON-RPC envelope in addition to the decoded payload;
 /// its streaming executor can temporarily hold twice that wire ceiling while
 /// the adapter classifies an overflowing chunk. A session-ID server can also
-/// leave a standalone GET parser and rmcp messages live after each call.
+/// leave a standalone GET parser and rmcp messages live after each call. Its
+/// buffered DELETE response remains reserved while parked and closing.
 /// Charge every call in the batch because their futures may run concurrently.
 fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<usize> {
     if call_count == 0 {
@@ -1979,10 +1980,12 @@ fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<
     let payload = result_payload_limit(per_call);
     let wire = mcp_client::tool_result_wire_cap(payload);
     let stream = mcp_client::tool_stream_retained_reserve(payload, payload)?;
+    let delete = mcp_client::tool_delete_retained_reserve(payload)?;
     admitted_results
         .checked_mul(RESULT_PAYLOAD_OWNER_COUNT)?
         .checked_add(wire.checked_mul(2)?.checked_mul(call_count)?)
         .and_then(|peak| peak.checked_add(stream.checked_mul(call_count)?))
+        .and_then(|peak| peak.checked_add(delete.checked_mul(call_count)?))
 }
 
 /// Find the largest batch allowance whose complete wire and decoded peak

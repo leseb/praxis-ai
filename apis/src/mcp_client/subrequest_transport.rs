@@ -128,6 +128,15 @@ pub(crate) fn tool_stream_retained_reserve(result_payload_limit: usize, initiali
         .checked_mul(12)
 }
 
+/// Buffered DELETE can retain the executor body and returned response at once.
+/// Tool cleanup uses the same admitted control ceiling as its initialize; the
+/// unbudgeted control client continues to use the 1 MiB ceiling.
+pub(crate) fn tool_delete_retained_reserve(initialize_limit: usize) -> Option<usize> {
+    initialize_limit
+        .clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES)
+        .checked_mul(2)
+}
+
 /// The `mcp-session-id` header carrying the Streamable-HTTP session token.
 fn session_id_header() -> HeaderName {
     HeaderName::from_static("mcp-session-id")
@@ -774,7 +783,9 @@ impl McpSubrequestClient {
     /// `tools/call` uses the configured result ceiling. Tool-session
     /// `initialize` and its following `initialized` acknowledgment share the
     /// admitted handshake ceiling because both can buffer a response body;
-    /// other exchanges use the control ceiling.
+    /// other POST exchanges use the control ceiling. DELETE also uses the
+    /// admitted initialize ceiling so background cleanup stays within its
+    /// request-owned reservation.
     fn response_limit(&self, message: &ClientJsonRpcMessage) -> usize {
         match Self::response_limit_kind(message) {
             McpResponseLimitKind::Initialize => self.initialize_bytes,
@@ -1260,7 +1271,7 @@ impl StreamableHttpClient for McpSubrequestClient {
             &uri,
             Bytes::new(),
             headers,
-            MAX_CONTROL_RESPONSE_BYTES,
+            self.initialize_bytes,
             McpResponseLimitKind::Control,
             &signal,
         ))
@@ -2203,6 +2214,62 @@ mod tests {
             ),
             "an oversized initialized ACK must hit the admitted handshake cap"
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare budgeted and unbudgeted real DELETE bodies"
+    )]
+    async fn budgeted_delete_response_uses_admitted_control_cap() {
+        use std::io::{Read as _, Write as _};
+
+        for budgeted in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = [0_u8; 8_192];
+                let read = socket.read(&mut request).unwrap();
+                assert!(request[..read].starts_with(b"DELETE /mcp "));
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                drop(socket.write_all(&vec![b'x'; 2_048]));
+            });
+            let client = McpSubrequestClient::for_tool(
+                McpCallout::fabricated(true).unwrap(),
+                Duration::from_secs(5),
+                256,
+                if budgeted { 1_024 } else { MAX_CONTROL_RESPONSE_BYTES },
+                budgeted,
+                None,
+            );
+            let result = client
+                .delete_session(
+                    Arc::from(format!("http://{address}/mcp")),
+                    Arc::from("session"),
+                    None,
+                    HashMap::new(),
+                )
+                .await;
+            server.join().unwrap();
+            if budgeted {
+                assert!(
+                    matches!(
+                        result,
+                        Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+                    ),
+                    "budgeted cleanup must reject above its admitted handshake cap: {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "unbudgeted cleanup retains the 1 MiB control cap: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

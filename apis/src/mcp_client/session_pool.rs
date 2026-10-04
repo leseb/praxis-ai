@@ -154,11 +154,16 @@ impl PooledSession {
         &self.service
     }
 
-    /// Peer metadata and the possible GET parser remain owned while this
-    /// session is parked or awaiting its background DELETE.
+    /// Peer metadata, a possible GET parser, and the future buffered DELETE
+    /// remain charged from parking through background cleanup. Closing must
+    /// not need new headroom after an idle timeout or terminal drain.
     fn retained_payload_bytes(&self) -> Option<usize> {
         let info = self.service.peer_info()?;
-        retained_json_bytes(info.as_ref())?.checked_add(self.stream_retained_reserve?.get())
+        retained_json_bytes(info.as_ref())?
+            .checked_add(self.stream_retained_reserve?.get())?
+            .checked_add(super::subrequest_transport::tool_delete_retained_reserve(
+                self.initialize_limit,
+            )?)
     }
 
     #[cfg(test)]

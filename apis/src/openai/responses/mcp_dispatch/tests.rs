@@ -689,6 +689,20 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
 }
 
 #[test]
+fn aggregate_mcp_peak_reserves_budgeted_delete_response() {
+    let admitted = 1_024;
+    let payload = admitted / 4;
+    let wire = crate::mcp_client::tool_result_wire_cap(payload);
+    let stream = crate::mcp_client::tool_stream_retained_reserve(payload, payload).unwrap();
+    let delete = crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES;
+    assert_eq!(
+        super::mcp_callout_peak_bytes(admitted, 1),
+        Some(admitted * 4 + wire * 2 + stream + delete * 2),
+        "call admission must reserve the buffered DELETE peak before opening the session"
+    );
+}
+
+#[test]
 fn aggregate_mcp_limit_rejects_when_tool_wire_envelope_exceeds_headroom() {
     let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
     let mut state = ResponsesState {

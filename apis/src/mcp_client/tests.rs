@@ -2735,6 +2735,66 @@ async fn background_closing_session_remains_charged_until_delete_finishes() {
 }
 
 #[tokio::test]
+async fn budgeted_background_delete_charges_its_buffered_response_while_in_flight() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let fingerprint = "small-delete";
+    let key = McpPoolKey::new(McpPoolNamespace::new(), fingerprint.to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, Some(&key))),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "warm"}),
+        INTEGRATION_TIMEOUT,
+        256,
+        1_024,
+        true,
+        &callout,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "small admitted initialize should open a session: {result:?}"
+    );
+    let parked = pool.retained_payload_bytes().unwrap();
+    let checkout = pool.checkout_with_initialize_limit(&key, 256, 1_024, true);
+    assert!(checkout.rejected.is_empty());
+    let session = checkout.session.expect("warm session must be reusable");
+    let peer_bytes =
+        crate::openai::responses::state::retained_json_bytes(session.service().peer_info().unwrap().as_ref()).unwrap();
+    let expected = peer_bytes + tool_stream_retained_reserve(256, 1_024).unwrap() + 2 * 1_024;
+    pool.close_sessions_in_background(vec![session]);
+    tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+        .await
+        .expect("background DELETE must start");
+    let closing = pool.retained_closing_payload_bytes().unwrap();
+    delete_release.notify_one();
+    tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+        while pool.retained_closing_payload_bytes() != Some(0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("closing charge must clear after DELETE");
+    assert_eq!(
+        parked - fingerprint.len(),
+        expected,
+        "parked owner must pre-reserve DELETE"
+    );
+    assert_eq!(
+        closing, expected,
+        "closing owner must retain the same charge through DELETE"
+    );
+    ct.cancel();
+}
+
+#[tokio::test]
 async fn timed_out_pooled_tool_sessions_remain_charged_during_delete() {
     let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
     let pool = McpSessionPool::new();
