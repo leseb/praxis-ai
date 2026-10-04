@@ -2331,7 +2331,26 @@ mod tests {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut request = [0_u8; 8_192];
-                let read = socket.read(&mut request).unwrap();
+                let mut read = 0;
+                loop {
+                    let count = socket.read(&mut request[read..]).unwrap();
+                    assert!(count > 0, "POST closed before its body arrived");
+                    read += count;
+                    assert!(read < request.len(), "test POST exceeded request buffer");
+                    let Some(headers_end) = request[..read].windows(4).position(|part| part == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .expect("buffered POST supplies Content-Length");
+                    if read >= headers_end + 4 + length {
+                        break;
+                    }
+                }
                 assert!(request[..read].starts_with(b"POST /mcp "));
                 socket
                     .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n")
