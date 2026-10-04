@@ -508,6 +508,10 @@ impl ClientToolCompatFilter {
     /// Admit the raw buffer and all restoration copies before response headers
     /// commit. A unique identity-coded Content-Length or finalizer digest proves
     /// exact size. Otherwise derive a finite cap from remaining shared budget.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one header decision validates framing and reserves all restoration owners"
+    )]
     fn budgeted_restore_admission(&self, ctx: &HttpFilterContext<'_>) -> Option<ClientToolRestoreAdmission> {
         let state = ctx.extensions.get::<ResponsesState>()?;
         let response = ctx.response_header.as_ref()?;
@@ -672,6 +676,10 @@ impl HttpFilter for ClientToolCompatFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response headers select one bounded restoration path before commitment"
+    )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !restoration_armed(ctx) {
             return Ok(FilterAction::Continue);
@@ -717,6 +725,10 @@ impl HttpFilter for ClientToolCompatFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the body callback verifies header admission before restoring client tools"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,

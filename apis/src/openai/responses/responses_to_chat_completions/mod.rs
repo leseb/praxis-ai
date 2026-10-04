@@ -611,12 +611,17 @@ fn outbound_wire_fits(ctx: &HttpFilterContext<'_>, translated: &serde_json::Valu
         .is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
+/// Reject a translated Chat request before selecting an upstream body.
 fn chat_request_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstreamBodyOutcome {
     SelectedUpstreamBodyOutcome::Reject(super::budget_error::request_rejection(ctx, CHAT_BUDGET_MESSAGE))
 }
 
 /// Reserve the provider parse tree, translated resource, serialized wire body,
 /// and request fields echoed into the resource before creating any of them.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one finite translation admission counts old wire and new JSON owners"
+)]
 fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;

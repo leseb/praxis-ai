@@ -292,6 +292,10 @@ impl ResponseStoreFilter {
     }
 
     /// Persist a non-streaming response from the buffered body bytes.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "body admission and durable persistence must stay in one terminal callback"
+    )]
     fn persist_from_buffered_body(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
@@ -1009,10 +1013,13 @@ fn persistence_construction_fits_with_wire(
 
 /// A canonical response admitted for persistence before client headers commit.
 struct FinalizedPersistenceAdmission {
+    /// Upper bound for the restored or unchanged serialized response.
     response_upper_bytes: usize,
+    /// Whether Rehydrate will publish a digest for a rewritten response.
     rewritten: bool,
 }
 
+/// Bound the canonical response and any later ID rewrite before headers commit.
 fn finalized_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>()?;
     let wire_bytes = state.buffered_canonical_wire_bytes?;
@@ -1032,6 +1039,10 @@ fn finalized_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<us
 /// Admit direct finite persistence before headers commit using trusted framing.
 /// Rehydrate removes `Content-Length` only after handing its verified length to
 /// this hook. Twelve times the wire length bounds normalized JSON numbers.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one header gate validates framing and computes the conservative wire peak"
+)]
 fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     let response = ctx.response_header.as_ref()?;
     if response.headers.contains_key(http::header::TRANSFER_ENCODING)
@@ -1652,6 +1663,10 @@ impl HttpFilter for ResponseStoreFilter {
         bound_body_outcome(action)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response headers select bounded finite or streaming persistence before commitment"
+    )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // The exchange can enter another IRR response round. Never let a
         // previous round's durable-row marker authorize a later rollback.

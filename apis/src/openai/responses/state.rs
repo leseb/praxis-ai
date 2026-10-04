@@ -1127,6 +1127,7 @@ impl ResponsesState {
     #[expect(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
+        clippy::fn_params_excessive_bools,
         reason = "exhaustive accounting for the request-scoped state bag"
     )]
     fn retained_payload_bytes_bounded_inner(

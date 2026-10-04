@@ -394,7 +394,6 @@ impl StreamConverter {
     /// Payload still owned after a callback. The caller publishes this in the
     /// request-shared aggregate meter because other filters cannot access this
     /// filter's local state through their own filter IDs.
-    #[expect(clippy::too_many_lines, reason = "counts each independently owned converter field")]
     pub(super) fn retained_payload_bytes(&self) -> Option<usize> {
         let mut bytes = self.framing.retained_bytes().checked_add(self.response_id.len())?;
         for value in [

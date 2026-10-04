@@ -593,6 +593,10 @@ impl HttpFilter for OpenaiConversationsFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "finite and streamed append share terminal admission and rollback ordering"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -703,10 +707,10 @@ fn budgeted_append_state_missing(ctx: &HttpFilterContext<'_>) -> bool {
     if policy.is_none() && ctx.get_metadata("responses.retained_budget_active") != Some("true") {
         return false;
     }
-    !ctx.extensions
+    ctx.extensions
         .get::<ResponsesState>()
         .and_then(ResponsesState::retained_payload_limit)
-        .is_some_and(|limit| policy.is_none_or(|policy| limit <= policy.max_retained_bytes()))
+        .is_none_or(|limit| policy.is_some_and(|policy| limit > policy.max_retained_bytes()))
 }
 
 /// Bound the extra framework JSON buffer by unused request allowance.
@@ -728,6 +732,10 @@ fn existing_response_buffer_exceeds(ctx: &HttpFilterContext<'_>, cap: usize) -> 
 
 /// Admit parse and append item owners before cloning canonical output or
 /// parsing the buffered wire body.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one admission counts the parsed body and conversation append owners"
+)]
 fn append_extraction_fits(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>, streaming: bool) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;

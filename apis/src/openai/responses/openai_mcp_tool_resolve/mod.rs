@@ -2463,6 +2463,10 @@ async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), 
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
+#[expect(
+    clippy::too_many_lines,
+    reason = "deferred discovery reserves and commits one bounded connector batch"
+)]
 pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     state: &mut ResponsesState,
     forwarded_header_names: &[http::HeaderName],

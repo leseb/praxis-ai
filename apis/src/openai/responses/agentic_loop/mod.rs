@@ -540,7 +540,6 @@ pub(crate) fn finish_request_after_deferred_dispatch(
 
 /// Apply the request-wide retained-payload limit before any local dispatcher
 /// side effect or upstream inference request.
-#[expect(clippy::too_many_lines, reason = "shared initial and continuation budget admission")]
 fn admit_retained_payload_budget(
     ctx: &mut HttpFilterContext<'_>,
     configured_limit: usize,

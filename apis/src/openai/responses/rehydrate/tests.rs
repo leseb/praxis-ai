@@ -1980,7 +1980,7 @@ async fn finalized_numeric_restore_header_admission_survives_body_phase() {
     state.response_object = json!({
         "id": "resp_new", "object": "response", "status": "completed",
         "previous_response_id": null, "output": [],
-        "created_at": 12345678901234567890_u64,
+        "created_at": 12_345_678_901_234_567_890_u64,
     });
     let mut body = None;
     state.finalize_response_body(&mut body).unwrap();

@@ -107,9 +107,13 @@ pub(super) struct DirectFiniteRestoreFraming {
 /// Header admission for a canonical body already finalized by the agentic loop.
 /// The same body and ID are checked again before using this admission at EOS.
 pub(super) struct FinalizedFiniteRestoreAdmission {
+    /// Exact bytes emitted by the loop finalizer before ID replacement.
     pub wire_bytes: usize,
+    /// Upper bound after numeric normalization of that canonical wire.
     pub parsed_bound_bytes: usize,
+    /// Length of the caller's ID used to reserve escaped replacement bytes.
     pub previous_id_bytes: usize,
+    /// Upper bound for the body after restoring the caller's ID.
     pub response_upper_bytes: usize,
 }
 
@@ -506,6 +510,7 @@ fn finite_restore_fits(ctx: &HttpFilterContext<'_>, body: Option<&[u8]>, previou
     peak.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
+/// Reuse header admission only for the identical canonical body and caller ID.
 fn matches_finalized_restore_admission(ctx: &HttpFilterContext<'_>, body: &[u8], previous_id: &str) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return false;
