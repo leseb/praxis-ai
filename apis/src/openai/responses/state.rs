@@ -1116,6 +1116,7 @@ impl ResponsesState {
     /// Count owners that may change between Rehydrate SSE callbacks, including
     /// accumulated output and both published stream-parser charges. The stable
     /// request and history owners are measured once by the Rehydrate stream.
+    #[cfg(feature = "store")]
     pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
