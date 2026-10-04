@@ -3267,6 +3267,32 @@ async fn on_request_rejects_oversized_initial_state_with_413() {
 }
 
 #[tokio::test]
+#[cfg(feature = "openai-conversations")]
+async fn conversation_append_is_rejected_before_budgeted_dispatch() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 65536").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", "conv_123");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o", "input": "small", "conversation": "conv_123"
+    }));
+    state.store_persist_armed = true;
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("unmetered append must stop before inference");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_action(&ctx, "done");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
 #[cfg(feature = "store")]
 async fn on_request_charges_response_store_input_snapshot() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
