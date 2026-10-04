@@ -368,6 +368,7 @@ impl ClientToolCompatFilter {
         state: &mut ResponsesState,
         discovered: &[Value],
     ) -> Result<(), FilterAction> {
+        preflight_namespace_expansion(state, discovered)?;
         // Defense-in-depth idempotency invariant: if a prior lowering already
         // captured the canonical `tools`/`tool_choice` snapshot in `client_tool_echo`,
         // rebuild this lowering from that echo rather than from the request body. The
@@ -577,6 +578,70 @@ impl ClientToolCompatFilter {
                 canonical_digest,
             })
     }
+}
+
+/// Bound the repeated namespace description before lowering allocates one copy
+/// for each member. The request JSON contains that description only once, while
+/// the lowered tree, outbound serialization, and rewrite staging can coexist.
+/// Check both declared and discovered namespaces while the original tools still
+/// belong to `state`, so the shared budget includes their live ownership too.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one checked preflight covers declared and discovered namespace members before allocation"
+)]
+fn preflight_namespace_expansion(state: &ResponsesState, discovered: &[Value]) -> Result<(), FilterAction> {
+    if state.retained_payload_limit().is_none() {
+        return Ok(());
+    }
+    let declared = state
+        .client_tool_echo
+        .as_ref()
+        .map(|echo| echo.tools.as_slice())
+        .or_else(|| {
+            state
+                .request_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+        });
+    let declared = declared
+        .into_iter()
+        .flat_map(|tools| tools.iter().map(|tool| (tool, LoweringSource::Declaration)));
+    let discovered = discovered.iter().map(|tool| (tool, LoweringSource::Discovery));
+    let mut additional = Some(0_usize);
+    for (tool, source) in declared.chain(discovered) {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let (namespace, members) = namespace_header(tool)?;
+        let prefix = "Belongs to the `` tool namespace: "
+            .len()
+            .checked_add(namespace.name.len())
+            .and_then(|bytes| bytes.checked_add(namespace.description.len()));
+        for member in members {
+            if source == LoweringSource::Declaration && is_deferred_declaration(member) {
+                continue;
+            }
+            // The folded description has three simultaneous owners during the
+            // rewrite: the lowered JSON string, serializer output, and staging.
+            // Reserve a small entry allowance for the flat name/reverse recipe.
+            let member_description = member.get("description").and_then(Value::as_str).map_or(0, str::len);
+            let per_member = prefix
+                .and_then(|bytes| bytes.checked_add(member_description))
+                .and_then(|bytes| bytes.checked_add(2 + 512))
+                .and_then(|bytes| bytes.checked_mul(3));
+            additional =
+                additional.and_then(|bytes| per_member.and_then(|member_bytes| bytes.checked_add(member_bytes)));
+        }
+    }
+    if additional.is_none_or(|bytes| !state.can_retain_payload(bytes)) {
+        return Err(FilterAction::Reject(responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "client-tool namespace expansion exceeds openai_agentic_loop.max_retained_bytes",
+        )));
+    }
+    Ok(())
 }
 
 /// A provider error cannot contain a successful Responses resource to restore;
