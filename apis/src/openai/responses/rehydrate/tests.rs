@@ -2064,7 +2064,7 @@ async fn budgeted_direct_restore_rejects_unframed_response_before_headers() {
 }
 
 #[tokio::test]
-async fn finite_restore_rejects_before_copying_a_near_limit_response() {
+async fn finite_restore_rejects_near_limit_response_before_headers() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut response = json_ok_response();
@@ -2082,23 +2082,16 @@ async fn finite_restore_rejects_before_copying_a_near_limit_response() {
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(baseline + body_bytes.len() * 2);
     ctx.extensions.insert(state);
+    response.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&body_bytes.len().to_string()).unwrap(),
+    );
     ctx.response_header = Some(&mut response);
-    assert!(matches!(
-        filter.on_response(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-
-    let mut body = Some(Bytes::from(body_bytes.clone()));
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    let action = filter.on_response(&mut ctx).await.unwrap();
     match action {
         FilterAction::Reject(rejection) => assert_eq!(rejection.status, 502),
-        other => panic!("expected response-side budget rejection, got {other:?}"),
+        other => panic!("expected pre-header budget rejection, got {other:?}"),
     }
-    assert_eq!(
-        body.as_deref(),
-        Some(body_bytes.as_slice()),
-        "the rejected body was not rewritten"
-    );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
@@ -2763,10 +2756,10 @@ fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
     state.messages.pop();
     state.retained_stream_parser_bytes = 80;
     state.accumulated_output.push(json!("o".repeat(80)));
-    assert!(cached.matches(&state, state.retained_payload_limit().unwrap()));
+    assert!(!cached.matches(&state, state.retained_payload_limit().unwrap()));
     assert!(
         !fits(&mut armed, &state),
-        "the changing meter must include parser bytes and canonical output"
+        "the stable output cache and changing meter must include output and parser bytes"
     );
 
     state.retained_stream_parser_bytes = 0;
