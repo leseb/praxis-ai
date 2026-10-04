@@ -89,7 +89,9 @@ const FINITE_TRANSLATION_OVERFLOW_MESSAGE: &str =
 /// both old and new wire Vec capacities at a growth boundary. Every part is a
 /// JSON object, so counting all structural objects is conservative.
 const FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES: usize = 64 * 3;
+/// Reserve per-array framing and copied capacity during finite translation.
 const FINITE_TRANSLATION_ARRAY_EXPANSION_BYTES: usize = 64 * 3;
+/// Reserve per-string escaping and copied capacity during finite translation.
 const FINITE_TRANSLATION_STRING_EXPANSION_BYTES: usize = 64 * 3;
 
 /// `serde_json` can normalize `1e15` (four wire bytes) to
