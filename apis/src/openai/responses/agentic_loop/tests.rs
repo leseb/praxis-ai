@@ -3652,6 +3652,31 @@ fn buffered_numeric_projection_counts_normalization_only_outside_strings() {
 }
 
 #[test]
+fn private_file_search_normalization_reserves_nested_numeric_expansion() {
+    // The outer response stores arguments as a string. Parsing that string
+    // creates a second JSON owner whose scientific numbers become much larger.
+    let arguments = format!(r#"{{"query":"q","ignored":[{}]}}"#, vec!["1e15"; 5_000].join(","));
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "name": "file_search",
+            "call_id": "call_numeric",
+            "arguments": arguments,
+        }],
+    });
+    let nested: Value = serde_json::from_str(&arguments).unwrap();
+    let nested_bytes = super::super::state::retained_json_bytes(&nested).unwrap();
+    assert!(nested_bytes > arguments.len() * 2);
+
+    let staging = super::output_normalization_staging_bytes(&response, true).unwrap();
+    assert!(
+        staging >= nested_bytes + arguments.len(),
+        "staging must cover the parsed argument tree and a possible query copy"
+    );
+}
+
+#[test]
 fn buffered_numeric_expansion_rejects_before_parsed_tree_allocation() {
     let numbers = vec!["1e15"; 1_024].join(",");
     let body = Bytes::from(format!(r#"{{"object":"response","output":[],"numbers":[{numbers}]}}"#));
