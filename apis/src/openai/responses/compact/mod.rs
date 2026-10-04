@@ -688,7 +688,7 @@ fn reactive_compaction_response_limit(
         return Ok(None);
     };
     let current = state.retained_payload_bytes_bounded(limit).ok_or(())?;
-    let model = params.compaction_model.as_deref().unwrap_or(&config.default_model);
+    let model = params.compaction_model.unwrap_or(&config.default_model);
     let instructions = state
         .request_body
         .get("instructions")
