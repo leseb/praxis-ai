@@ -68,6 +68,7 @@ use super::{
         agentic_loop::AgenticBudgetPolicy,
         bound_body_outcome,
         error::responses_error_rejection,
+        rehydrate::DirectFiniteRestoreFraming,
         state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
     },
     config::{ResponseStoreConfig, validate_config},
@@ -759,6 +760,15 @@ pub(crate) fn discard_retained_request_payload(ctx: &mut HttpFilterContext<'_>) 
 
 /// Reserve record, history, and backend serialization owners before building them.
 pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, response_bytes: usize) -> bool {
+    persistence_construction_fits_with_wire(ctx, response_bytes, 0)
+}
+
+/// Include a separately owned wire body when a direct response is buffered.
+fn persistence_construction_fits_with_wire(
+    ctx: &HttpFilterContext<'_>,
+    response_bytes: usize,
+    wire_bytes: usize,
+) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
     };
@@ -782,8 +792,55 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
         .checked_mul(5)
         .and_then(|bytes| history_bytes.checked_mul(3)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(input_bytes))
-        .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes));
+        .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(wire_bytes));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Admit direct finite persistence before headers commit using trusted framing.
+/// Rehydrate removes `Content-Length` only after handing its verified length to
+/// this hook. Twelve times the wire length bounds normalized JSON numbers.
+fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let response = ctx.response_header.as_ref()?;
+    if response.headers.contains_key(http::header::TRANSFER_ENCODING)
+        || response.headers.contains_key(http::header::CONTENT_ENCODING)
+    {
+        return None;
+    }
+    let (wire_bytes, previous_id_bytes) = match &ctx.response_body_mode {
+        BodyMode::Stream => {
+            let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
+            let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
+            if lengths.next().is_some() {
+                return None;
+            }
+            (wire_bytes, None)
+        },
+        BodyMode::StreamBuffer {
+            max_bytes: Some(max_bytes),
+        } => {
+            let framing = ctx.extensions.get::<DirectFiniteRestoreFraming>()?;
+            if response.headers.contains_key(http::header::CONTENT_LENGTH) || *max_bytes != framing.wire_bytes {
+                return None;
+            }
+            (framing.wire_bytes, Some(framing.previous_id_bytes))
+        },
+        _ => return None,
+    };
+    if wire_bytes > MAX_JSON_BODY_BYTES {
+        return None;
+    }
+    let mut parsed_bytes = wire_bytes.checked_mul(12)?;
+    if let Some(id_bytes) = previous_id_bytes {
+        parsed_bytes = parsed_bytes.checked_add(id_bytes.checked_mul(6)?)?.checked_add(32)?;
+    }
+    let original_wire_bytes = wire_bytes.checked_mul(2)?;
+    let transient_wire_bytes = if previous_id_bytes.is_some() {
+        original_wire_bytes.max(parsed_bytes)
+    } else {
+        original_wire_bytes
+    };
+    persistence_construction_fits_with_wire(ctx, parsed_bytes, transient_wire_bytes).then_some(wire_bytes)
 }
 
 /// Reject persistence and emit the appropriate buffered or committed-stream error.
@@ -1256,7 +1313,7 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     /// Streaming by default. Non-streaming Responses requests select a
-    /// bounded `StreamBuffer` dynamically in [`Self::on_request`].
+    /// bounded `StreamBuffer` dynamically in [`Self::on_response`].
     ///
     /// Non-streaming Responses API payloads are bounded by output
     /// token limits (typically under 2 MiB). The 64 MiB ceiling is
@@ -1271,12 +1328,6 @@ impl HttpFilter for ResponseStoreFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
-        }
-
-        if is_responses_format(ctx) && !is_streaming_request(ctx) {
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(MAX_JSON_BODY_BYTES),
-            });
         }
 
         if ctx.request.method == http::Method::DELETE {
@@ -1347,6 +1398,14 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let Some(limit) = ctx
+            .extensions
+            .get::<AgenticBudgetPolicy>()
+            .map(|policy| policy.max_retained_bytes())
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            state.apply_retained_payload_limit(limit);
+        }
         if should_skip_persist(ctx) {
             return Ok(FilterAction::Continue);
         }
@@ -1357,6 +1416,51 @@ impl HttpFilter for ResponseStoreFilter {
 
         if !store_available(ctx) {
             return Ok(FilterAction::Reject(reject_store_error()));
+        }
+
+        if !is_streaming_request(ctx) {
+            let budgeted = ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+            let finalized = ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.buffered_canonical_finalized);
+            let direct = ctx.extensions.get::<praxis_filter::IterationState>().is_none();
+            let admitted_wire_length = if budgeted && !finalized && direct {
+                let Some(length) = buffered_header_persistence_length(ctx) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                Some(length)
+            } else {
+                None
+            };
+            let max_bytes = if budgeted && !finalized {
+                let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                let Some(limit) = state.retained_payload_limit() else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                let Some(current) = state.retained_payload_bytes_bounded(limit) else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                limit.saturating_sub(current).min(MAX_JSON_BODY_BYTES)
+            } else {
+                MAX_JSON_BODY_BYTES
+            };
+            if budgeted
+                && !finalized
+                && let BodyMode::StreamBuffer { max_bytes: existing } = &ctx.response_body_mode
+                && existing.is_none_or(|bytes| bytes > max_bytes)
+            {
+                return Ok(persistence_budget_failure(ctx, false, &mut None));
+            }
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(admitted_wire_length.map_or(max_bytes, |length| length.min(max_bytes))),
+            });
         }
 
         trace!("response body persistence armed");
@@ -2061,14 +2165,47 @@ mod encode_replay_event_tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use bytes::Bytes;
-    use praxis_filter::{HttpFilter as _, sse::SseDecoder};
+    use praxis_filter::{HttpFilter as _, body::BodyMode, sse::SseDecoder};
     use serde_json::json;
 
     use super::{
-        ResponseEventRecord, ResponseStoreFilter, StateOwner, capture_request_input, encode_replay_event,
-        persistence_budget_failure,
+        DirectFiniteRestoreFraming, ResponseEventRecord, ResponseStoreFilter, StateOwner,
+        buffered_header_persistence_length, capture_request_input, encode_replay_event, persistence_budget_failure,
     };
     use crate::openai::responses::state::ResponsesState;
+
+    #[test]
+    fn budgeted_finite_persistence_requires_trusted_header_or_restore_handoff() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut response = crate::test_utils::make_response();
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut state = ResponsesState::default();
+        state.apply_retained_payload_limit(1 << 20);
+        ctx.extensions.insert(state);
+        ctx.response_header = Some(&mut response);
+        ctx.response_body_mode = BodyMode::Stream;
+
+        assert_eq!(buffered_header_persistence_length(&ctx), None);
+        ctx.response_header
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert(http::header::CONTENT_LENGTH, "80".parse().unwrap());
+        assert_eq!(buffered_header_persistence_length(&ctx), Some(80));
+
+        ctx.response_header
+            .as_mut()
+            .unwrap()
+            .headers
+            .remove(http::header::CONTENT_LENGTH);
+        ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: Some(80) };
+        assert_eq!(buffered_header_persistence_length(&ctx), None);
+        ctx.extensions.insert(DirectFiniteRestoreFraming {
+            wire_bytes: 80,
+            previous_id_bytes: 9,
+        });
+        assert_eq!(buffered_header_persistence_length(&ctx), Some(80));
+    }
 
     /// Build a minimal event record carrying `payload` for the encoder under test.
     fn record_with_payload(event_type: &str, payload: &[u8]) -> ResponseEventRecord {

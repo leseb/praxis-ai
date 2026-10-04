@@ -348,6 +348,9 @@ pub(crate) struct ResponsesState {
     /// charge between stream callbacks.
     pub(crate) retained_stream_parser_bytes: usize,
 
+    /// An incomplete SSE frame retained by response ID restoration between callbacks.
+    pub(crate) retained_rehydrate_stream_bytes: usize,
+
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
 
@@ -606,6 +609,9 @@ pub(crate) struct ResponsesState {
 
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
+
+    /// The loop already admitted and serialized this round's buffered body.
+    pub(crate) buffered_canonical_finalized: bool,
 
     /// Prior streamed terminal response retained across request-side re-entry.
     ///
@@ -907,6 +913,7 @@ impl Default for ResponsesState {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
             retained_stream_parser_bytes: 0,
+            retained_rehydrate_stream_bytes: 0,
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -948,6 +955,7 @@ impl Default for ResponsesState {
             request_body: serde_json::Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
+            buffered_canonical_finalized: false,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
             tool_search_calls: Vec::new(),
@@ -1037,9 +1045,12 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        let remaining = max_bytes.checked_sub(self.retained_stream_parser_bytes)?;
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
         self.retained_payload_bytes_bounded_inner(remaining, true, false)?
-            .checked_add(self.retained_stream_parser_bytes)
+            .checked_add(stream_bytes)
     }
 
     /// Request and history owners cannot change while one upstream stream is
@@ -1066,7 +1077,9 @@ impl ResponsesState {
     /// Count the owners which may change during a streaming response. The
     /// stream-local meter adds the cached request/history charge separately.
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true, true)
+        let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true)?
+            .checked_add(self.retained_rehydrate_stream_bytes)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1307,6 +1320,7 @@ impl ResponsesState {
         self.response_id = None;
         self.request_body = serde_json::json!({ "stream": streaming });
         self.response_object = serde_json::Value::Null;
+        self.buffered_canonical_finalized = false;
         self.local_completion_response_template = serde_json::Value::Null;
         self.tool_choice = serde_json::Value::Null;
         self.tools.clear();
@@ -1317,6 +1331,7 @@ impl ResponsesState {
         self.provider_streamed_terminal_ids.clear();
         self.provider_compaction_ids.clear();
         self.retained_stream_parser_bytes = 0;
+        self.retained_rehydrate_stream_bytes = 0;
         self.dispatch_failure = None;
     }
 
@@ -1558,6 +1573,7 @@ impl ResponsesState {
         };
         self.response_object = response;
         *body = Some(Bytes::from(serialized));
+        self.buffered_canonical_finalized = true;
         Ok(())
     }
 

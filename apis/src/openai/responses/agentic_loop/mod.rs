@@ -841,6 +841,7 @@ fn end_stream_with_error(
 /// re-entry, reset `tool_choice`. Header replay has already happened during
 /// body pre-read, before request filters and routing inspect the headers.
 fn prepare_iteration(state: &mut ResponsesState) {
+    state.buffered_canonical_finalized = false;
     state.tool_calls.clear();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
