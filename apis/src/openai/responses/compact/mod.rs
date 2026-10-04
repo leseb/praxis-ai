@@ -683,7 +683,7 @@ fn reactive_compaction_text_fits(state: &ResponsesState) -> bool {
 fn reactive_compaction_response_limit(
     state: &ResponsesState,
     conversation_text: &str,
-    params: &CompactionParams,
+    params: &CompactionParams<'_>,
     config: &ValidatedConfig,
 ) -> Result<Option<usize>, ()> {
     let Some(limit) = state.retained_payload_limit() else {
