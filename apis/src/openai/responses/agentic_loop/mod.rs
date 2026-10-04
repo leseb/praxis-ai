@@ -855,7 +855,12 @@ fn prepare_iteration(state: &mut ResponsesState) {
 
     if state.iteration > 0 {
         let original = std::mem::replace(&mut state.tool_choice, json!("auto"));
-        state.original_tool_choice.get_or_insert(original);
+        if state.original_tool_choice.is_none() {
+            state.original_tool_choice = Some(original);
+            // An explicit `"auto"` leaves request_body unchanged, but the
+            // preserved original is a new owner in the stable stream charge.
+            state.mark_replay_stable_payload_changed();
+        }
         set_request_body_field(state, "tool_choice", json!("auto"));
     }
 }
@@ -1231,7 +1236,7 @@ fn end_at_iteration_limit(
     clippy::too_many_lines,
     reason = "single-pass lexical bound must skip quoted number-like text"
 )]
-pub(super) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+pub(crate) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
     const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
     let mut extra = 0_usize;
     let mut index = 0;

@@ -627,6 +627,10 @@ pub(crate) struct ResponsesState {
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
 
+    /// This round's buffered body was serialized and admitted by the agentic
+    /// loop. The outer response hook cannot read IRR's inner filter results.
+    pub(crate) buffered_canonical_finalized: bool,
+
     /// Prior streamed terminal response retained across request-side re-entry.
     ///
     /// `openai_stream_events` invalidates [`Self::response_object`] before the
@@ -984,6 +988,7 @@ impl Default for ResponsesState {
             request_body: serde_json::Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
+            buffered_canonical_finalized: false,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
             tool_search_calls: Vec::new(),
@@ -1098,6 +1103,10 @@ impl ResponsesState {
         if let Some(echo) = &self.client_tool_echo {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
+        }
+        meter.json(&self.tool_choice)?;
+        if let Some(original_tool_choice) = &self.original_tool_choice {
+            meter.json(original_tool_choice)?;
         }
         for ((server, tool), value) in &self.mcp_tool_map {
             meter.raw(server.len())?;
@@ -1247,6 +1256,10 @@ impl ResponsesState {
                 meter.json_values(&echo.tools)?;
                 meter.json(&echo.tool_choice)?;
             }
+            meter.json(&self.tool_choice)?;
+            if let Some(original_tool_choice) = &self.original_tool_choice {
+                meter.json(original_tool_choice)?;
+            }
             for ((server, tool), value) in &self.mcp_tool_map {
                 meter.raw(server.len())?;
                 meter.raw(tool.len())?;
@@ -1261,9 +1274,7 @@ impl ResponsesState {
             meter.json(&self.local_completion_response_template)?;
             meter.json_values(&self.tool_calls)?;
         }
-        for value in [&self.tool_choice, &self.usage] {
-            meter.json(value)?;
-        }
+        meter.json(&self.usage)?;
         if !skip_accumulated_output {
             meter.json_values(&self.accumulated_output)?;
         }
@@ -1273,7 +1284,6 @@ impl ResponsesState {
         for value in [
             self.context_management.as_ref(),
             self.conversation.as_ref(),
-            self.original_tool_choice.as_ref(),
             self.previous_usage.as_ref(),
         ]
         .into_iter()
@@ -1511,6 +1521,7 @@ impl ResponsesState {
     /// Invalidate store and rehydrate current-output measurements without
     /// invalidating the stream parser's completed prior-output cache.
     pub(crate) fn mark_current_output_changed(&mut self) {
+        self.buffered_canonical_finalized = false;
         self.current_output_revision = self
             .current_output_revision
             .and_then(|revision| revision.checked_add(1));
@@ -1697,6 +1708,7 @@ impl ResponsesState {
         }
         self.response_object = response;
         *body = Some(Bytes::from(serialized));
+        self.buffered_canonical_finalized = true;
         Ok(())
     }
 
@@ -2050,6 +2062,34 @@ mod tests {
         assert!(!state.can_retain_payload(0));
         state.discard_payload_for_budget_error();
         assert!(state.provider_compaction_ids.is_empty());
+    }
+
+    #[test]
+    fn tool_choice_copies_are_charged_once_in_stream_stable_baseline() {
+        let mut state = ResponsesState::default();
+        let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing_before = state
+            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
+            .unwrap();
+        let large_choice = json!({"type":"allowed_tools","tools":["x".repeat(32_000)]});
+        state.tool_choice = large_choice.clone();
+        state.original_tool_choice = Some(large_choice);
+        state.mark_replay_stable_payload_changed();
+
+        let stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let changing = state
+            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
+            .unwrap();
+        assert!(
+            stable > stable_before + 64_000,
+            "both owned tool-choice values join the stable charge"
+        );
+        assert_eq!(
+            changing, changing_before,
+            "per-chunk accounting does not rescan stable tool choices"
+        );
+        assert_eq!(state.retained_payload_bytes().unwrap(), stable + changing);
+        assert_eq!(state.replay_stable_payload_revision, Some(1));
     }
 
     #[test]
@@ -3083,6 +3123,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "wire allocation and canonical marker share one finalization witness"
+    )]
     fn finalize_response_body_serializes_with_one_admitted_wire_allocation() {
         let mut state = ResponsesState {
             response_object: json!({
@@ -3105,10 +3149,16 @@ mod tests {
             state.finalize_response_body(&mut body).unwrap();
         });
         assert_eq!(body.as_ref().map(Bytes::len), Some(serialized_bytes));
+        assert!(state.buffered_canonical_finalized);
         assert!(!state.retained_payload_failed);
         assert!(
             allocations.bytes_max <= u64::try_from(serialized_bytes).unwrap() + 65_536,
             "one wire-sized buffer is admitted; serializer growth must not keep a second buffer: {allocations:?}"
+        );
+        state.mark_current_output_changed();
+        assert!(
+            !state.buffered_canonical_finalized,
+            "a later output mutation invalidates the serialized body"
         );
     }
 

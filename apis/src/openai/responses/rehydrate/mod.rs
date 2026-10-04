@@ -396,10 +396,13 @@ fn finite_restore_fits(ctx: &HttpFilterContext<'_>, body: Option<&[u8]>, previou
     if state.retained_payload_limit().is_none() {
         return true;
     }
-    let raw_bytes = body.map_or(0, <[u8]>::len);
-    // A JSON string byte can expand to six wire bytes when escaped. The
-    // response body remains live while parsing and serializing its replacement.
-    let peak = raw_bytes
+    let Some(parsed_bytes) = body.and_then(super::buffered_parsed_json_bytes_upper_bound) else {
+        return false;
+    };
+    // Exponent-form numbers can grow after serde parses them. Reserve against
+    // the normalized JSON bound before building the parsed tree or replacement
+    // wire body; the original response body remains live during both steps.
+    let peak = parsed_bytes
         .checked_mul(5)
         .and_then(|bytes| previous_id.len().checked_mul(12)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(128));

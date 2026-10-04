@@ -145,6 +145,92 @@ use crate::{
     promotion::is_promotable_value,
 };
 
+/// Check the effective response buffer after every selected header filter has
+/// run. The server-injected store gate calls this from the last response hook.
+/// A noncanonical conversation response has no known wire size yet, so a
+/// framework buffer larger than remaining aggregate headroom must be rejected
+/// before its first chunk. Canonical completed turns were already serialized
+/// and admitted, including their separate wire/buffer owner.
+#[cfg(feature = "store")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the final response mode gate checks status, type, canonical state, and headroom"
+)]
+pub fn final_conversation_buffer_budget_rejection(ctx: &HttpFilterContext<'_>) -> Option<Rejection> {
+    if ctx.get_metadata("openai_responses_format.has_conversation") != Some("true") {
+        return None;
+    }
+    let response = ctx.response_header.as_ref()?;
+    let content_type = response.headers.get(http::header::CONTENT_TYPE)?.to_str().ok()?;
+    if !response.status.is_success()
+        || !content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+    {
+        return None;
+    }
+    let state = ctx.extensions.get::<state::ResponsesState>()?;
+    let limit = state.retained_payload_limit()?;
+    if buffered_canonical_completed(ctx) {
+        return None;
+    }
+    let remaining = state
+        .retained_payload_bytes_bounded(limit)
+        .and_then(|used| limit.checked_sub(used));
+    let fits = remaining.is_some_and(|remaining| match &ctx.response_body_mode {
+        BodyMode::StreamBuffer { max_bytes } => max_bytes.is_some_and(|cap| cap <= remaining),
+        _ => true,
+    });
+    (!fits).then(|| {
+        error::responses_error_rejection(
+            502,
+            "server_error",
+            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes before response buffering",
+        )
+    })
+}
+
+/// Complete a deferred conversation append when response conditions excluded
+/// the store after it had armed persistence during the request phase.
+///
+/// # Errors
+///
+/// Returns an error only if the delegated conversation hook cannot run.
+#[cfg(feature = "store")]
+pub async fn finish_unselected_store_conversation_append(
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<FilterAction, FilterError> {
+    #[cfg(feature = "openai-conversations")]
+    {
+        if ctx.get_metadata("responses.skip_persist") == Some("true") {
+            return Ok(FilterAction::Continue);
+        }
+        if !store::mark_store_response_header_skipped(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+        return super::conversations::append_after_store_response(ctx).await;
+    }
+    #[cfg(not(feature = "openai-conversations"))]
+    {
+        let _ = ctx;
+        Ok(FilterAction::Continue)
+    }
+}
+
+/// A buffered canonical response is usable by outer header hooks only after
+/// the agentic loop finalized this selected round. A completed-looking state
+/// from an earlier round or an unselected branch is not sufficient.
+#[cfg(feature = "store")]
+pub(crate) fn buffered_canonical_completed(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<state::ResponsesState>().is_some_and(|state| {
+        state.buffered_canonical_finalized
+            && state.response_object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+    })
+}
+
 /// Reduce an ordinary request-body action to the bound-upstream body's
 /// deliberately narrow continue-or-reject contract.
 ///
@@ -261,6 +347,9 @@ impl io::Write for BoundedJsonCounter {
 /// per-request registry.
 #[cfg(feature = "store")]
 pub const DEFAULT_STORE_NAME: &str = "default";
+
+#[cfg(feature = "openai-responses")]
+pub(crate) use agentic_loop::buffered_parsed_json_bytes_upper_bound;
 
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
@@ -519,8 +608,7 @@ pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]
         // Exponent-form numbers can grow when serde_json materializes Values.
         // Reserve that normalized size before the first owned JSON tree exists.
         if bytes.len() > body_limit
-            || agentic_loop::buffered_parsed_json_bytes_upper_bound(bytes)
-                .is_none_or(|parsed_bytes| parsed_bytes > body_limit)
+            || buffered_parsed_json_bytes_upper_bound(bytes).is_none_or(|parsed_bytes| parsed_bytes > body_limit)
         {
             let message = format!(
                 "request body exceeds the {body_limit}-byte admission limit derived from openai_agentic_loop.max_retained_bytes"

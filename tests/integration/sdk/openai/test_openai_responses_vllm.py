@@ -868,6 +868,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
     concurrent_barrier: ClassVar[threading.Barrier | None] = None
     terminal_gate: ClassVar[threading.Event | None] = None
     tool_round_count: ClassVar[int] = 0
+    last_response_id: ClassVar[str | None] = None
 
     def log_message(self, fmt, *args):
         pass
@@ -1019,6 +1020,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             assert barrier is not None
             barrier.wait(timeout=15)
         response_id = f"resp_sdk_conv_{time.time_ns()}"
+        type(self).last_response_id = response_id
         response = {
             "id": response_id,
             "object": "response",
@@ -1085,7 +1087,11 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             content_type = "application/json"
         self.send_response(200)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
+        chunked = "BUDGET-CHUNKED-410" in request_input and not request_body.get("stream")
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         if request_body.get("stream") and (
             "STREAM-DELETE-410" in request_input
@@ -1099,7 +1105,13 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             assert gate.wait(timeout=15), "test did not release the terminal event"
             self.wfile.write(encoded_frames[1] + b"data: [DONE]\n\n")
         else:
-            self.wfile.write(payload)
+            if chunked:
+                for start in range(0, len(payload), 64):
+                    part = payload[start : start + 64]
+                    self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            else:
+                self.wfile.write(payload)
         self.wfile.flush()
 
     def do_POST(self):
@@ -1819,7 +1831,7 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
 
 
 def _witness_proxy_session(
-    tmp_path_factory, request, search_port=None, max_event_bytes=None
+    tmp_path_factory, request, search_port=None, max_event_bytes=None, retained_limit=None
 ):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
@@ -1830,6 +1842,7 @@ def _witness_proxy_session(
     """
     ResponsesWitnessHandler.forwarded_bodies = []
     ResponsesWitnessHandler.tool_round_count = 0
+    ResponsesWitnessHandler.last_response_id = None
     forwarded = ResponsesWitnessHandler.forwarded_bodies
     backend_port = _free_port()
     server = ThreadingHTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
@@ -1845,6 +1858,7 @@ def _witness_proxy_session(
         backend_endpoint=f"127.0.0.1:{backend_port}",
         search_port=search_port,
         max_event_bytes=max_event_bytes,
+        retained_limit=retained_limit,
     )
     binary = _find_binary()
 
@@ -1885,6 +1899,18 @@ def _witness_proxy_session(
 def witness_backend_client(tmp_path_factory, request):
     """Function-scoped witness proxy with the stock rehydrate config."""
     yield from _witness_proxy_session(tmp_path_factory, request)
+
+
+@pytest.fixture()
+def witness_budgeted_conversation_client(tmp_path_factory, request):
+    """Full-flow SQLite witness with room for the response but not append staging."""
+    yield from _witness_proxy_session(tmp_path_factory, request, retained_limit=8_192)
+
+
+@pytest.fixture()
+def witness_budgeted_continuation_client(tmp_path_factory, request):
+    """Full-flow SQLite witness at the default 64 MiB retained allowance."""
+    yield from _witness_proxy_session(tmp_path_factory, request, retained_limit=67_108_864)
 
 
 @pytest.fixture()
@@ -2562,6 +2588,91 @@ class TestOpenAIResponsesVLLM:
             "client even though it strips the id from the rehydrated upstream "
             f"request; got: {second.previous_response_id!r}"
         )
+
+    def test_buffered_store_false_conversation_appends_before_body(self, witness_backend_client):
+        """The full-flow IRR has canonical output when the outer header hook runs."""
+        client, _ = witness_backend_client
+        conversation = client.conversations.create()
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="BUFFERED-STORE-FALSE-410",
+                conversation=conversation.id,
+                store=False,
+            )
+            assert response.status == "completed"
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+            ]
+            assert "BUFFERED-STORE-FALSE-410" in items.data[0].content[0].text
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_budgeted_previous_response_id_continuation_keeps_small_completion(
+        self, witness_budgeted_continuation_client
+    ):
+        """A rehydrate buffer ceiling must not reject an admitted small body."""
+        client, _ = witness_budgeted_continuation_client
+        first = client.responses.create(
+            model="sdk-conversation-stream", input="BUDGET-PREVIOUS-BASE-410", store=True
+        )
+        assert first.status == "completed"
+        second = client.responses.create(
+            model="sdk-conversation-stream",
+            input="BUDGET-PREVIOUS-NEXT-410",
+            previous_response_id=first.id,
+            store=True,
+        )
+        assert second.status == "completed"
+        assert second.previous_response_id == first.id
+
+    def test_buffered_store_true_conversation_persists_before_append(self, witness_backend_client):
+        """Header persistence and append both complete before buffered delivery."""
+        client, _ = witness_backend_client
+        conversation = client.conversations.create()
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="BUFFERED-STORE-TRUE-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert response.status == "completed"
+            assert client.responses.retrieve(response.id).id == response.id
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+            ]
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_budgeted_chunked_store_true_conversation_rejects_before_commit(
+        self, witness_budgeted_conversation_client
+    ):
+        """A chunked native completion returns Responses 502 without durable success."""
+        client, _ = witness_budgeted_conversation_client
+        conversation = client.conversations.create()
+        try:
+            with pytest.raises(APIStatusError) as exc_info:
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="BUDGET-CHUNKED-410",
+                    conversation=conversation.id,
+                    store=True,
+                )
+            assert exc_info.value.status_code == 502
+            assert exc_info.value.response.json()["error"]["type"] == "server_error"
+            assert client.conversations.items.list(conversation.id).data == []
+            response_id = ResponsesWitnessHandler.last_response_id
+            assert response_id is not None
+            with pytest.raises(APIStatusError) as retrieval:
+                client.responses.retrieve(response_id)
+            assert retrieval.value.status_code == 404
+        finally:
+            client.conversations.delete(conversation.id)
 
     def test_streamed_conversation_append_and_follow_up(self, witness_backend_client):
         """The shipped full-flow graph appends a streamed turn before completion.

@@ -303,7 +303,7 @@ fn response_body_mode_defaults_to_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() {
+async fn on_response_selects_bounded_stream_buffer_for_non_streaming_responses() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -311,9 +311,14 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "false");
 
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    let mut response = crate::test_utils::make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue), "request should continue");
+    assert!(matches!(action, FilterAction::Continue), "response should continue");
     assert_eq!(
         ctx.response_body_mode,
         BodyMode::StreamBuffer {
