@@ -1964,6 +1964,40 @@ fn result_payload_limit(retained_result_limit: usize) -> usize {
     retained_result_limit / RESULT_PAYLOAD_OWNER_COUNT
 }
 
+/// Bound the wire body alongside parsed and retained result owners. The
+/// transport accepts a JSON-RPC envelope in addition to the decoded payload;
+/// its streaming executor can temporarily hold twice that wire ceiling while
+/// the adapter classifies an overflowing chunk. Charge every call in the batch
+/// because their futures may run concurrently.
+fn mcp_callout_peak_bytes(admitted_results: usize, call_count: usize) -> Option<usize> {
+    let per_call = admitted_results / call_count;
+    let wire = mcp_client::tool_result_wire_cap(result_payload_limit(per_call));
+    admitted_results
+        .checked_mul(RESULT_PAYLOAD_OWNER_COUNT)?
+        .checked_add(wire.checked_mul(2)?.checked_mul(call_count)?)
+}
+
+/// Find the largest batch allowance whose complete wire and decoded peak
+/// fits, including the transport's fixed JSON-RPC envelope.
+fn admitted_result_bytes_for_peak(available: usize, call_count: usize, configured_limit: usize) -> Option<usize> {
+    let minimum = call_count.checked_mul(MIN_RETAINED_RESULT_BYTES)?;
+    let mut admitted = minimum;
+    let mut upper = configured_limit.min(available / RESULT_PAYLOAD_OWNER_COUNT);
+    if admitted > upper || mcp_callout_peak_bytes(admitted, call_count).is_none_or(|peak| peak > available) {
+        return None;
+    }
+    while admitted < upper {
+        let distance = upper - admitted;
+        let candidate = admitted + distance / 2 + distance % 2;
+        if mcp_callout_peak_bytes(candidate, call_count).is_some_and(|peak| peak <= available) {
+            admitted = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    Some(admitted)
+}
+
 /// Result of executing a single MCP tool call.
 #[derive(Debug)]
 struct McpCallResult {
@@ -2007,6 +2041,9 @@ fn aggregate_mcp_result_limit(
     mcp_calls: &[&serde_json::Value],
     configured_limit: usize,
 ) -> Option<(usize, bool)> {
+    if mcp_calls.is_empty() {
+        return Some((configured_limit, false));
+    }
     let Some(limit) = state.retained_payload_limit() else {
         return Some((configured_limit, false));
     };
@@ -2040,9 +2077,8 @@ fn aggregate_mcp_result_limit(
         .checked_sub(current)?
         .checked_sub(staging)?
         .checked_sub(initialize_floor)?;
-    let admitted = configured_limit.min(available / 4);
-    let minimum = mcp_calls.len().checked_mul(MIN_RETAINED_RESULT_BYTES)?;
-    (admitted >= minimum).then_some((admitted, admitted < configured_limit))
+    let admitted = admitted_result_bytes_for_peak(available, mcp_calls.len(), configured_limit)?;
+    Some((admitted, admitted < configured_limit))
 }
 
 /// The result vector remains live while messages are cloned into two distinct

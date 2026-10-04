@@ -670,7 +670,8 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    state.apply_retained_payload_limit(current + result_id_bytes + 20_000);
+    let headroom = 170_000;
+    state.apply_retained_payload_limit(current + result_id_bytes + headroom);
     let calls = call_refs(&state.tool_calls);
 
     let arguments = super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap();
@@ -679,12 +680,27 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
         panic!("weather tool must resolve")
     };
     let entry = retained_json_bytes(entry).unwrap();
-    assert_eq!(
-        aggregate_mcp_result_limit(&state, &calls, 8_192),
-        Some((
-            (20_000 - arguments - entry - 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
-            true
-        ))
+    let available = headroom - arguments - entry - 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES;
+    let (admitted, constrained) = aggregate_mcp_result_limit(&state, &calls, 8_192).unwrap();
+    assert!(constrained, "the wire envelope must lower the configured allowance");
+    assert!(super::mcp_callout_peak_bytes(admitted, calls.len()).unwrap() <= available);
+    assert!(super::mcp_callout_peak_bytes(admitted + 1, calls.len()).unwrap() > available);
+}
+
+#[test]
+fn aggregate_mcp_limit_rejects_when_tool_wire_envelope_exceeds_headroom() {
+    let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + 20_000);
+
+    assert!(
+        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        "the tools/call wire envelope alone can exceed 20 KiB of request headroom"
     );
 }
 
