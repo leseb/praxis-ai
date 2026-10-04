@@ -1393,7 +1393,13 @@ async fn per_call_overflow_remains_fail_open_when_aggregate_budget_only_tightens
         "on_failure: open\nmax_response_bytes: 256\nmax_total_response_bytes: 8192\n",
     );
     let mut state = one_pending_state(&["vs-a"]);
-    state.apply_retained_payload_limit(4_096);
+    let baseline = state.retained_payload_bytes().unwrap();
+    let plan = build_search_plan(&state, &state.file_search_assignments);
+    let specs = build_search_specs(&plan);
+    let execution_bytes = plan.retained_payload_bytes().unwrap() + outbound_request_peak_bytes(&specs).unwrap();
+    // Leave enough room for one decoder's fixed allowance and a per-call 256
+    // byte response, while the request-wide cap still tightens the total.
+    state.apply_retained_payload_limit(baseline + execution_bytes + 80_000);
     let mut ctx = make_context(Some(state));
 
     assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
@@ -1448,7 +1454,11 @@ async fn aggregate_response_overflow_stops_later_searches_when_callout_policy_is
     let mut state = one_pending_state(&store_refs);
     let baseline = state.retained_payload_bytes().unwrap();
     let plan = build_search_plan(&state, &state.file_search_assignments);
-    state.apply_retained_payload_limit(baseline + plan.retained_payload_bytes().unwrap() + 6_000);
+    let specs = build_search_specs(&plan);
+    let execution_bytes = plan.retained_payload_bytes().unwrap() + outbound_request_peak_bytes(&specs).unwrap();
+    // Nine pages reserve 64 KiB of decoder headroom each. The remaining
+    // allowance fits one scheduled response but not its 4 KiB body.
+    state.apply_retained_payload_limit(baseline + execution_bytes + 600_000);
     let mut ctx = make_context(Some(state));
 
     assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
