@@ -2735,6 +2735,76 @@ async fn background_closing_session_remains_charged_until_delete_finishes() {
 }
 
 #[tokio::test]
+async fn timed_out_pooled_tool_sessions_remain_charged_during_delete() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "timed-close".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    // First establish a reusable initialized session; then exercise both the
+    // reused and fresh timeout branches with a server-held DELETE.
+    let warm = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, &key)),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "warm"}),
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
+        true,
+        &callout,
+    )
+    .await;
+    assert!(warm.is_ok());
+
+    for expected_parked in [true, false] {
+        assert_eq!(pool.retained_payload_bytes().unwrap() > 0, expected_parked);
+        let result = call_tool_with_forwarded_headers_bounded_initialize(
+            Some((&pool, &key)),
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "slow",
+            serde_json::json!({"sleep_ms": 5_000}),
+            Duration::from_secs(1),
+            TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
+            true,
+            &callout,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(McpClientError::Timeout { .. })),
+            "slow tool must time out"
+        );
+        tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+            .await
+            .expect("timed-out session DELETE must start");
+        assert!(
+            pool.retained_payload_bytes().unwrap() > 0,
+            "timed-out session must remain charged while rmcp owns cleanup"
+        );
+        delete_release.notify_one();
+        tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+            while pool.retained_payload_bytes() != Some(0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed-out session charge must clear after DELETE");
+    }
+    ct.cancel();
+}
+
+#[tokio::test]
 async fn checkout_rejects_session_whose_idle_get_exhausted_its_budget() {
     let (url, ct, _methods) = start_method_recording_mcp_server().await;
     let pool = McpSessionPool::new();

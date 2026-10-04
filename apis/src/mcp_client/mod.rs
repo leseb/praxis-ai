@@ -679,21 +679,22 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
                 // `SessionExpired` session, so any error surfaced here is genuine and of unknown delivery — retrying a
                 // timeout or 5xx could execute a non-idempotent tool twice (at-most-once for the reused path).
                 Ok(Err(err)) => {
-                    session.close_before(deadline).await;
+                    pool.close_sessions_in_background(vec![session]);
                     Err(err)
                 },
                 Err(_elapsed) => {
                     // Read the signal (an oversized/SSRF exchange surfaced only when the deadline fired) before
                     // closing.
-                    session.close_before(deadline).await;
+                    pool.close_sessions_in_background(vec![session]);
                     Err(classify_deadline(&signal, &display_url, timeout))
                 },
             };
         }
     }
 
-    // 2. Fresh session: first use, a `None` pool, or the empty-fingerprint sentinel. Close (not drop) the service on
-    //    every post-serve exit so no background worker task is left holding our subrequest executor.
+    // 2. Fresh session: first use, a `None` pool, or the empty-fingerprint sentinel. On failure, a pooled service
+    //    closes in the background with its payload charged until rmcp exits; an unpooled service uses the call
+    //    deadline.
     let mut session: Option<PooledSession> = None;
     let mut call_signal = None;
     let outcome = tokio::time::timeout_at(deadline, async {
@@ -737,7 +738,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
         },
         Ok(Err(err)) => {
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_failed_tool_session(pool.map(|(pool, _key)| pool), session, deadline).await;
             }
             Err(err)
         },
@@ -746,7 +747,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             // oversized/SSRF exchange surfaced only when the deadline fired still
             // maps to its typed error.
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_failed_tool_session(pool.map(|(pool, _key)| pool), session, deadline).await;
             }
             Err(call_signal.map_or_else(
                 || McpClientError::Timeout {
@@ -756,6 +757,20 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
                 |signal| classify_deadline(&signal, &display_url, timeout),
             ))
         },
+    }
+}
+
+/// A pooled failure stays charged until rmcp releases its peer information
+/// and transport, even when the tool call's deadline has expired.
+async fn close_failed_tool_session(
+    pool: Option<&McpSessionPool>,
+    session: PooledSession,
+    deadline: tokio::time::Instant,
+) {
+    if let Some(pool) = pool {
+        pool.close_sessions_in_background(vec![session]);
+    } else {
+        session.close_before(deadline).await;
     }
 }
 
