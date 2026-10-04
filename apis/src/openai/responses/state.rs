@@ -197,6 +197,42 @@ impl ResponseObjectChargeCache {
     }
 }
 
+/// Exact completed-call charge reused by Store and Rehydrate during one SSE
+/// response. Every production write advances the dedicated call revision;
+/// overflow disables reuse rather than admitting a stale size.
+#[cfg(feature = "store")]
+#[derive(Clone, Copy)]
+pub(crate) struct CompletedToolCallsChargeCache {
+    iteration: u32,
+    revision: u64,
+    length: usize,
+    bytes: usize,
+}
+
+#[cfg(feature = "store")]
+impl CompletedToolCallsChargeCache {
+    /// Measure once per stream mutation revision, respecting a smaller later limit.
+    pub(crate) fn measure(cache: &mut Option<Self>, state: &ResponsesState, max_bytes: usize) -> Option<usize> {
+        if let Some(existing) = cache
+            && existing.iteration == state.iteration
+            && Some(existing.revision) == state.tool_calls_revision
+            && existing.length == state.tool_calls.len()
+        {
+            return (existing.bytes <= max_bytes).then_some(existing.bytes);
+        }
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json_values(&state.tool_calls)?;
+        let bytes = meter.used();
+        *cache = state.tool_calls_revision.map(|revision| Self {
+            iteration: state.iteration,
+            revision,
+            length: state.tool_calls.len(),
+            bytes,
+        });
+        Some(bytes)
+    }
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
@@ -383,6 +419,10 @@ pub(crate) struct ResponsesState {
     /// Invalidates response-object byte caches after an owned or in-place edit.
     /// Overflow disables reuse so a stale charge can never be admitted.
     pub(crate) response_object_revision: Option<u64>,
+
+    /// Invalidates Store and Rehydrate's completed-call charge after any write.
+    /// Overflow disables cache reuse.
+    pub(crate) tool_calls_revision: Option<u64>,
 
     /// Parser buffers published by `openai_stream_events`. Its filter-local
     /// slot is invisible to other filters, so the request-wide meter owns this
@@ -966,6 +1006,7 @@ impl Default for ResponsesState {
             retained_external_payload_bytes: 0,
             replay_stable_payload_revision: Some(0),
             response_object_revision: Some(0),
+            tool_calls_revision: Some(0),
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
@@ -1177,7 +1218,7 @@ impl ResponsesState {
     /// fixed tool snapshots, and prior output. Include the stream parsers'
     /// published charges.
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
-        self.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(max_bytes, None)
+        self.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(max_bytes, None, None)
     }
 
     /// The Store and Chat changing meter with an exact cached response-object
@@ -1186,13 +1227,22 @@ impl ResponsesState {
         &self,
         max_bytes: usize,
         response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
     ) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, response_object_bytes, None)?
-            .checked_add(stream_bytes)
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            true,
+            true,
+            response_object_bytes,
+            tool_calls_bytes,
+        )?
+        .checked_add(stream_bytes)
     }
 
     /// Count owners that may change between Rehydrate SSE callbacks, including
@@ -1205,13 +1255,22 @@ impl ResponsesState {
         &self,
         max_bytes: usize,
         response_object_bytes: Option<usize>,
+        tool_calls_bytes: Option<usize>,
     ) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, true, response_object_bytes, None)?
-            .checked_add(stream_bytes)
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            false,
+            true,
+            response_object_bytes,
+            tool_calls_bytes,
+        )?
+        .checked_add(stream_bytes)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1426,6 +1485,7 @@ impl ResponsesState {
     pub(crate) fn fail_retained_payload_budget(&mut self) {
         self.retained_payload_failed = true;
         self.tool_calls.clear();
+        self.mark_tool_calls_changed();
         self.tool_search_calls.clear();
         self.web_search_calls.clear();
         self.file_search_assignments.clear();
@@ -1555,6 +1615,11 @@ impl ResponsesState {
         self.response_object_revision = self
             .response_object_revision
             .and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Invalidate completed-call byte charges before an append, replacement, or clear.
+    pub(crate) fn mark_tool_calls_changed(&mut self) {
+        self.tool_calls_revision = self.tool_calls_revision.and_then(|revision| revision.checked_add(1));
     }
 
     /// Borrow the response object for mutation and invalidate response-filter byte caches.
@@ -2124,7 +2189,7 @@ mod tests {
         assert_eq!(
             stable
                 + state
-                    .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None)
+                    .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None, None)
                     .unwrap(),
             total,
             "Rehydrate charges each fixed tool snapshot once"
@@ -2148,6 +2213,50 @@ mod tests {
         let next = ResponseObjectChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
         assert!(next > first, "overflowed revisions must remeasure the new object");
         assert!(cache.is_none(), "an overflowed revision must disable reuse");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn completed_tool_calls_charge_cache_remeasures_after_revision_overflow() {
+        let mut state = ResponsesState::default();
+        state.tool_calls.push(json!({"arguments": "small"}));
+        state.mark_tool_calls_changed();
+        let mut cache = None;
+        let first = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        state.tool_calls_revision = Some(u64::MAX);
+        state.tool_calls[0]["arguments"] = json!("x".repeat(4_096));
+        state.mark_tool_calls_changed();
+        let next = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert!(next > first);
+        assert!(cache.is_none(), "an overflowed revision must disable reuse");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn cached_completed_tool_calls_preserve_store_and_rehydrate_meter_parity() {
+        let mut state = ResponsesState::from_request_body(json!({"input":"hello"}));
+        state
+            .tool_calls
+            .push(json!({"type":"function_call", "arguments":"x".repeat(4_096)}));
+        state.mark_tool_calls_changed();
+        let mut cache = None;
+        let charge = CompletedToolCallsChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert_eq!(
+            state.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+                usize::MAX,
+                None,
+                Some(charge)
+            ),
+            state.stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+        );
+        assert_eq!(
+            state.rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+                usize::MAX,
+                None,
+                Some(charge)
+            ),
+            state.rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None, None)
+        );
     }
 
     #[cfg(feature = "store")]

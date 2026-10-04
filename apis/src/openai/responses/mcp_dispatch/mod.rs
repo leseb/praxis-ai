@@ -352,6 +352,7 @@ impl McpDispatchFilter {
         }
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
         state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+        state.mark_tool_calls_changed();
     }
 
     /// Fail closed when no shared sub-request client is available to dial the
@@ -374,6 +375,7 @@ impl McpDispatchFilter {
     fn result_limit_action(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.tool_calls.clear();
+            state.mark_tool_calls_changed();
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
@@ -618,6 +620,7 @@ impl McpDispatchFilter {
                 let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
                 let fits = aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes).is_some();
                 state.tool_calls.truncate(original_calls);
+                state.mark_tool_calls_changed();
                 state.messages.truncate(original_messages);
                 state.persisted_messages.truncate(original_persisted);
                 fits
@@ -1006,6 +1009,7 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
             "resuming approved MCP tool call"
         );
         state.tool_calls.push(build_approved_tool_call(decision));
+        state.mark_tool_calls_changed();
     } else {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
@@ -1463,10 +1467,12 @@ pub(crate) fn prepare_response_round(
     record_and_emit_approvals(state, pending);
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+    state.mark_tool_calls_changed();
     if executable.is_empty() {
         state.mcp_approval_state = McpApprovalState::ApprovalPendingThenReturn;
     } else {
         state.tool_calls.extend(executable);
+        state.mark_tool_calls_changed();
         state.mcp_approval_state = McpApprovalState::ExecuteUngatedThenReturn;
     }
     Ok(())

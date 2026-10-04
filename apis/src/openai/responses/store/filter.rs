@@ -70,7 +70,8 @@ use super::{
         error::responses_error_rejection,
         rehydrate::{DirectFiniteRestoreFraming, FinalizedFiniteRestoreAdmission, FinalizedRestoredBodyDigest},
         state::{
-            PayloadMeter, ResponseObjectChargeCache, ResponsesState, retained_json_bytes, retained_json_values_bytes,
+            CompletedToolCallsChargeCache, PayloadMeter, ResponseObjectChargeCache, ResponsesState,
+            retained_json_bytes, retained_json_values_bytes,
         },
     },
     config::{ResponseStoreConfig, validate_config},
@@ -405,6 +406,7 @@ impl ResponseStoreFilter {
         let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
         if terminal_ready {
             state.response_object_charge = None;
+            state.tool_calls_charge = None;
         }
         if let Some(responses) = ctx.extensions.get::<ResponsesState>()
             && let Some(limit) = responses.retained_payload_limit()
@@ -458,6 +460,7 @@ impl ResponseStoreFilter {
                             responses,
                             state.shared_stable_bytes,
                             &mut state.response_object_charge,
+                            &mut state.tool_calls_charge,
                             0,
                             peak,
                         )
@@ -479,6 +482,7 @@ impl ResponseStoreFilter {
                     responses,
                     state.shared_stable_bytes,
                     &mut state.response_object_charge,
+                    &mut state.tool_calls_charge,
                     state.charged_retained_bytes.unwrap_or(0),
                     next,
                 )
@@ -855,6 +859,8 @@ struct ResponseStoreRequestState {
     shared_stable_bytes: Option<StoreStableCache>,
     /// Exact current-round response object charge, keyed by its mutation revision.
     response_object_charge: Option<ResponseObjectChargeCache>,
+    /// Exact completed-call charge, keyed by the request-wide call revision.
+    tool_calls_charge: Option<CompletedToolCallsChargeCache>,
     /// Owner captured before inference begins.
     owner: Option<StateOwner>,
     /// Incremental SSE decoder over the outbound stream, lazily created on the
@@ -959,6 +965,7 @@ fn store_stream_budget_fits(
     responses: &ResponsesState,
     stable: Option<StoreStableCache>,
     response_object_charge: &mut Option<ResponseObjectChargeCache>,
+    tool_calls_charge: &mut Option<CompletedToolCallsChargeCache>,
     removed: usize,
     added: usize,
 ) -> bool {
@@ -979,10 +986,16 @@ fn store_stream_budget_fits(
     else {
         return false;
     };
+    let Some(tool_calls_bytes) =
+        CompletedToolCallsChargeCache::measure(tool_calls_charge, responses, measurement_limit)
+    else {
+        return false;
+    };
     responses
         .stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
             measurement_limit,
             Some(response_object_bytes),
+            Some(tool_calls_bytes),
         )
         .and_then(|current| current.checked_sub(removed))
         .and_then(|current| current.checked_add(added))
@@ -1227,6 +1240,7 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Resul
     state.input_retained_bytes = retained_bytes;
     state.shared_stable_bytes = None;
     state.response_object_charge = None;
+    state.tool_calls_charge = None;
     let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
     let admitted = charge_store_payload(ctx, &mut state, next);
     ctx.extensions.insert(state);
@@ -1678,6 +1692,7 @@ impl HttpFilter for ResponseStoreFilter {
         if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
             state.shared_stable_bytes = None;
             state.response_object_charge = None;
+            state.tool_calls_charge = None;
         }
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
@@ -1719,6 +1734,7 @@ impl HttpFilter for ResponseStoreFilter {
         if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
             state.shared_stable_bytes = None;
             state.response_object_charge = None;
+            state.tool_calls_charge = None;
         }
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
@@ -3225,5 +3241,90 @@ mod encode_replay_event_tests {
             !filter.capture_stream_events(&mut ctx, &frame, false),
             "a same-shape request rewrite must be measured before the next replay chunk"
         );
+    }
+
+    #[test]
+    fn store_completed_call_cache_invalidates_same_length_replacement() {
+        let mut state = ResponsesState::default();
+        state
+            .tool_calls
+            .push(json!({"type":"function_call", "arguments":"small"}));
+        state.mark_tool_calls_changed();
+        state.apply_retained_payload_limit(4_096);
+        let stable =
+            super::StoreStableCache::new(&state, state.stream_stable_payload_bytes_bounded(4_096).unwrap()).unwrap();
+        let mut response_charge = None;
+        let mut tool_calls_charge = None;
+        assert!(super::store_stream_budget_fits(
+            &state,
+            Some(stable),
+            &mut response_charge,
+            &mut tool_calls_charge,
+            0,
+            0
+        ));
+
+        state.tool_calls[0]["arguments"] = json!("x".repeat(4_096));
+        state.mark_tool_calls_changed();
+        assert!(
+            !super::store_stream_budget_fits(&state, Some(stable), &mut response_charge, &mut tool_calls_charge, 0, 0),
+            "the same vector length must not reuse a stale completed-call charge"
+        );
+        state.tool_calls[0]["arguments"] = json!("small");
+        state.mark_tool_calls_changed();
+        assert!(super::store_stream_budget_fits(
+            &state,
+            Some(stable),
+            &mut response_charge,
+            &mut tool_calls_charge,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "matched before/after Store budget-meter timing probe"
+    )]
+    fn store_completed_call_budget_checks_reuse_exact_charge() {
+        fn timed_checks(size: usize) -> std::time::Duration {
+            let mut state = ResponsesState::default();
+            state.apply_retained_payload_limit(64 * 1024 * 1024);
+            state
+                .tool_calls
+                .push(json!({"type":"function_call", "arguments":"x".repeat(size)}));
+            state.mark_tool_calls_changed();
+            let stable = super::StoreStableCache::new(
+                &state,
+                state.stream_stable_payload_bytes_bounded(64 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+            let mut response_charge = None;
+            let mut tool_calls_charge = None;
+            assert!(super::store_stream_budget_fits(
+                &state,
+                Some(stable),
+                &mut response_charge,
+                &mut tool_calls_charge,
+                0,
+                100
+            ));
+            let start = std::time::Instant::now();
+            for _ in 0..1_000 {
+                assert!(std::hint::black_box(super::store_stream_budget_fits(
+                    std::hint::black_box(&state),
+                    Some(stable),
+                    &mut response_charge,
+                    &mut tool_calls_charge,
+                    0,
+                    100
+                )));
+            }
+            start.elapsed()
+        }
+        let empty = timed_checks(0);
+        let completed_call = timed_checks(1_000_000);
+        eprintln!("1,000 Store budget checks: empty={empty:?}; 1MiB completed call={completed_call:?}");
     }
 }

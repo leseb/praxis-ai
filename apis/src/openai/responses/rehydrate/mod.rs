@@ -54,7 +54,7 @@ use super::{
     append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
-    state::{ResponseObjectChargeCache, ResponsesState, strip_local_compaction_marker},
+    state::{CompletedToolCallsChargeCache, ResponseObjectChargeCache, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
@@ -411,6 +411,11 @@ impl HttpFilter for RehydrateFilter {
         // `previous_response_id` inside response-lifecycle frames as they arrive,
         // never assembling the whole stream in memory.
         if let Some(mut armed) = ctx.remove_filter_state::<RestorePreviousResponseIdStream>() {
+            if end_of_stream {
+                // The loop owner can clear dispatch calls during this terminal
+                // callback without changing the response object.
+                armed.tool_calls_charge = None;
+            }
             let budget = ctx.extensions.get::<ResponsesState>();
             let restored =
                 restore_previous_response_id_stream_chunk_with_budget(&mut armed, body, end_of_stream, budget);
@@ -698,6 +703,7 @@ fn arm_streaming_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
         forwarded_terminal: false,
         stable_payload: None,
         response_object_charge: None,
+        tool_calls_charge: None,
     });
 
     true
@@ -758,6 +764,8 @@ struct RestorePreviousResponseIdStream {
     stable_payload: Option<RestoreStablePayloadCache>,
     /// Exact current-round response object charge, keyed by mutation revision.
     response_object_charge: Option<ResponseObjectChargeCache>,
+    /// Exact completed-call charge, keyed by the request-wide call revision.
+    tool_calls_charge: Option<CompletedToolCallsChargeCache>,
 }
 
 /// An O(1) invalidation key for request, history, and tool snapshots cached by Rehydrate.
@@ -1055,10 +1063,13 @@ fn streaming_restore_budget(
     let changing_limit = measurement_limit.checked_sub(stable).ok_or(())?;
     let response_object_bytes =
         ResponseObjectChargeCache::measure(&mut armed.response_object_charge, state, changing_limit).ok_or(())?;
+    let tool_calls_bytes =
+        CompletedToolCallsChargeCache::measure(&mut armed.tool_calls_charge, state, changing_limit).ok_or(())?;
     let changing = state
         .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
             changing_limit,
             Some(response_object_bytes),
+            Some(tool_calls_bytes),
         )
         .ok_or(())?;
     let current = stable.checked_add(changing).ok_or(())?;
