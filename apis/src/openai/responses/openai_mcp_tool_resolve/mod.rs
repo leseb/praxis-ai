@@ -72,7 +72,7 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
-    bound_body_outcome,
+    bound_body_outcome, budget_error,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -848,8 +848,7 @@ impl HttpFilter for McpToolResolveFilter {
             .get::<ResponsesState>()
             .is_none_or(|state| state.retained_payload_limit().is_none() || state.can_retain_payload(bytes.len()));
         if !parse_fits {
-            let streaming = is_streaming(ctx);
-            return Ok(reject_retained_budget(ctx, streaming, &bytes));
+            return Ok(reject_retained_budget(ctx));
         }
         let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return Ok(FilterAction::Continue);
@@ -862,7 +861,7 @@ impl HttpFilter for McpToolResolveFilter {
         // captures the size-bounded request options from it) is cheap.
         match Box::pin(self.resolve_mcp_tools(ctx, body, parsed)).await {
             Ok(action) => Ok(action),
-            Err(ResolveError::RetainedBudget) => Ok(reject_retained_budget(ctx, streaming, &bytes)),
+            Err(ResolveError::RetainedBudget) => Ok(reject_retained_budget(ctx)),
             Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
     }
@@ -879,12 +878,8 @@ impl HttpFilter for McpToolResolveFilter {
 
 /// Mark an aggregate-budget failure terminal before constructing its response.
 /// No successful response may later be persisted for this request body.
-fn reject_retained_budget(ctx: &mut HttpFilterContext<'_>, streaming: bool, body: &[u8]) -> FilterAction {
-    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-        state.discard_payload_for_budget_error();
-    }
-    ctx.set_metadata("responses.skip_persist", "true");
-    resolve_error_action(ctx, &ResolveError::RetainedBudget, streaming, body)
+fn reject_retained_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    budget_error::reject_request(ctx, &ResolveError::RetainedBudget.to_string())
 }
 
 // -----------------------------------------------------------------------------
@@ -936,9 +931,9 @@ pub(crate) enum ResolveError {
         limit: usize,
     },
 
-    /// Deferred discovery cannot fit its next listing or commit staging in
-    /// the request-wide retained-payload budget.
-    #[error("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during deferred MCP discovery")]
+    /// MCP discovery cannot fit its next listing or commit staging in the
+    /// request-wide retained-payload budget.
+    #[error("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during MCP discovery")]
     RetainedBudget,
 
     /// Unknown `connector_id` was referenced.
@@ -1438,6 +1433,9 @@ pub(crate) fn resolve_error_action(
     streaming: bool,
     body: &[u8],
 ) -> FilterAction {
+    if matches!(err, ResolveError::RetainedBudget) {
+        return reject_retained_budget(ctx);
+    }
     if streaming && is_mcp_listing_runtime_failure(err) {
         return stash_list_tools_failure(ctx, err, capture_echoed_options(body));
     }
