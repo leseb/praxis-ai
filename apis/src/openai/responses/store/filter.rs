@@ -328,7 +328,7 @@ impl ResponseStoreFilter {
         };
         let response_bytes = retained_json_bytes(&state.response_object);
         if !response_bytes.is_some_and(|bytes| persistence_construction_fits(ctx, bytes)) {
-            return Ok(persistence_budget_failure(ctx, true, body));
+            return streaming_persistence_budget_failure(ctx, body);
         }
 
         // Capture the proxy-issued pending approvals before taking the context.
@@ -353,11 +353,11 @@ impl ResponseStoreFilter {
         if budgeted_conversation {
             let inserted = match persist_response_if_absent_blocking(&persist.store, &record, &pending_approvals) {
                 Ok(inserted) => inserted,
-                Err(StoreError::PayloadTooLarge) => return Ok(persistence_budget_failure(ctx, true, body)),
+                Err(StoreError::PayloadTooLarge) => return streaming_persistence_budget_failure(ctx, body),
                 Err(error) => return Err(Box::new(error)),
             };
             if !inserted {
-                return Ok(persistence_budget_failure(ctx, true, body));
+                return streaming_persistence_budget_failure(ctx, body);
             }
         } else {
             persist_response_blocking(&persist.store, &record, &pending_approvals)?;
@@ -482,6 +482,7 @@ impl ResponseStoreFilter {
             return true;
         };
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+        state.terminal_in_chunk = false;
         let previously_retained = state.retained_payload_bytes();
         let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
         if let Some(responses) = ctx.extensions.get::<ResponsesState>()
@@ -607,6 +608,7 @@ impl ResponseStoreFilter {
         });
         let batch = decoder.push(chunk);
         for record in &batch.records {
+            state.terminal_in_chunk |= is_forwarded_terminal_record(record);
             if !self.capture_one(state, record) {
                 // The replay log is abandoned, but the separate header scanner
                 // still checks later chunks for a client-visible error.
@@ -684,6 +686,33 @@ fn decode_replay_row(record: &SseRecord) -> Option<(u64, CapturedEvent)> {
             terminal,
         },
     ))
+}
+
+/// Classify a completed SSE frame from the wire, even when it cannot be
+/// indexed in the replay log (for example, a direct provider omitted a
+/// sequence number). `SseDecoder` emits only frames with a `data:` field, so
+/// a data-less `event:` line cannot falsely mark the stream complete.
+fn is_forwarded_terminal_record(record: &SseRecord) -> bool {
+    if !record.is_event() || record.data().as_ref() == b"[DONE]" {
+        return false;
+    }
+    if let Some(event) = record.event().and_then(|value| std::str::from_utf8(value).ok()) {
+        return is_terminal_event_type(event);
+    }
+    let data = record.data();
+    serde_json::from_slice::<EventType<'_>>(&data)
+        .ok()
+        .and_then(|event| event.ty)
+        .is_some_and(|event| is_terminal_event_type(&event))
+}
+
+/// Borrow the `type` field for a data-only SSE terminal without materializing
+/// the provider's full response JSON.
+#[derive(serde::Deserialize)]
+struct EventType<'a> {
+    /// Borrowed logical event name, when a data-only frame carries one.
+    #[serde(borrow, default, rename = "type")]
+    ty: Option<Cow<'a, str>>,
 }
 
 /// The only fields read from a captured SSE event's JSON `data` payload: the
@@ -1007,7 +1036,14 @@ struct ResponseStoreRequestState {
     events_over_budget: bool,
     /// A client-visible SSE error superseded any completed upstream snapshot.
     error_event_detector: SseErrorEventDetector,
+    /// A logical terminal decoded from the current admitted wire chunk.
+    terminal_in_chunk: bool,
 }
+
+/// A logical SSE terminal from a chunk that this filter already released in
+/// this loop round. Kept outside capture state because persistence may consume
+/// that state; a later IRR round must not inherit the prior round's marker.
+struct StoreForwardedTerminal(u32);
 
 impl ResponseStoreRequestState {
     /// Count the sibling-owned input, replay rows, and unfinished decoder data.
@@ -1428,6 +1464,32 @@ fn persistence_budget_failure(
         "server_error",
         "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during persistence",
     ))
+}
+
+/// An error frame is valid only while no logical terminal has reached the
+/// client. Once Store released one, a later budget failure must stop the
+/// transport rather than append a contradictory second terminal.
+fn streaming_persistence_budget_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+) -> Result<FilterAction, FilterError> {
+    let terminal_forwarded_this_round = ctx.extensions.get::<StoreForwardedTerminal>().is_some_and(|marker| {
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.iteration == marker.0)
+    });
+    if !terminal_forwarded_this_round {
+        return Ok(persistence_budget_failure(ctx, true, body));
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.set_metadata("responses.store_stream_budget_failed", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    discard_retained_request_payload(ctx);
+    crate::openai::responses::fs_arm_stream_stop(ctx);
+    *body = None;
+    Err("response store retained budget exceeded after a forwarded SSE terminal".into())
 }
 
 /// Capture the immutable owner once, before inference or a body-first consumer.
@@ -2173,8 +2235,15 @@ impl HttpFilter for ResponseStoreFilter {
             // any persist seam below drains that state. Parse-only; the
             // client-visible bytes are never withheld or altered.
             if !self.capture_stream_events(ctx, body, end_of_stream) {
-                return Ok(persistence_budget_failure(ctx, true, body));
+                return streaming_persistence_budget_failure(ctx, body);
             }
+
+            // This signal is only promoted after the whole chunk passes
+            // admission. A terminal in a rejected chunk was never forwarded.
+            let terminal_in_chunk = ctx
+                .extensions
+                .get_mut::<ResponseStoreRequestState>()
+                .is_some_and(|state| std::mem::take(&mut state.terminal_in_chunk));
 
             if !end_of_stream {
                 // Deferred and locally encoded terminals can both reach this
@@ -2197,6 +2266,12 @@ impl HttpFilter for ResponseStoreFilter {
                         action => return Ok(action),
                     }
                 }
+                if terminal_in_chunk
+                    && body.is_some()
+                    && let Some(iteration) = ctx.extensions.get::<ResponsesState>().map(|state| state.iteration)
+                {
+                    ctx.extensions.insert(StoreForwardedTerminal(iteration));
+                }
                 return Ok(FilterAction::Release);
             }
             // Skip after an earlier chunk consumed persistence state. This
@@ -2206,7 +2281,15 @@ impl HttpFilter for ResponseStoreFilter {
             if ctx.extensions.get::<StreamingResponsePersistenceAttempted>().is_some() {
                 return Ok(FilterAction::Continue);
             }
-            return Self::persist_from_streaming_state(ctx, body);
+            let action = Self::persist_from_streaming_state(ctx, body)?;
+            if terminal_in_chunk
+                && body.is_some()
+                && matches!(action, FilterAction::Continue | FilterAction::Release)
+                && let Some(iteration) = ctx.extensions.get::<ResponsesState>().map(|state| state.iteration)
+            {
+                ctx.extensions.insert(StoreForwardedTerminal(iteration));
+            }
+            return Ok(action);
         }
 
         if !end_of_stream {
@@ -3500,6 +3583,142 @@ mod encode_replay_event_tests {
         let mut later = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
         drop(filter.on_response_body(&mut ctx, &mut later, true).unwrap());
         assert!(later.is_none(), "a provider terminal after the error must be withheld");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks admitted, rejected, and payload-only SSE frames"
+    )]
+    fn direct_store_overflow_after_forwarded_completion_aborts_transport() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        for terminal in [
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":0}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"sequence_number\":0}\n\n".as_slice(),
+            b"event: response.completed\ndata: {}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\"}\n\n".as_slice(),
+        ] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.set_metadata("openai_responses_format.stream", "true");
+            let registry = crate::store::ResponseStoreRegistry::new();
+            registry
+                .register(
+                    &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                    std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+                )
+                .unwrap();
+            ctx.extensions.insert(registry);
+            let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":"x","stream":true}));
+            responses.apply_retained_payload_limit(4_096);
+            ctx.extensions.insert(responses);
+
+            let mut completed = Some(Bytes::copy_from_slice(terminal));
+            assert!(matches!(
+                filter.on_response_body(&mut ctx, &mut completed, false).unwrap(),
+                FilterAction::Release
+            ));
+            assert_eq!(completed.as_deref(), Some(terminal));
+
+            let trailing = b": keepalive\n\n";
+            let mut admitted_tail = Some(Bytes::from_static(trailing));
+            assert!(matches!(
+                filter.on_response_body(&mut ctx, &mut admitted_tail, false).unwrap(),
+                FilterAction::Release
+            ));
+            assert_eq!(admitted_tail.as_deref(), Some(trailing.as_slice()));
+
+            let mut overflow = Some(Bytes::from(vec![b'x'; 2_048]));
+            assert!(
+                filter.on_response_body(&mut ctx, &mut overflow, false).is_err(),
+                "a completed stream cannot receive a second terminal error"
+            );
+            assert!(overflow.is_none(), "the rejected chunk must not reach the client");
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks that a rejected terminal does not change the wire state"
+    )]
+    fn terminal_in_rejected_chunk_is_not_marked_as_forwarded() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":"x","stream":true}));
+        responses.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(responses);
+
+        let mut chunk =
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":0}\n\n".to_vec();
+        chunk.extend_from_slice(&vec![b'x'; 2_048]);
+        let mut rejected = Some(Bytes::from(chunk));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut rejected, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(
+            rejected
+                .as_ref()
+                .is_some_and(|bytes| bytes.starts_with(b"event: error")),
+            "the only terminal should be the replacement error"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks data-less SSE framing across separate chunks"
+    )]
+    fn data_less_terminal_header_does_not_mark_a_forwarded_terminal() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new()),
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        let mut responses = ResponsesState::from_request_body(json!({"model":"m","input":"x","stream":true}));
+        responses.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(responses);
+
+        let mut header = Some(Bytes::from_static(b"event: response.completed\n\n"));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut header, false).unwrap(),
+            FilterAction::Release
+        ));
+        let mut overflow = Some(Bytes::from(vec![b'x'; 2_048]));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut overflow, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(
+            overflow
+                .as_ref()
+                .is_some_and(|bytes| bytes.starts_with(b"event: error"))
+        );
     }
 
     /// Once replay is abandoned at its independent cap, later wire chunks do

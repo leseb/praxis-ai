@@ -2050,10 +2050,25 @@ def direct_budget_client(tmp_path, request):
         proxy_port,
         backend_endpoint=f"127.0.0.1:{backend.server_port}",
     )
-    budget_limit = getattr(request, "param", 16_384)
+    budget_param = getattr(request, "param", 16_384)
+    budget_limit, store_response_first = (
+        budget_param if isinstance(budget_param, tuple) else (budget_param, False)
+    )
     config = config.replace(
         "max_retained_bytes: 67108864", f"max_retained_bytes: {budget_limit}"
     )
+    if store_response_first:
+        # Put Store on the first response callback while Rehydrate still
+        # establishes the request's retained state before the direct branch.
+        store_start = config.index("      - filter: openai_response_store\n")
+        rehydrate = "      - filter: openai_responses_rehydrate\n"
+        rehydrate_start = config.index(rehydrate, store_start)
+        config = (
+            config[:store_start]
+            + rehydrate
+            + config[store_start:rehydrate_start]
+            + config[rehydrate_start + len(rehydrate):]
+        )
     anchor = "      - filter: iterative_request_router\n"
     assert config.count(anchor) == 1
     config = config.replace(
@@ -2199,6 +2214,45 @@ def test_direct_budget_stream_overflow_after_completion_has_one_terminal(direct_
     assert b"event: error" not in wire
     assert b"event: response.failed" not in wire
     assert b"x" * 128 not in wire, "the rejected comment cannot leak downstream"
+
+
+@pytest.mark.parametrize("direct_budget_client", [(65_536, True)], indirect=True)
+def test_direct_store_stream_overflow_after_completion_closes_wire(direct_budget_client):
+    """Store cannot append an error after forwarding a direct SSE completion."""
+    seed = direct_budget_client.responses.create(model="10", input="seed", store=True)
+    url = f"{str(direct_budget_client.base_url).rstrip('/')}/responses"
+    wire = bytearray()
+    transport_failed = False
+    gate = threading.Event()
+    DirectBudgetBackendHandler.terminal_gate = gate
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            try:
+                with client.stream(
+                    "POST", url,
+                    headers={"Content-Type": "application/json", **TRUSTED_OWNER_HEADERS},
+                    json={
+                        "model": "terminal-stream", "input": "next", "stream": True,
+                        "store": True, "previous_response_id": seed.id,
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    for chunk in response.iter_raw():
+                        wire.extend(chunk)
+                        if b"event: response.completed" in wire and b"\n\n" in wire:
+                            gate.set()
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                transport_failed = True
+    finally:
+        gate.set()
+        DirectBudgetBackendHandler.terminal_gate = None
+    assert transport_failed, "late Store exhaustion must abort the committed stream"
+    assert wire.count(b"event: response.completed") == 1
+    assert b"event: error" not in wire
+    assert b"event: response.failed" not in wire
+    assert b"x" * 128 not in wire
+    with pytest.raises(NotFoundError):
+        direct_budget_client.responses.retrieve("resp_direct_budget_terminal_stream")
 
 
 @pytest.fixture()
