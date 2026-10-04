@@ -2027,7 +2027,7 @@ fn accumulate_chunk(
     reason = "preflight and charge both budgets before copying a lowered completion"
 )]
 fn capture_client_tool_completion(
-    state: &StreamEventsState,
+    state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     completions: &mut Vec<client_tools::ClientToolCompletion>,
     event: &ResponsesEvent,
