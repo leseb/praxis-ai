@@ -143,7 +143,7 @@ pub(crate) fn append_after_store_body(
     body: &mut Option<Bytes>,
     end_of_stream: bool,
 ) -> Result<FilterAction, FilterError> {
-    if !conversation_response_selected(ctx) {
+    if !conversation_body_selected(ctx) {
         return Ok(FilterAction::Continue);
     }
     OpenaiConversationsFilter.on_response_body(ctx, body, end_of_stream)
@@ -154,6 +154,14 @@ pub(crate) fn conversation_response_selected(ctx: &HttpFilterContext<'_>) -> boo
     ctx.extensions
         .get::<ConversationResponseState>()
         .is_some_and(|state| state.round == response_round(ctx))
+}
+
+/// An outer SSE header is selected once and remains live while inner agentic
+/// continuations advance their own iteration and detach IRR's iteration state.
+fn conversation_body_selected(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ConversationResponseState>()
+        .is_some_and(|state| state.streaming || state.round == response_round(ctx))
 }
 
 /// Owner captured on the request path before inference begins.
@@ -709,9 +717,9 @@ impl HttpFilter for OpenaiConversationsFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         let response_state = ctx.extensions.get::<ConversationResponseState>();
-        if response_state.is_none_or(|state| {
-            state.round != response_round(ctx) || state.append_owner.is_none() || state.append_attempted
-        }) {
+        if !conversation_body_selected(ctx)
+            || response_state.is_none_or(|state| state.append_owner.is_none() || state.append_attempted)
+        {
             // This filter is composed with other response-body consumers, such
             // as `openai_response_store`. Releasing here drains a shared
             // StreamBuffer before those filters see end-of-stream, which can

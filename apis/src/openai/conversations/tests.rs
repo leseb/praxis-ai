@@ -6614,3 +6614,44 @@ async fn review_final_gate_must_not_revive_a_conversation_hook_skipped_this_roun
         "Conversations was not selected for this final response"
     );
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_outer_stream_append_survives_inner_tool_round() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        ..ResponsesState::default()
+    });
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    // Parent headers are run once by run_streaming_terminal_response.
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    // IRR's next_chunk processes a hosted tool continuation before final output.
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.iteration += 1;
+    state.response_object =
+        serde_json::json!({"status":"completed", "output":[{"type":"message","role":"assistant","content":"answer"}]});
+    state.logical_stream_terminal_emitted = true;
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut terminal, false).unwrap());
+    let items = store
+        .list_conversation_items(&owner, &conv_id, None, 100, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        items.len(),
+        2,
+        "outer Conversations remains selected across inner IRR rounds"
+    );
+}
