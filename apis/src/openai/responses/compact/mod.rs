@@ -240,9 +240,24 @@ impl CompactFilter {
             return Err(ReactiveCompactionError::RetainedBudget);
         }
         Ok(self
-            .handle_subrequest_result(result)
-            .map_err(ReactiveCompactionError::Rejection)?
+            .handle_reactive_subrequest_result(result, response_limit)?
             .map(|s| s.content))
+    }
+
+    /// Admit the raw, parsed, and extracted response owners before JSON parsing.
+    fn handle_reactive_subrequest_result(
+        &self,
+        result: Result<subrequest::SubResponse, subrequest::SubRequestError>,
+        response_limit: Option<usize>,
+    ) -> Result<Option<Summarization>, ReactiveCompactionError> {
+        if let (Some(limit), Ok(resp)) = (response_limit, &result)
+            && (200..300).contains(&(resp.status as usize))
+            && !reactive_summarization_response_fits(&resp.body, limit)
+        {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
+        self.handle_subrequest_result(result)
+            .map_err(ReactiveCompactionError::Rejection)
     }
 
     /// Map a subrequest result to a parsed summarization or a filter action.
@@ -543,6 +558,18 @@ fn reactive_compaction_response_limit(
         return Err(());
     }
     Ok(Some(response_limit))
+}
+
+/// The reactive response allowance reserves four raw-body lengths. A parsed
+/// JSON tree can expand numeric tokens, while summary text and usage are copied
+/// out of that tree before it is dropped. Their individual compact sizes are
+/// each bounded by the normalized size of the whole tree.
+fn reactive_summarization_response_fits(body: &[u8], response_limit: usize) -> bool {
+    super::agentic_loop::buffered_parsed_json_bytes_upper_bound(body)
+        .and_then(|normalized| normalized.checked_mul(3))
+        .and_then(|owners| owners.checked_add(body.len()))
+        .zip(response_limit.checked_mul(4))
+        .is_some_and(|(peak, reserved)| peak <= reserved)
 }
 
 /// Use the shared request-phase rejection for a compaction admission failure.
