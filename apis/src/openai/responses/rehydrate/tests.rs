@@ -3794,6 +3794,28 @@ impl ResponseStore for MockStore {
                 messages: c.messages.clone(),
             }))
     }
+
+    async fn get_conversation_bounded(
+        &self,
+        tenant_id: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let Some(record) = self
+            .conversations
+            .get(conversation_id)
+            .filter(|record| &record.owner == tenant_id)
+        else {
+            return Ok(None);
+        };
+        let encoded = serde_json::to_vec(&record.metadata)
+            .and_then(|metadata| serde_json::to_vec(&record.messages).map(|messages| metadata.len() + messages.len()))
+            .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+        if encoded > max_bytes {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        self.get_conversation(tenant_id, conversation_id).await
+    }
 }
 
 fn setup_registry(store: MockStore) -> ResponseStoreRegistry {
