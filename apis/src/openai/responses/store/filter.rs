@@ -147,6 +147,12 @@ pub struct ResponseStoreFilter {
 /// failed terminal-chunk write continue.
 struct StreamingResponsePersistenceAttempted;
 
+/// A newly inserted response owned by this exchange. Conversation append-back
+/// may remove it if a later shared-budget check fails before the terminal body
+/// is released. This is set only after an atomic no-overwrite insert succeeds.
+#[cfg(feature = "openai-conversations")]
+pub(crate) struct PersistedResponseForConversation(pub(crate) String);
+
 impl ResponseStoreFilter {
     /// Construct the filter with explicit replay-log bounds.
     ///
@@ -250,7 +256,24 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&persist.store, &record, &pending_approvals)?;
+        let budgeted_conversation = cfg!(feature = "openai-conversations")
+            && has_conversation(ctx)
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+        if budgeted_conversation {
+            match persist_response_if_absent_blocking(&persist.store, &record, &pending_approvals) {
+                Ok(true) => {},
+                Ok(false) | Err(StoreError::PayloadTooLarge) => {
+                    return Ok(persistence_budget_failure(ctx, true, body));
+                },
+                Err(error) => return Err(Box::new(error)),
+            }
+        } else {
+            persist_response_blocking(&persist.store, &record, &pending_approvals)?;
+        }
         // Flush the replay event log only after the record is durable, so the
         // parent-exists gate is satisfied, and before releasing the terminal
         // frame, so a client never observes completion for a response whose
@@ -261,6 +284,10 @@ impl ResponseStoreFilter {
             persist.captured_events,
             persist.events_over_budget,
         )?;
+        #[cfg(feature = "openai-conversations")]
+        if budgeted_conversation {
+            ctx.extensions.insert(PersistedResponseForConversation(record.id));
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -320,7 +347,28 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&store, &record, &pending_approvals)?;
+        let budgeted_conversation = cfg!(feature = "openai-conversations")
+            && has_conversation(ctx)
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .and_then(ResponsesState::retained_payload_limit)
+                .is_some();
+        if budgeted_conversation {
+            match persist_response_if_absent_blocking(&store, &record, &pending_approvals) {
+                Ok(true) => {},
+                Ok(false) | Err(StoreError::PayloadTooLarge) => {
+                    return Ok(persistence_budget_failure(ctx, false, body));
+                },
+                Err(error) => return Err(Box::new(error)),
+            }
+        } else {
+            persist_response_blocking(&store, &record, &pending_approvals)?;
+        }
+        #[cfg(feature = "openai-conversations")]
+        if budgeted_conversation {
+            ctx.extensions.insert(PersistedResponseForConversation(record.id));
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -1377,6 +1425,20 @@ fn persist_response_blocking(
     .map_err(|e| -> FilterError { Box::new(e) })
 }
 
+/// Insert only a new response owned by this exchange. A later Conversation
+/// budget rejection may delete that row, so replacing an existing ID would
+/// risk deleting another exchange's response.
+fn persist_response_if_absent_blocking(
+    store: &OwnerScopedResponseStore,
+    record: &ResponseRecord,
+    pending_approvals: &[PendingApprovalRecord],
+) -> Result<bool, StoreError> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| {
+        handle.block_on(store.persist_response_with_pending_approvals_if_absent(record, pending_approvals))
+    })
+}
+
 /// Flush the captured replay event log synchronously, right after the response
 /// record is durable and before the terminal frame is released.
 ///
@@ -1591,6 +1653,10 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The exchange can enter another IRR response round. Never let a
+        // previous round's durable-row marker authorize a later rollback.
+        #[cfg(feature = "openai-conversations")]
+        ctx.extensions.remove::<PersistedResponseForConversation>();
         ctx.extensions.remove::<FinalizedPersistenceAdmission>();
         if let Some(limit) = ctx
             .extensions

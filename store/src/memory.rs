@@ -342,6 +342,20 @@ impl ResponseStore for InMemoryStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        if inner.responses.contains_key(&record.id) {
+            return Ok(false);
+        }
+        upsert_response_into(&mut inner, record)?;
+        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
+        Ok(true)
+    }
+
     async fn get_pending_approvals(
         &self,
         owner: &StateOwner,

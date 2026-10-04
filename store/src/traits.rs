@@ -185,6 +185,18 @@ pub trait ResponseStore: Send + Sync {
         Ok(())
     }
 
+    /// Insert a response and its approvals atomically only when its ID is
+    /// unused. A later budget failure may roll back this exchange's row, so
+    /// replacing a prior response is unsafe. Backends without an atomic
+    /// implementation fail closed.
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        _record: &ResponseRecord,
+        _pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
+
     /// Fetch the server-owned pending approvals matching `approval_ids` that
     /// were issued by `response_id`.
     ///

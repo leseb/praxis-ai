@@ -909,6 +909,73 @@ impl ResponseStore for PostgresResponseStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let [response_object, input, messages] = self.compression.encode(record).await?;
+        let insert_sql = format!(
+            "INSERT INTO {} \
+             (id, tenant_id, owner_issuer, owner_subject, created_at, model, response_object, input, messages) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING",
+            self.tables.responses
+        );
+        let approvals_table = pending_approvals_table(&self.tables.responses);
+        let approval_sql = format!(
+            "INSERT INTO {approvals_table} \
+             (tenant_id, owner_issuer, owner_subject, response_id, approval_id, server_label, tool_name, arguments, \
+             target_fingerprint, created_at, consumed_at) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 \
+             WHERE EXISTS (SELECT 1 FROM {} WHERE id = $12 AND tenant_id = $13 \
+               AND owner_issuer = $14 AND owner_subject = $15) \
+             ON CONFLICT (response_id, approval_id) DO NOTHING",
+            self.tables.responses
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        let inserted = sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            .bind(&record.id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
+            .bind(record.created_at)
+            .bind(&record.model)
+            .bind(&response_object)
+            .bind(&input)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?
+            .rows_affected()
+            == 1;
+        if !inserted {
+            return Ok(false);
+        }
+        for approval in pending_approvals {
+            sqlx::query(AssertSqlSafe(approval_sql.as_str()))
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
+                .bind(&record.id)
+                .bind(&approval.approval_id)
+                .bind(&approval.server_label)
+                .bind(&approval.tool_name)
+                .bind(&approval.arguments)
+                .bind(&approval.target_fingerprint)
+                .bind(record.created_at)
+                .bind(Option::<i64>::None)
+                .bind(&record.id)
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+        }
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+        Ok(true)
+    }
+
     async fn get_pending_approvals(
         &self,
         owner: &StateOwner,

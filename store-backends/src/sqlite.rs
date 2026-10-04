@@ -814,6 +814,67 @@ impl ResponseStore for SqliteResponseStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let [response_object, input, messages] = self.compression.encode(record).await?;
+        let insert_sql = format!(
+            "INSERT INTO {} \
+             (id, tenant_id, owner_issuer, owner_subject, created_at, model, response_object, input, messages) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+            self.tables.responses
+        );
+        let approval_sql = pending_approval_insert_sql(&self.tables.responses);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let inserted = sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            .bind(&record.id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
+            .bind(record.created_at)
+            .bind(&record.model)
+            .bind(&response_object)
+            .bind(&input)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .rows_affected()
+            == 1;
+        if !inserted {
+            return Ok(false);
+        }
+        for approval in pending_approvals {
+            sqlx::query(AssertSqlSafe(approval_sql.as_str()))
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
+                .bind(&record.id)
+                .bind(&approval.approval_id)
+                .bind(&approval.server_label)
+                .bind(&approval.tool_name)
+                .bind(&approval.arguments)
+                .bind(&approval.target_fingerprint)
+                .bind(record.created_at)
+                .bind(Option::<i64>::None)
+                .bind(&record.id)
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(true)
+    }
+
     async fn get_pending_approvals(
         &self,
         owner: &StateOwner,

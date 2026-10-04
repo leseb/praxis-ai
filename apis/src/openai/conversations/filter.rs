@@ -33,6 +33,7 @@ use crate::{
             AgenticBudgetPolicy, bound_body_outcome, buffered_parsed_json_bytes_upper_bound,
             error::responses_error_rejection,
             state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
+            store::PersistedResponseForConversation,
         },
     },
     operation::Transport,
@@ -815,6 +816,26 @@ fn conversation_budget_failure(
     streaming: bool,
     body: &mut Option<Bytes>,
 ) -> FilterAction {
+    if let Some(marker) = ctx.extensions.remove::<PersistedResponseForConversation>() {
+        let rollback = (|| -> Result<(), FilterError> {
+            let owner = ctx
+                .extensions
+                .get::<CapturedAppendOwner>()
+                .ok_or_else(|| FilterError::from("openai_conversations: append owner missing for rollback"))?;
+            let store = ctx
+                .extensions
+                .get::<ResponseStoreRegistry>()
+                .and_then(|registry| registry.get_scoped(crate::openai::responses::DEFAULT_STORE_NAME, &owner.0))
+                .ok_or_else(|| FilterError::from("openai_conversations: response store missing for rollback"))?;
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| handle.block_on(store.delete_response(&marker.0)))
+                .map_err(|error| -> FilterError { Box::new(error) })?;
+            Ok(())
+        })();
+        if let Err(error) = rollback {
+            warn!(%error, "response rollback failed after conversation budget denial");
+        }
+    }
     if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
         state.append_attempted = true;
     }

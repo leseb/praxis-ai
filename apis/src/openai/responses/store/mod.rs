@@ -12,6 +12,8 @@
 mod config;
 mod filter;
 
+#[cfg(feature = "openai-conversations")]
+pub(crate) use self::filter::PersistedResponseForConversation;
 pub use self::filter::ResponseStoreFilter;
 pub(crate) use self::filter::{
     discard_retained_request_payload, mark_retained_request_payload_charged, retained_request_payload_bytes,

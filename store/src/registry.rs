@@ -147,6 +147,23 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Atomically insert this owner's response and approvals without replacing
+    /// an existing response with the same ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when owner validation or the backend write fails.
+    pub async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        self.store
+            .persist_response_with_pending_approvals_if_absent(record, pending_approvals)
+            .await
+    }
+
     /// Retrieve pending approvals issued to this owner.
     ///
     /// # Errors
