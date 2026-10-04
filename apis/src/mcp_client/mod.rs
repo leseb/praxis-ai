@@ -490,6 +490,7 @@ async fn open_tool_session(
     timeout: Duration,
     max_result_bytes: usize,
     max_control_response_bytes: usize,
+    preparse_peak_limit: Option<usize>,
     callout: &McpCallout,
     display_url: &McpDisplayUrl,
 ) -> Result<PooledSession, McpClientError> {
@@ -498,6 +499,7 @@ async fn open_tool_session(
         timeout,
         max_result_bytes,
         max_control_response_bytes,
+        preparse_peak_limit,
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();
@@ -571,17 +573,10 @@ async fn invoke_tool(
 /// with a non-404 status therefore surfaces an error rather than opening a fresh
 /// session automatically. Fresh sessions are pooled on success and closed on any
 /// error; a `None` pool never reuses or retains a session.
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "trusted forwarded headers and optional pooling extend the existing API"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "reuse attempt and fresh open share one boundary with distinct cleanup on each exit"
-)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "rmcp service setup and explicit success/error cleanup remain in one async ownership boundary"
+    reason = "preserves the unbudgeted MCP call API in tests"
 )]
 pub(crate) async fn call_tool_with_forwarded_headers(
     pool: Option<(&McpSessionPool, &McpPoolKey)>,
@@ -596,6 +591,54 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     timeout: Duration,
     max_result_bytes: usize,
     max_control_response_bytes: usize,
+    callout: &McpCallout,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    call_tool_with_forwarded_headers_with_budget(
+        pool,
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+        tool_name,
+        arguments,
+        timeout,
+        max_result_bytes,
+        max_control_response_bytes,
+        None,
+        callout,
+    )
+    .await
+}
+
+/// Budgeted variant: reserve the raw wire and rmcp parse peak before decoding.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "trusted forwarded headers and optional pooling extend the existing API"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "reuse attempt and fresh open share one boundary with distinct cleanup on each exit"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "rmcp service setup and explicit success/error cleanup remain in one async ownership boundary"
+)]
+pub(crate) async fn call_tool_with_forwarded_headers_with_budget(
+    pool: Option<(&McpSessionPool, &McpPoolKey)>,
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout: Duration,
+    max_result_bytes: usize,
+    max_control_response_bytes: usize,
+    preparse_peak_limit: Option<usize>,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let display_url = parse_display_url(server_url);
@@ -654,6 +697,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
             timeout,
             max_result_bytes,
             max_control_response_bytes,
+            preparse_peak_limit,
             callout,
             &display_url,
         )
