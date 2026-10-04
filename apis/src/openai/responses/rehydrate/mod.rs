@@ -54,7 +54,7 @@ use super::{
     append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
-    state::{ResponsesState, strip_local_compaction_marker},
+    state::{ResponseObjectChargeCache, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
@@ -697,6 +697,7 @@ fn arm_streaming_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
         last_forwarded_sequence: None,
         forwarded_terminal: false,
         stable_payload: None,
+        response_object_charge: None,
     });
 
     true
@@ -755,6 +756,8 @@ struct RestorePreviousResponseIdStream {
     forwarded_terminal: bool,
     /// Stable request/history payload measured once per streaming round.
     stable_payload: Option<RestoreStablePayloadCache>,
+    /// Exact current-round response object charge, keyed by mutation revision.
+    response_object_charge: Option<ResponseObjectChargeCache>,
 }
 
 /// An O(1) invalidation key for request, history, and tool snapshots cached by Rehydrate.
@@ -1049,8 +1052,14 @@ fn streaming_restore_budget(
         bytes
     };
     let measurement_limit = limit.checked_add(state.retained_rehydrate_stream_bytes).ok_or(())?;
+    let changing_limit = measurement_limit.checked_sub(stable).ok_or(())?;
+    let response_object_bytes =
+        ResponseObjectChargeCache::measure(&mut armed.response_object_charge, state, changing_limit).ok_or(())?;
     let changing = state
-        .rehydrate_stream_changing_payload_bytes_bounded(measurement_limit.checked_sub(stable).ok_or(())?)
+        .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+            changing_limit,
+            Some(response_object_bytes),
+        )
         .ok_or(())?;
     let current = stable.checked_add(changing).ok_or(())?;
     Ok(Some(RestoreBudgetView {

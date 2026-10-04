@@ -69,7 +69,9 @@ use super::{
         bound_body_outcome,
         error::responses_error_rejection,
         rehydrate::{DirectFiniteRestoreFraming, FinalizedFiniteRestoreAdmission, FinalizedRestoredBodyDigest},
-        state::{PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
+        state::{
+            PayloadMeter, ResponseObjectChargeCache, ResponsesState, retained_json_bytes, retained_json_values_bytes,
+        },
     },
     config::{ResponseStoreConfig, validate_config},
 };
@@ -401,6 +403,9 @@ impl ResponseStoreFilter {
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
         let previously_retained = state.retained_payload_bytes();
         let terminal_ready = end_of_stream || streaming_terminal_emitted(ctx);
+        if terminal_ready {
+            state.response_object_charge = None;
+        }
         if let Some(responses) = ctx.extensions.get::<ResponsesState>()
             && let Some(limit) = responses.retained_payload_limit()
             && (terminal_ready
@@ -448,9 +453,15 @@ impl ResponseStoreFilter {
                     }
                 })
                 .is_some_and(|peak| {
-                    ctx.extensions
-                        .get::<ResponsesState>()
-                        .is_none_or(|responses| store_stream_budget_fits(responses, state.shared_stable_bytes, 0, peak))
+                    ctx.extensions.get::<ResponsesState>().is_none_or(|responses| {
+                        store_stream_budget_fits(
+                            responses,
+                            state.shared_stable_bytes,
+                            &mut state.response_object_charge,
+                            0,
+                            peak,
+                        )
+                    })
                 });
         if !admitted {
             ctx.extensions.insert(state);
@@ -467,6 +478,7 @@ impl ResponseStoreFilter {
                 store_stream_budget_fits(
                     responses,
                     state.shared_stable_bytes,
+                    &mut state.response_object_charge,
                     state.charged_retained_bytes.unwrap_or(0),
                     next,
                 )
@@ -808,7 +820,26 @@ impl StoreStableCache {
     }
 }
 
-/// Request-phase data needed when persisting the response.
+/// Position of the last raw SSE line boundary across chunk splits.
+#[derive(Default)]
+enum PendingWireLineBoundary {
+    /// A line has content, or no line ending has yet been observed.
+    #[default]
+    Content,
+    /// A line ended with LF, or the optional LF after CR was consumed.
+    EndedLine,
+    /// A line ended with CR, which may be followed by LF in the next chunk.
+    EndedWithCr,
+}
+
+impl PendingWireLineBoundary {
+    /// Whether another line ending completes an empty SSE record boundary.
+    fn line_ended(&self) -> bool {
+        !matches!(self, Self::Content)
+    }
+}
+
+/// Request-phase input and response-phase SSE replay data retained by Store.
 #[derive(Default)]
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
@@ -822,6 +853,8 @@ struct ResponseStoreRequestState {
     charged_retained_bytes: Option<usize>,
     /// Request, history, and prior output charged once per streamed round.
     shared_stable_bytes: Option<StoreStableCache>,
+    /// Exact current-round response object charge, keyed by its mutation revision.
+    response_object_charge: Option<ResponseObjectChargeCache>,
     /// Owner captured before inference begins.
     owner: Option<StateOwner>,
     /// Incremental SSE decoder over the outbound stream, lazily created on the
@@ -833,13 +866,12 @@ struct ResponseStoreRequestState {
     event_bytes: u64,
     /// Raw bytes in independently owned captured event names.
     event_name_bytes: usize,
-    /// Upper bound on raw bytes after the last complete LF-delimited record.
+    /// Upper bound on raw bytes after the last complete SSE record.
     /// The retained meter charges this twice because the decoder may keep a
-    /// field value and the current line independently. CR-delimited records
-    /// are deliberately overcounted.
+    /// field value and the current line independently.
     pending_wire_bytes: usize,
-    /// Whether the previous wire byte was LF, including across chunk edges.
-    last_wire_byte_was_lf: bool,
+    /// Track complete SSE records and pair CR with an optional following LF.
+    pending_wire_boundary: PendingWireLineBoundary,
     /// Sticky flag: capture exceeded a bound or the decoder was poisoned, so the
     /// partial log is abandoned and the response becomes non-replayable.
     events_over_budget: bool,
@@ -864,12 +896,28 @@ impl ResponseStoreRequestState {
             return;
         }
         for &byte in chunk {
-            if byte == b'\n' && self.pending_wire_bytes > 0 && self.last_wire_byte_was_lf {
-                self.pending_wire_bytes = 0;
-            } else {
-                self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+            if byte == b'\n' && matches!(self.pending_wire_boundary, PendingWireLineBoundary::EndedWithCr) {
+                self.pending_wire_boundary = PendingWireLineBoundary::EndedLine;
+                continue;
             }
-            self.last_wire_byte_was_lf = byte == b'\n';
+            match byte {
+                b'\n' | b'\r' => {
+                    self.pending_wire_bytes = if self.pending_wire_boundary.line_ended() {
+                        0
+                    } else {
+                        self.pending_wire_bytes.saturating_add(1)
+                    };
+                    self.pending_wire_boundary = if byte == b'\r' {
+                        PendingWireLineBoundary::EndedWithCr
+                    } else {
+                        PendingWireLineBoundary::EndedLine
+                    };
+                },
+                _ => {
+                    self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+                    self.pending_wire_boundary = PendingWireLineBoundary::Content;
+                },
+            }
         }
     }
 }
@@ -910,6 +958,7 @@ fn charge_store_payload(ctx: &mut HttpFilterContext<'_>, store: &mut ResponseSto
 fn store_stream_budget_fits(
     responses: &ResponsesState,
     stable: Option<StoreStableCache>,
+    response_object_charge: &mut Option<ResponseObjectChargeCache>,
     removed: usize,
     added: usize,
 ) -> bool {
@@ -925,8 +974,16 @@ fn store_stream_budget_fits(
     let Some(measurement_limit) = remaining.checked_add(removed) else {
         return false;
     };
+    let Some(response_object_bytes) =
+        ResponseObjectChargeCache::measure(response_object_charge, responses, measurement_limit)
+    else {
+        return false;
+    };
     responses
-        .stream_changing_payload_bytes_bounded_with_cached_output(measurement_limit)
+        .stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+            measurement_limit,
+            Some(response_object_bytes),
+        )
         .and_then(|current| current.checked_sub(removed))
         .and_then(|current| current.checked_add(added))
         .is_some_and(|next| next <= remaining)
@@ -1169,6 +1226,7 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Resul
     state.input = Some(input);
     state.input_retained_bytes = retained_bytes;
     state.shared_stable_bytes = None;
+    state.response_object_charge = None;
     let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
     let admitted = charge_store_payload(ctx, &mut state, next);
     ctx.extensions.insert(state);
@@ -1619,6 +1677,7 @@ impl HttpFilter for ResponseStoreFilter {
         // Request re-entry may rewrite cached owners without changing lengths.
         if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
             state.shared_stable_bytes = None;
+            state.response_object_charge = None;
         }
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
@@ -1659,6 +1718,7 @@ impl HttpFilter for ResponseStoreFilter {
         }
         if let Some(state) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
             state.shared_stable_bytes = None;
+            state.response_object_charge = None;
         }
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
@@ -3043,6 +3103,78 @@ mod encode_replay_event_tests {
         assert!(
             !cache.matches(&state),
             "a same-shape schema rewrite changes the revision"
+        );
+    }
+
+    #[test]
+    fn replay_capture_does_not_retain_complete_crlf_or_cr_comments() {
+        for (label, wire) in [
+            ("LF", &b": heartbeat\n\n"[..]),
+            ("CRLF", &b": heartbeat\r\n\r\n"[..]),
+            ("CR", &b": heartbeat\r\r"[..]),
+        ] {
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+            let mut responses = ResponsesState::default();
+            responses.apply_retained_payload_limit(4_096);
+            ctx.extensions.insert(responses);
+            let filter =
+                ResponseStoreFilter::with_bounds(NonZeroU32::new(1_000).unwrap(), NonZeroU64::new(65_536).unwrap());
+            let chunk = Some(Bytes::copy_from_slice(wire));
+            for _ in 0..128 {
+                assert!(
+                    filter.capture_stream_events(&mut ctx, &chunk, false),
+                    "{label} comment frame"
+                );
+            }
+            assert_eq!(
+                ctx.extensions
+                    .get::<super::ResponseStoreRequestState>()
+                    .unwrap()
+                    .pending_wire_bytes,
+                0,
+                "{label} frame ends at an SSE record boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_pending_wire_tracker_pairs_crlf_across_chunks() {
+        let mut state = super::ResponseStoreRequestState::default();
+        state.track_pending_wire_bytes(b"data: x\r");
+        assert!(state.pending_wire_bytes > 0, "the data line is unfinished");
+        state.track_pending_wire_bytes(b"\n\r");
+        assert_eq!(state.pending_wire_bytes, 0, "a split CRLF and CR finish the record");
+        state.track_pending_wire_bytes(b"\n");
+        assert_eq!(
+            state.pending_wire_bytes, 0,
+            "the paired LF remains outside the next record"
+        );
+    }
+
+    #[test]
+    fn replay_meter_remeasures_same_shape_response_object_edits() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState::default();
+        responses.replace_response_object(json!({"output": [{"text": "small"}]}));
+        responses.apply_retained_payload_limit(8_192);
+        ctx.extensions.insert(responses);
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_000).unwrap(), NonZeroU64::new(65_536).unwrap());
+        let chunk = Some(Bytes::from_static(b": heartbeat\n\n"));
+        assert!(filter.capture_stream_events(&mut ctx, &chunk, false));
+        let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+        responses
+            .output_items_mut()
+            .get_mut(0)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("text".to_owned(), json!("x".repeat(8_192)));
+        assert!(
+            !filter.capture_stream_events(&mut ctx, &chunk, false),
+            "a same-shape output-item rewrite must invalidate the exact response charge"
         );
     }
 

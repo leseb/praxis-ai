@@ -163,6 +163,40 @@ pub(crate) struct ClientToolEcho {
     pub tool_choice: serde_json::Value,
 }
 
+/// Exact response-object charge reused by response filters while the object is unchanged.
+#[cfg(feature = "store")]
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseObjectChargeCache {
+    /// Agentic round whose response object was measured.
+    iteration: u32,
+    /// Explicit mutation revision; an overflow disables reuse.
+    revision: u64,
+    /// Compact JSON bytes of the response object.
+    bytes: usize,
+}
+
+#[cfg(feature = "store")]
+impl ResponseObjectChargeCache {
+    /// Measure once per revision, including after an in-place output-item rewrite.
+    pub(crate) fn measure(cache: &mut Option<Self>, state: &ResponsesState, max_bytes: usize) -> Option<usize> {
+        if let Some(existing) = cache
+            && existing.iteration == state.iteration
+            && Some(existing.revision) == state.response_object_revision
+        {
+            return (existing.bytes <= max_bytes).then_some(existing.bytes);
+        }
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json(&state.response_object)?;
+        let bytes = meter.used();
+        *cache = state.response_object_revision.map(|revision| Self {
+            iteration: state.iteration,
+            revision,
+            bytes,
+        });
+        Some(bytes)
+    }
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
@@ -345,6 +379,10 @@ pub(crate) struct ResponsesState {
     /// Invalidates the store replay cache after in-place request, history, or
     /// output changes that do not alter collection lengths. Overflow fails closed.
     pub(crate) replay_stable_payload_revision: Option<u64>,
+
+    /// Invalidates response-object byte caches after an owned or in-place edit.
+    /// Overflow disables reuse so a stale charge can never be admitted.
+    pub(crate) response_object_revision: Option<u64>,
 
     /// Parser buffers published by `openai_stream_events`. Its filter-local
     /// slot is invisible to other filters, so the request-wide meter owns this
@@ -927,6 +965,7 @@ impl Default for ResponsesState {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
             replay_stable_payload_revision: Some(0),
+            response_object_revision: Some(0),
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
@@ -1128,11 +1167,21 @@ impl ResponsesState {
     /// fixed tool snapshots, and prior output. Include the stream parsers'
     /// published charges.
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        self.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(max_bytes, None)
+    }
+
+    /// The Store and Chat changing meter with an exact cached response-object
+    /// charge when the Store has already measured this revision.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: Option<usize>,
+    ) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, None)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, response_object_bytes)?
             .checked_add(stream_bytes)
     }
 
@@ -1140,12 +1189,18 @@ impl ResponsesState {
     /// accumulated output and both published stream-parser charges. The stable
     /// request, history, and tool snapshots are measured once by Rehydrate.
     #[cfg(feature = "store")]
-    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+    /// Rehydrate's changing meter with an exact cached response-object charge.
+    #[cfg(feature = "store")]
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+        &self,
+        max_bytes: usize,
+        response_object_bytes: Option<usize>,
+    ) -> Option<usize> {
         let stream_bytes = self
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, true, None)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, false, true, response_object_bytes)?
             .checked_add(stream_bytes)
     }
 
@@ -1392,7 +1447,7 @@ impl ResponsesState {
         self.original_tool_choice = None;
         self.response_id = None;
         self.request_body = serde_json::json!({ "stream": streaming });
-        self.response_object = serde_json::Value::Null;
+        self.replace_response_object(serde_json::Value::Null);
         self.buffered_canonical_finalized = false;
         self.buffered_canonical_wire_bytes = None;
         self.buffered_canonical_parsed_bound_bytes = None;
@@ -1479,6 +1534,31 @@ impl ResponsesState {
             .and_then(|revision| revision.checked_add(1));
     }
 
+    /// Invalidate exact response-object charges before an owned or in-place edit.
+    pub(crate) fn mark_response_object_changed(&mut self) {
+        self.response_object_revision = self
+            .response_object_revision
+            .and_then(|revision| revision.checked_add(1));
+    }
+
+    /// Borrow the response object for mutation and invalidate response-filter byte caches.
+    pub(crate) fn response_object_mut(&mut self) -> &mut serde_json::Value {
+        self.mark_response_object_changed();
+        &mut self.response_object
+    }
+
+    /// Replace the response object and invalidate response-filter byte caches.
+    pub(crate) fn replace_response_object(&mut self, response: serde_json::Value) {
+        self.response_object = response;
+        self.mark_response_object_changed();
+    }
+
+    /// Move the response object out and invalidate response-filter byte caches.
+    pub(crate) fn take_response_object(&mut self) -> serde_json::Value {
+        self.mark_response_object_changed();
+        std::mem::take(&mut self.response_object)
+    }
+
     /// Borrow the public output owned by [`Self::response_object`].
     pub(crate) fn output_items(&self) -> &[serde_json::Value] {
         self.response_object
@@ -1490,6 +1570,7 @@ impl ResponsesState {
 
     /// Mutably borrow public output, creating a valid array when absent.
     pub(crate) fn output_items_mut(&mut self) -> &mut Vec<serde_json::Value> {
+        self.mark_response_object_changed();
         if !self.response_object.is_object() {
             self.response_object = serde_json::Value::Object(serde_json::Map::new());
         }
@@ -1612,7 +1693,7 @@ impl ResponsesState {
         // the retained-state mutation transactional through annotation and both
         // size admissions; on failure no oversized response or serialization
         // buffer becomes an additional state owner.
-        let mut response = std::mem::take(&mut self.response_object);
+        let mut response = self.take_response_object();
         if let Some(obj) = response.as_object_mut() {
             if !self.accumulated_output.is_empty() {
                 obj.insert(
@@ -1626,11 +1707,11 @@ impl ResponsesState {
         }
         if let Err(error) = annotate_response(&mut response, &self.citation_files) {
             tracing::warn!(%error, "failed to annotate final response");
-            self.response_object = response;
+            self.replace_response_object(response);
             return Err(finalize_rejection("failed to annotate final response"));
         }
         let Some(serialized_bytes) = bounded_json_size(&response, MAX_JSON_BODY_BYTES).ok().flatten() else {
-            self.response_object = response;
+            self.replace_response_object(response);
             return Err(finalize_rejection(
                 "final response exceeds the JSON response byte limit",
             ));
@@ -1656,7 +1737,7 @@ impl ResponsesState {
             Ok(serialized) => serialized,
             Err(error) => {
                 tracing::warn!(%error, "failed to encode final response");
-                self.response_object = response;
+                self.replace_response_object(response);
                 return Err(finalize_rejection("failed to encode final response"));
             },
         };
@@ -1667,7 +1748,7 @@ impl ResponsesState {
             return Err(finalize_rejection("failed to bound final response JSON"));
         };
         let body_digest = crate::hash::Sha256::digest(&serialized);
-        self.response_object = response;
+        self.replace_response_object(response);
         *body = Some(Bytes::from(serialized));
         self.buffered_canonical_finalized = true;
         self.buffered_canonical_wire_bytes = Some(serialized_bytes);
@@ -2027,7 +2108,7 @@ mod tests {
         assert_eq!(
             stable
                 + state
-                    .rehydrate_stream_changing_payload_bytes_bounded(usize::MAX)
+                    .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(usize::MAX, None)
                     .unwrap(),
             total,
             "Rehydrate charges each fixed tool snapshot once"
@@ -2036,6 +2117,39 @@ mod tests {
             stable + state.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
             total,
             "StreamEvents charges each fixed tool snapshot once"
+        );
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn response_object_charge_cache_remeasures_after_revision_overflow() {
+        let mut state = ResponsesState::default();
+        state.replace_response_object(json!({"output": "small"}));
+        let mut cache = None;
+        let first = ResponseObjectChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        state.response_object_revision = Some(u64::MAX);
+        state.replace_response_object(json!({"output": "x".repeat(4_096)}));
+        let next = ResponseObjectChargeCache::measure(&mut cache, &state, usize::MAX).unwrap();
+        assert!(next > first, "overflowed revisions must remeasure the new object");
+        assert!(cache.is_none(), "an overflowed revision must disable reuse");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn response_object_charge_cache_respects_smaller_measurement_limits() {
+        let mut state = ResponsesState::default();
+        state.replace_response_object(json!({"output": "x".repeat(4_096)}));
+        let mut cache = None;
+        assert!(
+            ResponseObjectChargeCache::measure(&mut cache, &state, 512).is_none(),
+            "the first measurement must stop at the available budget"
+        );
+        assert!(cache.is_none(), "a failed measurement must not be cached");
+        let bytes = ResponseObjectChargeCache::measure(&mut cache, &state, 8_192).unwrap();
+        assert!(bytes > 512, "the exact charge must exceed the smaller limit");
+        assert!(
+            ResponseObjectChargeCache::measure(&mut cache, &state, 512).is_none(),
+            "a cached charge must still honor each callback's limit"
         );
     }
 

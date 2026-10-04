@@ -1205,7 +1205,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
         .ok()
         .filter(is_responses_api_output);
     let Some(mut response) = response else {
-        state.response_object = Value::Null;
+        state.replace_response_object(Value::Null);
         state.tool_calls.clear();
         return Ok(());
     };
@@ -1237,7 +1237,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
     if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
         merge_usage(&mut state.usage, usage);
     }
-    state.response_object = response;
+    state.replace_response_object(response);
     Ok(())
 }
 

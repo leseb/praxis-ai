@@ -1720,7 +1720,7 @@ fn build_list_tools_failure_response(
     // into state here without a clone.
     ctx.extensions
         .get_or_insert_with(ResponsesState::default)
-        .response_object = response;
+        .replace_response_object(response);
 
     // Emit as a header-phase `TerminalResponse`, not a `Reject`. A terminal
     // response preserves downstream keepalive (this is a successful 200 transport

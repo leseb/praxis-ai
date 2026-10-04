@@ -2299,6 +2299,27 @@ fn streaming_restore_cache_remeasures_changed_tool_snapshots() {
     assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
 }
 
+#[test]
+fn streaming_restore_cache_remeasures_same_shape_response_object_edits() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "short", "previous_response_id": "resp_prev"}));
+    state.replace_response_object(json!({"output": [{"text": "small"}]}));
+    state.apply_retained_payload_limit(4_096);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state
+        .output_items_mut()
+        .get_mut(0)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("text".to_owned(), json!("x".repeat(4_096)));
+    assert!(
+        streaming_restore_budget(&mut armed, Some(&state)).is_err(),
+        "the same output array shape must not reuse a stale response charge"
+    );
+}
+
 /// Re-parse assembled SSE output bytes into frames for assertions.
 fn parse_sse_frames(bytes: &[u8]) -> Vec<SseFrame> {
     SseFrameParser::new(1 << 20)
@@ -3474,6 +3495,7 @@ fn armed_stream(max_buffer_bytes: usize, prev_id: &str) -> RestorePreviousRespon
         last_forwarded_sequence: None,
         forwarded_terminal: false,
         stable_payload: None,
+        response_object_charge: None,
     }
 }
 

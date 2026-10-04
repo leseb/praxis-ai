@@ -443,9 +443,10 @@ impl OpenaiStreamEventsFilter {
             // `on_response` drops this fallback so a later provider `error` cannot
             // persist stale success as the logical result.
             if state.response_object.is_object() {
-                state.local_completion_response_template = std::mem::take(&mut state.response_object);
+                let prior = state.take_response_object();
+                state.local_completion_response_template = prior;
             } else {
-                state.response_object = Value::Null;
+                state.replace_response_object(Value::Null);
             }
             (state.iteration, output_index_offset)
         });
@@ -2722,7 +2723,8 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let deferred_done = state.deferred_stream_done || parser_deferred_done;
     if !state.response_object.is_object() {
-        state.response_object = std::mem::take(&mut state.local_completion_response_template);
+        let response = std::mem::take(&mut state.local_completion_response_template);
+        state.replace_response_object(response);
     }
     if !canonicalization_staging_bytes(state, output.len())
         .is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging))
@@ -3200,7 +3202,7 @@ fn canonicalize_logical_response(
     ) {
         tracing::warn!(%error, "failed to annotate logical stream response citations");
     }
-    if let Some(response) = state.response_object.as_object_mut() {
+    if let Some(response) = state.response_object_mut().as_object_mut() {
         if let Some(logical_id) = logical_id {
             response.insert("id".to_owned(), Value::String(logical_id));
         }
