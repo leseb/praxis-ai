@@ -31,6 +31,85 @@ fn wide_stream_limits() -> super::stream::StreamLimits {
     }
 }
 
+#[tokio::test]
+async fn budget_failure_after_completed_terminal_suppresses_later_provider_chunks() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_complete_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.as_ref().is_some_and(|chunk| {
+        chunk
+            .windows(b"event: response.completed".len())
+            .any(|window| window == b"event: response.completed")
+    }));
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(filter.on_response_body(&mut context, &mut body, false).is_err());
+    assert!(body.is_none());
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+
+    // A fail-open response pipeline may call this filter again after the error.
+    body = Some(Bytes::from_static(b"data: {\"provider_private\":true}\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none(), "raw Chat bytes must never resume after budget failure");
+    body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none());
+}
+
 #[test]
 fn repeated_stream_budget_checks_do_not_reserialize_unchanged_current_output() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
