@@ -247,13 +247,22 @@ pub(super) fn lifecycle_restore_staging_bytes(
     if reverse.is_empty() {
         return Some(0);
     }
-    let echo_bytes = echoed_tools_bytes(echo)?;
+    // Most chunks carry only deltas. Measure the immutable echoed tool list
+    // once, and only if this chunk actually restores a response snapshot.
+    let mut echo_bytes = None;
     events.iter().try_fold(0_usize, |used, event| {
         if event.is_terminal() {
             return Some(used);
         }
         let Some(response) = event.payload().get("response") else {
             return Some(used);
+        };
+        let echoed = if let Some(bytes) = echo_bytes {
+            bytes
+        } else {
+            let bytes = echoed_tools_bytes(echo)?;
+            echo_bytes = Some(bytes);
+            bytes
         };
         let response_bytes = retained_json_bytes(response)?;
         let growth = response
@@ -264,7 +273,7 @@ pub(super) fn lifecycle_restore_staging_bytes(
         // disposition application, and the outgoing SSE buffer serializes a
         // third copy while the whole plan remains live.
         used.checked_add(response_bytes)?
-            .checked_add(echo_bytes.checked_add(growth)?.checked_mul(3)?)
+            .checked_add(echoed.checked_add(growth)?.checked_mul(3)?)
     })
 }
 
@@ -1398,6 +1407,43 @@ mod tests {
         assert!(
             result.is_err(),
             "output_item.done before arguments.done must fail closed"
+        );
+    }
+
+    #[test]
+    fn ordinary_deltas_do_not_remeasure_large_client_tool_echo() {
+        fn measure(echo_size: usize) -> std::time::Duration {
+            let reverse = reverse_custom();
+            let echo = ClientToolEcho {
+                tools: vec![serde_json::json!({"type": "custom", "description": "x".repeat(echo_size)})],
+                tool_choice: serde_json::json!("auto"),
+            };
+            let delta = ResponsesEvent::OutputTextDelta(serde_json::json!({
+                "type": "response.output_text.delta", "delta": "x"
+            }));
+            let started = std::time::Instant::now();
+            for _ in 0..2_000 {
+                let staged = lifecycle_restore_staging_bytes(&reverse, Some(&echo), std::slice::from_ref(&delta));
+                assert_eq!(std::hint::black_box(staged), Some(0));
+            }
+            let elapsed = started.elapsed();
+
+            let snapshot = ResponsesEvent::ResponseCreated(serde_json::json!({
+                "type": "response.created", "response": {"output": [], "tools": []}
+            }));
+            assert!(
+                lifecycle_restore_staging_bytes(&reverse, Some(&echo), &[delta, snapshot])
+                    .is_some_and(|bytes| bytes > echo_size * 3),
+                "a later response snapshot in the same chunk must still reserve echo copies"
+            );
+            elapsed
+        }
+
+        let small = measure(1_024);
+        let large = measure(1_048_576);
+        assert!(
+            large <= small * 20 + std::time::Duration::from_millis(100),
+            "2,000 plain deltas took {large:?} with 1 MiB echo versus {small:?} with 1 KiB"
         );
     }
 

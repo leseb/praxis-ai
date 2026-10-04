@@ -84,6 +84,10 @@ pub(crate) struct McpConnectorContext<'a> {
 /// tools averaging 32 KiB) so well-behaved servers are never rejected.
 pub(super) const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
 
+/// Raw control response, parsed JSON, and retained rmcp peer metadata can
+/// coexist. Budgeted dispatch reserves this many bytes per admitted wire byte.
+pub(crate) const MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER: usize = 256;
+
 // -----------------------------------------------------------------------------
 // McpDisplayUrl
 // -----------------------------------------------------------------------------
