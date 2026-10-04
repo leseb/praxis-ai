@@ -38,7 +38,7 @@ fn repeated_stream_budget_checks_do_not_reserialize_unchanged_current_output() {
     let mut context = crate::test_utils::make_filter_context(&request);
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "stream": true, "input": "hi"}));
     state.apply_retained_payload_limit(64 * 1024 * 1024);
-    let mut converter = super::stream::StreamConverter::new("resp_output_cache".to_owned(), 1, wide_stream_limits());
+    let mut converter = StreamConverter::new("resp_output_cache".to_owned(), 1, wide_stream_limits());
     converter.set_echo_projection(&state.request_body, &state.tools, None);
     context.extensions.insert(state);
 
