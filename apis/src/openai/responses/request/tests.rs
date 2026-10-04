@@ -161,6 +161,29 @@ async fn create_request_rejects_raw_body_before_state_allocation() {
     );
 }
 
+#[tokio::test]
+async fn create_request_rejects_numeric_expansion_before_state_allocation() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context_without_subrequest_client(&request);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 24000").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let numbers = vec!["1e15"; 500].join(",");
+    let raw = format!(
+        r#"{{"model":"test","input":[{{"type":"tool_search_output","tools":[{{"type":"function","name":"pick","parameters":{{"type":"number","enum":[{numbers}]}}}}]}}]}}"#
+    );
+    assert!(raw.len() < 3_000);
+    let mut body = Some(Bytes::from(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("numeric normalization must be rejected before state initialization");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
 /// Classification once moved `model` out of the parsed value, which a shared
 /// parse would forward upstream as an empty string.
 #[tokio::test]
