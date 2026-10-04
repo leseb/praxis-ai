@@ -154,6 +154,62 @@ struct BufferedResponsePersistenceAttempted;
 #[cfg(feature = "openai-conversations")]
 pub(crate) struct PersistedResponseForConversation(pub(crate) String);
 
+/// Set only when the store's response hook participated in this exchange.
+#[cfg(feature = "openai-conversations")]
+pub(crate) struct StoreResponseHeaderRan(ResponseRound);
+
+/// The store was armed on request, but response conditions excluded its hook.
+#[cfg(feature = "openai-conversations")]
+pub(crate) struct StoreResponseHeaderSkipped(ResponseRound);
+
+/// A response callback can run more than once inside IRR. Match handoff
+/// markers to the current round so an intermediate response cannot satisfy
+/// the final response's store participation check.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "openai-conversations")]
+pub(crate) struct ResponseRound {
+    /// Core's IRR round, when a router is active.
+    router: Option<u32>,
+    /// Responses loop round, including local continuations.
+    agentic: Option<u32>,
+}
+
+/// Identify the current response attempt across both loop owners.
+#[cfg(feature = "openai-conversations")]
+pub(crate) fn response_round(ctx: &HttpFilterContext<'_>) -> ResponseRound {
+    ResponseRound {
+        router: ctx
+            .extensions
+            .get::<praxis_filter::IterationState>()
+            .map(praxis_filter::IterationState::iteration),
+        agentic: ctx.extensions.get::<ResponsesState>().map(|state| state.iteration),
+    }
+}
+
+/// Return whether the Store response hook was skipped in this response round.
+#[cfg(feature = "openai-conversations")]
+pub(crate) fn store_response_header_skipped(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<StoreResponseHeaderSkipped>()
+        .is_some_and(|marker| marker.0 == response_round(ctx))
+}
+
+/// Record that Store response conditions excluded this round's response hook.
+#[cfg(feature = "openai-conversations")]
+pub(crate) fn mark_store_response_header_skipped(ctx: &mut HttpFilterContext<'_>) -> bool {
+    let round = response_round(ctx);
+    if !request_persistence_armed(ctx)
+        || ctx
+            .extensions
+            .get::<StoreResponseHeaderRan>()
+            .is_some_and(|marker| marker.0 == round)
+    {
+        return false;
+    }
+    ctx.extensions.insert(StoreResponseHeaderSkipped(round));
+    true
+}
+
 impl ResponseStoreFilter {
     /// Construct the filter with explicit replay-log bounds.
     ///
@@ -296,7 +352,7 @@ impl ResponseStoreFilter {
         }
         #[cfg(feature = "openai-conversations")]
         {
-            crate::openai::conversations::append_after_store_body(ctx, body, false)
+            Ok(crate::openai::conversations::append_after_store_body(ctx, body, false))
         }
         #[cfg(not(feature = "openai-conversations"))]
         {
@@ -369,7 +425,7 @@ impl ResponseStoreFilter {
         }
         #[cfg(feature = "openai-conversations")]
         {
-            crate::openai::conversations::append_after_store_body(ctx, body, true)
+            Ok(crate::openai::conversations::append_after_store_body(ctx, body, true))
         }
         #[cfg(not(feature = "openai-conversations"))]
         {
@@ -1802,9 +1858,15 @@ impl HttpFilter for ResponseStoreFilter {
             .get::<ResponsesState>()
             .and_then(ResponsesState::retained_payload_limit)
             .is_some();
-        let canonical_completed = has_conversation(ctx) && budgeted && super::super::buffered_canonical_completed(ctx);
+        let canonical_finalized = budgeted && super::super::buffered_canonical_completed(ctx);
+        let canonical_completed = has_conversation(ctx) && canonical_finalized;
         if !is_streaming_request(ctx) && !canonical_completed {
-            let max_bytes = if let Some(state) = ctx.extensions.get::<ResponsesState>().filter(|_| budgeted) {
+            let max_bytes = if canonical_finalized {
+                // The agentic loop already admitted and serialized this exact
+                // body. A previous-response restore may have selected a 64 MiB
+                // ceiling, but the ceiling itself owns no payload allocation.
+                MAX_JSON_BODY_BYTES
+            } else if let Some(state) = ctx.extensions.get::<ResponsesState>().filter(|_| budgeted) {
                 let Some(limit) = state.retained_payload_limit() else {
                     return Ok(persistence_budget_failure(ctx, false, &mut None));
                 };
@@ -1816,6 +1878,7 @@ impl HttpFilter for ResponseStoreFilter {
                 MAX_JSON_BODY_BYTES
             };
             if budgeted
+                && !canonical_finalized
                 && let BodyMode::StreamBuffer { max_bytes: existing } = &ctx.response_body_mode
                 && existing.is_none_or(|bytes| bytes > max_bytes)
             {
@@ -1866,6 +1929,8 @@ impl HttpFilter for ResponseStoreFilter {
                 }
                 ctx.extensions.insert(BufferedResponsePersistenceAttempted);
                 #[cfg(feature = "openai-conversations")]
+                ctx.extensions.insert(StoreResponseHeaderRan(response_round(ctx)));
+                #[cfg(feature = "openai-conversations")]
                 ctx.extensions.insert(PersistedResponseForConversation(record.id));
                 #[cfg(feature = "openai-conversations")]
                 {
@@ -1878,6 +1943,8 @@ impl HttpFilter for ResponseStoreFilter {
             }
         }
 
+        #[cfg(feature = "openai-conversations")]
+        ctx.extensions.insert(StoreResponseHeaderRan(response_round(ctx)));
         trace!("response body persistence armed");
 
         Ok(FilterAction::Continue)
@@ -3533,5 +3600,62 @@ mod encode_replay_event_tests {
             !filter.capture_stream_events(&mut ctx, &frame, false),
             "a same-shape request rewrite must be measured before the next replay chunk"
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "rehydrate and store must share a realistic response context"
+    )]
+    async fn budgeted_previous_response_completion_keeps_rehydrate_buffer() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let store = std::sync::Arc::new(praxis_ai_store::memory::InMemoryStore::new());
+        let registry = crate::store::ResponseStoreRegistry::new();
+        registry
+            .register(
+                &std::sync::Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                store,
+            )
+            .unwrap();
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.stream", "false");
+        let mut state = ResponsesState {
+            history_rehydrated: true,
+            previous_response_id: Some("resp_previous".to_owned()),
+            response_object: json!({"id":"resp_new", "status":"completed", "output":[]}),
+            ..Default::default()
+        };
+        state.apply_retained_payload_limit(67_108_864);
+        ctx.extensions.insert(state);
+        ctx.filter_results
+            .entry("openai_agentic_loop")
+            .or_default()
+            .set("action", "done")
+            .unwrap();
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .buffered_canonical_finalized = true;
+        let mut response = crate::test_utils::make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        let rehydrate = crate::openai::RehydrateFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+        drop(rehydrate.on_response(&mut ctx).await.unwrap());
+        assert_eq!(
+            ctx.response_body_mode,
+            praxis_filter::body::BodyMode::StreamBuffer {
+                max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+            }
+        );
+        let store_filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(100).unwrap(), NonZeroU64::new(1_000_000).unwrap());
+        assert!(matches!(
+            store_filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
     }
 }

@@ -1908,6 +1908,12 @@ def witness_budgeted_conversation_client(tmp_path_factory, request):
 
 
 @pytest.fixture()
+def witness_budgeted_continuation_client(tmp_path_factory, request):
+    """Full-flow SQLite witness at the default 64 MiB retained allowance."""
+    yield from _witness_proxy_session(tmp_path_factory, request, retained_limit=67_108_864)
+
+
+@pytest.fixture()
 def witness_tool_client(tmp_path_factory, request, search_server):
     """Full-flow witness with a deterministic hosted web-search endpoint."""
     yield from _witness_proxy_session(tmp_path_factory, request, search_server)
@@ -2603,6 +2609,24 @@ class TestOpenAIResponsesVLLM:
             assert "BUFFERED-STORE-FALSE-410" in items.data[0].content[0].text
         finally:
             client.conversations.delete(conversation.id)
+
+    def test_budgeted_previous_response_id_continuation_keeps_small_completion(
+        self, witness_budgeted_continuation_client
+    ):
+        """A rehydrate buffer ceiling must not reject an admitted small body."""
+        client, _ = witness_budgeted_continuation_client
+        first = client.responses.create(
+            model="sdk-conversation-stream", input="BUDGET-PREVIOUS-BASE-410", store=True
+        )
+        assert first.status == "completed"
+        second = client.responses.create(
+            model="sdk-conversation-stream",
+            input="BUDGET-PREVIOUS-NEXT-410",
+            previous_response_id=first.id,
+            store=True,
+        )
+        assert second.status == "completed"
+        assert second.previous_response_id == first.id
 
     def test_buffered_store_true_conversation_persists_before_append(self, witness_backend_client):
         """Header persistence and append both complete before buffered delivery."""

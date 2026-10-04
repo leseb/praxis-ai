@@ -624,6 +624,10 @@ pub(crate) struct ResponsesState {
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
 
+    /// This round's buffered body was serialized and admitted by the agentic
+    /// loop. The outer response hook cannot read IRR's inner filter results.
+    pub(crate) buffered_canonical_finalized: bool,
+
     /// Prior streamed terminal response retained across request-side re-entry.
     ///
     /// `openai_stream_events` invalidates [`Self::response_object`] before the
@@ -981,6 +985,7 @@ impl Default for ResponsesState {
             request_body: serde_json::Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
+            buffered_canonical_finalized: false,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
             tool_search_calls: Vec::new(),
@@ -1506,6 +1511,7 @@ impl ResponsesState {
     /// Invalidate store and rehydrate current-output measurements without
     /// invalidating the stream parser's completed prior-output cache.
     pub(crate) fn mark_current_output_changed(&mut self) {
+        self.buffered_canonical_finalized = false;
         self.current_output_revision = self
             .current_output_revision
             .and_then(|revision| revision.checked_add(1));
@@ -1692,6 +1698,7 @@ impl ResponsesState {
         }
         self.response_object = response;
         *body = Some(Bytes::from(serialized));
+        self.buffered_canonical_finalized = true;
         Ok(())
     }
 
@@ -3078,6 +3085,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "wire allocation and canonical marker share one finalization witness"
+    )]
     fn finalize_response_body_serializes_with_one_admitted_wire_allocation() {
         let mut state = ResponsesState {
             response_object: json!({
@@ -3100,10 +3111,16 @@ mod tests {
             state.finalize_response_body(&mut body).unwrap();
         });
         assert_eq!(body.as_ref().map(Bytes::len), Some(serialized_bytes));
+        assert!(state.buffered_canonical_finalized);
         assert!(!state.retained_payload_failed);
         assert!(
             allocations.bytes_max <= u64::try_from(serialized_bytes).unwrap() + 65_536,
             "one wire-sized buffer is admitted; serializer growth must not keep a second buffer: {allocations:?}"
+        );
+        state.mark_current_output_changed();
+        assert!(
+            !state.buffered_canonical_finalized,
+            "a later output mutation invalidates the serialized body"
         );
     }
 

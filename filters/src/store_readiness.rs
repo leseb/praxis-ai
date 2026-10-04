@@ -70,7 +70,7 @@ impl HttpFilter for StoreReadinessGateFilter {
             ctx.set_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(rejection));
         }
-        Ok(FilterAction::Continue)
+        praxis_ai_apis::openai::finish_unselected_store_conversation_append(ctx).await
     }
 
     async fn on_request_body(

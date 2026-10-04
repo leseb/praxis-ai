@@ -19,6 +19,8 @@ pub(crate) use self::filter::{
     discard_retained_request_payload, mark_retained_request_payload_charged, request_persistence_armed,
     retained_request_payload_bytes,
 };
+#[cfg(feature = "openai-conversations")]
+pub(crate) use self::filter::{mark_store_response_header_skipped, store_response_header_skipped};
 
 #[cfg(test)]
 #[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]

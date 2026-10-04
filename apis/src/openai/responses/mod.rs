@@ -192,18 +192,42 @@ pub fn final_conversation_buffer_budget_rejection(ctx: &HttpFilterContext<'_>) -
     })
 }
 
+/// Complete a deferred conversation append when response conditions excluded
+/// the store after it had armed persistence during the request phase.
+///
+/// # Errors
+///
+/// Returns an error only if the delegated conversation hook cannot run.
+#[cfg(feature = "store")]
+pub async fn finish_unselected_store_conversation_append(
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<FilterAction, FilterError> {
+    #[cfg(feature = "openai-conversations")]
+    {
+        if ctx.get_metadata("responses.skip_persist") == Some("true") {
+            return Ok(FilterAction::Continue);
+        }
+        if !store::mark_store_response_header_skipped(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+        return super::conversations::append_after_store_response(ctx).await;
+    }
+    #[cfg(not(feature = "openai-conversations"))]
+    {
+        let _ = ctx;
+        Ok(FilterAction::Continue)
+    }
+}
+
 /// A buffered canonical response is usable by outer header hooks only after
 /// the agentic loop finalized this selected round. A completed-looking state
 /// from an earlier round or an unselected branch is not sufficient.
 #[cfg(feature = "store")]
 pub(crate) fn buffered_canonical_completed(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.filter_results
-        .get("openai_agentic_loop")
-        .and_then(|result| result.get("action"))
-        == Some("done")
-        && ctx.extensions.get::<state::ResponsesState>().is_some_and(|state| {
-            state.response_object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
-        })
+    ctx.extensions.get::<state::ResponsesState>().is_some_and(|state| {
+        state.buffered_canonical_finalized
+            && state.response_object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+    })
 }
 
 /// Reduce an ordinary request-body action to the bound-upstream body's
@@ -323,6 +347,7 @@ impl io::Write for BoundedJsonCounter {
 #[cfg(feature = "store")]
 pub const DEFAULT_STORE_NAME: &str = "default";
 
+#[cfg(feature = "openai-responses")]
 pub(crate) use agentic_loop::buffered_parsed_json_bytes_upper_bound;
 
 /// Legacy test tenant value retained for fixture compatibility.

@@ -49,6 +49,10 @@ fn final_conversation_buffer_guard_checks_effective_mode_after_wideners() {
         .or_default()
         .set("action", "done")
         .unwrap();
+    ctx.extensions
+        .get_mut::<state::ResponsesState>()
+        .unwrap()
+        .buffered_canonical_finalized = true;
     assert!(final_conversation_buffer_budget_rejection(&ctx).is_none());
 }
 

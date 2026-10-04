@@ -3607,6 +3607,10 @@ async fn capture_append_owner_for_test(filter: &dyn HttpFilter, ctx: &mut HttpFi
 }
 
 fn mark_buffered_agentic_done(ctx: &mut HttpFilterContext<'_>) {
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .buffered_canonical_finalized = true;
     ctx.filter_results
         .entry("openai_agentic_loop")
         .or_default()
@@ -4375,12 +4379,13 @@ async fn reversed_response_filter_order_rolls_back_after_append_budget_rejection
     };
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
     ctx.extensions.insert(state);
-    mark_buffered_agentic_done(&mut ctx);
     let mut response = make_response();
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
     ctx.response_header = Some(&mut response);
+
+    mark_buffered_agentic_done(&mut ctx);
 
     ctx.current_filter_id = Some(0);
     assert!(matches!(
@@ -4412,6 +4417,181 @@ async fn reversed_response_filter_order_rolls_back_after_append_budget_rejection
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_conditions_excluding_store_do_not_suppress_conversation_append() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_store_excluded", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    // An intermediate IRR response did run Store. Its participation marker
+    // must not count for the completed round excluded by response_conditions.
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().iteration = 1;
+    mark_buffered_agentic_done(&mut ctx);
+
+    ctx.current_filter_id = Some(0);
+    assert!(matches!(
+        conversations.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    // The configured Store's response_conditions exclude this exchange, so
+    // core never calls its response hook. The final readiness hook must end
+    // the request-phase-only handoff without inventing a response write.
+    assert!(matches!(
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_store_excluded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_conditions_excluding_store_allow_streaming_conversation_append() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    drop(response_store.on_request(&mut ctx).await.unwrap());
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_stream_excluded", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    ctx.current_filter_id = Some(0);
+    drop(conversations.on_response(&mut ctx).await.unwrap());
+    assert!(matches!(
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    assert!(matches!(
+        conversations.on_response_body(&mut ctx, &mut terminal, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_stream_excluded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2
     );
 }
 
@@ -4822,6 +5002,40 @@ async fn streaming_terminal_propagates_append_failure_before_release() {
             Ok(FilterAction::Continue)
         ),
         "a failure-mode-open terminal must not retry an ambiguous item commit at EOS"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegated_streaming_append_failure_is_explicit_rejection() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::CreateItems,
+        conversation_exists: false,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})],
+        response_object: serde_json::json!({"status":"completed","output":[]}),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    });
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    let action = super::append_after_store_body(&mut ctx, &mut terminal, false);
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 500),
+        "the Store's fail-open setting must not release a failed delegated append"
     );
 }
 
