@@ -22,6 +22,54 @@ use crate::{
     },
 };
 
+#[test]
+fn aggregate_file_parse_admission_respects_existing_state() {
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "hello"}));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 96);
+    ctx.extensions.insert(state);
+
+    assert!(file_parse_fits_budget(&ctx, 96), "exact remaining allowance should fit");
+    assert!(
+        !file_parse_fits_budget(&ctx, 97),
+        "one byte over the allowance should fail"
+    );
+    assert_eq!(aggregate_resolution_headroom(&ctx, 32, 32), Ok(Some(32)));
+    assert_eq!(aggregate_resolution_headroom(&ctx, 64, 64), Err(()));
+}
+
+#[tokio::test]
+async fn aggregate_file_exhaustion_cannot_fail_open() {
+    let client = make_client();
+    let mut budget = client.resolution_budget(None);
+    budget.apply_aggregate_headroom(0);
+    let mut items = vec![json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_file", "file_id": "file-never-dispatched"}]
+    })];
+
+    let result = resolve_items(
+        &mut items,
+        &client,
+        OnMissing::Continue,
+        &http::HeaderMap::new(),
+        None,
+        &mut budget,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ResolveError::RetainedBudget)),
+        "aggregate exhaustion must not follow on_missing: continue"
+    );
+    assert_eq!(items[0]["content"][0]["file_id"], "file-never-dispatched");
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
@@ -474,8 +522,9 @@ timeout_ms: 2000"#
             "content": [{"type": "input_file", "file_url": file_url}]
         }]
     });
-    ctx.extensions
-        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let mut state = ResponsesState::from_request_body(request_body.clone());
+    state.apply_retained_payload_limit(2 * 1024 * 1024);
+    ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
