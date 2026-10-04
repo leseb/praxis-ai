@@ -1249,12 +1249,9 @@ impl ResponsesState {
         .checked_add(stream_bytes)
     }
 
-    /// Count owners that may change between Rehydrate SSE callbacks, including
-    /// accumulated output and both published stream-parser charges. The stable
-    /// request, history, and tool snapshots are measured once by Rehydrate.
-    #[cfg(feature = "store")]
-    /// Rehydrate's changing meter with an exact cached response-object charge.
-    #[cfg(feature = "store")]
+    /// Uncached Rehydrate meter retained for parity tests. Production caches
+    /// prior output with request/history and uses the shared changing meter.
+    #[cfg(all(test, feature = "store"))]
     pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
         &self,
         max_bytes: usize,

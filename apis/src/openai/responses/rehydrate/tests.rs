@@ -2276,6 +2276,71 @@ fn streaming_restore_cache_remeasures_changed_request_and_output() {
 }
 
 #[test]
+fn streaming_restore_cache_remeasures_same_length_prior_output_replacement() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi", "previous_response_id": "resp_prev"}));
+    state.accumulated_output.push(json!({"output": "small"}));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 128);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    let first = streaming_restore_budget(&mut armed, Some(&state)).unwrap().unwrap();
+    assert_eq!(
+        first.current, baseline,
+        "cached meter must count prior output exactly once"
+    );
+
+    state.accumulated_output[0] = json!({"output": "x".repeat(4_096)});
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert!(
+        streaming_restore_budget(&mut armed, Some(&state)).is_err(),
+        "same-length prior-output replacement must invalidate the cached charge"
+    );
+
+    state.accumulated_output[0] = json!({"output": "small"});
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(
+        streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current,
+        baseline
+    );
+}
+
+#[test]
+fn streaming_restore_budget_reuses_large_prior_output_across_small_callbacks() {
+    fn measure(prior_output_bytes: usize) -> std::time::Duration {
+        let mut state = ResponsesState::from_request_body(json!({"input": "hi", "previous_response_id": "resp_prev"}));
+        state
+            .accumulated_output
+            .push(json!({"output": "x".repeat(prior_output_bytes)}));
+        state.apply_retained_payload_limit(64 << 20);
+        let mut armed = armed_stream(1 << 20, "resp_prev");
+        let expected = streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current;
+        assert_eq!(expected, state.retained_payload_bytes().unwrap());
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            let measured = streaming_restore_budget(&mut armed, Some(&state))
+                .unwrap()
+                .unwrap()
+                .current;
+            assert_eq!(std::hint::black_box(measured), expected);
+        }
+        started.elapsed()
+    }
+
+    let small = measure(1);
+    let large = measure(1_000_000);
+    assert!(
+        large <= small * 20 + std::time::Duration::from_millis(100),
+        "200 cached checks with 1 MiB of unchanged prior output took {large:?} versus {small:?} for a small item"
+    );
+}
+
+#[test]
 fn streaming_restore_cache_remeasures_changed_tool_snapshots() {
     let mut state = ResponsesState::from_request_body(json!({"input": "short", "previous_response_id": "resp_prev"}));
     state.apply_retained_payload_limit(4_096);
