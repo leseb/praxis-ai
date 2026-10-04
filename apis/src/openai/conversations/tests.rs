@@ -1650,7 +1650,7 @@ async fn early_body_pre_read_defers_store_write_until_request_filters_run() {
 }
 
 #[tokio::test]
-async fn unmatched_pre_read_body_state_is_discarded_after_classification() {
+async fn unmatched_pre_read_body_bytes_are_discarded_after_classification() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = base_owned_filter_context(&req);
@@ -1667,8 +1667,8 @@ async fn unmatched_pre_read_body_state_is_discarded_after_classification() {
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert!(
-        !ctx.filter_state.contains_key(&7),
-        "unmatched requests must not retain the pre-read body through the upstream response"
+        ctx.filter_state.contains_key(&7),
+        "Responses retains its small request-pipeline placement marker after releasing pre-read bytes"
     );
 }
 

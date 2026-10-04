@@ -98,6 +98,10 @@ struct ConversationRequestState {
 
     /// Full body captured by an early pre-read pass.
     deferred_body: Option<Bytes>,
+
+    /// The request hook's pipeline placement survives IRR's extension swap
+    /// into the parent response context.
+    outside_router_at_request: Option<bool>,
 }
 
 /// Per-request response-phase state that controls whether append-back
@@ -176,11 +180,12 @@ fn conversation_body_selected(ctx: &HttpFilterContext<'_>) -> bool {
     })
 }
 
-/// IRR strips its iteration state before handing the committed stream to its
-/// parent pipeline. A Conversations hook in a router step still has that state
-/// and may be excluded by response conditions in a later step.
+/// Use the request hook's pipeline placement, which IRR does not swap with
+/// response extensions when a nested stream becomes the parent response.
 fn is_outer_response_filter(ctx: &HttpFilterContext<'_>) -> bool {
-    response_round(ctx).is_outside_router()
+    ctx.get_filter_state::<ConversationRequestState>()
+        .and_then(|state| state.outside_router_at_request)
+        .unwrap_or_else(|| response_round(ctx).is_outside_router())
 }
 
 /// Owner captured on the request path before inference begins.
@@ -286,7 +291,14 @@ impl OpenaiConversationsFilter {
     /// Drop a body captured during pre-read when header classification shows
     /// that this filter will not handle the request locally.
     fn discard_request_state(ctx: &mut HttpFilterContext<'_>) {
-        drop(ctx.remove_filter_state::<ConversationRequestState>());
+        if let Some(mut state) = ctx.remove_filter_state::<ConversationRequestState>() {
+            state.deferred_body = None;
+            // Only Responses can need the request-pipeline placement at the
+            // eventual response header. Local Conversations CRUD is complete.
+            if ctx.request.method == http::Method::POST && ctx.request.uri.path() == "/v1/responses" {
+                ctx.insert_filter_state(state);
+            }
+        }
     }
 
     /// Recover a matched parameter from the immutable original request path.
@@ -504,6 +516,13 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if ctx.current_filter_id.is_some() {
+            let mut state = ctx
+                .remove_filter_state::<ConversationRequestState>()
+                .unwrap_or_default();
+            state.outside_router_at_request = Some(ctx.extensions.get::<praxis_filter::IterationState>().is_none());
+            ctx.insert_filter_state(state);
+        }
         if let Err(action) = capture_append_owner(ctx) {
             return Ok(action);
         }
@@ -1200,6 +1219,35 @@ fn reject_classifier_unavailable() -> Rejection {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streamed_response_uses_request_pipeline_placement_after_extension_handoff() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(ConversationRequestState {
+            deferred_body: Some(Bytes::from_static(b"discard me")),
+            ..ConversationRequestState::default()
+        });
+        assert!(matches!(
+            OpenaiConversationsFilter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(is_outer_response_filter(&ctx));
+        assert!(
+            ctx.get_filter_state::<ConversationRequestState>()
+                .unwrap()
+                .deferred_body
+                .is_none()
+        );
+
+        // The nested step's extensions can also be stripped before its
+        // response hook. It must remain a step selection in that context.
+        let mut state = ctx.remove_filter_state::<ConversationRequestState>().unwrap();
+        state.outside_router_at_request = Some(false);
+        ctx.insert_filter_state(state);
+        assert!(!is_outer_response_filter(&ctx));
+    }
 
     #[test]
     fn reject_store_unavailable_returns_500_server_error() {

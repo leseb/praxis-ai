@@ -220,13 +220,15 @@ pub(crate) fn mark_store_response_header_skipped(ctx: &mut HttpFilterContext<'_>
     {
         return false;
     }
-    let outer_stream = round.is_outside_router()
-        && ctx
-            .response_header
-            .as_ref()
-            .and_then(|response| response.headers.get(http::header::CONTENT_TYPE))
-            .and_then(|content_type| content_type.to_str().ok())
-            .is_some_and(is_event_stream_content_type);
+    // Only the server-injected, top-level readiness gate calls this helper.
+    // IRR may have swapped its iteration extension into the parent by now,
+    // so the response-round extension cannot identify that outer placement.
+    let outer_stream = ctx
+        .response_header
+        .as_ref()
+        .and_then(|response| response.headers.get(http::header::CONTENT_TYPE))
+        .and_then(|content_type| content_type.to_str().ok())
+        .is_some_and(is_event_stream_content_type);
     ctx.extensions
         .insert(StoreResponseHeaderSkipped { round, outer_stream });
     true
