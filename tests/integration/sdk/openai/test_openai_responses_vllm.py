@@ -5645,6 +5645,8 @@ def retained_tool_search_client(tmp_path, request):
         "  allow_private_upstreams: true # stubbed Files API callouts",
         1,
     )
+    if getattr(request, "param", None) == "file_metadata":
+        config = config.replace("max_retained_bytes: 16384", "max_retained_bytes: 196608", 1)
     config_path = _persist_config(config)
     log_path = str(tmp_path / "praxis.log")
     log_file = open(log_path, "w")
@@ -5779,7 +5781,7 @@ filter_chains:
               - filter: openai_stream_events
               - filter: openai_agentic_loop
                 max_infer_iters: 1
-                max_retained_bytes: 4096
+                max_retained_bytes: 196608
               - filter: openai_responses_proxy
               - filter: router
                 routes:
@@ -5803,7 +5805,6 @@ insecure_options:
             "              - filter: responses_to_chat_completions\n",
             1,
         )
-        config = config.replace("max_retained_bytes: 4096", "max_retained_bytes: 65536")
     if scenario.endswith("header_suppressed"):
         first = config.index("          - name: first\n")
         transition = config.index("            on_result:\n", first)
@@ -5972,7 +5973,30 @@ class TestAgenticLoopVLLM:
     def test_initial_file_resolution_budget_rejects_through_sdk(
         self, retained_tool_search_client
     ):
-        """A declared oversized file is rejected before content or inference."""
+        """A small budget rejects before staging a Files API transport read."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file-budget"}],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedFileMetadataHandler.metadata_requests == 0
+        assert RetainedFileMetadataHandler.content_requests == 0
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    @pytest.mark.parametrize("retained_tool_search_client", ["file_metadata"], indirect=True)
+    def test_file_metadata_budget_rejects_before_content_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A larger budget admits metadata, then blocks oversized content."""
         with pytest.raises(APIStatusError) as exc_info:
             retained_tool_search_client.responses.create(
                 model=VLLM_MODEL,
