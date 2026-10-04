@@ -1451,28 +1451,19 @@ impl ConversationItemStore for SqliteResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        require_matching_item_scope(owner, conversation_id, items)?;
-
-        let items_table = self
-            .tables
-            .items
-            .as_deref()
-            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
-        let conv_table = &self.tables.conversations;
-
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+    }
 
-        sqlite_create_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items).await?;
-
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(())
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
+            .await
     }
 
     async fn delete_item_and_sync_messages(
@@ -1502,6 +1493,53 @@ impl ConversationItemStore for SqliteResponseStore {
     }
 }
 
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "transactional cache helpers sit beside their trait implementation"
+)]
+impl SqliteResponseStore {
+    /// Insert items and rebuild the owner-scoped cache in one transaction.
+    async fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        require_matching_item_scope(owner, conversation_id, items)?;
+
+        let items_table = self
+            .tables
+            .items
+            .as_deref()
+            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+        let conv_table = &self.tables.conversations;
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlite_create_items_and_sync(
+            &mut tx,
+            items_table,
+            conv_table,
+            owner,
+            conversation_id,
+            items,
+            max_rebuild_bytes,
+        )
+        .await?;
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Transactional Helpers
 // -----------------------------------------------------------------------------
@@ -1521,6 +1559,7 @@ async fn sqlite_create_items_and_sync(
     owner: &StateOwner,
     conversation_id: &str,
     items: &[ConversationItemRecord],
+    max_rebuild_bytes: Option<usize>,
 ) -> Result<(), StoreError> {
     let max_sql = format!(
         "SELECT COALESCE(MAX(position), 0) AS max_pos \
@@ -1563,7 +1602,7 @@ async fn sqlite_create_items_and_sync(
             .map_err(|e| StoreError::Database(e.to_string()))?;
     }
 
-    sqlite_rebuild_messages(tx, items_table, conv_table, owner, conversation_id).await
+    sqlite_rebuild_messages(tx, items_table, conv_table, owner, conversation_id, max_rebuild_bytes).await
 }
 
 /// Body of [`SqliteResponseStore::delete_item_and_sync_messages`].
@@ -1597,7 +1636,7 @@ async fn sqlite_delete_item_and_sync(
         return Ok(false);
     }
 
-    sqlite_rebuild_messages(tx, items_table, conv_table, owner, conversation_id).await?;
+    sqlite_rebuild_messages(tx, items_table, conv_table, owner, conversation_id, None).await?;
     Ok(true)
 }
 
@@ -1609,13 +1648,42 @@ async fn sqlite_delete_item_and_sync(
 /// run this inside a transaction, so the propagated error rolls back
 /// any item mutations made in the same transaction.
 #[expect(clippy::too_many_lines, reason = "sequential query pipeline within a transaction")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "transactional cache rebuild needs table names and owner scope"
+)]
 async fn sqlite_rebuild_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     items_table: &str,
     conv_table: &str,
     owner: &StateOwner,
     conversation_id: &str,
+    max_rebuild_bytes: Option<usize>,
 ) -> Result<(), StoreError> {
+    if let Some(max_rebuild_bytes) = max_rebuild_bytes {
+        let size_sql = format!(
+            "SELECT COALESCE(SUM(length(CAST(item_data AS BLOB))), 0) AS raw_bytes, COUNT(*) AS row_count \
+             FROM {items_table} \
+             WHERE tenant_id = ? AND owner_issuer = ? AND owner_subject = ? AND conversation_id = ?"
+        );
+        let size_row = sqlx::query(AssertSqlSafe(size_sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let raw_bytes: i64 = size_row
+            .try_get("raw_bytes")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let row_count: i64 = size_row
+            .try_get("row_count")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !super::conversation_rebuild_fits(raw_bytes, row_count, max_rebuild_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+    }
     let select_sql = format!(
         "SELECT item_data FROM {items_table} \
          WHERE tenant_id = ? AND owner_issuer = ? AND owner_subject = ? AND conversation_id = ? \

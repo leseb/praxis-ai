@@ -1557,6 +1557,49 @@ impl ConversationItemStore for PostgresResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
+            .await
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
+            .await
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.delete_item_and_sync_messages_inner(owner, conversation_id, item_id)
+            .await
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "transactional cache helpers sit beside their trait implementation"
+)]
+impl PostgresResponseStore {
+    /// Insert items and rebuild the owner-scoped cache in one transaction.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "transactional insert and bounded rebuild share one lock"
+    )]
+    async fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
         }
@@ -1625,13 +1668,26 @@ impl ConversationItemStore for PostgresResponseStore {
                 .map_err(|e| self.db_err(&e))?;
         }
 
-        pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
+        pg_rebuild_messages(
+            &mut tx,
+            items_table,
+            conv_table,
+            owner,
+            conversation_id,
+            max_rebuild_bytes,
+        )
+        .await?;
 
         tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(())
     }
 
-    async fn delete_item_and_sync_messages(
+    /// Delete one item and rebuild its conversation cache transactionally.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "transactional delete and cache update share one lock"
+    )]
+    async fn delete_item_and_sync_messages_inner(
         &self,
         owner: &StateOwner,
         conversation_id: &str,
@@ -1680,7 +1736,7 @@ impl ConversationItemStore for PostgresResponseStore {
             return Ok(false);
         }
 
-        pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
+        pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id, None).await?;
 
         tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(true)
@@ -1699,13 +1755,42 @@ impl ConversationItemStore for PostgresResponseStore {
 /// run this inside a transaction, so the propagated error rolls back
 /// any item mutations made in the same transaction.
 #[expect(clippy::too_many_lines, reason = "sequential query pipeline within a transaction")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "transactional cache rebuild needs table names and owner scope"
+)]
 async fn pg_rebuild_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     items_table: &str,
     conv_table: &str,
     owner: &StateOwner,
     conversation_id: &str,
+    max_rebuild_bytes: Option<usize>,
 ) -> Result<(), StoreError> {
+    if let Some(max_rebuild_bytes) = max_rebuild_bytes {
+        let size_sql = format!(
+            "SELECT COALESCE(SUM(octet_length(item_data)), 0) AS raw_bytes, COUNT(*) AS row_count \
+             FROM {items_table} \
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
+        );
+        let size_row = sqlx::query(AssertSqlSafe(size_sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let raw_bytes: i64 = size_row
+            .try_get("raw_bytes")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let row_count: i64 = size_row
+            .try_get("row_count")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !super::conversation_rebuild_fits(raw_bytes, row_count, max_rebuild_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+    }
     let select_sql = format!(
         "SELECT item_data FROM {items_table} \
          WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \

@@ -565,6 +565,24 @@ pub trait ConversationItemStore: Send + Sync {
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
 
+    /// Append and rebuild the message cache only when the complete rebuild
+    /// fits `max_rebuild_bytes`. Backends must check stored row sizes inside
+    /// the append transaction before loading item data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when the cache would exceed the
+    /// allowance, including for backends without a bounded implementation.
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+        _max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
+
     /// Atomically delete an item and rebuild the conversation message cache.
     ///
     /// Within a single database transaction this method:

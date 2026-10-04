@@ -643,6 +643,64 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
     drop(proxy);
 }
 
+/// A normal finite Responses turn must pass the shared 64 MiB admission with
+/// Store and Conversations both active and append its items once.
+#[test]
+fn full_flow_budgeted_finite_conversation_appends_items() {
+    let response = json!({
+        "id": "resp_conversation_finite",
+        "created_at": 1_000,
+        "model": "gpt-4.1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "msg_conversation_finite",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Hi there"}]
+        }]
+    });
+    let backend = Backend::fixed(&response.to_string())
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let db = TempSqlite::new("full_flow_budgeted_finite_conversation");
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        free_port(),
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    ));
+
+    let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "conversation creation failed: {created_raw}"
+    );
+    let created: Value = serde_json::from_str(&parse_body(&created_raw)).expect("conversation JSON");
+    let conversation_id = created["id"].as_str().expect("conversation id");
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "Hello"}],
+        "conversation": conversation_id,
+        "store": true,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200, "finite budgeted turn failed: {raw}");
+
+    let (status, body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "item list failed: {body}");
+    let listed: Value = serde_json::from_str(&body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(items.len(), 2, "input and output must be appended once: {body}");
+    assert_eq!(items[0]["content"][0]["text"], "Hello");
+    assert_eq!(items[1]["content"][0]["text"], "Hi there");
+}
+
 /// A completed stream updates the local Conversation even with `store:false`.
 /// A later turn must rehydrate those items from the same on-disk store.
 #[test]

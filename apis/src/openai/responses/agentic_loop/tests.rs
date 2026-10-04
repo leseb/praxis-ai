@@ -3291,8 +3291,8 @@ async fn on_request_rejects_oversized_initial_state_with_413() {
 
 #[tokio::test]
 #[cfg(feature = "openai-conversations")]
-async fn conversation_append_is_rejected_before_budgeted_dispatch() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 65536").unwrap();
+async fn conversation_append_is_admitted_with_room_for_bounded_append() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 67108864").unwrap();
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -3306,13 +3306,11 @@ async fn conversation_append_is_rejected_before_budgeted_dispatch() {
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
-        panic!("unmetered append must stop before inference");
-    };
-    assert_eq!(rejection.status, 413);
-    assert_action(&ctx, "done");
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
-    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_payload_limit(), Some(64 * 1024 * 1024));
+    assert!(!state.retained_payload_failed);
 }
 
 #[tokio::test]

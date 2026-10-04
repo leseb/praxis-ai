@@ -413,6 +413,25 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Append and rebuild only if the transaction's retained payload fits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an owner mismatch, budget overflow, or backend error.
+    pub async fn create_items_and_sync_messages_bounded(
+        &self,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store
+            .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_rebuild_bytes)
+            .await
+    }
+
     /// Atomically delete an item and rebuild this owner's message cache.
     ///
     /// # Errors

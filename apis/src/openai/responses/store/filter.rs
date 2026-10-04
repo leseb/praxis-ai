@@ -1498,7 +1498,8 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     /// Streaming by default. Non-streaming Responses requests select a
-    /// bounded `StreamBuffer` dynamically in [`Self::on_response`].
+    /// bounded `StreamBuffer` at the response-header boundary, when the
+    /// shared retained-payload charge is available.
     ///
     /// Non-streaming Responses API payloads are bounded by output
     /// token limits (typically under 2 MiB). The 64 MiB ceiling is
@@ -1611,6 +1612,8 @@ impl HttpFilter for ResponseStoreFilter {
             return Ok(FilterAction::Reject(reject_store_error()));
         }
 
+        // The loop publishes shared retained state after request headers. Pick
+        // the finite buffer only now, before core reads the response body.
         if !is_streaming_request(ctx) {
             let budgeted = ctx
                 .extensions
@@ -1641,10 +1644,15 @@ impl HttpFilter for ResponseStoreFilter {
                 None
             };
             let max_bytes = if budgeted && finalized {
-                ctx.extensions
+                let Some(wire_bytes) = ctx
+                    .extensions
                     .get::<ResponsesState>()
                     .and_then(|state| state.buffered_canonical_wire_bytes)
-                    .unwrap_or(MAX_JSON_BODY_BYTES)
+                    .filter(|&wire_bytes| wire_bytes <= MAX_JSON_BODY_BYTES)
+                else {
+                    return Ok(persistence_budget_failure(ctx, false, &mut None));
+                };
+                wire_bytes
             } else if budgeted && !finalized {
                 let Some(state) = ctx.extensions.get::<ResponsesState>() else {
                     return Ok(persistence_budget_failure(ctx, false, &mut None));
@@ -1659,15 +1667,30 @@ impl HttpFilter for ResponseStoreFilter {
             } else {
                 MAX_JSON_BODY_BYTES
             };
+            let max_bytes = admitted_wire_length.map_or(max_bytes, |length| length.min(max_bytes));
+            if max_bytes == 0 {
+                return Ok(persistence_budget_failure(ctx, false, &mut None));
+            }
             if budgeted
-                && !finalized
-                && let BodyMode::StreamBuffer { max_bytes: existing } = &ctx.response_body_mode
-                && existing.is_none_or(|bytes| bytes > max_bytes)
+                && matches!(
+                    ctx.response_body_mode,
+                    BodyMode::StreamBuffer { max_bytes: existing } if existing.is_none_or(|existing| existing > max_bytes)
+                )
+            {
+                return Ok(persistence_budget_failure(ctx, false, &mut None));
+            }
+            if ctx
+                .response_header
+                .as_ref()
+                .and_then(|response| response.headers.get(http::header::CONTENT_LENGTH))
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > max_bytes)
             {
                 return Ok(persistence_budget_failure(ctx, false, &mut None));
             }
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(admitted_wire_length.map_or(max_bytes, |length| length.min(max_bytes))),
+                max_bytes: Some(max_bytes),
             });
         }
 

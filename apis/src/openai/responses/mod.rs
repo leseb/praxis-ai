@@ -86,6 +86,8 @@ pub(crate) struct ObservedResponsesSse;
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
+pub(crate) use agentic_loop::buffered_parsed_json_bytes_upper_bound;
+#[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
