@@ -614,10 +614,12 @@ fn preflight_namespace_expansion(state: &ResponsesState, discovered: &[Value]) -
             continue;
         }
         let (namespace, members) = namespace_header(tool)?;
-        let prefix = "Belongs to the `` tool namespace: "
-            .len()
-            .checked_add(namespace.name.len())
-            .and_then(|bytes| bytes.checked_add(namespace.description.len()));
+        // The outbound wire escapes control characters in the repeated text.
+        // Count that form before building any member description, so a compact
+        // parsed string cannot fan out into a much larger serialized body.
+        let prefix = retained_json_bytes(namespace.name)
+            .and_then(|name_bytes| "Belongs to the `` tool namespace: ".len().checked_add(name_bytes))
+            .and_then(|bytes| bytes.checked_add(retained_json_bytes(namespace.description)?));
         for member in members {
             if source == LoweringSource::Declaration && is_deferred_declaration(member) {
                 continue;
@@ -625,9 +627,9 @@ fn preflight_namespace_expansion(state: &ResponsesState, discovered: &[Value]) -
             // The folded description has three simultaneous owners during the
             // rewrite: the lowered JSON string, serializer output, and staging.
             // Reserve a small entry allowance for the flat name/reverse recipe.
-            let member_description = member.get("description").and_then(Value::as_str).map_or(0, str::len);
+            let member_description = member.get("description").and_then(Value::as_str).unwrap_or_default();
             let per_member = prefix
-                .and_then(|bytes| bytes.checked_add(member_description))
+                .and_then(|bytes| bytes.checked_add(retained_json_bytes(member_description)?))
                 .and_then(|bytes| bytes.checked_add(2 + 512))
                 .and_then(|bytes| bytes.checked_mul(3));
             additional =
