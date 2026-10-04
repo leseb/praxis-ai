@@ -48,7 +48,7 @@ use super::{
     body_limits::reject_rewritten_body_too_large,
     enforce_agentic_stream_guard,
     error::responses_error_rejection,
-    state::{ResponsesState, normalize_input_owned},
+    state::{ResponsesState, normalize_input_owned, retained_json_bytes, retained_json_values_bytes},
 };
 use crate::json_body::SerializedJson;
 
@@ -165,18 +165,16 @@ impl ResponsesProxyFilter {
     fn serialize_selected_body(
         &self,
         body: &Bytes,
+        members: &[TopLevelMember],
         state: &ResponsesState,
         preserve_native_compaction: bool,
+        live_input: Option<Vec<serde_json::Value>>,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let members = scan_top_level_object(body).map_err(|error| -> FilterError {
-            format!("openai_responses_proxy: invalid selected request body: {error}").into()
-        })?;
         let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
             state.messages.get(state.provider_history_len..).unwrap_or_default()
         } else {
             &state.messages
         };
-        let live_input = selected_input_messages(body, &members)?;
         let state_backend_messages = messages_for_backend(
             state_messages,
             preserve_native_compaction,
@@ -393,6 +391,133 @@ fn selected_input_messages(
     Ok(Some(normalize_input_owned(value)))
 }
 
+/// Reserve the parsed input, reconciled history, encoded input, and final
+/// selected-upstream body before constructing any of those owned copies.
+fn selected_rewrite_reservation(body: &[u8], members: &[TopLevelMember], state: &ResponsesState) -> Option<usize> {
+    let input_bytes = members
+        .iter()
+        .rev()
+        .find(|member| member.name == TopLevelField::Input)
+        .map_or(Some(0), |member| {
+            let raw = body.get(member.value_start..member.value_end)?;
+            // Normalization can turn a string into a message object, while
+            // parsed numeric values can serialize longer than their spelling.
+            raw.len().checked_mul(8)?.checked_add(64)
+        })?;
+    let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
+        state.messages.get(state.provider_history_len..).unwrap_or_default()
+    } else {
+        &state.messages
+    };
+    let message_bytes = retained_json_bytes(state_messages)?;
+    let (replacement_fields, repeated_field_wire) = if state.request_body_requires_rebuild() {
+        [
+            ("tools", TopLevelField::Tools),
+            ("tool_choice", TopLevelField::ToolChoice),
+        ]
+        .into_iter()
+        .try_fold((0_usize, 0_usize), |(fields, wire), (key, name)| {
+            let bytes = state.request_body.get(key).map_or(Some(0), retained_json_bytes)?;
+            let repeated = members
+                .iter()
+                .filter(|member| member.name == name)
+                .count()
+                .saturating_sub(1);
+            Some((
+                fields.checked_add(bytes)?,
+                wire.checked_add(bytes.checked_mul(repeated)?.checked_mul(2)?)?,
+            ))
+        })?
+    } else {
+        (0, 0)
+    };
+    let provider_ids = state
+        .provider_compaction_ids
+        .iter()
+        .try_fold(0_usize, |used, id| used.checked_add(id.len()))?;
+    let source_messages = input_bytes.checked_add(message_bytes)?;
+    // The splice preserves duplicate input members and replaces each one.
+    let repeated_inputs = members
+        .iter()
+        .filter(|member| member.name == TopLevelField::Input)
+        .count()
+        .saturating_sub(1);
+    let repeated_input_wire = source_messages
+        .checked_mul(6)?
+        .checked_add(64)?
+        .checked_mul(repeated_inputs)?
+        .checked_mul(2)?;
+    source_messages
+        .checked_mul(8)?
+        .checked_add(body.len().checked_mul(3)?)?
+        .checked_add(replacement_fields.checked_mul(4)?)?
+        .checked_add(repeated_input_wire)?
+        .checked_add(repeated_field_wire)?
+        .checked_add(provider_ids)?
+        .checked_add(512)
+}
+
+/// Local compaction items may grow when decoded summary bytes need JSON escapes.
+fn selected_compaction_expansion(
+    state: &ResponsesState,
+    live_input: Option<&[serde_json::Value]>,
+    preserve_native_compaction: bool,
+) -> Option<usize> {
+    let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
+        state.messages.get(state.provider_history_len..).unwrap_or_default()
+    } else {
+        &state.messages
+    };
+    state_messages
+        .iter()
+        .chain(live_input.into_iter().flatten())
+        .filter(|message| {
+            message.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                && !(preserve_native_compaction
+                    && message
+                        .get(crate::openai::responses::state::LOCAL_COMPACTION_MARKER)
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                    && message
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|id| state.provider_compaction_ids.contains(id)))
+        })
+        .try_fold(0_usize, |used, message| {
+            let encoded_len = message
+                .get("encrypted_content")
+                .and_then(serde_json::Value::as_str)
+                .map_or(0, str::len);
+            used.checked_add(encoded_len.checked_mul(6)?.checked_add(64)?)
+        })?
+        .checked_mul(4)
+}
+
+const REWRITE_BUDGET_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during native request rewrite";
+
+/// Bound the complete buffered rewrite before `serialize_outbound_body` can
+/// allocate its output or translate a compaction summary.
+fn request_rewrite_reservation(state: &ResponsesState) -> Option<usize> {
+    let history = retained_json_values_bytes(&state.messages)?;
+    let request = retained_json_bytes(&state.request_body)?;
+    let history_multiplier = if state
+        .messages
+        .iter()
+        .any(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+    {
+        8
+    } else {
+        4
+    };
+    history
+        .checked_mul(history_multiplier)?
+        // Non-input request fields are serialized into a growing Vec. Allow
+        // room for its old and new buffers during a capacity increase.
+        .checked_add(request.checked_mul(4)?)?
+        .checked_add(512)
+}
+
 /// Append state-owned messages that are not part of the original input.
 fn append_state_messages(
     mut live_input: Vec<serde_json::Value>,
@@ -602,6 +727,12 @@ impl HttpFilter for ResponsesProxyFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if state.retained_payload_limit().is_some()
+            && !request_rewrite_reservation(state).is_some_and(|bytes| state.can_retain_payload(bytes))
+        {
+            return Ok(super::budget_error::reject_request(ctx, REWRITE_BUDGET_MESSAGE));
+        }
+
         let serialized = match self.serialize_body(state, true)? {
             Ok(bytes) => bytes,
             Err(action) => return Ok(action),
@@ -670,7 +801,39 @@ impl HttpFilter for ResponsesProxyFilter {
         let Some(current_body) = body.as_ref() else {
             return Ok(SelectedUpstreamBodyOutcome::Continue);
         };
-        let serialized = match self.serialize_selected_body(current_body, state, preserve_native_compaction)? {
+        let members = scan_top_level_object(current_body).map_err(|error| -> FilterError {
+            format!("openai_responses_proxy: invalid selected request body: {error}").into()
+        })?;
+        let reservation = if state.retained_payload_limit().is_some() {
+            let Some(bytes) = selected_rewrite_reservation(current_body, &members, state)
+                .filter(|bytes| state.can_retain_payload(*bytes))
+            else {
+                return Ok(SelectedUpstreamBodyOutcome::Reject(
+                    super::budget_error::request_rejection(ctx, REWRITE_BUDGET_MESSAGE),
+                ));
+            };
+            Some(bytes)
+        } else {
+            None
+        };
+        let live_input = selected_input_messages(current_body, &members)?;
+        if let Some(bytes) = reservation {
+            let admitted = selected_compaction_expansion(state, live_input.as_deref(), preserve_native_compaction)
+                .and_then(|expansion| bytes.checked_add(expansion))
+                .is_some_and(|total| state.can_retain_payload(total));
+            if !admitted {
+                return Ok(SelectedUpstreamBodyOutcome::Reject(
+                    super::budget_error::request_rejection(ctx, REWRITE_BUDGET_MESSAGE),
+                ));
+            }
+        }
+        let serialized = match self.serialize_selected_body(
+            current_body,
+            &members,
+            state,
+            preserve_native_compaction,
+            live_input,
+        )? {
             Ok(bytes) => bytes,
             Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
             Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
