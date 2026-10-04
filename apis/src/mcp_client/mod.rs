@@ -47,9 +47,9 @@ pub use self::streaming_selector::McpStreamingSelectorFilter;
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
-        MAX_CONTROL_RESPONSE_BYTES, MIN_TOOL_INITIALIZE_BYTES, McpCallout, bind_mcp_outbound_chain,
-        build_bare_outbound_pipeline, streaming_executor_backstop, tool_result_wire_cap, tool_stream_cumulative_cap,
-        transport_signal_error, validate_mcp_target,
+        MAX_CONTROL_RESPONSE_BYTES, MIN_TOOL_INITIALIZE_BYTES, McpCallout, McpResponseLimitKind,
+        bind_mcp_outbound_chain, build_bare_outbound_pipeline, streaming_executor_backstop, tool_result_wire_cap,
+        tool_stream_cumulative_cap, transport_signal_error, validate_mcp_target,
     },
 };
 use crate::StateOwner;
@@ -255,6 +255,9 @@ pub(crate) enum McpClientError {
 
         /// The effective response-size limit that was exceeded.
         limit: usize,
+
+        /// Exchange whose wire ceiling produced the limit.
+        kind: McpResponseLimitKind,
     },
 
     /// MCP server URL is invalid or resolves to a blocked address.

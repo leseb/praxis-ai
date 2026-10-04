@@ -2925,7 +2925,10 @@ fn classify_deadline_maps_size_signal_to_413_else_timeout() {
     let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
     assert!(
         signal
-            .set(subrequest_transport::TransportSignal::ResponseTooLarge { limit: 5 })
+            .set(subrequest_transport::TransportSignal::ResponseTooLarge {
+                limit: 5,
+                kind: McpResponseLimitKind::Control,
+            })
             .is_ok(),
         "signal OnceLock should be empty"
     );

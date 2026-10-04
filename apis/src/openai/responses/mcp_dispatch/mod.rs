@@ -1909,9 +1909,13 @@ enum McpSizeLimitFailure {
     /// Decoded content exceeded the admitted result allowance; retain its
     /// measured size so the configured cap can still own a recoverable error.
     Decoded(usize),
-    /// An MCP exchange exceeded this wire ceiling. Initialization and tool
-    /// result exchanges have different caps, so the cap must be identified.
-    Transport(usize),
+    /// An MCP exchange exceeded this wire ceiling and records its origin.
+    Transport {
+        /// The exceeded byte ceiling.
+        limit: usize,
+        /// Exchange that selected the ceiling.
+        kind: mcp_client::McpResponseLimitKind,
+    },
 }
 
 impl McpCallResult {
@@ -2036,22 +2040,34 @@ fn lowered_exchange_ceiling(limit: usize, admitted: usize, configured: usize) ->
 }
 
 /// Match the transport's POST, GET cumulative, and streaming executor ceilings.
-fn aggregate_transport_ceiling_lowered(limit: usize, admitted_payload: usize, configured_payload: usize) -> bool {
-    let admitted_initialize = admitted_payload.clamp(
-        mcp_client::MIN_TOOL_INITIALIZE_BYTES,
-        mcp_client::MAX_CONTROL_RESPONSE_BYTES,
-    );
-    let configured_initialize = configured_payload.clamp(
-        mcp_client::MIN_TOOL_INITIALIZE_BYTES,
-        mcp_client::MAX_CONTROL_RESPONSE_BYTES,
-    );
-    let admitted_tool_wire = mcp_client::tool_result_wire_cap(admitted_payload);
-    let configured_tool_wire = mcp_client::tool_result_wire_cap(configured_payload);
-    let admitted_get_cumulative = mcp_client::tool_stream_cumulative_cap(admitted_tool_wire);
-    let configured_get_cumulative = mcp_client::tool_stream_cumulative_cap(configured_tool_wire);
-    lowered_exchange_ceiling(limit, admitted_initialize, configured_initialize)
-        || lowered_exchange_ceiling(limit, admitted_tool_wire, configured_tool_wire)
-        || lowered_exchange_ceiling(limit, admitted_get_cumulative, configured_get_cumulative)
+fn aggregate_transport_ceiling_lowered(
+    limit: usize,
+    kind: mcp_client::McpResponseLimitKind,
+    admitted_payload: usize,
+    configured_payload: usize,
+) -> bool {
+    let (admitted, configured) = match kind {
+        mcp_client::McpResponseLimitKind::Initialize => (
+            admitted_payload.clamp(
+                mcp_client::MIN_TOOL_INITIALIZE_BYTES,
+                mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+            ),
+            configured_payload.clamp(
+                mcp_client::MIN_TOOL_INITIALIZE_BYTES,
+                mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+            ),
+        ),
+        mcp_client::McpResponseLimitKind::Tool => (
+            mcp_client::tool_result_wire_cap(admitted_payload),
+            mcp_client::tool_result_wire_cap(configured_payload),
+        ),
+        mcp_client::McpResponseLimitKind::GetStream => (
+            mcp_client::tool_stream_cumulative_cap(mcp_client::tool_result_wire_cap(admitted_payload)),
+            mcp_client::tool_stream_cumulative_cap(mcp_client::tool_result_wire_cap(configured_payload)),
+        ),
+        mcp_client::McpResponseLimitKind::Control => return false,
+    };
+    lowered_exchange_ceiling(limit, admitted, configured)
 }
 
 /// Distinguish a request-wide size failure from a configured per-tool limit.
@@ -2067,8 +2083,8 @@ fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutio
     let configured_payload = result_payload_limit(options.configured_max_result_bytes);
     let exceeded_aggregate_cap = match result.size_limit_exceeded {
         Some(McpSizeLimitFailure::Decoded(actual)) => actual <= configured_payload,
-        Some(McpSizeLimitFailure::Transport(limit)) => {
-            aggregate_transport_ceiling_lowered(limit, admitted_payload, configured_payload)
+        Some(McpSizeLimitFailure::Transport { limit, kind }) => {
+            aggregate_transport_ceiling_lowered(limit, kind, admitted_payload, configured_payload)
         },
         None => false,
     };
@@ -2360,8 +2376,11 @@ fn process_call_result(
         Err(e) => {
             warn!(tool_name, call_id, error = %e, "MCP tool call failed");
             let size_limit_exceeded = match &e {
-                mcp_client::McpClientError::ResponseTooLarge { limit, .. } => {
-                    Some(McpSizeLimitFailure::Transport(*limit))
+                mcp_client::McpClientError::ResponseTooLarge { limit, kind, .. } => {
+                    Some(McpSizeLimitFailure::Transport {
+                        limit: *limit,
+                        kind: *kind,
+                    })
                 },
                 _ => None,
             };
