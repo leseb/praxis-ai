@@ -186,8 +186,10 @@ const RESTORE_FIXED_PEAK_BYTES: usize = 4_096;
 /// Header-phase proof carried to the one buffered body callback.
 #[derive(Clone, Copy)]
 struct ClientToolRestoreAdmission {
-    /// Trusted identity-coded response length and the exact core buffer cap.
-    wire_bytes: usize,
+    /// Exact wire length when a header or finalized digest proves it.
+    exact_wire_bytes: Option<usize>,
+    /// Maximum raw body bytes core may buffer before this filter runs.
+    buffer_cap: usize,
     /// Peak allowance reserved before body buffering and restoration.
     peak_bytes: usize,
     /// Exact finalized body proof when the composed response has no length header.
@@ -504,70 +506,108 @@ impl ClientToolCompatFilter {
     }
 
     /// Admit the raw buffer and all restoration copies before response headers
-    /// commit. A unique identity-coded Content-Length proves a direct response;
-    /// the agentic finalizer's length and digest prove a composed response.
+    /// commit. A unique identity-coded Content-Length or finalizer digest proves
+    /// exact size. Otherwise derive a finite cap from remaining shared budget.
     fn budgeted_restore_admission(&self, ctx: &HttpFilterContext<'_>) -> Option<ClientToolRestoreAdmission> {
         let state = ctx.extensions.get::<ResponsesState>()?;
         let response = ctx.response_header.as_ref()?;
-        if response.headers.contains_key(http::header::TRANSFER_ENCODING)
-            || response.headers.contains_key(http::header::CONTENT_ENCODING)
+        if response.headers.contains_key(http::header::CONTENT_ENCODING)
             || response.headers.contains_key(http::header::CONTENT_RANGE)
         {
             return None;
         }
-        let (wire_bytes, canonical_digest) = if state.buffered_canonical_finalized {
+        let (exact_wire_bytes, canonical_digest) = if state.buffered_canonical_finalized {
             // The finalizer has already serialized this exact body. Check its
             // digest again before restore allocation in the body callback.
             state.buffered_canonical_parsed_bound_bytes?;
             (
-                state.buffered_canonical_wire_bytes?,
+                Some(state.buffered_canonical_wire_bytes?),
                 Some(state.buffered_canonical_body_digest?),
             )
         } else {
             let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
-            let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
-            if lengths.next().is_some() {
+            let length = lengths.next();
+            if lengths.next().is_some()
+                || (length.is_some() && response.headers.contains_key(http::header::TRANSFER_ENCODING))
+            {
                 return None;
             }
+            let wire_bytes = match length {
+                Some(length) => Some(length.to_str().ok()?.parse::<usize>().ok()?),
+                None => None,
+            };
             (wire_bytes, None)
         };
-        if wire_bytes > self.max_rewritten_body_bytes {
-            return None;
-        }
-        match ctx.response_body_mode {
-            BodyMode::Stream => {},
-            BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap <= wire_bytes => {},
-            _ => return None,
-        }
         let echo = state.client_tool_echo.as_ref()?;
         let echo_bytes =
             retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)?;
-        let peak_bytes = wire_bytes
-            .checked_mul(RESTORE_WIRE_PEAK_MULTIPLIER)?
-            .checked_add(echo_bytes.checked_mul(RESTORE_ECHO_PEAK_MULTIPLIER)?)?
+        let limit = state.retained_payload_limit()?;
+        let current = state.retained_payload_bytes_bounded(limit)?;
+        let overhead = echo_bytes
+            .checked_mul(RESTORE_ECHO_PEAK_MULTIPLIER)?
             .checked_add(RESTORE_FIXED_PEAK_BYTES)?;
+        let safe_cap = limit
+            .checked_sub(current)?
+            .checked_sub(overhead)?
+            .checked_div(RESTORE_WIRE_PEAK_MULTIPLIER)?
+            .min(self.max_rewritten_body_bytes);
+        let buffer_cap = exact_wire_bytes.unwrap_or(safe_cap);
+        if buffer_cap == 0 || buffer_cap > safe_cap {
+            return None;
+        }
+        let buffer_cap = match ctx.response_body_mode {
+            BodyMode::Stream => buffer_cap,
+            BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap <= safe_cap && exact_wire_bytes.is_none() => cap,
+            BodyMode::StreamBuffer { max_bytes: Some(cap) } if Some(cap) == exact_wire_bytes => cap,
+            _ => return None,
+        };
+        let peak_bytes = buffer_cap
+            .checked_mul(RESTORE_WIRE_PEAK_MULTIPLIER)?
+            .checked_add(overhead)?;
         state
             .can_retain_payload(peak_bytes)
             .then_some(ClientToolRestoreAdmission {
-                wire_bytes,
+                exact_wire_bytes,
+                buffer_cap,
                 peak_bytes,
                 canonical_digest,
             })
     }
 }
 
-/// A provider error or non-JSON success cannot contain a finite Responses
-/// resource to restore; leave it byte-for-byte under its original status.
+/// A provider error cannot contain a successful Responses resource to restore;
+/// leave it byte-for-byte under its original status. A 200 without a JSON type
+/// may still contain a valid Responses resource and must not bypass restoration.
 fn eligible_restore_response(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.response_header.as_ref().is_some_and(|response| {
-        response.status == http::StatusCode::OK
-            && response
-                .headers
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|header| header.to_str().ok())
-                .and_then(|header| header.split(';').next())
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
-    })
+    ctx.response_header
+        .as_ref()
+        .is_some_and(|response| response.status == http::StatusCode::OK)
+}
+
+/// Reserve the actual body before parsing. The header cap covers raw core
+/// buffering; this rechecks the changing state and the response that reached
+/// this callback, including a body translated by a preceding Chat adapter.
+fn restoration_peak_bytes(state: &ResponsesState, wire_bytes: usize) -> Option<usize> {
+    let echo = state.client_tool_echo.as_ref()?;
+    let echo_bytes = retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)?;
+    wire_bytes
+        .checked_mul(RESTORE_WIRE_PEAK_MULTIPLIER)?
+        .checked_add(echo_bytes.checked_mul(RESTORE_ECHO_PEAK_MULTIPLIER)?)?
+        .checked_add(RESTORE_FIXED_PEAK_BYTES)
+}
+
+/// The body hook runs after core may have committed finite response headers.
+/// Clear all bytes and abort instead of trying to replace JSON with a late SSE
+/// or forwarding a partially restored private tool name.
+fn fail_restore_body_budget(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> FilterError {
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    *body = None;
+    RESTORE_BUDGET_MESSAGE.into()
 }
 
 #[async_trait]
@@ -667,7 +707,7 @@ impl HttpFilter for ClientToolCompatFilter {
         // A prior filter's larger cap is declined above. The core ratchet can
         // now select the admitted cap without overriding another filter's need.
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(admission.wire_bytes),
+            max_bytes: Some(admission.buffer_cap),
         });
         ctx.insert_filter_state(admission);
         Ok(FilterAction::Continue)
@@ -694,17 +734,17 @@ impl HttpFilter for ClientToolCompatFilter {
         if state.retained_payload_limit().is_some() && state.client_tool_echo.is_some() {
             let admitted = ctx.get_filter_state::<ClientToolRestoreAdmission>().copied();
             let fits = admitted.is_some_and(|admission| {
-                bytes.len() == admission.wire_bytes
+                admission
+                    .exact_wire_bytes
+                    .is_none_or(|wire_bytes| bytes.len() == wire_bytes)
                     && admission
                         .canonical_digest
                         .is_none_or(|digest| crate::hash::Sha256::digest(bytes) == digest)
-                    && state.can_retain_payload(admission.peak_bytes)
+                    && restoration_peak_bytes(state, bytes.len())
+                        .is_some_and(|peak| state.can_retain_payload(peak.max(admission.peak_bytes)))
             });
             if !fits {
-                return Ok(FilterAction::Reject(super::budget_error::response_rejection(
-                    ctx,
-                    RESTORE_BUDGET_MESSAGE,
-                )));
+                return Err(fail_restore_body_budget(ctx, body));
             }
         }
         match self.restore_response(state, bytes) {

@@ -15,7 +15,7 @@ use super::{
     reject_incompatible_reasoning, stream::StreamConverter,
 };
 use crate::openai::{
-    responses::state::ResponsesState,
+    responses::state::{ClientToolEcho, ResponsesState},
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
 
@@ -208,6 +208,64 @@ async fn finite_chat_buffer_uses_remaining_aggregate_headroom() {
     assert!(
         cap > 0 && cap < 8_192,
         "the active budget must reduce the prior 64 MiB cap"
+    );
+}
+
+#[tokio::test]
+async fn finite_chat_client_tool_restore_accepts_unframed_composed_headers() {
+    let chat = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let compat = crate::openai::responses::openai_client_tool_compat::ClientToolCompatFilter::from_config(
+        &serde_yaml::Value::Null,
+    )
+    .unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": false
+    }));
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "run_python"})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("512"));
+    context.response_header = Some(response);
+    assert!(matches!(
+        chat.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        !context
+            .response_header
+            .as_ref()
+            .unwrap()
+            .headers
+            .contains_key(http::header::CONTENT_LENGTH)
+    );
+    let chat_cap = match context.response_body_mode {
+        BodyMode::StreamBuffer { max_bytes: Some(cap) } => cap,
+        other => panic!("expected a bounded Chat buffer, got {other:?}"),
+    };
+    context.current_filter_id = Some(1);
+    assert!(matches!(
+        compat.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        context.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(chat_cap)
+        },
+        "compat preserves the adapter's already admitted raw buffer cap",
     );
 }
 

@@ -790,12 +790,16 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
         // Cap the raw buffered owner before parsing creates more owned trees.
+        // A later client-tool restore has no transformed wire length at this
+        // header phase, so leave enough headroom for its conservative peak.
         let finite_cap = ctx.extensions.get::<ResponsesState>().map(|state| {
             state.retained_payload_limit().map(|limit| {
                 state
                     .retained_payload_bytes_bounded(limit)
                     .and_then(|current| limit.checked_sub(current))
-                    .map_or(0, |remaining| remaining / 8)
+                    .map_or(0, |remaining| {
+                        remaining / if state.client_tool_echo.is_some() { 512 } else { 8 }
+                    })
             })
         });
         if finite_cap == Some(Some(0)) {

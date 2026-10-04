@@ -5654,10 +5654,6 @@ async fn budgeted_restore_caps_buffer_to_trusted_length_and_restores_echo() {
     let wire = json!({"object": "response", "output": [], "tools": [], "tool_choice": "auto"}).to_string();
     let response = Box::leak(Box::new(make_response()));
     response.headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-    response.headers.insert(
         http::header::CONTENT_LENGTH,
         http::HeaderValue::from_str(&wire.len().to_string()).unwrap(),
     );
@@ -5685,10 +5681,11 @@ async fn budgeted_restore_caps_buffer_to_trusted_length_and_restores_echo() {
 }
 
 #[tokio::test]
-async fn budgeted_restore_rejects_missing_length_before_buffering() {
+async fn budgeted_restore_accepts_unframed_body_under_bounded_cap() {
     let filter = filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
     }));
@@ -5705,8 +5702,49 @@ async fn budgeted_restore_rejects_missing_length_before_buffering() {
     );
     ctx.response_header = Some(response);
     let action = filter.on_response(&mut ctx).await.unwrap();
-    assert_eq!(reject_parts(&action).0, 502);
-    assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+    assert!(matches!(action, FilterAction::Continue));
+    let BodyMode::StreamBuffer { max_bytes: Some(cap) } = ctx.response_body_mode else {
+        panic!("an unframed provider body needs a finite core cap");
+    };
+    assert!(cap > 0 && cap < 16_384, "the cap reserves restoration copies");
+    let wire = json!({"object": "response", "output": [], "tools": [], "tool_choice": "auto"}).to_string();
+    assert!(wire.len() < cap);
+    let mut body = Some(Bytes::from(wire));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(restored["tools"][0]["name"], "run_python");
+}
+
+#[tokio::test]
+async fn budgeted_restore_aborts_late_body_expansion_without_forwarding() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "run_python"})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(65_536);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(Box::leak(Box::new(make_response())));
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let BodyMode::StreamBuffer { max_bytes: Some(cap) } = ctx.response_body_mode else {
+        panic!("unframed restoration must be capped");
+    };
+    // Core enforces this cap on raw bytes. A preceding translator can replace
+    // that raw body with a larger value before this callback, so check again.
+    let mut body = Some(Bytes::from(vec![b'x'; cap + 1]));
+    assert!(filter.on_response_body(&mut ctx, &mut body, true).is_err());
+    assert!(body.is_none(), "late failure cannot forward private lowered data");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[tokio::test]
