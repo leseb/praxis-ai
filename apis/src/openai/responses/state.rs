@@ -1094,10 +1094,11 @@ impl ResponsesState {
     }
 
     /// Count the owners which may change during a streaming response. The
-    /// stream-local meter adds the cached request/history charge separately.
+    /// stream-local meter adds the cached request/history and prior-round
+    /// output charges separately; `accumulated_output` is fixed until EOS.
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true)?
             .checked_add(self.retained_rehydrate_stream_bytes)
     }
 

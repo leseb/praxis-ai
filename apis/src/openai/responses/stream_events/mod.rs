@@ -149,13 +149,13 @@ pub(super) struct StreamEventsState {
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
     stream_failed: bool,
-    /// Request and history charge cached across ordinary upstream chunks.
-    /// Refreshed at EOS after the loop owner may append the round to history.
+    /// Request, history, and prior-round output charge cached across ordinary
+    /// upstream chunks. Refreshed at EOS after the loop owner may append output.
     shared_stable_bytes: OnceLock<usize>,
 }
 
 impl StreamEventsState {
-    /// The owner can append history between ordinary chunks and EOS.
+    /// The owner can append history and output between ordinary chunks and EOS.
     fn clear_shared_budget_cache(&mut self) {
         self.shared_stable_bytes = OnceLock::new();
     }
@@ -979,7 +979,7 @@ fn stream_payload_fits(ctx: &HttpFilterContext<'_>, state: &StreamEventsState, s
     stream_payload_fits_with_budget(state, staging_bytes, shared_retained_budget(ctx, state))
 }
 
-/// Snapshot the shared retained JSON total once for pre-commit checks.
+/// Snapshot request, history, and prior output once per round for pre-commit checks.
 /// `None` means no aggregate budget is active; the inner `None` signals that
 /// the current retained state already exceeds the limit.
 fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsState) -> Option<(usize, Option<usize>)> {
@@ -988,6 +988,8 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
     let stable = *stream.shared_stable_bytes.get_or_init(|| {
         responses
             .stream_stable_payload_bytes_bounded(limit)
+            .and_then(|bytes| bytes.checked_add(retained_json_values_bytes(&responses.accumulated_output)?))
+            .filter(|bytes| *bytes <= limit)
             .unwrap_or(usize::MAX)
     });
     let current = limit
@@ -2904,8 +2906,19 @@ fn emit_deferred_terminal(
     if let Some(response) = terminal.payload.get_mut("response") {
         restore_snapshot_tools(response, state.client_tool_echo.as_ref());
     }
-    let terminal_bytes = retained_json_bytes(&terminal.payload);
-    let staging = terminal_bytes.and_then(|bytes| output.len().checked_add(bytes));
+    // The restored terminal Value remains live while its normalized SSE frame
+    // is serialized into `output`. Reserve both independently owned payloads,
+    // including normalization growth and the optional final sentinel.
+    let staging = normalized_sse_event_upper_bound(ctx, &terminal.event_type, &terminal.payload)
+        .and_then(|event_bytes| event_bytes.checked_mul(2))
+        .and_then(|bytes| output.len().checked_add(bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(if parser_state.deferred_done {
+                b"data: [DONE]\n\n".len()
+            } else {
+                0
+            })
+        });
     if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
         output.clear();
         record_retained_payload_overflow(ctx, parser_state);

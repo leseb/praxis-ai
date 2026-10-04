@@ -412,19 +412,70 @@ fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
 }
 
 #[test]
+fn deferred_terminal_reserves_restored_payload_and_wire_together() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let tools = vec![json!({"type": "custom", "name": "custom", "description": "x".repeat(10_000)})];
+    let mut state = ResponsesState {
+        request_body: json!({"tools": tools, "stream": true}),
+        tools: tools.clone(),
+        client_tool_echo: Some(ClientToolEcho {
+            tools,
+            tool_choice: json!("auto"),
+        }),
+        response_object: json!({"id": "resp_1", "object": "response", "status": "completed", "output": []}),
+        client_tool_lowering: [(
+            "custom".to_owned(),
+            LoweredClientTool {
+                original_name: "custom".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        )]
+        .into(),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": state.response_object}),
+    };
+    // The parser's published retained charge still contains the deferred
+    // terminal until finalize replaces it, as it does on the live path.
+    state.retained_stream_parser_bytes = terminal.retained_payload_bytes().unwrap();
+    let limit = 131_072;
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.set_retained_external_payload_bytes(limit - baseline - 25_000);
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    let mut wire = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut wire).is_err());
+    assert!(
+        wire.is_empty(),
+        "an unadmitted successful terminal must not reach the client"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
 fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     let (_filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState {
         request_body: json!({"input": "p".repeat(32_768)}),
         input: vec![json!({"text": "history"})],
+        accumulated_output: vec![json!({"type": "mcp_call", "result": "o".repeat(1_048_576)})],
         response_object: json!({"output": []}),
         ..ResponsesState::default()
     };
-    responses.apply_retained_payload_limit(1_000_000);
+    responses.apply_retained_payload_limit(2_000_000);
     ctx.extensions.insert(responses);
     let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
-    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+    let cached = stream.shared_stable_bytes.get().copied().unwrap();
+    assert!(
+        cached > 1_048_576,
+        "the large prior-round output must be in the per-round cache"
+    );
     assert_eq!(
         initial,
         ctx.extensions
@@ -443,7 +494,27 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .retained_payload_bytes()
             .unwrap()
     );
-    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+    for _ in 0..100 {
+        assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(next));
+        assert_eq!(stream.shared_stable_bytes.get().copied(), Some(cached));
+    }
+    // The owner may append output at EOS; the next round must charge it again.
+    stream.clear_shared_budget_cache();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .accumulated_output
+        .push(json!({"type": "message", "content": "next round"}));
+    let after_eos = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    assert_eq!(
+        after_eos,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert!(stream.shared_stable_bytes.get().copied().unwrap() > cached);
 }
 
 #[test]
