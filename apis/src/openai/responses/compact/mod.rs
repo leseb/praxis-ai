@@ -296,34 +296,33 @@ impl CompactFilter {
             return Err(ReactiveCompactionError::RetainedBudget);
         }
         let request = build_summarization_request_from_shape(&request_shape);
-        let (aggregate_response_limit, aggregate_controls_response) =
-            if let Some(limit) = state.retained_payload_limit() {
-                let retained = state
-                    .retained_payload_bytes_bounded(limit)
-                    .ok_or(ReactiveCompactionError::RetainedBudget)?;
-                let available = limit
-                    .checked_sub(retained)
-                    .and_then(|bytes| bytes.checked_sub(conversation_text.len()))
-                    .and_then(|bytes| bytes.checked_sub(system.len()))
-                    .and_then(|bytes| bytes.checked_sub(request_bytes.checked_mul(2)?))
-                    .ok_or(ReactiveCompactionError::RetainedBudget)?;
-                // The core buffered client can hold its Vec, its old capacity
-                // during growth, and the just-read transport chunk at once.
-                let aggregate_read_limit = available / 3;
-                if aggregate_read_limit == 0 {
-                    return Err(ReactiveCompactionError::RetainedBudget);
-                }
-                (
-                    aggregate_read_limit.min(MAX_SUMMARIZATION_RESPONSE_BYTES),
-                    aggregate_read_limit <= MAX_SUMMARIZATION_RESPONSE_BYTES,
-                )
-            } else {
-                (MAX_SUMMARIZATION_RESPONSE_BYTES, false)
-            };
+        let aggregate_response_limit = if let Some(limit) = state.retained_payload_limit() {
+            let retained = state
+                .retained_payload_bytes_bounded(limit)
+                .ok_or(ReactiveCompactionError::RetainedBudget)?;
+            let available = limit
+                .checked_sub(retained)
+                .and_then(|bytes| bytes.checked_sub(conversation_text.len()))
+                .and_then(|bytes| bytes.checked_sub(system.len()))
+                .and_then(|bytes| bytes.checked_sub(request_bytes.checked_mul(2)?))
+                .ok_or(ReactiveCompactionError::RetainedBudget)?;
+            // The core buffered client can hold its Vec, its old capacity
+            // during growth, and the just-read transport chunk at once.
+            let aggregate_read_limit = available / 3;
+            if aggregate_read_limit == 0 {
+                return Err(ReactiveCompactionError::RetainedBudget);
+            }
+            aggregate_read_limit.min(MAX_SUMMARIZATION_RESPONSE_BYTES)
+        } else {
+            MAX_SUMMARIZATION_RESPONSE_BYTES
+        };
         let response_limit = preflight_response_limit
             .unwrap_or(MAX_SUMMARIZATION_RESPONSE_BYTES)
             .min(aggregate_response_limit);
-        let aggregate_controls_response = aggregate_controls_response || preflight_response_limit.is_some();
+        // A hit on the independent 1 MiB summarizer cap still follows the
+        // configured callout failure policy. Only a tighter aggregate cap is
+        // a retained-payload failure.
+        let aggregate_controls_response = response_limit < MAX_SUMMARIZATION_RESPONSE_BYTES;
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
         let result = subrequest::execute_url(
             &self.client,

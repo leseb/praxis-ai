@@ -866,6 +866,57 @@ fn reactive_budget_allows_a_bounded_small_callout() {
 }
 
 #[tokio::test]
+async fn reactive_compaction_normal_response_cap_keeps_fail_open_policy() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "summary callout did not start");
+                    std::thread::park_timeout(Duration::from_millis(5));
+                },
+                Err(error) => panic!("summary stub accept failed: {error}"),
+            }
+        };
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut received = [0_u8; 4096];
+        drop(socket.read(&mut received));
+        let body = vec![b'x'; MAX_SUMMARIZATION_RESPONSE_BYTES + 1];
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        drop(socket.write_all(headers.as_bytes()));
+        drop(socket.write_all(&body));
+    });
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{address}/v1/chat/completions");
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hello"}));
+    state.apply_retained_payload_limit(16 * 1024 * 1024);
+    let params = CompactionParams {
+        compact_threshold: 1000,
+        compaction_model: None,
+    };
+    let preflight = reactive_compaction_response_limit(&state, "hello", &params, &filter.config).unwrap();
+    assert_eq!(preflight, Some(MAX_SUMMARIZATION_RESPONSE_BYTES));
+
+    let result = filter.execute_compaction(&state, &params, "hello", preflight).await;
+
+    server.join().unwrap();
+    assert!(
+        matches!(result, Ok(None)),
+        "ordinary cap failure must skip compaction in open mode"
+    );
+}
+
+#[tokio::test]
 async fn reactive_compaction_aggregate_cap_rejects_oversized_summary_even_fail_open() {
     use std::io::{Read as _, Write as _};
 
