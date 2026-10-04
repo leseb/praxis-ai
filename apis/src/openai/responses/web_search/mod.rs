@@ -995,6 +995,7 @@ fn push_search_turn(
             state.locally_executed_output_items.insert(id.to_owned());
         }
         upsert_output_item(&mut state.accumulated_output, round_start, index, output_item);
+        state.mark_replay_stable_payload_changed();
     }
 }
 

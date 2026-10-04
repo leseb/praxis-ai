@@ -342,6 +342,9 @@ pub(crate) struct ResponsesState {
     /// captured SSE replay rows, and the store decoder's unfinished record).
     /// The loop owner refreshes this before initial admission.
     pub(crate) retained_external_payload_bytes: usize,
+    /// Invalidates the store replay cache after in-place request, history, or
+    /// output changes that do not alter collection lengths. Overflow fails closed.
+    pub(crate) replay_stable_payload_revision: Option<u64>,
 
     /// Parser buffers published by `openai_stream_events`. Its filter-local
     /// slot is invisible to other filters, so the request-wide meter owns this
@@ -920,6 +923,7 @@ impl Default for ResponsesState {
         Self {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
+            replay_stable_payload_revision: Some(0),
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_payload_failed: false,
@@ -1060,7 +1064,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, false)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, false, false)?
             .checked_add(stream_bytes)
     }
 
@@ -1089,8 +1093,19 @@ impl ResponsesState {
     /// stream-local meter adds the cached request/history charge separately.
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, false)?
             .checked_add(self.retained_rehydrate_stream_bytes)
+    }
+
+    /// Count changing owners while a response filter caches request, history,
+    /// and prior output. Include the stream parsers' published charges.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true)?
+            .checked_add(stream_bytes)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1101,7 +1116,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1115,6 +1130,7 @@ impl ResponsesState {
         max_bytes: usize,
         include_external: bool,
         skip_stream_stable: bool,
+        skip_accumulated_output: bool,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
@@ -1144,12 +1160,10 @@ impl ResponsesState {
         ] {
             meter.json(value)?;
         }
-        for values in [
-            &self.accumulated_output,
-            &self.tool_calls,
-            &self.tool_search_calls,
-            &self.web_search_calls,
-        ] {
+        if !skip_accumulated_output {
+            meter.json_values(&self.accumulated_output)?;
+        }
+        for values in [&self.tool_calls, &self.tool_search_calls, &self.web_search_calls] {
             meter.json_values(values)?;
         }
         for value in [
@@ -1406,6 +1420,14 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+        self.mark_replay_stable_payload_changed();
+    }
+
+    /// Invalidate the store replay cache after an in-place stable-owner edit.
+    pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
+        self.replay_stable_payload_revision = self
+            .replay_stable_payload_revision
+            .and_then(|revision| revision.checked_add(1));
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
