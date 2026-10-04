@@ -317,6 +317,60 @@ fn streaming_guard_ignores_requests_without_rich_client_tools() {
 // -----------------------------------------------------------------------------
 
 #[test]
+fn namespace_description_fanout_is_rejected_before_lowering_allocates_copies() {
+    let members = (0..32)
+        .map(|index| json!({"type": "function", "name": format!("member_{index}"), "parameters": {"type": "object"}}))
+        .collect::<Vec<_>>();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "namespace", "name": "large", "description": "x".repeat(4096), "tools": members}],
+    }));
+    state.apply_retained_payload_limit(64 * 1024);
+    assert!(state.can_retain_payload(0), "the original request fits");
+
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("the repeated description exceeds the shared budget");
+    assert_eq!(reject_parts(&action).0, 413);
+    assert_eq!(state.request_body["tools"][0]["type"], "namespace");
+    assert!(state.client_tool_lowering.is_empty(), "no lowered state was committed");
+}
+
+#[test]
+fn namespace_description_escape_fanout_is_rejected_before_serialization() {
+    let members = (0..48)
+        .map(|index| json!({"type": "function", "name": format!("member_{index}"), "parameters": {"type": "object"}}))
+        .collect::<Vec<_>>();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "namespace", "name": "escaped", "description": "\0".repeat(4096), "tools": members}],
+    }));
+    state.apply_retained_payload_limit(1024 * 1024);
+    assert!(state.can_retain_payload(0), "the compact original request fits");
+
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("JSON escaping the repeated description exceeds the shared budget");
+    assert_eq!(reject_parts(&action).0, 413);
+    assert_eq!(state.request_body["tools"][0]["type"], "namespace");
+}
+
+#[test]
+fn discovered_namespace_description_fanout_is_preflighted() {
+    let members = (0..32)
+        .map(|index| json!({"type": "function", "name": format!("member_{index}"), "parameters": {"type": "object"}}))
+        .collect::<Vec<_>>();
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi"}));
+    state.apply_retained_payload_limit(64 * 1024);
+    let discovered = [json!({"type": "namespace", "name": "large", "description": "x".repeat(4096), "tools": members})];
+    let action = preflight_namespace_expansion(&state, &discovered)
+        .expect_err("discovered descriptions are repeated during lowering too");
+    assert_eq!(reject_parts(&action).0, 413);
+}
+
+#[test]
 fn lowers_namespace_members_to_flat_functions() {
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{
