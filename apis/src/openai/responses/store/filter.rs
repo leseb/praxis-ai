@@ -1053,6 +1053,17 @@ fn finalized_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<us
         .then_some(response_upper_bytes)
 }
 
+/// Return the unique identity-coded Content-Length used for direct finite
+/// admission. A buffering filter may select this exact cap before Store runs.
+pub(crate) fn trusted_identity_content_length(headers: &http::HeaderMap) -> Option<usize> {
+    if headers.contains_key(http::header::TRANSFER_ENCODING) || headers.contains_key(http::header::CONTENT_ENCODING) {
+        return None;
+    }
+    let mut lengths = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
+    (lengths.next().is_none() && wire_bytes > 0 && wire_bytes <= MAX_JSON_BODY_BYTES).then_some(wire_bytes)
+}
+
 /// Admit direct finite persistence before headers commit using trusted framing.
 /// Rehydrate removes `Content-Length` only after handing its verified length to
 /// this hook. Twelve times the wire length bounds normalized JSON numbers.
@@ -1068,22 +1079,22 @@ fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usi
         return None;
     }
     let (wire_bytes, previous_id_bytes) = match &ctx.response_body_mode {
-        BodyMode::Stream => {
-            let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
-            let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
-            if lengths.next().is_some() {
-                return None;
-            }
-            (wire_bytes, None)
-        },
+        BodyMode::Stream => (trusted_identity_content_length(&response.headers)?, None),
         BodyMode::StreamBuffer {
             max_bytes: Some(max_bytes),
         } => {
-            let framing = ctx.extensions.get::<DirectFiniteRestoreFraming>()?;
-            if response.headers.contains_key(http::header::CONTENT_LENGTH) || *max_bytes != framing.wire_bytes {
-                return None;
+            if let Some(framing) = ctx.extensions.get::<DirectFiniteRestoreFraming>() {
+                if response.headers.contains_key(http::header::CONTENT_LENGTH) || *max_bytes != framing.wire_bytes {
+                    return None;
+                }
+                (framing.wire_bytes, Some(framing.previous_id_bytes))
+            } else {
+                let wire_bytes = trusted_identity_content_length(&response.headers)?;
+                if *max_bytes != wire_bytes {
+                    return None;
+                }
+                (wire_bytes, None)
             }
-            (framing.wire_bytes, Some(framing.previous_id_bytes))
         },
         _ => return None,
     };

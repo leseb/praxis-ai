@@ -33,7 +33,7 @@ use crate::{
             AgenticBudgetPolicy, bound_body_outcome, buffered_parsed_json_bytes_upper_bound,
             error::responses_error_rejection,
             state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
-            store::PersistedResponseForConversation,
+            store::{PersistedResponseForConversation, trusted_identity_content_length},
         },
     },
     operation::Transport,
@@ -560,19 +560,11 @@ impl HttpFilter for OpenaiConversationsFilter {
                     .get::<ResponsesState>()
                     .is_some_and(|state| state.retained_payload_limit().is_some())
                 {
-                    let Some(max_bytes) = buffered_response_headroom(ctx) else {
+                    let Some(max_bytes) = buffered_response_headroom(ctx)
+                        .and_then(|headroom| finite_conversation_buffer_cap(ctx, headroom))
+                    else {
                         return Ok(conversation_budget_failure(ctx, false, &mut None));
                     };
-                    let known_length_exceeds = ctx
-                        .response_header
-                        .as_ref()
-                        .and_then(|response| response.headers.get(http::header::CONTENT_LENGTH))
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .is_some_and(|length| length > max_bytes);
-                    if max_bytes == 0 || existing_response_buffer_exceeds(ctx, max_bytes) || known_length_exceeds {
-                        return Ok(conversation_budget_failure(ctx, false, &mut None));
-                    }
                     ctx.set_response_body_mode(BodyMode::StreamBuffer {
                         max_bytes: Some(max_bytes),
                     });
@@ -721,12 +713,51 @@ fn buffered_response_headroom(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     limit.checked_sub(current).map(|bytes| bytes.min(MAX_JSON_BODY_BYTES))
 }
 
-/// Core only ratchets a response buffer upward, so a prior larger buffer
-/// cannot be narrowed to the remaining aggregate headroom here.
-fn existing_response_buffer_exceeds(ctx: &HttpFilterContext<'_>, cap: usize) -> bool {
+/// Choose the finite transport cap before Store runs. The loop's finalizer
+/// publishes an exact wire length and digest; a direct response may instead
+/// use one trusted identity-coded Content-Length. Preserve any prior narrower
+/// buffer when no exact length is known because core only ratchets caps upward.
+fn finite_conversation_buffer_cap(ctx: &HttpFilterContext<'_>, headroom: usize) -> Option<usize> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let exact = if state.buffered_canonical_finalized {
+        state.buffered_canonical_body_digest?;
+        Some(state.buffered_canonical_wire_bytes?)
+    } else if ctx.extensions.get::<praxis_filter::IterationState>().is_none() {
+        ctx.response_header
+            .as_ref()
+            .and_then(|response| trusted_identity_content_length(&response.headers))
+    } else {
+        None
+    };
+    let cap = exact.unwrap_or(headroom);
+    if cap == 0 || cap > headroom {
+        return None;
+    }
+    if ctx
+        .response_header
+        .as_ref()
+        .and_then(|response| response.headers.get(http::header::CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > cap)
+    {
+        return None;
+    }
+    compatible_finite_buffer_cap(ctx, cap, exact.is_some())
+}
+
+/// Core only ratchets a response buffer upward. An exact wire admission must
+/// match an earlier buffer; a headroom cap may retain an earlier narrower one.
+fn compatible_finite_buffer_cap(ctx: &HttpFilterContext<'_>, cap: usize, exact: bool) -> Option<usize> {
     match &ctx.response_body_mode {
-        BodyMode::StreamBuffer { max_bytes } => max_bytes.is_none_or(|existing| existing > cap),
-        _ => false,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(existing),
+        } if *existing > cap || (exact && *existing != cap) => None,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(existing),
+        } => Some(*existing),
+        BodyMode::StreamBuffer { max_bytes: None } => None,
+        _ => Some(cap),
     }
 }
 

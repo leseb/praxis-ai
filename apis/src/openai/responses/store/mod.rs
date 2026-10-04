@@ -15,6 +15,8 @@ mod filter;
 #[cfg(feature = "openai-conversations")]
 pub(crate) use self::filter::PersistedResponseForConversation;
 pub use self::filter::ResponseStoreFilter;
+#[cfg(feature = "openai-conversations")]
+pub(crate) use self::filter::trusted_identity_content_length;
 pub(crate) use self::filter::{
     discard_retained_request_payload, mark_retained_request_payload_charged, retained_request_payload_bytes,
 };
