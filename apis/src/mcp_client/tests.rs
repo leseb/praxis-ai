@@ -2770,7 +2770,10 @@ async fn budgeted_background_delete_charges_its_buffered_response_while_in_fligh
     let session = checkout.session.expect("warm session must be reusable");
     let peer_bytes =
         crate::openai::responses::state::retained_json_bytes(session.service().peer_info().unwrap().as_ref()).unwrap();
-    let expected = peer_bytes + tool_stream_retained_reserve(256, 1_024).unwrap() + 2 * 1_024;
+    let expected = peer_bytes
+        + tool_stream_retained_reserve(256, 1_024).unwrap()
+        + tool_delete_retained_reserve(1_024).unwrap()
+        + tool_control_retained_reserve(1_024).unwrap();
     pool.close_sessions_in_background(vec![session]);
     tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
         .await
