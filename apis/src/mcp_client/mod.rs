@@ -660,7 +660,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     //    an idle GET-stream failure cannot poison this call.
     if let Some((pool, key)) = pool {
         let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit, budgeted);
-        session_pool::close_sessions_in_background(checkout.rejected);
+        pool.close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
             let signal = session.begin_call();
             let outcome = tokio::time::timeout_at(
@@ -672,7 +672,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             return match outcome {
                 Ok(Ok(result)) => {
                     let rejected = pool.checkin(key.clone(), session);
-                    session_pool::close_sessions_in_background(rejected);
+                    pool.close_sessions_in_background(rejected);
                     Ok(result)
                 },
                 // A reused session's failure is evicted, never retried: rmcp already transparently reinitializes a 404
@@ -728,7 +728,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             match (pool, session.take()) {
                 (Some((pool, key)), Some(session)) => {
                     let rejected = pool.checkin(key.clone(), session);
-                    session_pool::close_sessions_in_background(rejected);
+                    pool.close_sessions_in_background(rejected);
                 },
                 (None, Some(session)) => session.close_before(deadline).await,
                 (_, None) => {},

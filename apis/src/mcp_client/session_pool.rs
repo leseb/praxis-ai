@@ -25,7 +25,7 @@ use std::{
     collections::HashMap,
     num::NonZeroUsize,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -152,6 +152,13 @@ impl PooledSession {
     /// The running rmcp client service used for issuing a tool request.
     pub(crate) fn service(&self) -> &RunningService<RoleClient, ()> {
         &self.service
+    }
+
+    /// Peer metadata and the possible GET parser remain owned while this
+    /// session is parked or awaiting its background DELETE.
+    fn retained_payload_bytes(&self) -> Option<usize> {
+        let info = self.service.peer_info()?;
+        retained_json_bytes(info.as_ref())?.checked_add(self.stream_retained_reserve?.get())
     }
 
     #[cfg(test)]
@@ -282,6 +289,16 @@ pub(crate) struct McpSessionPool {
 struct PoolInner {
     /// Idle sessions grouped by opaque dispatcher + target identity.
     sessions: Mutex<HashMap<McpPoolKey, Vec<PooledSession>>>,
+    /// Weak charges for sessions moved to bounded background closure. The
+    /// close task owns the strong charge until its rmcp service is dropped.
+    closing: Mutex<Vec<Weak<ClosingCharge>>>,
+}
+
+/// Snapshot of independently owned metadata retained by a closing session.
+/// `None` keeps aggregate admission fail-closed if a size cannot be measured.
+struct ClosingCharge {
+    /// Snapshot of the session's bounded live payload, or unknown on overflow.
+    bytes: Option<usize>,
 }
 
 impl Drop for PoolInner {
@@ -312,6 +329,7 @@ impl McpSessionPool {
         Self {
             inner: Arc::new(PoolInner {
                 sessions: Mutex::new(HashMap::new()),
+                closing: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -321,13 +339,21 @@ impl McpSessionPool {
     /// rmcp keeps initialize `instructions` and `_meta` in `peer_info`; read the
     /// live value so a transparent reinitialization cannot leave a stale charge.
     pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
-        self.lock().iter().try_fold(0_usize, |used, (key, sessions)| {
+        let parked = self.lock().iter().try_fold(0_usize, |used, (key, sessions)| {
             let used = used.checked_add(key.target_fingerprint.len())?;
             sessions.iter().try_fold(used, |used, session| {
-                let info = session.service.peer_info()?;
-                used.checked_add(retained_json_bytes(info.as_ref())?)?
-                    .checked_add(session.stream_retained_reserve?.get())
+                used.checked_add(session.retained_payload_bytes()?)
             })
+        })?;
+        let mut closing = self
+            .inner
+            .closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        closing.retain(|charge| charge.strong_count() > 0);
+        closing.iter().try_fold(parked, |used, weak| {
+            weak.upgrade()
+                .map_or(Some(used), |charge| used.checked_add(charge.bytes?))
         })
     }
 
@@ -421,7 +447,39 @@ impl McpSessionPool {
 
     /// Remove every idle session and schedule bounded graceful closure.
     pub(crate) fn drain_in_background(&self) {
-        close_sessions_in_background(self.take_all());
+        self.close_sessions_in_background(self.take_all());
+    }
+
+    /// Keep rejected sessions charged until their bounded DELETE completes.
+    pub(crate) fn close_sessions_in_background(&self, sessions: Vec<PooledSession>) {
+        if sessions.is_empty() {
+            return;
+        }
+        let tracked: Vec<_> = sessions
+            .into_iter()
+            .map(|session| {
+                let charge = Arc::new(ClosingCharge {
+                    bytes: session.retained_payload_bytes(),
+                });
+                (session, charge)
+            })
+            .collect();
+        {
+            let mut closing = self
+                .inner
+                .closing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            closing.retain(|entry| entry.strong_count() > 0);
+            closing.extend(tracked.iter().map(|(_, charge)| Arc::downgrade(charge)));
+        }
+        drop(tokio::spawn(async move {
+            join_all(tracked.into_iter().map(|(session, charge)| async move {
+                session.close().await;
+                drop(charge);
+            }))
+            .await;
+        }));
     }
 
     #[cfg(test)]
@@ -462,18 +520,6 @@ impl McpSessionPool {
 /// Explicitly close rejected sessions concurrently.
 pub(crate) async fn close_sessions(sessions: Vec<PooledSession>) {
     join_all(sessions.into_iter().map(PooledSession::close)).await;
-}
-
-/// Explicitly close rejected sessions in the background.
-///
-/// Rejected idle sessions have not received the current tool call, so their
-/// best-effort DELETE must not consume that call's delivery deadline. Each
-/// close remains bounded by [`MAX_CLOSE_WAIT`].
-pub(crate) fn close_sessions_in_background(sessions: Vec<PooledSession>) {
-    if sessions.is_empty() {
-        return;
-    }
-    drop(tokio::spawn(close_sessions(sessions)));
 }
 
 // -----------------------------------------------------------------------------

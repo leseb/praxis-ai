@@ -1362,6 +1362,53 @@ async fn start_method_recording_mcp_server() -> (String, tokio_util::sync::Cance
     (format!("http://{addr}/mcp"), ct, methods)
 }
 
+/// Hold a session DELETE in flight so its closing rmcp service remains live.
+async fn start_delayed_delete_mcp_server() -> (
+    String,
+    tokio_util::sync::CancellationToken,
+    StdArc<tokio::sync::Notify>,
+    StdArc<tokio::sync::Notify>,
+) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let service = StreamableHttpService::new(
+        || Ok(TestMcpServer::new()),
+        StdArc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_sse_keep_alive(None)
+            .with_cancellation_token(ct.child_token()),
+    );
+    let delete_started = StdArc::new(tokio::sync::Notify::new());
+    let delete_release = StdArc::new(tokio::sync::Notify::new());
+    let started = StdArc::clone(&delete_started);
+    let release = StdArc::clone(&delete_release);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let started = StdArc::clone(&started);
+                let release = StdArc::clone(&release);
+                async move {
+                    if request.method() == http::Method::DELETE {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, delete_started, delete_release)
+}
+
 /// A stateful server leaves a partial standalone GET event in rmcp's parser
 /// after the successful tool call has returned its session to the pool.
 async fn start_partial_get_mcp_server() -> (String, tokio_util::sync::CancellationToken, StdArc<tokio::sync::Notify>) {
@@ -2637,6 +2684,41 @@ async fn budgeted_checkout_rejects_unbudgeted_get_stream_session() {
     );
     assert_eq!(checkout.rejected.len(), 1);
     close_sessions(checkout.rejected).await;
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn background_closing_session_remains_charged_until_delete_finishes() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "closing-owner".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let session = open_pooled_session_with_budget(&url, &callout, true).await;
+    let parked_bytes = pool.retained_payload_bytes().unwrap();
+    assert_eq!(parked_bytes, 0);
+    assert!(pool.checkin(key.clone(), session).is_empty());
+    let parked_bytes = pool.retained_payload_bytes().unwrap();
+    assert!(parked_bytes > "closing-owner".len());
+
+    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, false);
+    assert!(checkout.session.is_none());
+    assert_eq!(checkout.rejected.len(), 1);
+    pool.close_sessions_in_background(checkout.rejected);
+    tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+        .await
+        .expect("background DELETE must start");
+    assert!(
+        pool.retained_payload_bytes().unwrap() >= parked_bytes - "closing-owner".len(),
+        "closing peer info and GET stream remain live until DELETE completes"
+    );
+    delete_release.notify_one();
+    tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+        while pool.retained_payload_bytes() != Some(0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("closing charge must clear after DELETE completes");
     ct.cancel();
 }
 
