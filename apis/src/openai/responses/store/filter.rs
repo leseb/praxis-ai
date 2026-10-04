@@ -781,7 +781,7 @@ struct StoreStableCache {
     revision: u64,
     /// Lengths of every cached collection. Dispatch may append after synthesis
     /// has already advanced the iteration.
-    collection_lengths: [usize; 10],
+    collection_lengths: [usize; 11],
     /// Serialized payload charge of cached request, history, output, and tools.
     bytes: usize,
 }
@@ -805,7 +805,7 @@ impl StoreStableCache {
     }
 
     /// Lengths of the collections covered by the stable charge.
-    fn collection_lengths(state: &ResponsesState) -> [usize; 10] {
+    fn collection_lengths(state: &ResponsesState) -> [usize; 11] {
         [
             state.input.len(),
             state.messages.len(),
@@ -815,6 +815,7 @@ impl StoreStableCache {
             state.provider_compaction_ids.len(),
             state.accumulated_output.len(),
             state.mcp_tool_map.len(),
+            state.deferred_mcp.len(),
             usize::from(state.client_tool_echo.is_some()),
             state.client_tool_echo.as_ref().map_or(0, |echo| echo.tools.len()),
         ]
@@ -3086,7 +3087,7 @@ mod encode_replay_event_tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "checks shape and revision invalidation for both fixed tool owners"
+        reason = "checks shape and revision invalidation for fixed tool owners"
     )]
     fn replay_meter_invalidates_changed_tool_snapshots() {
         let mut state = ResponsesState::default();
@@ -3123,6 +3124,38 @@ mod encode_replay_event_tests {
             !cache.matches(&state),
             "a same-shape schema rewrite changes the revision"
         );
+
+        let expanded = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, expanded).unwrap();
+        state
+            .deferred_mcp
+            .push(crate::openai::responses::state::DeferredMcpConnector {
+                authorization: None,
+                allowed_tools: None,
+                connector_id: "connector".to_owned(),
+                headers: Some(json!({"X-Header": "small"})),
+                max_rewritten_body_bytes: 67_108_864,
+                max_tools: 128,
+                require_approval: None,
+                server_label: "server".to_owned(),
+                server_url: "https://example.com/mcp".to_owned(),
+                timeout: std::time::Duration::from_secs(5),
+            });
+        assert!(
+            !cache.matches(&state),
+            "a newly deferred connector changes the cached shape"
+        );
+
+        let expanded = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let cache = super::StoreStableCache::new(&state, expanded).unwrap();
+        state.deferred_mcp.get_mut(0).unwrap().headers = Some(json!({"X-Header": "x".repeat(4_096)}));
+        state.mark_replay_stable_payload_changed();
+        assert_eq!(state.deferred_mcp.len(), 1);
+        assert!(
+            !cache.matches(&state),
+            "a same-length descriptor rewrite changes the revision"
+        );
+        assert!(state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap() > expanded);
     }
 
     #[test]

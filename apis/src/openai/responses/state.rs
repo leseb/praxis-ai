@@ -1183,7 +1183,43 @@ impl ResponsesState {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
         }
+        self.meter_deferred_mcp(&mut meter)?;
         Some(meter.used())
+    }
+
+    /// Charge deferred connector descriptors and their fixed security slots.
+    /// Discovery changes these only between upstream rounds; stream owners
+    /// cache this charge until the next round or stable-payload revision.
+    fn meter_deferred_mcp(&self, meter: &mut PayloadMeter) -> Option<()> {
+        for connector in &self.deferred_mcp {
+            meter.raw(connector.connector_id.len())?;
+            meter.raw(connector.server_label.len())?;
+            meter.raw(connector.server_url.len())?;
+            if let Some(authorization) = &connector.authorization {
+                meter.raw(authorization.len())?;
+            }
+            for value in [
+                connector.allowed_tools.as_ref(),
+                connector.headers.as_ref(),
+                connector.require_approval.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                meter.json(value)?;
+            }
+        }
+        #[cfg(feature = "openai-mcp-tools")]
+        for slot in [
+            self.mcp_connector_context_policy.credential_slot.as_ref(),
+            self.mcp_connector_context_policy.authorization_slot.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.raw(slot.len())?;
+        }
+        Some(())
     }
 
     /// Count the owners which may change during a streaming response. The
@@ -1372,35 +1408,8 @@ impl ResponsesState {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
         }
-        for connector in &self.deferred_mcp {
-            meter.raw(connector.connector_id.len())?;
-            meter.raw(connector.server_label.len())?;
-            meter.raw(connector.server_url.len())?;
-            if let Some(authorization) = &connector.authorization {
-                meter.raw(authorization.len())?;
-            }
-            for value in [
-                connector.allowed_tools.as_ref(),
-                connector.headers.as_ref(),
-                connector.require_approval.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                meter.json(value)?;
-            }
-        }
-        #[cfg(feature = "openai-mcp-tools")]
-        {
-            for slot in [
-                self.mcp_connector_context_policy.credential_slot.as_ref(),
-                self.mcp_connector_context_policy.authorization_slot.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                meter.raw(slot.len())?;
-            }
+        if !skip_stream_fixed_tools {
+            self.meter_deferred_mcp(&mut meter)?;
         }
         for (key, value) in &self.citation_files {
             meter.raw(key.len())?;
@@ -1511,6 +1520,10 @@ impl ResponsesState {
         self.logical_stream_response_id = None;
         self.input.clear();
         self.deferred_mcp.clear();
+        #[cfg(feature = "openai-mcp-tools")]
+        {
+            self.mcp_connector_context_policy = McpConnectorContextPolicy::default();
+        }
         self.mcp_tool_map.clear();
         self.client_tool_lowering.clear();
         self.client_tool_echo = None;
@@ -1524,6 +1537,7 @@ impl ResponsesState {
         self.original_tool_choice = None;
         self.response_id = None;
         self.request_body = serde_json::json!({ "stream": streaming });
+        self.mark_replay_stable_payload_changed();
         self.replace_response_object(serde_json::Value::Null);
         self.buffered_canonical_finalized = false;
         self.buffered_canonical_wire_bytes = None;
@@ -2174,6 +2188,18 @@ mod tests {
             tools: vec![json!({"type": "function", "name": "t", "description": "e".repeat(4_096)})],
             tool_choice: json!("auto"),
         });
+        state.deferred_mcp.push(DeferredMcpConnector {
+            authorization: Some("Bearer secret".to_owned()),
+            allowed_tools: Some(json!(["lookup"])),
+            connector_id: "connector".to_owned(),
+            headers: Some(json!({"X-Header": "h".repeat(4_096)})),
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: Some(json!("never")),
+            server_label: "server".to_owned(),
+            server_url: "https://example.com/mcp".to_owned(),
+            timeout: Duration::from_secs(5),
+        });
         state.response_object = json!({"output": [{"text": "changing"}]});
 
         let total = state.retained_payload_bytes().unwrap();
@@ -2199,6 +2225,47 @@ mod tests {
             stable + state.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
             total,
             "StreamEvents charges each fixed tool snapshot once"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compares 2,000 stream measurements for small and large descriptors"
+    )]
+    fn deferred_connector_charge_is_stable_across_stream_deltas() {
+        fn measure(header_bytes: usize) -> Duration {
+            let mut state = ResponsesState::from_request_body(json!({"input": "hello", "stream": true}));
+            state.deferred_mcp.push(DeferredMcpConnector {
+                authorization: None,
+                allowed_tools: None,
+                connector_id: "connector".to_owned(),
+                headers: Some(json!({"X-Header": "x".repeat(header_bytes)})),
+                max_rewritten_body_bytes: 67_108_864,
+                max_tools: 128,
+                require_approval: None,
+                server_label: "server".to_owned(),
+                server_url: "https://example.com/mcp".to_owned(),
+                timeout: Duration::from_secs(5),
+            });
+            let stable = state.stream_stable_payload_bytes_bounded(64 << 20).unwrap();
+            let changing_limit = (64 << 20) - stable;
+            let started = std::time::Instant::now();
+            for _ in 0..2_000 {
+                std::hint::black_box(
+                    state
+                        .stream_changing_payload_bytes_bounded_with_cached_output(changing_limit)
+                        .unwrap(),
+                );
+            }
+            started.elapsed()
+        }
+
+        let small = measure(1_024);
+        let large = measure(1 << 20);
+        assert!(
+            large <= small.saturating_mul(20) + Duration::from_millis(100),
+            "unchanged 1 MiB deferred headers must not be serialized for every delta: small={small:?}, large={large:?}"
         );
     }
 

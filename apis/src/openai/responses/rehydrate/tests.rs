@@ -2308,6 +2308,53 @@ fn streaming_restore_cache_remeasures_same_length_prior_output_replacement() {
 }
 
 #[test]
+fn streaming_restore_cache_remeasures_same_length_deferred_connector_replacement() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi", "previous_response_id": "resp_prev"}));
+    state
+        .deferred_mcp
+        .push(crate::openai::responses::state::DeferredMcpConnector {
+            authorization: None,
+            allowed_tools: None,
+            connector_id: "connector".to_owned(),
+            headers: Some(json!({"X-Header": "small"})),
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: None,
+            server_label: "server".to_owned(),
+            server_url: "https://example.com/mcp".to_owned(),
+            timeout: std::time::Duration::from_secs(5),
+        });
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 128);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert_eq!(
+        streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current,
+        baseline
+    );
+
+    state.deferred_mcp.get_mut(0).unwrap().headers = Some(json!({"X-Header": "x".repeat(4_096)}));
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(state.deferred_mcp.len(), 1);
+    assert!(
+        streaming_restore_budget(&mut armed, Some(&state)).is_err(),
+        "same-length descriptor replacement must invalidate the cached charge"
+    );
+
+    state.deferred_mcp.get_mut(0).unwrap().headers = Some(json!({"X-Header": "small"}));
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(
+        streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current,
+        baseline
+    );
+}
+
+#[test]
 fn streaming_restore_budget_reuses_large_prior_output_across_small_callbacks() {
     fn measure(prior_output_bytes: usize) -> std::time::Duration {
         let mut state = ResponsesState::from_request_body(json!({"input": "hi", "previous_response_id": "resp_prev"}));
