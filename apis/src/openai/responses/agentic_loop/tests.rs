@@ -3647,7 +3647,7 @@ fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
 
 #[test]
 fn buffered_numeric_projection_counts_normalization_only_outside_strings() {
-    let ordinary = br#"{"quoted":"1e15","escaped":"\\\"1e15","numbers":[1,2,3,1.0]}"#;
+    let ordinary = br#"{"quoted":"1e15","escaped":"\\\"1e15","numbers":[1,2,3]}"#;
     assert_eq!(
         super::buffered_parsed_json_bytes_upper_bound(ordinary),
         Some(ordinary.len())
@@ -3664,6 +3664,19 @@ fn buffered_numeric_projection_counts_normalization_only_outside_strings() {
     assert!(
         bound > scientific.len(),
         "scientific notation expands in the parsed owner"
+    );
+}
+
+#[test]
+fn buffered_numeric_projection_covers_plain_decimal_float_expansion() {
+    let wire = format!(r#"{{"numbers":[{}]}}"#, vec!["12345678901234567.0"; 1_000].join(","));
+    let parsed: Value = serde_json::from_str(&wire).unwrap();
+    let normalized = serde_json::to_vec(&parsed).unwrap();
+    let bound = super::buffered_parsed_json_bytes_upper_bound(wire.as_bytes()).unwrap();
+    assert!(normalized.len() > wire.len());
+    assert!(
+        bound >= normalized.len(),
+        "decimal float normalization must fit the pre-parse reservation"
     );
 }
 
