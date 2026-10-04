@@ -2131,7 +2131,7 @@ async fn oversized_tool_initialize_is_rejected_before_tool_call() {
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "large-initialize".to_owned()).unwrap();
     let result = call_tool_with_forwarded_headers_bounded_initialize(
-        Some((&pool, &key)),
+        Some((&pool, Some(&key))),
         &url,
         None,
         None,
@@ -2166,7 +2166,7 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "small-initialize".to_owned()).unwrap();
     let result = call_tool_with_forwarded_headers_bounded_initialize(
-        Some((&pool, &key)),
+        Some((&pool, Some(&key))),
         &url,
         None,
         None,
@@ -2195,7 +2195,7 @@ async fn parked_session_reserves_partial_get_sse_parser() {
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "partial-get".to_owned()).unwrap();
     let result = call_tool_with_forwarded_headers_bounded_initialize(
-        Some((&pool, &key)),
+        Some((&pool, Some(&key))),
         &url,
         None,
         None,
@@ -2744,7 +2744,7 @@ async fn timed_out_pooled_tool_sessions_remain_charged_during_delete() {
     // First establish a reusable initialized session; then exercise both the
     // reused and fresh timeout branches with a server-held DELETE.
     let warm = call_tool_with_forwarded_headers_bounded_initialize(
-        Some((&pool, &key)),
+        Some((&pool, Some(&key))),
         &url,
         None,
         None,
@@ -2765,7 +2765,7 @@ async fn timed_out_pooled_tool_sessions_remain_charged_during_delete() {
     for expected_parked in [true, false] {
         assert_eq!(pool.retained_payload_bytes().unwrap() > 0, expected_parked);
         let result = call_tool_with_forwarded_headers_bounded_initialize(
-            Some((&pool, &key)),
+            Some((&pool, Some(&key))),
             &url,
             None,
             None,
@@ -2801,6 +2801,50 @@ async fn timed_out_pooled_tool_sessions_remain_charged_during_delete() {
         .await
         .expect("timed-out session charge must clear after DELETE");
     }
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn unkeyable_budgeted_tool_session_remains_charged_during_delete() {
+    let (url, ct, delete_started, delete_release) = start_delayed_delete_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let headers = serde_json::json!({"X-Target-Tenant": "A", "x-target-tenant": "B"});
+    assert!(McpPoolKey::new(McpPoolNamespace::new(), String::new()).is_none());
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    let result = call_tool_with_forwarded_headers_bounded_initialize(
+        Some((&pool, None)),
+        &url,
+        Some(&headers),
+        None,
+        &[],
+        None,
+        None,
+        "slow",
+        serde_json::json!({"sleep_ms": 5_000}),
+        Duration::from_secs(1),
+        TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
+        true,
+        &callout,
+    )
+    .await;
+    assert!(matches!(result, Err(McpClientError::Timeout { .. })));
+    tokio::time::timeout(INTEGRATION_TIMEOUT, delete_started.notified())
+        .await
+        .expect("timed-out unkeyable session DELETE must start");
+    assert!(
+        pool.retained_payload_bytes().unwrap() > 0,
+        "request pool must charge an unkeyable budgeted session until rmcp closes"
+    );
+    delete_release.notify_one();
+    tokio::time::timeout(INTEGRATION_TIMEOUT, async {
+        while pool.retained_payload_bytes() != Some(0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unkeyable session charge must clear after DELETE");
     ct.cancel();
 }
 

@@ -605,7 +605,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     call_tool_with_forwarded_headers_bounded_initialize(
-        pool,
+        pool.map(|(pool, key)| (pool, Some(key))),
         server_url,
         headers,
         authorization,
@@ -635,7 +635,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
 )]
 #[expect(clippy::large_stack_frames, reason = "rmcp session setup owns its callout state")]
 pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
-    pool: Option<(&McpSessionPool, &McpPoolKey)>,
+    pool: Option<(&McpSessionPool, Option<&McpPoolKey>)>,
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
@@ -658,7 +658,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     //    those sessions are explicitly closed in the background so their DELETE cannot consume this call's delivery
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
-    if let Some((pool, key)) = pool {
+    if let Some((pool, Some(key))) = pool {
         let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit, budgeted);
         pool.close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
@@ -692,9 +692,8 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
         }
     }
 
-    // 2. Fresh session: first use, a `None` pool, or the empty-fingerprint sentinel. On failure, a pooled service
-    //    closes in the background with its payload charged until rmcp exits; an unpooled service uses the call
-    //    deadline.
+    // 2. Fresh session: first use, no pool, or the empty-fingerprint sentinel. A request-owned pool tracks closure even
+    //    when the target is unkeyable and cannot be reused. Only callers without a pool use the call deadline.
     let mut session: Option<PooledSession> = None;
     let mut call_signal = None;
     let outcome = tokio::time::timeout_at(deadline, async {
@@ -727,10 +726,11 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     match outcome {
         Ok(Ok(result)) => {
             match (pool, session.take()) {
-                (Some((pool, key)), Some(session)) => {
+                (Some((pool, Some(key))), Some(session)) => {
                     let rejected = pool.checkin(key.clone(), session);
                     pool.close_sessions_in_background(rejected);
                 },
+                (Some((pool, None)), Some(session)) => pool.close_sessions_in_background(vec![session]),
                 (None, Some(session)) => session.close_before(deadline).await,
                 (_, None) => {},
             }

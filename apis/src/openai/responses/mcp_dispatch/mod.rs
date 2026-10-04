@@ -2593,8 +2593,9 @@ async fn execute_single_call(
     }
 
     // The opaque key binds target identity to this dispatcher's outbound
-    // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
-    // key and therefore remain fail-closed and unpooled.
+    // pipeline, timeout, and forwarding policy. Empty fingerprints prohibit
+    // approval matching and session reuse, but the request pool still owns
+    // their background close until rmcp releases the session.
     let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
     let initialize_limit = if matches!(options.aggregate_result_policy, McpAggregateResultPolicy::Unbudgeted) {
         mcp_client::MAX_CONTROL_RESPONSE_BYTES
@@ -2602,7 +2603,7 @@ async fn execute_single_call(
         payload_limit
     };
     let result = mcp_client::call_tool_with_forwarded_headers_bounded_initialize(
-        session_key.as_ref().map(|key| (options.session_pool, key)),
+        Some((options.session_pool, session_key.as_ref())),
         server_url,
         headers,
         authorization,
