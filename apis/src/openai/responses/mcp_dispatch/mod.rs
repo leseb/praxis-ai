@@ -2613,6 +2613,7 @@ async fn execute_single_call(
         options.timeout,
         payload_limit,
         initialize_limit,
+        !matches!(options.aggregate_result_policy, McpAggregateResultPolicy::Unbudgeted),
         callout,
     )
     .await;

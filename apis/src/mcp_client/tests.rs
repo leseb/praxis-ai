@@ -2096,6 +2096,7 @@ async fn oversized_tool_initialize_is_rejected_before_tool_call() {
         INTEGRATION_TIMEOUT,
         2_048,
         2_048,
+        true,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await;
@@ -2130,6 +2131,7 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
         INTEGRATION_TIMEOUT,
         2_048,
         2_048,
+        true,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await;
@@ -2158,6 +2160,7 @@ async fn parked_session_reserves_partial_get_sse_parser() {
         INTEGRATION_TIMEOUT,
         2_048,
         2_048,
+        true,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await;
@@ -2569,6 +2572,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
         MAX_CONTROL_RESPONSE_BYTES,
+        false,
         callout,
         &parse_display_url(url),
     )
@@ -2610,6 +2614,25 @@ async fn checkout_removes_emptied_key() {
         pool.checkout(&key, TEST_MAX_RESULT_BYTES).session.is_none(),
         "the emptied key must be removed, so a second checkout finds nothing"
     );
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn budgeted_checkout_rejects_unbudgeted_get_stream_session() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "budget-mode".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let rejected = pool.checkin(key.clone(), open_pooled_session(&url, &callout).await);
+    close_sessions(rejected).await;
+
+    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, true);
+    assert!(
+        checkout.session.is_none(),
+        "an unbounded GET session cannot satisfy a budgeted checkout"
+    );
+    assert_eq!(checkout.rejected.len(), 1);
+    close_sessions(checkout.rejected).await;
     ct.cancel();
 }
 

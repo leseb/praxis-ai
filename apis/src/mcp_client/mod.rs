@@ -497,6 +497,7 @@ async fn open_tool_session(
     timeout: Duration,
     max_result_bytes: usize,
     initialize_limit: usize,
+    budgeted: bool,
     callout: &McpCallout,
     display_url: &McpDisplayUrl,
 ) -> Result<PooledSession, McpClientError> {
@@ -505,6 +506,7 @@ async fn open_tool_session(
         timeout,
         max_result_bytes,
         initialize_limit,
+        budgeted,
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();
@@ -615,6 +617,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
         timeout,
         max_result_bytes,
         MAX_CONTROL_RESPONSE_BYTES,
+        false,
         callout,
     )
     .await
@@ -644,6 +647,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     timeout: Duration,
     max_result_bytes: usize,
     initialize_limit: usize,
+    budgeted: bool,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let initialize_limit = initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES);
@@ -655,7 +659,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
     if let Some((pool, key)) = pool {
-        let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit);
+        let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit, budgeted);
         session_pool::close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
             let signal = session.begin_call();
@@ -703,6 +707,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             timeout,
             max_result_bytes,
             initialize_limit,
+            budgeted,
             callout,
             &display_url,
         )

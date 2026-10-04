@@ -35,6 +35,21 @@ pub(super) enum SseSignalTarget {
 }
 
 impl SseSignalTarget {
+    /// Check the per-connection ceiling and, for budgeted standalone GETs,
+    /// the session ceiling shared across rmcp reconnects.
+    fn admit_bytes(&self, emitted: &mut usize, added: usize, limit: usize) -> bool {
+        let Some(next) = emitted.checked_add(added).filter(|next| *next <= limit) else {
+            return false;
+        };
+        if let Self::Active(state) = self
+            && !state.admit_get_stream_bytes(added)
+        {
+            return false;
+        }
+        *emitted = next;
+        true
+    }
+
     /// Record one first-wins transport classification.
     fn record(&self, classification: TransportSignal) {
         match self {
@@ -261,8 +276,7 @@ pub(super) fn sse_stream_from_body(
                         return Err(SseByteStreamError::EventTooLarge { max_size: limit });
                     }
                     // Cumulative operation-stream ceiling.
-                    st.emitted = st.emitted.saturating_add(chunk.len());
-                    if st.emitted > st.operation_cap {
+                    if !st.signal.admit_bytes(&mut st.emitted, chunk.len(), st.operation_cap) {
                         let limit = st.operation_cap;
                         st.signal.record(TransportSignal::ResponseTooLarge {
                             limit,
@@ -440,6 +454,70 @@ mod tests {
             ),
             "cumulative breach records a 413 signal at the operation cap"
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "both GET connections and typed overflow are checked"
+    )]
+    async fn reconnect_keeps_get_byte_ceiling_across_streams() {
+        let signal_state = Arc::new(super::TransportSignalState::new(Some(15)));
+        let first = Box::new(FakeStreamingBody::from_chunks(
+            [Bytes::from_static(b"data: a\n\n")],
+            cancelled_flag(),
+        ));
+        let mut stream = sse_stream_from_body(
+            first,
+            1_024,
+            15,
+            1_024,
+            super::SseSignalTarget::Active(Arc::clone(&signal_state)),
+        );
+        assert!(stream.next().await.expect("first event").is_ok());
+        drop(stream);
+
+        let second = Box::new(FakeStreamingBody::from_chunks(
+            [Bytes::from_static(b"data: b\n\n")],
+            cancelled_flag(),
+        ));
+        let mut reconnected = sse_stream_from_body(
+            second,
+            1_024,
+            15,
+            1_024,
+            super::SseSignalTarget::Active(Arc::clone(&signal_state)),
+        );
+        assert!(
+            reconnected.next().await.expect("cumulative breach").is_err(),
+            "a new GET must not reset the session's admitted stream bytes"
+        );
+        assert!(matches!(
+            signal_state.current().get(),
+            Some(TransportSignal::ResponseTooLarge {
+                limit: 15,
+                kind: McpResponseLimitKind::GetStream
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unbudgeted_reconnect_retains_per_get_ceiling() {
+        let signal_state = Arc::new(super::TransportSignalState::new(None));
+        for frame in [b"data: a\n\n", b"data: b\n\n"] {
+            let body = Box::new(FakeStreamingBody::from_chunks(
+                [Bytes::copy_from_slice(frame)],
+                cancelled_flag(),
+            ));
+            let mut stream = sse_stream_from_body(
+                body,
+                1_024,
+                15,
+                1_024,
+                super::SseSignalTarget::Active(Arc::clone(&signal_state)),
+            );
+            assert!(stream.next().await.expect("event").is_ok());
+        }
     }
 
     #[tokio::test]

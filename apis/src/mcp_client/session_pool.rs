@@ -329,7 +329,7 @@ impl McpSessionPool {
     /// so the caller can close them outside the synchronous mutex boundary.
     #[cfg(test)]
     pub(crate) fn checkout(&self, key: &McpPoolKey, payload_limit: usize) -> PoolCheckout {
-        self.checkout_with_initialize_limit(key, payload_limit, super::MAX_CONTROL_RESPONSE_BYTES)
+        self.checkout_with_initialize_limit(key, payload_limit, super::MAX_CONTROL_RESPONSE_BYTES, false)
     }
 
     /// Checkout additionally binds the immutable handshake limit, preventing a
@@ -339,6 +339,7 @@ impl McpSessionPool {
         key: &McpPoolKey,
         payload_limit: usize,
         initialize_limit: usize,
+        budgeted: bool,
     ) -> PoolCheckout {
         let mut map = self.lock();
         let Some(stack) = map.get_mut(key) else {
@@ -357,6 +358,7 @@ impl McpSessionPool {
                 && idle_timer_disarmed
                 && candidate.payload_limit == payload_limit
                 && candidate.initialize_limit == initialize_limit
+                && candidate.signal_state.has_get_stream_budget() == budgeted
                 && !candidate.is_closed()
                 && !candidate.is_expired_at(now)
             {
@@ -379,7 +381,10 @@ impl McpSessionPool {
         if let Some(existing) = map.get_mut(&key) {
             let mut retained = Vec::with_capacity(existing.len());
             for prior in std::mem::take(existing) {
-                if prior.payload_limit == session.payload_limit && prior.initialize_limit == session.initialize_limit {
+                if prior.payload_limit == session.payload_limit
+                    && prior.initialize_limit == session.initialize_limit
+                    && prior.signal_state.has_get_stream_budget() == session.signal_state.has_get_stream_budget()
+                {
                     retained.push(prior);
                 } else {
                     rejected.push(prior);

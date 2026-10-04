@@ -21,7 +21,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -248,14 +251,42 @@ pub(crate) enum McpResponseLimitKind {
 pub(crate) struct TransportSignalState {
     /// Signal generation assigned to the active initialization or tool call.
     active: Mutex<Option<Arc<OnceLock<TransportSignal>>>>,
+    /// Session-wide raw GET bytes for a budgeted tool session. Reconnects share
+    /// this counter so queued messages cannot multiply the parked reservation.
+    get_stream_bytes: Option<(AtomicUsize, usize)>,
 }
 
 impl TransportSignalState {
     /// Create state with a pristine initialization-generation signal.
-    fn new() -> Self {
+    pub(super) fn new(get_stream_lifetime_cap: Option<usize>) -> Self {
         Self {
             active: Mutex::new(Some(Arc::new(OnceLock::new()))),
+            get_stream_bytes: get_stream_lifetime_cap.map(|cap| (AtomicUsize::new(0), cap)),
         }
+    }
+
+    /// Admit raw bytes across every GET connection in this pooled session.
+    pub(super) fn admit_get_stream_bytes(&self, added: usize) -> bool {
+        self.get_stream_bytes.as_ref().is_none_or(|(used, cap)| {
+            let previous = used
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+                    Some(current.saturating_add(added).min(*cap))
+                })
+                .unwrap_or_else(|current| current);
+            previous.checked_add(added).is_some_and(|next| next <= *cap)
+        })
+    }
+
+    /// Refuse a reconnect before opening another GET after the cap is spent.
+    fn get_stream_exhausted(&self) -> bool {
+        self.get_stream_bytes
+            .as_ref()
+            .is_some_and(|(used, cap)| used.load(AtomicOrdering::Acquire) >= *cap)
+    }
+
+    /// Pool compatibility must preserve whether GET reconnects share a cap.
+    pub(crate) fn has_get_stream_budget(&self) -> bool {
+        self.get_stream_bytes.is_some()
     }
 
     /// Return the active signal, or a detached slot for idle traffic.
@@ -631,6 +662,7 @@ impl McpSubrequestClient {
             MAX_CONTROL_RESPONSE_BYTES,
             MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            false,
             owner,
         )
     }
@@ -645,11 +677,16 @@ impl McpSubrequestClient {
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
     /// posture decides whether loopback destinations are permitted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the tool transport binds independent response, handshake, and lifetime limits"
+    )]
     pub(crate) fn for_tool(
         callout: McpCallout,
         step_timeout: Duration,
         max_result_bytes: usize,
         initialize_limit: usize,
+        budgeted: bool,
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
@@ -660,6 +697,7 @@ impl McpSubrequestClient {
             wire,
             initialize_bytes,
             tool_stream_cumulative_cap(wire, initialize_bytes),
+            budgeted,
             owner,
         )
     }
@@ -676,6 +714,7 @@ impl McpSubrequestClient {
         tool_result_bytes: usize,
         initialize_bytes: usize,
         stream_cumulative_cap: usize,
+        budgeted: bool,
         owner: Option<StateOwner>,
     ) -> Self {
         Self {
@@ -685,7 +724,7 @@ impl McpSubrequestClient {
             step_timeout,
             stream_cumulative_cap,
             owner,
-            signal_state: Arc::new(TransportSignalState::new()),
+            signal_state: Arc::new(TransportSignalState::new(budgeted.then_some(stream_cumulative_cap))),
         }
     }
 
@@ -715,6 +754,19 @@ impl McpSubrequestClient {
     /// Cumulative wire ceiling for a GET SSE stream.
     fn stream_cumulative_cap(&self) -> usize {
         self.stream_cumulative_cap
+    }
+
+    /// An exhausted budgeted session cannot open another successful GET
+    /// reconnect; rmcp then follows its bounded failed-reconnect path.
+    fn ensure_get_stream_budget_available(&self) -> Result<(), StreamableHttpError<McpTransportError>> {
+        if self.signal_state.get_stream_exhausted() {
+            self.signal_state.record_active(TransportSignal::ResponseTooLarge {
+                limit: self.stream_cumulative_cap(),
+                kind: McpResponseLimitKind::GetStream,
+            });
+            return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+        }
+        Ok(())
     }
 
     /// Select the wire byte ceiling for one outbound message.
@@ -1256,6 +1308,7 @@ impl StreamableHttpClient for McpSubrequestClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<McpTransportError>> {
+        self.ensure_get_stream_budget_available()?;
         let headers = self.build_get_stream_headers(
             auth_header,
             custom_headers,
@@ -1865,7 +1918,7 @@ mod tests {
         reason = "test covers signal replacement and active generation isolation"
     )]
     fn reusable_session_starts_each_exchange_with_a_pristine_signal() {
-        let state = TransportSignalState::new();
+        let state = TransportSignalState::new(None);
         let prior = state.current();
         assert!(
             prior
@@ -2050,6 +2103,7 @@ mod tests {
             Duration::from_secs(5),
             2048,
             2048,
+            true,
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -2081,6 +2135,7 @@ mod tests {
             Duration::from_secs(5),
             2048,
             MAX_CONTROL_RESPONSE_BYTES,
+            false,
             None,
         );
         assert_eq!(unbudgeted.response_limit(&initialize), MAX_CONTROL_RESPONSE_BYTES);
@@ -2125,6 +2180,7 @@ mod tests {
             Duration::from_secs(5),
             1024,
             1024,
+            true,
             None,
         );
         let initialized: ClientJsonRpcMessage =
@@ -2162,6 +2218,7 @@ mod tests {
             Duration::from_secs(5),
             4_096,
             1_024,
+            true,
             None,
         );
         let message: ClientJsonRpcMessage = serde_json::from_str(
@@ -2490,6 +2547,7 @@ mod tests {
             Duration::from_secs(1),
             max_result_bytes,
             MAX_CONTROL_RESPONSE_BYTES,
+            false,
             None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
@@ -2520,6 +2578,7 @@ mod tests {
             Duration::from_secs(5),
             1024,
             MAX_CONTROL_RESPONSE_BYTES,
+            false,
             None,
         )
     }
@@ -2952,6 +3011,48 @@ mod tests {
     // -- GET SSE stream path (Task 7) --
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "pre-open refusal and its typed signal are checked together"
+    )]
+    async fn exhausted_budgeted_get_reconnect_fails_before_opening_a_stream() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            2_048,
+            true,
+            None,
+        );
+        let limit = client.stream_cumulative_cap();
+        assert!(client.signal_state.admit_get_stream_bytes(limit));
+        assert!(client.signal_state.get_stream_exhausted());
+        let signal = client.signal_handle();
+        let reconnect_client = client.clone();
+        let result = reconnect_client
+            .get_stream_with_max_sse_event_size(
+                Arc::from("http://unreachable.invalid/mcp"),
+                None,
+                None,
+                None,
+                HashMap::new(),
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge {
+                limit: reached,
+                kind: McpResponseLimitKind::GetStream
+            }) if *reached == limit
+        ));
+    }
+
+    #[tokio::test]
     async fn get_stream_forwards_event_stream() {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let body: Box<dyn StreamingResponseBody> =
@@ -3041,6 +3142,7 @@ mod tests {
             Duration::from_secs(5),
             2_048,
             2_048,
+            true,
             None,
         );
         let initialize: ClientJsonRpcMessage = serde_json::from_str(
