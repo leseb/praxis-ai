@@ -157,15 +157,45 @@ use tracing::debug;
 
 use self::config::{ClientToolCompatConfig, build_config};
 use super::{
+    agentic_loop::AgenticBudgetPolicy,
     body_limits::reject_rewritten_body_too_large,
     error::responses_error_rejection,
-    state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call},
+    state::{
+        ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call,
+        retained_json_bytes, retained_json_values_bytes,
+    },
 };
 use crate::json_body::{SerializedJson, serialize_json_body};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
+
+/// Error returned before a budgeted client-tool response can be buffered or restored.
+const RESTORE_BUDGET_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during client-tool restoration";
+/// Covers numeric normalization, nested argument parsing, typed item replacement,
+/// and old/new serialization Vec capacities while the original wire body lives.
+const RESTORE_WIRE_PEAK_MULTIPLIER: usize = 256;
+/// A response can temporarily retain echoed tools in the state, restored tree,
+/// and output wire alongside the backend's echoed form.
+const RESTORE_ECHO_PEAK_MULTIPLIER: usize = 16;
+/// Fixed response and serializer framing allowance.
+const RESTORE_FIXED_PEAK_BYTES: usize = 4_096;
+
+/// Header-phase proof carried to the one buffered body callback.
+#[derive(Clone, Copy)]
+struct ClientToolRestoreAdmission {
+    /// Trusted identity-coded response length and the exact core buffer cap.
+    wire_bytes: usize,
+    /// Peak allowance reserved before body buffering and restoration.
+    peak_bytes: usize,
+    /// Exact finalized body proof when the composed response has no length header.
+    canonical_digest: Option<[u8; 32]>,
+}
+
+/// This provider response is not a finite Responses resource to restore.
+struct ClientToolRestoreBypass;
 
 /// Fixed private function name a local `shell` tool lowers to.
 const SHELL_FUNCTION_NAME: &str = "shell";
@@ -457,11 +487,10 @@ impl ClientToolCompatFilter {
         Ok(Some(serialized))
     }
 
-    /// Ratchet the upstream response to a bounded `StreamBuffer` and strip the
-    /// request's `Accept-Encoding` header so [`Self::restore_response`] sees a
-    /// single, complete, uncompressed body.
+    /// Strip request `Accept-Encoding` before dispatch so restoration sees an
+    /// uncompressed body. The response buffer is selected when headers arrive.
     ///
-    /// Both are armed only once lowering recorded a [`ClientToolEcho`]. Without
+    /// This is armed only once lowering recorded a [`ClientToolEcho`]. Without
     /// buffering, a non-streaming response delivered in multiple chunks would let
     /// early chunks reach the client with lowered private function names un-restored
     /// (`restore_response` only rewrites the final end-of-stream chunk, and a
@@ -469,15 +498,76 @@ impl ClientToolCompatFilter {
     /// `Accept-Encoding` strip, a compressed body would likewise fail to parse and
     /// pass through with those names intact. The IRR clears `request_headers_to_remove`
     /// per inference iteration, so this re-strips the header on every continuation
-    /// round that lowers. The buffer is bounded by the same rewrite cap
-    /// `restore_response` enforces, failing closed rather than buffering an
-    /// unbounded un-restored body.
-    fn arm_restoration(&self, ctx: &mut HttpFilterContext<'_>) {
-        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_rewritten_body_bytes),
-        });
+    /// round that lowers.
+    fn strip_restore_encoding(ctx: &mut HttpFilterContext<'_>) {
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
     }
+
+    /// Admit the raw buffer and all restoration copies before response headers
+    /// commit. A unique identity-coded Content-Length proves a direct response;
+    /// the agentic finalizer's length and digest prove a composed response.
+    fn budgeted_restore_admission(&self, ctx: &HttpFilterContext<'_>) -> Option<ClientToolRestoreAdmission> {
+        let state = ctx.extensions.get::<ResponsesState>()?;
+        let response = ctx.response_header.as_ref()?;
+        if response.headers.contains_key(http::header::TRANSFER_ENCODING)
+            || response.headers.contains_key(http::header::CONTENT_ENCODING)
+            || response.headers.contains_key(http::header::CONTENT_RANGE)
+        {
+            return None;
+        }
+        let (wire_bytes, canonical_digest) = if state.buffered_canonical_finalized {
+            // The finalizer has already serialized this exact body. Check its
+            // digest again before restore allocation in the body callback.
+            state.buffered_canonical_parsed_bound_bytes?;
+            (
+                state.buffered_canonical_wire_bytes?,
+                Some(state.buffered_canonical_body_digest?),
+            )
+        } else {
+            let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
+            let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
+            if lengths.next().is_some() {
+                return None;
+            }
+            (wire_bytes, None)
+        };
+        if wire_bytes > self.max_rewritten_body_bytes {
+            return None;
+        }
+        match ctx.response_body_mode {
+            BodyMode::Stream => {},
+            BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap <= wire_bytes => {},
+            _ => return None,
+        }
+        let echo = state.client_tool_echo.as_ref()?;
+        let echo_bytes =
+            retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)?;
+        let peak_bytes = wire_bytes
+            .checked_mul(RESTORE_WIRE_PEAK_MULTIPLIER)?
+            .checked_add(echo_bytes.checked_mul(RESTORE_ECHO_PEAK_MULTIPLIER)?)?
+            .checked_add(RESTORE_FIXED_PEAK_BYTES)?;
+        state
+            .can_retain_payload(peak_bytes)
+            .then_some(ClientToolRestoreAdmission {
+                wire_bytes,
+                peak_bytes,
+                canonical_digest,
+            })
+    }
+}
+
+/// A provider error or non-JSON success cannot contain a finite Responses
+/// resource to restore; leave it byte-for-byte under its original status.
+fn eligible_restore_response(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.response_header.as_ref().is_some_and(|response| {
+        response.status == http::StatusCode::OK
+            && response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|header| header.to_str().ok())
+                .and_then(|header| header.split(';').next())
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
+    })
 }
 
 #[async_trait]
@@ -504,8 +594,8 @@ impl HttpFilter for ClientToolCompatFilter {
 
     fn response_body_mode(&self) -> BodyMode {
         // Stream by default so a request that lowers nothing never pays to buffer
-        // the response. When lowering records an echo, `on_request_body` ratchets
-        // this up to a bounded `StreamBuffer` (see `arm_restoration`) so the whole
+        // the response. When lowering records an echo, `on_response` selects a
+        // bounded `StreamBuffer` after upstream headers arrive so the whole
         // response is restored before any bytes reach the client. A streaming
         // response is never armed (an echo is only set on a buffered, non-streaming
         // request) and is handled by `openai_stream_events`.
@@ -534,13 +624,52 @@ impl HttpFilter for ClientToolCompatFilter {
             return Ok(action);
         }
         // The `state` borrow above ends here. Re-read the echo flag before mutating
-        // `ctx`: when lowering armed restoration, buffer the response and strip
-        // `Accept-Encoding` so restoration sees a single, complete, uncompressed
-        // body (see `arm_restoration`). On the streaming path, the stream owner
-        // drives restoration, so the compat filter must not buffer.
+        // `ctx`: when lowering armed restoration, strip `Accept-Encoding` now.
+        // The bounded response buffer is selected from upstream headers.
         if !streaming && restoration_armed(ctx) {
-            self.arm_restoration(ctx);
+            Self::strip_restore_encoding(ctx);
         }
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if !restoration_armed(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+        if !eligible_restore_response(ctx) {
+            ctx.insert_filter_state(ClientToolRestoreBypass);
+            return Ok(FilterAction::Continue);
+        }
+        if let Some(limit) = ctx
+            .extensions
+            .get::<AgenticBudgetPolicy>()
+            .map(|policy| policy.max_retained_bytes())
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            state.apply_retained_payload_limit(limit);
+        }
+        let budgeted = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_limit().is_some());
+        if !budgeted {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(self.max_rewritten_body_bytes),
+            });
+            return Ok(FilterAction::Continue);
+        }
+        let Some(admission) = self.budgeted_restore_admission(ctx) else {
+            return Ok(FilterAction::Reject(super::budget_error::response_rejection(
+                ctx,
+                RESTORE_BUDGET_MESSAGE,
+            )));
+        };
+        // A prior filter's larger cap is declined above. The core ratchet can
+        // now select the admitted cap without overriding another filter's need.
+        ctx.set_response_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(admission.wire_bytes),
+        });
+        ctx.insert_filter_state(admission);
         Ok(FilterAction::Continue)
     }
 
@@ -550,6 +679,9 @@ impl HttpFilter for ClientToolCompatFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx.get_filter_state::<ClientToolRestoreBypass>().is_some() {
+            return Ok(FilterAction::Continue);
+        }
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
@@ -559,6 +691,22 @@ impl HttpFilter for ClientToolCompatFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if state.retained_payload_limit().is_some() && state.client_tool_echo.is_some() {
+            let admitted = ctx.get_filter_state::<ClientToolRestoreAdmission>().copied();
+            let fits = admitted.is_some_and(|admission| {
+                bytes.len() == admission.wire_bytes
+                    && admission
+                        .canonical_digest
+                        .is_none_or(|digest| crate::hash::Sha256::digest(bytes) == digest)
+                    && state.can_retain_payload(admission.peak_bytes)
+            });
+            if !fits {
+                return Ok(FilterAction::Reject(super::budget_error::response_rejection(
+                    ctx,
+                    RESTORE_BUDGET_MESSAGE,
+                )));
+            }
+        }
         match self.restore_response(state, bytes) {
             Ok(Some(serialized)) => {
                 serialized.commit(body, self.name(), "body");
