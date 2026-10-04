@@ -28,6 +28,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -287,6 +288,8 @@ def _write_full_flow_config(
     backend_endpoint: str | None = None,
     search_port: int | None = None,
     max_event_bytes: int | None = None,
+    compact_callout_port: int | None = None,
+    retained_limit: int | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     config = _load_example_config(
@@ -316,6 +319,27 @@ def _write_full_flow_config(
         )
         assert config.count(anchor) == 1
         config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
+    if compact_callout_port is not None:
+        anchor = "      - filter: iterative_request_router\n"
+        assert config.count(anchor) == 1
+        config = config.replace(
+            anchor,
+            "      - filter: openai_responses_compact\n"
+            "        allow_pre_security_callout: true\n"
+            f"        inference_url: http://127.0.0.1:{compact_callout_port}/v1/chat/completions\n"
+            "        allow_private_inference_url: true\n"
+            f"        default_model: {VLLM_MODEL}\n"
+            "        on_failure: open\n"
+            "        conditions:\n"
+            "          - unless:\n"
+            "              bound_upstream:\n"
+            "                application_provider: openai\n"
+            + anchor,
+        )
+    if retained_limit is not None:
+        anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
+        assert config.count(anchor) == 1
+        config = config.replace(anchor, anchor + f"                max_retained_bytes: {retained_limit}\n")
     if compression:
         config = _enable_response_store_compression(config)
 
@@ -1923,6 +1947,51 @@ def provider_compaction_client(tmp_path_factory, request):
                     f"\n=== Provider compaction Praxis logs ===\n{f.read()}",
                     file=sys.stderr,
                 )
+        os.unlink(config_path)
+
+
+@pytest.fixture()
+def usage_less_compact_client(tmp_path_factory, request, compaction_server):
+    """Native Responses continuation with no stored usage and an armed budget."""
+    NativeCompactionBackendHandler.requests = []
+    CompactionHandler.requests = []
+    backend_port = _free_port()
+    backend = HTTPServer(("127.0.0.1", backend_port), NativeCompactionBackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-usage-less-compact")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        compact_callout_port=compaction_server,
+        retained_limit=65_536,
+    )
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS), db_path
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        if request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== Usage-less compact Praxis logs ===\n{f.read()}", file=sys.stderr)
         os.unlink(config_path)
 
 
@@ -4032,6 +4101,40 @@ class TestResponsesCompactionVLLM:
         assert second.output_text
         assert len(CompactionHandler.requests) == request_count
 
+    def test_usage_less_rehydration_rejects_tokenizer_peak_before_callout(
+        self, usage_less_compact_client
+    ):
+        client, _ = usage_less_compact_client
+        conversation = client.conversations.create()
+        try:
+            first = client.responses.create(
+                model=VLLM_MODEL,
+                input="abcdefghijklmnopqrstuvwxyz0123456789" * 90,
+                conversation=conversation.id,
+                store=True,
+            )
+            assert first.usage is None, "backend intentionally omits usage"
+            backend_calls = len(NativeCompactionBackendHandler.requests)
+            callouts = len(CompactionHandler.requests)
+            persisted_before = len(client.conversations.items.list(conversation.id).data)
+            assert persisted_before == 2
+
+            with pytest.raises(APIStatusError) as exc_info:
+                client.responses.create(
+                    model=VLLM_MODEL,
+                    input="continue",
+                    conversation=conversation.id,
+                    context_management=[{"type": "compaction", "compact_threshold": 1000}],
+                    store=True,
+                )
+
+            assert exc_info.value.status_code == 413
+            assert len(NativeCompactionBackendHandler.requests) == backend_calls
+            assert len(CompactionHandler.requests) == callouts
+            assert len(client.conversations.items.list(conversation.id).data) == persisted_before
+        finally:
+            client.conversations.delete(conversation.id)
+
     @requires_real_inference
     def test_over_threshold_compacts_rehydrated_history(
         self,
@@ -5493,7 +5596,10 @@ def retained_tool_search_client(tmp_path, request):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["direct", "buffered_middle", "empty_stream", "buffered_sse", "translated"]
+    "scenario", [
+        "direct", "buffered_middle", "empty_stream", "buffered_sse",
+        "translated", "header_suppressed", "translated_header_suppressed",
+    ]
 )
 def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
     tmp_path, scenario
@@ -5520,7 +5626,7 @@ def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
         def do_POST(self):
             self.paths.append("POST " + self.path)
             self.rfile.read(int(self.headers["Content-Length"]))
-            if scenario == "translated":
+            if scenario.startswith("translated"):
                 payload = (
                     b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
                     b'"created":1,"model":"m","choices":[{"index":0,'
@@ -5605,7 +5711,7 @@ insecure_options:
   allow_private_endpoints: true
   allow_private_upstreams: true
 """
-    if scenario == "translated":
+    if scenario.startswith("translated"):
         config = config.replace(
             "              - filter: openai_responses_proxy\n",
             "              - filter: openai_stream_events\n"
@@ -5613,6 +5719,14 @@ insecure_options:
             1,
         )
         config = config.replace("max_retained_bytes: 4096", "max_retained_bytes: 65536")
+    if scenario.endswith("header_suppressed"):
+        first = config.index("          - name: first\n")
+        transition = config.index("            on_result:\n", first)
+        config = config[:transition] + config[transition:].replace(
+            "              - default: true\n                next: resolve",
+            "              - status: [200]\n                next: resolve",
+            1,
+        )
     if scenario in {"buffered_middle", "empty_stream"}:
         config = config.replace("max_iterations: 2", "max_iterations: 3", 1)
         config = config.replace("next: resolve", "next: middle", 1)
@@ -5674,7 +5788,7 @@ insecure_options:
                 },
                 timeout=20,
             )
-            if scenario == "buffered_sse":
+            if scenario in {"buffered_sse", "header_suppressed", "translated_header_suppressed"}:
                 assert response.status_code == 502, response.text
                 assert response.headers["content-type"].startswith("application/json")
                 assert response.json()["error"]["type"] == "server_error"

@@ -924,7 +924,43 @@ pub(crate) fn discard_retained_request_payload(ctx: &mut HttpFilterContext<'_>) 
     }
 }
 
-/// Reserve record, history, and backend serialization owners before building them.
+/// Count the independent response-ID strings built for replay rows at flush.
+fn replay_row_id_copy_bytes(ctx: &HttpFilterContext<'_>, state: &ResponsesState) -> Option<usize> {
+    let Some(capture) = ctx.extensions.get::<ResponseStoreRequestState>() else {
+        return Some(0);
+    };
+    if capture.events_over_budget {
+        return Some(0);
+    }
+    let id_bytes = state
+        .response_object
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    id_bytes.checked_mul(capture.events.len())
+}
+
+/// Reserve the zstd replay peak: one worker-owned copy of every payload plus
+/// compressed frames alongside the still-live captured rows. Zstd's
+/// `compressBound(n)` is at most `n + n / 256 + 64` per event. The store codec
+/// is hidden behind the backend trait, so this also conservatively applies to
+/// stores that borrow uncompressed replay payloads.
+fn replay_payload_staging_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let Some(capture) = ctx.extensions.get::<ResponseStoreRequestState>() else {
+        return Some(0);
+    };
+    if capture.events_over_budget {
+        return Some(0);
+    }
+    let payload_bytes = usize::try_from(capture.event_bytes).ok()?;
+    payload_bytes
+        .checked_mul(2)?
+        .checked_add(payload_bytes >> 8)?
+        .checked_add(capture.events.len().checked_mul(64)?)
+}
+
+/// Reserve record, history, replay-row IDs, and backend serialization owners
+/// before building them.
 pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, response_bytes: usize) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
@@ -945,11 +981,15 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
             .checked_add(record.arguments.len())?
             .checked_add(record.target_fingerprint.len())
     });
+    let replay_id_bytes = replay_row_id_copy_bytes(ctx, state);
+    let replay_payload_bytes = replay_payload_staging_bytes(ctx);
     let additional = response_bytes
         .checked_mul(5)
         .and_then(|bytes| history_bytes.checked_mul(3)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(input_bytes))
-        .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes));
+        .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(replay_id_bytes?))
+        .and_then(|bytes| bytes.checked_add(replay_payload_bytes?));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
@@ -2264,8 +2304,8 @@ mod encode_replay_event_tests {
     use serde_json::json;
 
     use super::{
-        ResponseEventRecord, ResponseStoreFilter, StateOwner, capture_request_input, encode_replay_event,
-        persistence_budget_failure,
+        CapturedEvent, ResponseEventRecord, ResponseStoreFilter, StateOwner, capture_request_input,
+        encode_replay_event, persistence_budget_failure, persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
 
@@ -2353,6 +2393,107 @@ mod encode_replay_event_tests {
             128 + store_bytes,
             "replay accounting must preserve other sibling-filter charges"
         );
+    }
+
+    /// The record builder accepts the provider's response ID, and the replay
+    /// flush copies it into every row. Admit all those copies before persistence.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sets the exact near-limit replay ownership boundary"
+    )]
+    fn replay_persistence_preflights_per_row_response_id_copies() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let response_id = format!("resp_{}", "x".repeat(8_192));
+        let response_id_len = response_id.len();
+        let mut store = super::ResponseStoreRequestState::default();
+        for sequence_number in 0..64 {
+            let payload = format!(
+                "{{\"type\":\"response.output_text.delta\",\"sequence_number\":{sequence_number},\"delta\":\"x\"}}"
+            )
+            .into_bytes();
+            store.event_bytes += payload.len() as u64;
+            store.event_name_bytes += "response.output_text.delta".len();
+            store.events.push(CapturedEvent {
+                sequence_number,
+                event_type: "response.output_text.delta".to_owned(),
+                payload,
+                terminal: false,
+            });
+        }
+        let store_bytes = store.retained_payload_bytes().unwrap();
+        let mut responses = ResponsesState {
+            response_object: json!({"id": response_id, "created_at": 0, "model": "m", "output": []}),
+            ..ResponsesState::default()
+        };
+        responses.set_retained_external_payload_bytes(store_bytes);
+        let response_bytes = super::retained_json_bytes(&responses.response_object).unwrap();
+        let baseline = responses.retained_payload_bytes().unwrap();
+        let payload_bytes = usize::try_from(store.event_bytes).unwrap();
+        let replay_staging = payload_bytes * 2 + (payload_bytes >> 8) + store.events.len() * 64;
+        let record_staging = response_bytes * 5 + store_bytes + replay_staging;
+        let replay_id_copies = response_id_len * store.events.len();
+        responses.apply_retained_payload_limit(baseline + record_staging + replay_id_copies);
+        ctx.extensions.insert(responses);
+        ctx.extensions.insert(store);
+
+        assert!(persistence_construction_fits(&ctx, response_bytes));
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(baseline + record_staging + replay_id_copies - 1);
+        assert!(!persistence_construction_fits(&ctx, response_bytes));
+    }
+
+    /// Zstd copies the captured payloads into a worker, then owns the frames.
+    /// Reserve that peak even when the codec is hidden behind the store trait.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sets the exact replay compression staging boundary"
+    )]
+    fn replay_persistence_preflights_compression_payload_copies() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut capture = super::ResponseStoreRequestState::default();
+        for sequence_number in 0..16 {
+            let payload = serde_json::to_vec(&json!({
+                "type": "response.output_text.delta",
+                "sequence_number": sequence_number,
+                "delta": "x".repeat(4_096),
+            }))
+            .unwrap();
+            capture.event_bytes += payload.len() as u64;
+            capture.event_name_bytes += "response.output_text.delta".len();
+            capture.events.push(CapturedEvent {
+                sequence_number,
+                event_type: "response.output_text.delta".to_owned(),
+                payload,
+                terminal: false,
+            });
+        }
+        let captured_bytes = capture.retained_payload_bytes().unwrap();
+        let payload_bytes = usize::try_from(capture.event_bytes).unwrap();
+        let replay_staging = payload_bytes * 2 + (payload_bytes >> 8) + capture.events.len() * 64;
+        let mut responses = ResponsesState {
+            response_object: json!({"id": "resp_zstd", "created_at": 0, "model": "m", "output": []}),
+            ..ResponsesState::default()
+        };
+        responses.set_retained_external_payload_bytes(captured_bytes);
+        let response_bytes = super::retained_json_bytes(&responses.response_object).unwrap();
+        let baseline = responses.retained_payload_bytes().unwrap();
+        let existing_staging = response_bytes * 5 + captured_bytes + "resp_zstd".len() * capture.events.len();
+        responses.apply_retained_payload_limit(baseline + existing_staging + replay_staging);
+        ctx.extensions.insert(responses);
+        ctx.extensions.insert(capture);
+
+        assert!(persistence_construction_fits(&ctx, response_bytes));
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(baseline + existing_staging + replay_staging - 1);
+        assert!(!persistence_construction_fits(&ctx, response_bytes));
     }
 
     #[test]

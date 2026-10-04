@@ -838,6 +838,8 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
             Some(RESPONSE_TRANSFORM_STREAM) => {
                 let action = Self::transform_stream_response(ctx, body, end_of_stream)?;
+                // Record a real translated SSE payload when the stream has not
+                // already terminated or been suppressed by the router.
                 if ctx.get_metadata("responses.stream_completion").is_none()
                     && ctx.extensions.get::<praxis_filter::StreamBodySuppressed>().is_none()
                     && body.as_ref().is_some_and(|bytes| !bytes.is_empty())

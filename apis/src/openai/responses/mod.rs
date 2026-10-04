@@ -531,6 +531,41 @@ pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]
     None
 }
 
+/// Create canonical request state and admit its independently retained owners.
+///
+/// Both Responses request filters use this boundary so store snapshots and the
+/// configured budget are applied before either can expose state to later filters.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn insert_budgeted_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+) -> Result<(), FilterAction> {
+    let mut state = state::ResponsesState::from_request_body(parsed);
+    state.response_id = Some(response_id.to_owned());
+    #[cfg(feature = "store")]
+    {
+        state.set_retained_external_payload_bytes(store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX));
+        state.store_persist_armed = store::request_persistence_armed(ctx);
+    }
+    if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+        state.apply_retained_payload_limit(policy.max_retained_bytes());
+        if !state.can_retain_payload(0) {
+            #[cfg(feature = "store")]
+            store::discard_retained_request_payload(ctx);
+            return Err(FilterAction::Reject(error::responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+            )));
+        }
+    }
+    ctx.extensions.insert(state);
+    #[cfg(feature = "store")]
+    store::mark_retained_request_payload_charged(ctx);
+    Ok(())
+}
+
 #[async_trait]
 impl HttpFilter for ResponsesFormatFilter {
     fn name(&self) -> &'static str {

@@ -731,6 +731,7 @@ impl HttpFilter for ResponsesProxyFilter {
         // request-phase failure cannot append a JSON rejection.
         if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming
             && ctx.extensions.get::<IterationState>().is_some()
+            && ctx.extensions.get::<praxis_filter::StreamBodySuppressed>().is_none()
             && ctx.extensions.get::<ObservedResponsesSse>().is_none()
             && (end_of_stream || body.as_ref().is_some_and(|bytes| !bytes.is_empty()))
             && ctx.get_metadata(PROXY_SSE_HEADER_KEY) == Some("true")

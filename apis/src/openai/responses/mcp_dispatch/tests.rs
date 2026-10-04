@@ -16,11 +16,11 @@ use serde_json::json;
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
     approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result, build_success_result,
-    content_blocks_to_output, denial_message_projection_bytes, execute_mcp_calls, execute_single_call,
-    extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry,
-    is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits, normalize_arguments,
-    parse_call_arguments, partition_calls_by_approval, prepare_response_round, process_call_result, resolve_tool_entry,
-    result_payload_limit,
+    content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls,
+    execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
+    is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits,
+    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
+    process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -31,8 +31,8 @@ use crate::{
             approval::{
                 ApprovalError, ApprovalResponseInput, ResolvedApproval, bind_credential_context,
                 bind_forwarded_header_context, bind_owner_context, build_approved_tool_call, build_denial_message,
-                extract_approval_responses, is_approval_response, owner_fingerprint, parse_approval_response,
-                resolve_approval, target_fingerprint,
+                connector_binding_growth_bytes, extract_approval_responses, is_approval_response, owner_fingerprint,
+                parse_approval_response, resolve_approval, target_fingerprint,
             },
             config::{McpDispatchConfig, build_config},
         },
@@ -109,6 +109,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+        aggregate_budgeted: false,
         timeout,
         forwarded_header_names: &[],
         forwarded_headers: None,
@@ -607,7 +608,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    state.apply_retained_payload_limit(current + result_id_bytes + 4_000);
+    state.apply_retained_payload_limit(current + result_id_bytes + 20_000);
     let calls = call_refs(&state.tool_calls);
 
     let arguments = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap() * 3;
@@ -618,8 +619,35 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     let entry = retained_json_bytes(entry).unwrap();
     assert_eq!(
         aggregate_mcp_result_limit(&state, &calls, 8_192),
-        Some(((4_000 - arguments - entry) / 3, true))
+        Some((
+            (20_000 - arguments - entry - 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES) / 4,
+            true
+        ))
     );
+}
+
+#[test]
+fn aggregate_mcp_limit_reserves_initialize_and_parked_peer_info() {
+    let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    state.tool_calls = vec![call];
+    let without_pool = state.retained_payload_bytes().unwrap();
+    let state_only = state
+        .retained_payload_bytes_bounded_without_external(usize::MAX)
+        .unwrap();
+    state.retained_mcp_session_bytes = 2_048;
+    let current = state.retained_payload_bytes().unwrap();
+    assert_eq!(current, without_pool + 2_048);
+    assert_eq!(
+        state.retained_payload_bytes_bounded_without_external(usize::MAX),
+        Some(state_only)
+    );
+    state.apply_retained_payload_limit(current + 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES - 1);
+    let calls = call_refs(&state.tool_calls);
+    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
 }
 
 #[test]
@@ -1906,6 +1934,84 @@ async fn on_request_no_mcp_calls_returns_continue() {
 }
 
 #[tokio::test]
+async fn connector_binding_over_budget_stops_before_upstream_without_tool_calls() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut tool_map = sample_tool_map();
+    tool_map.retain(|(server, _), _| server == "weather");
+    tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap()["connector_id"] = json!("weather");
+    let mut state = ResponsesState {
+        request_body: json!({"model": "gpt-4.1", "input": "x".repeat(4_096)}),
+        mcp_tool_map: tool_map,
+        ..ResponsesState::default()
+    };
+    let admitted = state.retained_payload_bytes().unwrap();
+    assert!(admitted >= 4_096);
+    state.apply_retained_payload_limit(admitted + 106);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.retained_payload_failed,
+        "the owner must reject before another inference request"
+    );
+    assert!(state.dispatch_failure.is_some());
+    assert!(
+        state.mcp_tool_map.is_empty(),
+        "over-budget tool definitions must be released"
+    );
+}
+
+#[test]
+fn connector_binding_projection_matches_actual_map_growth() {
+    let mut entry = json!({"connector_id": "weather", "server_url": "https://mcp.example"});
+    let before = retained_json_bytes(&entry).unwrap();
+    let growth = connector_binding_growth_bytes(&entry, false, false).unwrap();
+
+    bind_forwarded_header_context(&mut entry, &[], &http::HeaderMap::new());
+
+    assert_eq!(growth, retained_json_bytes(&entry).unwrap() - before);
+    assert_eq!(connector_binding_growth_bytes(&entry, false, false), Some(0));
+    assert_eq!(
+        connector_binding_growth_bytes(&json!({"server_url": "https://mcp.example"}), true, true),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn connector_binding_invalidates_cached_mcp_definition_charge() {
+    let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
+    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&request);
+    let mut tool_map = sample_tool_map();
+    tool_map.retain(|(server, _), _| server == "weather");
+    tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap()["connector_id"] = json!("weather");
+    let state = ResponsesState {
+        mcp_tool_map: tool_map,
+        ..ResponsesState::default()
+    };
+    let before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.replay_stable_payload_revision, Some(1));
+    assert!(state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap() > before);
+}
+
+#[tokio::test]
 async fn configured_deferred_connector_missing_assertion_records_security_failure_before_dispatch() {
     let filter = make_scoped_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -2074,6 +2180,59 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
 }
 
 #[tokio::test]
+async fn deferred_budget_failure_skips_successful_response_persistence() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    let mut state = ResponsesState {
+        deferred_mcp: vec![DeferredMcpConnector {
+            authorization: None,
+            allowed_tools: None,
+            connector_id: "weather".to_owned(),
+            headers: None,
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: None,
+            server_label: "weather".to_owned(),
+            server_url,
+            timeout: std::time::Duration::from_secs(1),
+        }],
+        ..ResponsesState::default()
+    };
+    let search = json!({"type": "tool_search_call", "id": "tsc_budget"});
+    state.tool_search_calls = vec![search.clone()];
+    state.accumulated_output = vec![search.clone()];
+    state.response_object = json!({"output": [search]});
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+    ctx.extensions.insert(state);
+    let callout = crate::mcp_client::McpCallout::fabricated(true).unwrap();
+
+    let action = discover_pending_connectors(
+        &mut ctx,
+        Some(br#"{"model":"gpt-4.1"}"#),
+        &[],
+        &http::HeaderMap::new(),
+        &callout,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "budget rejection must not dial the next MCP server"
+    );
+}
+
+#[tokio::test]
 #[expect(clippy::too_many_lines, reason = "header-phase SSE lifecycle assertions")]
 async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2140,6 +2299,73 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     assert!(
         !raw.contains("event: error"),
         "deferred streaming failure must not use the sequence-zero SSE error path: {raw}"
+    );
+}
+
+#[test]
+fn bodyless_deferred_failure_does_not_copy_full_retained_request_for_echo() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    drop(listener);
+    let filter = make_dispatch_filter_allow_private();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    let instructions = "x".repeat(26 * 1024 * 1024);
+    let body_json = json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+        "instructions": instructions,
+    });
+    let mut state = ResponsesState::from_request_body(body_json);
+    state.deferred_mcp = vec![DeferredMcpConnector {
+        authorization: None,
+        allowed_tools: None,
+        connector_id: "corp_drive".to_owned(),
+        headers: None,
+        max_rewritten_body_bytes: 67_108_864,
+        max_tools: 128,
+        require_approval: None,
+        server_label: "drive".to_owned(),
+        server_url,
+        timeout: std::time::Duration::from_secs(1),
+    }];
+    let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
+    state.tool_search_calls = vec![search.clone()];
+    state.accumulated_output = vec![search.clone()];
+    state.response_object = json!({"output": [search]});
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 25 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut action = None;
+    let allocation = allocation_counter::measure(|| {
+        action = Some(
+            runtime
+                .block_on(filter.on_request_body(&mut ctx, &mut None, true))
+                .unwrap(),
+        );
+    });
+
+    assert!(matches!(action, Some(FilterAction::Continue)));
+    assert!(
+        allocation.bytes_max < 13 * 1024 * 1024,
+        "bodyless deferred failure must borrow small echoed fields: {allocation:?}"
+    );
+    let action = runtime.block_on(filter.on_request(&mut ctx)).unwrap();
+    let FilterAction::TerminalResponse(terminal) = action else {
+        panic!("failed deferred discovery must terminate with SSE");
+    };
+    let raw = std::str::from_utf8(terminal.body.as_deref().unwrap()).unwrap();
+    assert!(raw.contains("gpt-4o-mini"), "model option should be echoed");
+    assert!(
+        !raw.contains(&"x".repeat(1024)),
+        "oversized instructions must not be echoed"
     );
 }
 

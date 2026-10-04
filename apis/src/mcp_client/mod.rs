@@ -42,12 +42,13 @@ use rmcp::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
+use self::session_pool::PooledSession;
 pub use self::streaming_selector::McpStreamingSelectorFilter;
-use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPONSE_BYTES};
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
-        McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+        MAX_CONTROL_RESPONSE_BYTES, MIN_TOOL_INITIALIZE_BYTES, McpCallout, bind_mcp_outbound_chain,
+        build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
     },
 };
 use crate::StateOwner;
@@ -478,6 +479,10 @@ pub(crate) async fn call_tool(
     clippy::too_many_arguments,
     reason = "mirrors the tool-call boundary's forwarded-header + connector context inputs"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "rmcp initialization and signal setup form one session boundary"
+)]
 async fn open_tool_session(
     server_url: &str,
     headers: Option<&serde_json::Value>,
@@ -487,6 +492,7 @@ async fn open_tool_session(
     connector_context: Option<&McpConnectorContext<'_>>,
     timeout: Duration,
     max_result_bytes: usize,
+    initialize_limit: usize,
     callout: &McpCallout,
     display_url: &McpDisplayUrl,
 ) -> Result<PooledSession, McpClientError> {
@@ -494,6 +500,7 @@ async fn open_tool_session(
         callout.clone(),
         timeout,
         max_result_bytes,
+        initialize_limit,
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();
@@ -517,14 +524,19 @@ async fn open_tool_session(
         })
     })?;
     signal_state.finish_exchange(&signal);
-    Ok(PooledSession::new(service, signal_state, max_result_bytes))
+    Ok(PooledSession::new(
+        service,
+        signal_state,
+        max_result_bytes,
+        initialize_limit,
+    ))
 }
 
 /// Issue one `tools/call` on an already-initialized session without closing it.
 ///
-/// `initialize` uses the control ceiling; the `tools/call` result is bounded to
-/// the configured `max_result_bytes` cap (expanded for worst-case JSON string
-/// escaping) before deserialization, applied inside the session's transport.
+/// Under an aggregate budget, `initialize` uses the admitted payload cap with
+/// a 1 KiB floor; otherwise it retains the 1 MiB control ceiling. The
+/// `tools/call` result uses `max_result_bytes` (expanded for JSON escaping).
 async fn invoke_tool(
     session: &PooledSession,
     signal: &Arc<OnceLock<subrequest_transport::TransportSignal>>,
@@ -571,14 +583,7 @@ async fn invoke_tool(
     clippy::too_many_arguments,
     reason = "trusted forwarded headers and optional pooling extend the existing API"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "reuse attempt and fresh open share one boundary with distinct cleanup on each exit"
-)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "rmcp service setup and explicit success/error cleanup remain in one async ownership boundary"
-)]
+#[cfg(test)]
 pub(crate) async fn call_tool_with_forwarded_headers(
     pool: Option<(&McpSessionPool, &McpPoolKey)>,
     server_url: &str,
@@ -593,6 +598,51 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     max_result_bytes: usize,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    call_tool_with_forwarded_headers_bounded_initialize(
+        pool,
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+        tool_name,
+        arguments,
+        timeout,
+        max_result_bytes,
+        MAX_CONTROL_RESPONSE_BYTES,
+        callout,
+    )
+    .await
+}
+
+/// The aggregate-budget variant caps initialization before rmcp retains its
+/// peer information. Unbudgeted callers use the established control ceiling.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tool and initialization ceilings are distinct transport limits"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "reused and fresh sessions share one call lifecycle"
+)]
+#[expect(clippy::large_stack_frames, reason = "rmcp session setup owns its callout state")]
+pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
+    pool: Option<(&McpSessionPool, &McpPoolKey)>,
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout: Duration,
+    max_result_bytes: usize,
+    initialize_limit: usize,
+    callout: &McpCallout,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    let initialize_limit = initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES);
     let display_url = parse_display_url(server_url);
     let deadline = tokio::time::Instant::now() + timeout;
     // 1. Reuse a warm session for this exact identity, if one exists. A reused session only ever existed after a prior
@@ -601,7 +651,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
     if let Some((pool, key)) = pool {
-        let checkout = pool.checkout(key, max_result_bytes);
+        let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit);
         session_pool::close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
             let signal = session.begin_call();
@@ -648,6 +698,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
             connector_context,
             timeout,
             max_result_bytes,
+            initialize_limit,
             callout,
             &display_url,
         )

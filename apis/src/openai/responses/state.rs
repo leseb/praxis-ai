@@ -346,9 +346,12 @@ pub(crate) struct ResponsesState {
     pub(crate) retained_rehydrate_stream_bytes: usize,
     /// Semantic and framing payload published by the Chat stream translator.
     pub(crate) retained_chat_converter_bytes: usize,
+    /// Initialized MCP peer metadata retained in the request-scoped session pool.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub(crate) retained_mcp_session_bytes: usize,
 
-    /// Revision of request/history/output owners cached by response-store
-    /// replay admission. In-place changes do not alter collection lengths.
+    /// Revision of request, history, output, and resolved MCP definitions
+    /// cached by streaming admission. In-place changes do not alter lengths.
     /// `None` means the counter overflowed and replay must fail closed.
     pub(crate) replay_stable_payload_revision: Option<u64>,
 
@@ -926,6 +929,8 @@ impl Default for ResponsesState {
             retained_stream_parser_bytes: 0,
             retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
+            #[cfg(feature = "openai-mcp-tools")]
+            retained_mcp_session_bytes: 0,
             replay_stable_payload_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
@@ -1060,9 +1065,10 @@ impl ResponsesState {
         self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
     }
 
-    /// Request, history, and the capture-once client-tool echo remain stable
-    /// between upstream chunks. Measure them once per round; streaming filters
-    /// refresh this baseline when a request rewrite or next round changes it.
+    /// Request, history, resolved MCP definitions, and the capture-once
+    /// client-tool echo remain stable between upstream chunks. Measure them
+    /// once per round; streaming filters refresh this baseline when discovery,
+    /// binding, a request rewrite, or the next round changes it.
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
@@ -1081,6 +1087,11 @@ impl ResponsesState {
         if let Some(echo) = &self.client_tool_echo {
             meter.json_values(&echo.tools)?;
             meter.json(&echo.tool_choice)?;
+        }
+        for ((server, tool), value) in &self.mcp_tool_map {
+            meter.raw(server.len())?;
+            meter.raw(tool.len())?;
+            meter.json(value)?;
         }
         Some(meter.used())
     }
@@ -1152,6 +1163,10 @@ impl ResponsesState {
         if include_chat_converter {
             meter.raw(self.retained_chat_converter_bytes)?;
         }
+        #[cfg(feature = "openai-mcp-tools")]
+        if include_external {
+            meter.raw(self.retained_mcp_session_bytes)?;
+        }
 
         if !skip_stream_stable {
             meter.json(&self.request_body)?;
@@ -1170,6 +1185,11 @@ impl ResponsesState {
             if let Some(echo) = &self.client_tool_echo {
                 meter.json_values(&echo.tools)?;
                 meter.json(&echo.tool_choice)?;
+            }
+            for ((server, tool), value) in &self.mcp_tool_map {
+                meter.raw(server.len())?;
+                meter.raw(tool.len())?;
+                meter.json(value)?;
             }
         }
         for value in [
@@ -1195,11 +1215,6 @@ impl ResponsesState {
         .into_iter()
         .flatten()
         {
-            meter.json(value)?;
-        }
-        for ((server, tool), value) in &self.mcp_tool_map {
-            meter.raw(server.len())?;
-            meter.raw(tool.len())?;
             meter.json(value)?;
         }
         for (private_name, lowered) in &self.client_tool_lowering {
@@ -1350,6 +1365,10 @@ impl ResponsesState {
         self.mcp_tool_map.clear();
         self.client_tool_lowering.clear();
         self.client_tool_echo = None;
+        #[cfg(feature = "openai-mcp-tools")]
+        {
+            self.retained_mcp_session_bytes = 0;
+        }
         self.messages.clear();
         self.persisted_messages.clear();
         #[cfg(feature = "store")]
@@ -1442,8 +1461,8 @@ impl ResponsesState {
         self.mark_replay_stable_payload_changed();
     }
 
-    /// Invalidate the store replay meter after an in-place mutation of a
-    /// cached request, history, tool, or accumulated output owner.
+    /// Invalidate streaming meters after an in-place mutation of a cached
+    /// request, history, tool definition, or accumulated output owner.
     pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
         self.replay_stable_payload_revision = self
             .replay_stable_payload_revision
@@ -2013,6 +2032,33 @@ mod tests {
             "the capture-once echo must not be serialized by changing meters: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn resolved_mcp_definitions_are_measured_once_in_stream_stable_charge() {
+        let mut state = ResponsesState::default();
+        let baseline_stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        let baseline_changing = state.stream_changing_payload_bytes_bounded_for_parser(1_024).unwrap();
+        let definition = json!({"description": "x".repeat(1_048_576)});
+        let map_bytes = "server".len() + "tool".len() + retained_json_bytes(&definition).unwrap();
+        state
+            .mcp_tool_map
+            .insert(("server".to_owned(), "tool".to_owned()), definition);
+        state.mark_replay_stable_payload_changed();
+
+        let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
+        assert_eq!(stable, baseline_stable + map_bytes);
+        for changing in [
+            state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+            state.stream_changing_payload_bytes_bounded_with_cached_output(1_024),
+            #[cfg(feature = "store")]
+            state.rehydrate_stream_changing_payload_bytes_bounded(1_024),
+            #[cfg(feature = "store")]
+            state.store_stream_changing_payload_bytes_bounded(1_024),
+        ] {
+            assert_eq!(changing, Some(baseline_changing));
+        }
+        assert_eq!(state.retained_payload_bytes().unwrap(), stable + baseline_changing);
     }
 
     #[cfg(feature = "store")]

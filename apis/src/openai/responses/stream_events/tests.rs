@@ -185,6 +185,112 @@ fn lowered_completion_uses_post_accumulation_staging_near_cap() {
     assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
+#[test]
+fn co_batched_completions_do_not_reserialize_unrelated_large_output() {
+    assert_completion_batch_does_not_reserialize_unrelated_output(false);
+}
+
+#[test]
+fn interleaved_item_done_does_not_reserialize_unrelated_large_output() {
+    assert_completion_batch_does_not_reserialize_unrelated_output(true);
+}
+
+fn assert_completion_batch_does_not_reserialize_unrelated_output(interleave_done: bool) {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    responses.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(responses);
+    let mut added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "x".repeat(1_048_576)}]}}),
+    )
+    .to_vec();
+    let mut done = Vec::new();
+    for index in 0..300 {
+        added.extend_from_slice(&make_sse_chunk(
+            "response.output_item.added",
+            &json!({"output_index": index + 1, "item": {"type": "function_call", "name": "private", "id": format!("fc_{index}"), "call_id": format!("c{index}"), "arguments": "", "status": "in_progress"}}),
+        ));
+        done.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": index + 1, "item_id": format!("fc_{index}"), "arguments": "{}"}),
+        ));
+        if interleave_done {
+            done.extend_from_slice(&make_sse_chunk(
+                "response.output_item.done",
+                &json!({"output_index": index + 1, "item": {"type": "function_call", "name": "private", "id": format!("fc_{index}"), "call_id": format!("c{index}"), "arguments": "{}", "status": "completed"}}),
+            ));
+        }
+    }
+    let mut body = Some(Bytes::from(added));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_some());
+    body = Some(Bytes::from(done));
+    let started = std::time::Instant::now();
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_some(), "the completion batch must fit its 64 MiB budget");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "300 small completions (interleaved={interleave_done}) must not rescan a 1 MiB output per event: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn co_batched_completion_snapshots_reject_before_next_large_clone() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    ctx.extensions.insert(responses);
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "function_call", "name": "private", "id": "fc_1", "call_id": "c1", "arguments": "", "status": "in_progress", "padding": "x".repeat(16_384)}}),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    let baseline = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(65_536);
+    let frame = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
+    );
+    let mut body = Some(Bytes::from([frame.as_ref(), frame.as_ref()].concat()));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none());
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+    assert!(
+        allocations.bytes_max < u64::try_from(65_536 - baseline).unwrap(),
+        "reject before the next clone exceeds remaining headroom: {allocations:?}"
+    );
+}
+
 /// A terminal response is retained in shared state before restoration planning.
 fn assert_terminal_avoids_duplicate_staging(lowered: bool) {
     let (filter, mut ctx) = make_armed_context();
@@ -722,6 +828,37 @@ fn streaming_budget_caches_client_tool_echo_captured_after_arm() {
             .is_some()
     );
     assert!(!responses.retained_payload_failed);
+}
+
+#[test]
+fn unbounded_stream_skips_echo_projection_without_snapshots() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "function", "name": "large", "description": "x".repeat(1_048_576)})],
+        tool_choice: json!("auto"),
+    });
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(responses);
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let mut body = Some(Bytes::from_static(b": ping\n\n"));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "heartbeat chunks must not serialize a 1 MiB echo without snapshots: {:?}",
+        started.elapsed()
+    );
+    assert!(ctx.get_metadata("responses.stream_error_message").is_none());
 }
 
 #[test]

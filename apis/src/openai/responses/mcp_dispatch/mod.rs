@@ -8,7 +8,7 @@
 //! response classification, approval partitioning, and terminal policy. This
 //! dispatcher resumes client approval responses, lists deferred connectors
 //! after a hosted `tool_search_call`, and executes prepared MCP calls via
-//! [`mcp_client::call_tool_with_forwarded_headers`]. A streaming deferred `tools/list` failure is
+//! [`mcp_client::call_tool_with_forwarded_headers_bounded_initialize`]. A streaming deferred `tools/list` failure is
 //! stashed during the body pre-read and emitted from `on_request` as the
 //! canonical `response.mcp_list_tools.failed` / `response.failed` lifecycle.
 //!
@@ -66,8 +66,8 @@ use tracing::{debug, warn};
 use self::{
     approval::{
         ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context, bind_owner_context,
-        build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
-        parse_approval_response, resolve_approval, target_fingerprint,
+        build_approved_tool_call, build_denial_message, connector_binding_growth_bytes, extract_approval_responses,
+        is_approval_response, parse_approval_response, resolve_approval, target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
@@ -78,6 +78,7 @@ use super::{
     openai_mcp_tool_resolve::{
         McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
+        resolve_error_action_from_request_state,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -290,6 +291,7 @@ impl McpDispatchFilter {
             max_parallel_calls: self.max_parallel_calls,
             max_result_bytes: per_result_limit,
             max_total_result_bytes: execution_batch_limit,
+            aggregate_budgeted: state.retained_payload_limit().is_some(),
             timeout: self.timeout,
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
@@ -318,15 +320,36 @@ impl McpDispatchFilter {
         ctx: &mut HttpFilterContext<'_>,
         headers: &http::HeaderMap,
         connector_identity: Option<&McpCalloutIdentity>,
-    ) {
+    ) -> bool {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
-            return;
+            return true;
         };
+        if state.retained_payload_limit().is_some() {
+            let growth = state.mcp_tool_map.values().try_fold(0_usize, |used, entry| {
+                used.checked_add(connector_binding_growth_bytes(
+                    entry,
+                    connector_identity.is_some(),
+                    connector_identity
+                        .and_then(McpCalloutIdentity::user_credential)
+                        .is_some(),
+                )?)
+            });
+            if !growth.is_some_and(|bytes| state.can_retain_payload(bytes)) {
+                return false;
+            }
+        }
         for entry in state.mcp_tool_map.values_mut() {
             bind_forwarded_header_context(entry, &self.forward_headers, headers);
             bind_owner_context(entry, connector_identity.map(McpCalloutIdentity::owner));
             bind_credential_context(entry, connector_identity.and_then(McpCalloutIdentity::user_credential));
         }
+        if !state.mcp_tool_map.is_empty() {
+            // The resolved map belongs to the cached streaming baseline. Header,
+            // owner, or credential binding may rewrite entries without changing
+            // the map's length, so invalidate store and rehydrate snapshots.
+            state.mark_replay_stable_payload_changed();
+        }
+        true
     }
 
     /// Append MCP execution results to private continuation and public output state.
@@ -381,12 +404,15 @@ impl McpDispatchFilter {
 
     /// Stop the request after an aggregate MCP result admission failure.
     fn aggregate_budget_action(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+        if let Some(pool) = ctx.extensions.get::<mcp_client::McpSessionPool>() {
+            pool.drain_in_background();
+        }
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.discard_payload_for_budget_error();
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while appending MCP results".to_owned(),
+                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while dispatching MCP tools".to_owned(),
             });
         }
         ctx.set_metadata("responses.skip_persist", "true");
@@ -1162,7 +1188,9 @@ impl McpDispatchFilter {
         } else {
             None
         };
-        self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
+        if !self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref()) {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
 
         // Fetch (or lazily create) the per-execution MCP session pool. It lives
         // in the request's threaded `RequestExtensions`, so this same pool is
@@ -1173,6 +1201,9 @@ impl McpDispatchFilter {
             .extensions
             .get_or_insert_with(mcp_client::McpSessionPool::new)
             .clone();
+        if !charge_pooled_mcp_sessions(ctx, &session_pool) {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -1180,6 +1211,16 @@ impl McpDispatchFilter {
         // `function_call_output` so inference resumes without a tool call.
         if let Err(rejection) = self.resume_approvals(ctx).await {
             return Ok(FilterAction::Reject(rejection));
+        }
+
+        // Binding, parked sessions, and approval resume can each grow retained
+        // state even when this round has no MCP call to execute.
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| !state.can_retain_payload(0))
+        {
+            return Ok(Self::aggregate_budget_action(ctx));
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -1213,18 +1254,7 @@ impl McpDispatchFilter {
         };
 
         if needs_discovery {
-            let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
-                ctx.extensions
-                    .get::<ResponsesState>()
-                    .and_then(|state| serde_json::to_vec(&state.request_body).ok())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let bytes = body
-                .as_ref()
-                .filter(|bytes| !bytes.is_empty())
-                .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
+            let bytes = body.as_ref().filter(|bytes| !bytes.is_empty()).map(Bytes::as_ref);
             let action = discover_pending_connectors(
                 ctx,
                 bytes,
@@ -1236,6 +1266,15 @@ impl McpDispatchFilter {
             .await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
+            }
+            // Deferred discovery inserts new map entries after the initial
+            // binding check. Its projected commit also needs a final admission.
+            if ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| !state.can_retain_payload(0))
+            {
+                return Ok(Self::aggregate_budget_action(ctx));
             }
         }
 
@@ -1275,6 +1314,12 @@ impl McpDispatchFilter {
             Err(_limit) if aggregate_constrained => return Ok(Self::aggregate_budget_action(ctx)),
             Err(_limit) => return Ok(Self::result_limit_action(ctx)),
         };
+        // rmcp retains initialization peer information (including instructions
+        // and _meta) in every parked session. Publish its current charge before
+        // admitting the result batch or the next agentic round.
+        if !charge_pooled_mcp_sessions(ctx, &session_pool) {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
         if !ctx
             .extensions
             .get::<ResponsesState>()
@@ -1288,6 +1333,22 @@ impl McpDispatchFilter {
     }
 }
 
+/// Publish the request pool's retained metadata only when aggregate admission
+/// is active; ordinary MCP calls do not need to serialize parked peer info.
+fn charge_pooled_mcp_sessions(ctx: &mut HttpFilterContext<'_>, pool: &mcp_client::McpSessionPool) -> bool {
+    let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let Some(bytes) = pool.retained_payload_bytes() else {
+        return false;
+    };
+    state.retained_mcp_session_bytes = bytes;
+    true
+}
+
 /// Load deferred connector tools when a hosted `tool_search_call` is pending.
 #[expect(
     clippy::too_many_arguments,
@@ -1296,7 +1357,7 @@ impl McpDispatchFilter {
 )]
 async fn discover_pending_connectors(
     ctx: &mut HttpFilterContext<'_>,
-    body: &[u8],
+    body: Option<&[u8]>,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
@@ -1332,7 +1393,10 @@ async fn discover_pending_connectors(
             let streaming = ctx
                 .get_metadata("openai_responses_format.stream")
                 .is_some_and(|v| v == "true");
-            Ok(resolve_error_action(ctx, &err, streaming, body))
+            Ok(match body {
+                Some(body) => resolve_error_action(ctx, &err, streaming, body),
+                None => resolve_error_action_from_request_state(ctx, &err, streaming),
+            })
         },
     }
 }
@@ -1728,6 +1792,10 @@ impl McpCallResult {
 
 /// Reserve raw callout bodies and parsed result staging alongside the three
 /// final result owners before making an external MCP call.
+#[expect(
+    clippy::too_many_lines,
+    reason = "result and handshake reservations share one MCP admission calculation"
+)]
 fn aggregate_mcp_result_limit(
     state: &ResponsesState,
     mcp_calls: &[&serde_json::Value],
@@ -1761,8 +1829,21 @@ fn aggregate_mcp_result_limit(
             .checked_add(arguments)?
             .checked_add(tool_bytes)
     })?;
-    let available = limit.checked_sub(current)?.checked_sub(staging)?;
-    let admitted = configured_limit.min(available / 3);
+    // Initialization can leave peer information in the pool after the result
+    // is committed. The transport caps each initialize response to at most the
+    // decoded tool payload allowance (one quarter of its retained-result
+    // allowance), with a 1 KiB compatibility floor. Four simultaneous forms
+    // cover buffered wire, decoded response, rmcp peer info, and conversion
+    // staging; reserve that floor plus one extra result allowance per call.
+    let initialize_floor = mcp_calls
+        .len()
+        .checked_mul(mcp_client::MIN_TOOL_INITIALIZE_BYTES)?
+        .checked_mul(4)?;
+    let available = limit
+        .checked_sub(current)?
+        .checked_sub(staging)?
+        .checked_sub(initialize_floor)?;
+    let admitted = configured_limit.min(available / 4);
     let minimum = mcp_calls.len().checked_mul(MIN_RETAINED_RESULT_BYTES)?;
     (admitted >= minimum).then_some((admitted, admitted < configured_limit))
 }
@@ -1836,6 +1917,8 @@ struct McpExecutionOptions<'a> {
     max_result_bytes: usize,
     /// Maximum serialized bytes retained by one result batch.
     max_total_result_bytes: usize,
+    /// Bound rmcp's retained initialize peer info only under agentic budget.
+    aggregate_budgeted: bool,
     /// Timeout applied independently to each MCP call.
     timeout: Duration,
     /// Names reserved for trusted forwarding, including when values are absent.
@@ -2138,7 +2221,12 @@ async fn execute_single_call(
     // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
     // key and therefore remain fail-closed and unpooled.
     let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
-    let result = mcp_client::call_tool_with_forwarded_headers(
+    let initialize_limit = if options.aggregate_budgeted {
+        payload_limit
+    } else {
+        mcp_client::MAX_CONTROL_RESPONSE_BYTES
+    };
+    let result = mcp_client::call_tool_with_forwarded_headers_bounded_initialize(
         session_key.as_ref().map(|key| (options.session_pool, key)),
         server_url,
         headers,
@@ -2150,6 +2238,7 @@ async fn execute_single_call(
         arguments,
         options.timeout,
         payload_limit,
+        initialize_limit,
         callout,
     )
     .await;
