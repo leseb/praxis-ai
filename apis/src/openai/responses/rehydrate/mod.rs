@@ -54,7 +54,10 @@ use super::{
     append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
-    state::{CompletedToolCallsChargeCache, ResponseObjectChargeCache, ResponsesState, strip_local_compaction_marker},
+    state::{
+        CompletedToolCallsChargeCache, PayloadMeter, ResponseObjectChargeCache, ResponsesState,
+        strip_local_compaction_marker,
+    },
 };
 use crate::{
     is_event_stream_content_type,
@@ -760,7 +763,7 @@ struct RestorePreviousResponseIdStream {
     last_forwarded_sequence: Option<u64>,
     /// A terminal SSE frame was admitted and forwarded in an earlier callback.
     forwarded_terminal: bool,
-    /// Stable request/history payload measured once per streaming round.
+    /// Stable request/history and prior output measured once per streaming round.
     stable_payload: Option<RestoreStablePayloadCache>,
     /// Exact current-round response object charge, keyed by mutation revision.
     response_object_charge: Option<ResponseObjectChargeCache>,
@@ -778,7 +781,7 @@ struct RestoreStablePayloadCache {
     /// In-place mutation revision of those owners.
     revision: u64,
     /// Shapes of all stable collections, catching appends without a revision.
-    collection_lengths: [usize; 9],
+    collection_lengths: [usize; 10],
     /// Serialized payload charge of the stable owners.
     bytes: usize,
 }
@@ -804,7 +807,7 @@ impl RestoreStablePayloadCache {
     }
 
     /// Snapshot collection lengths without scanning their JSON payloads.
-    fn collection_lengths(state: &ResponsesState) -> [usize; 9] {
+    fn collection_lengths(state: &ResponsesState) -> [usize; 10] {
         [
             state.input.len(),
             state.messages.len(),
@@ -812,6 +815,7 @@ impl RestoreStablePayloadCache {
             state.previous_tools.len(),
             state.tools.len(),
             state.provider_compaction_ids.len(),
+            state.accumulated_output.len(),
             state.mcp_tool_map.len(),
             usize::from(state.client_tool_echo.is_some()),
             state.client_tool_echo.as_ref().map_or(0, |echo| echo.tools.len()),
@@ -1040,8 +1044,8 @@ fn restore_previous_response_id_stream_chunk_with_budget(
     }
 }
 
-/// Measure stable request/history once, while counting changing owners on each
-/// callback. The old pending buffer can be replaced in the same admission.
+/// Measure stable request/history and prior output once, while counting changing
+/// owners on each callback. The old pending buffer can be replaced in the same admission.
 fn streaming_restore_budget(
     armed: &mut RestorePreviousResponseIdStream,
     budget: Option<&ResponsesState>,
@@ -1052,13 +1056,7 @@ fn streaming_restore_budget(
     let Some(limit) = state.retained_payload_limit() else {
         return Ok(None);
     };
-    let stable = if let Some(cache) = armed.stable_payload.filter(|cache| cache.matches(state, limit)) {
-        cache.bytes
-    } else {
-        let bytes = state.stream_stable_payload_bytes_bounded(limit).ok_or(())?;
-        armed.stable_payload = RestoreStablePayloadCache::new(state, limit, bytes);
-        bytes
-    };
+    let stable = restore_stable_payload_bytes(armed, state, limit)?;
     let measurement_limit = limit.checked_add(state.retained_rehydrate_stream_bytes).ok_or(())?;
     let changing_limit = measurement_limit.checked_sub(stable).ok_or(())?;
     let response_object_bytes =
@@ -1066,7 +1064,7 @@ fn streaming_restore_budget(
     let tool_calls_bytes =
         CompletedToolCallsChargeCache::measure(&mut armed.tool_calls_charge, state, changing_limit).ok_or(())?;
     let changing = state
-        .rehydrate_stream_changing_payload_bytes_bounded_with_response_object_size(
+        .stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
             changing_limit,
             Some(response_object_bytes),
             Some(tool_calls_bytes),
@@ -1078,6 +1076,24 @@ fn streaming_restore_budget(
         current,
         retained_rehydrate_stream_bytes: state.retained_rehydrate_stream_bytes,
     }))
+}
+
+/// Reuse the unchanged request/history and prior-output charge for each streamed callback.
+fn restore_stable_payload_bytes(
+    armed: &mut RestorePreviousResponseIdStream,
+    state: &ResponsesState,
+    limit: usize,
+) -> Result<usize, ()> {
+    if let Some(cache) = armed.stable_payload.filter(|cache| cache.matches(state, limit)) {
+        return Ok(cache.bytes);
+    }
+    let stable = state.stream_stable_payload_bytes_bounded(limit).ok_or(())?;
+    let remaining = limit.checked_sub(stable).ok_or(())?;
+    let mut prior_output = PayloadMeter::new(remaining);
+    prior_output.json_values(&state.accumulated_output).ok_or(())?;
+    let bytes = stable.checked_add(prior_output.used()).ok_or(())?;
+    armed.stable_payload = RestoreStablePayloadCache::new(state, limit, bytes);
+    Ok(bytes)
 }
 
 /// Admit one rewrite staging allocation against the current callback snapshot.

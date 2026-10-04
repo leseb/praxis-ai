@@ -579,8 +579,7 @@ pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]
         // Exponent-form numbers can grow when serde_json materializes Values.
         // Reserve that normalized size before the first owned JSON tree exists.
         if bytes.len() > body_limit
-            || buffered_parsed_json_bytes_upper_bound(bytes)
-                .is_none_or(|parsed_bytes| parsed_bytes > body_limit)
+            || buffered_parsed_json_bytes_upper_bound(bytes).is_none_or(|parsed_bytes| parsed_bytes > body_limit)
         {
             let message = format!(
                 "request body exceeds the {body_limit}-byte admission limit derived from openai_agentic_loop.max_retained_bytes"
