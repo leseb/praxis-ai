@@ -887,6 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "linear insert-only persistence assertions")]
     async fn insert_if_absent_keeps_existing_response_and_approval() {
         let store = InMemoryStore::new();
         let o = owner("tenant");
@@ -976,7 +977,7 @@ mod tests {
         assert!(matches!(rejected, Err(StoreError::PayloadTooLarge)));
         let listed = store.list_conversation_items(&o, "c1", None, 10, true).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].item_id, "prior");
+        assert_eq!(listed.first().map(|item| item.item_id.as_str()), Some("prior"));
         let conversation = ResponseStore::get_conversation(&store, &o, "c1")
             .await
             .unwrap()
