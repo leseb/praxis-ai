@@ -2762,8 +2762,13 @@ async fn connector_rebinding_reserves_transient_digest_even_when_final_map_size_
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
-    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(
+        state.dispatch_failure.is_none(),
+        "initial budget failure is an HTTP rejection"
+    );
 }
 
 #[tokio::test]
