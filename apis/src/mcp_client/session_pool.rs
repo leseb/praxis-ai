@@ -398,6 +398,7 @@ impl McpSessionPool {
 
     /// Take one compatible session and return all unusable entries separately
     /// so the caller can close them outside the synchronous mutex boundary.
+    #[cfg(test)]
     pub(crate) fn checkout(&self, key: &McpPoolKey, payload_limit: usize) -> PoolCheckout {
         self.checkout_with_initialize_limit(key, payload_limit, super::MAX_CONTROL_RESPONSE_BYTES, false)
     }
@@ -477,6 +478,7 @@ impl McpSessionPool {
     }
 
     /// Remove every idle session from the pool and close them concurrently.
+    #[cfg(test)]
     pub(crate) async fn drain(&self) {
         let sessions = self.take_all();
         close_sessions(sessions).await;

@@ -359,10 +359,11 @@ impl McpToolResolveFilter {
             .get::<AgenticBudgetPolicy>()
             .map(|policy| policy.max_retained_bytes())
         {
-            let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.apply_retained_payload_limit(limit);
+            } else if listener_budget.is_none() {
                 return Err(ResolveError::RetainedBudget);
-            };
-            state.apply_retained_payload_limit(limit);
+            }
         }
         let mut mcp_entries = extract_mcp_entries(&mut parsed);
         if mcp_entries.is_empty() {
@@ -391,7 +392,7 @@ impl McpToolResolveFilter {
             .iter()
             .any(|entry| resolvable_server_url(entry).is_some())
         {
-            eager_listing_budget(ctx, body, &parsed, &mcp_entries.values)?
+            eager_listing_budget(ctx, body, &parsed, &mcp_entries.values, listener_budget)?
         } else {
             None
         };
@@ -707,6 +708,7 @@ fn resolver_listener_budget(
         return Ok(None);
     }
     if let Some(rejection) = super::initial_budget_rejection(ctx, body) {
+        ctx.set_metadata("responses.skip_persist", "true");
         #[cfg(feature = "store")]
         super::store::discard_retained_request_payload(ctx);
         return Err(rejection);
@@ -833,18 +835,14 @@ impl HttpFilter for McpToolResolveFilter {
         let Some(bytes) = body.as_ref().cloned() else {
             return Ok(FilterAction::Continue);
         };
-        // The buffered wire body remains live while parsing creates another
-        // owned JSON tree. Admit its normalized size before allocating it.
-        let parse_fits = ctx.extensions.get::<ResponsesState>().is_none_or(|state| {
-            state.retained_payload_limit().is_none()
-                || super::buffered_parsed_json_bytes_upper_bound(&bytes)
-                    .is_some_and(|parsed_bytes| state.can_retain_payload(parsed_bytes))
-        });
-        if !parse_fits {
-            return Ok(reject_retained_budget(ctx));
-        }
-        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return Ok(FilterAction::Continue);
+        let mut listener_budget = match resolver_listener_budget(ctx, &bytes) {
+            Ok(budget) => budget,
+            Err(rejection) => return Ok(rejection),
+        };
+        let parsed = match parse_budgeted_mcp_request(ctx, &bytes, listener_budget.as_mut()) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return Ok(FilterAction::Continue),
+            Err(rejection) => return Ok(rejection),
         };
 
         let streaming = is_streaming(ctx);
@@ -1066,8 +1064,9 @@ fn eager_listing_budget(
     body: &Option<Bytes>,
     parsed: &serde_json::Value,
     entries: &[serde_json::Value],
+    listener_budget: Option<&ResponsesState>,
 ) -> Result<Option<EagerListingBudget>, ResolveError> {
-    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+    let Some(state) = ctx.extensions.get::<ResponsesState>().or(listener_budget) else {
         return Ok(None);
     };
     let Some(limit) = state.retained_payload_limit() else {

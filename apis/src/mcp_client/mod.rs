@@ -487,6 +487,7 @@ pub(crate) async fn call_tool(
 /// This does not apply a timeout; the caller bounds the handshake.
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "mirrors the tool-call boundary's forwarded-header + connector context inputs"
 )]
 async fn open_tool_session(
@@ -825,7 +826,9 @@ async fn call_tool_with_forwarded_headers_bounded_initialize(
         max_result_bytes,
         initialize_limit,
         initialize_limit,
-        budgeted.then_some(max_result_bytes.saturating_mul(8)),
+        // The test fixture explicitly admits parser structure and JSON-RPC
+        // envelope owners even when the tool's content cap is tiny.
+        budgeted.then_some(max_result_bytes.saturating_mul(8).saturating_add(16 * 1_024)),
         budgeted,
         callout,
     )

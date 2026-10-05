@@ -341,7 +341,9 @@ impl ResolutionBudget {
         let limit = headroom.saturating_sub(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES)
             / AGGREGATE_RESOLUTION_OWNER_RESERVATION;
         self.aggregate_remaining_bytes = Some(limit);
-        if limit < self.max_resolved_bytes {
+        // A tied shared allowance still controls error classification: an
+        // oversized response cannot be swallowed by `on_missing: continue`.
+        if limit <= self.max_resolved_bytes {
             self.max_resolved_bytes = limit;
             self.remaining_resolved_bytes = limit;
             self.aggregate_constrained = true;
@@ -1388,8 +1390,11 @@ mod tests {
         });
         let client = test_client_with_limits(&url, 1024, 1_000);
         let mut budget = client.resolution_budget(None);
-        budget.apply_aggregate_headroom(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 16 * 1024);
-        assert!(!budget.aggregate_constrained, "inline limit ties shared allowance");
+        budget.apply_aggregate_headroom(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 8 * 1024);
+        assert!(
+            budget.aggregate_constrained,
+            "tied inline limit is also a shared allowance"
+        );
         let mut items = vec![serde_json::json!({
             "role": "user", "content": [{"type": "input_file", "file_id": "file-a"}]
         })];
@@ -1444,7 +1449,7 @@ mod tests {
         .await;
         assert!(matches!(result, Ok(0)));
         assert_eq!(items, vec![original]);
-        assert_eq!(budget.aggregate_remaining_bytes, Some(20));
+        assert_eq!(budget.aggregate_remaining_bytes, Some(40));
     }
 
     #[tokio::test]
