@@ -362,12 +362,89 @@ fn discovered_namespace_description_fanout_is_preflighted() {
     let members = (0..32)
         .map(|index| json!({"type": "function", "name": format!("member_{index}"), "parameters": {"type": "object"}}))
         .collect::<Vec<_>>();
-    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi"}));
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": [
+            {"type": "tool_search_call", "call_id": "call_ts", "execution": "client", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "call_ts", "status": "completed", "tools": [
+                {"type": "namespace", "name": "large", "description": "x".repeat(4096), "tools": members}
+            ]}
+        ]
+    }));
     state.apply_retained_payload_limit(64 * 1024);
-    let discovered = [json!({"type": "namespace", "name": "large", "description": "x".repeat(4096), "tools": members})];
-    let action = preflight_namespace_expansion(&state, &discovered)
+    assert!(state.can_retain_payload(0), "the original discovery history fits");
+    let action = preflight_lowering_payload(&state, false)
         .expect_err("discovered descriptions are repeated during lowering too");
     assert_eq!(reject_parts(&action).0, 413);
+}
+
+#[test]
+fn discovered_function_is_rejected_before_conflict_map_clones_its_schema() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "store": true,
+        "input": [
+            {"type": "tool_search_call", "call_id": "call_ts", "execution": "client", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "call_ts", "status": "completed", "tools": [
+                {"type": "function", "name": "loaded", "parameters": {
+                    "type": "object", "properties": {"payload": {"type": "string", "description": "x".repeat(100_000)}}
+                }}
+            ]}
+        ]
+    }));
+    state.apply_retained_payload_limit(1024 * 1024);
+    assert!(state.can_retain_payload(0), "the original request fits");
+    let original = state.request_body.clone();
+
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("discovery fanout exceeds the shared budget before cloning");
+    assert_eq!(reject_parts(&action).0, 413);
+    assert_eq!(state.request_body, original, "no lowerable source was mutated");
+    assert!(state.client_tool_lowering.is_empty());
+}
+
+#[test]
+fn discovered_custom_escaped_schema_is_rejected_before_history_stringification() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": [
+            {"type": "tool_search_call", "call_id": "call_ts", "execution": "client", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "call_ts", "status": "completed", "tools": [
+                {"type": "custom", "name": "loaded", "format": {"type": "text"},
+                 "output_schema": {"description": "\"".repeat(40_000)}}
+            ]}
+        ]
+    }));
+    state.apply_retained_payload_limit(1024 * 1024);
+    assert!(state.can_retain_payload(0), "the compact original history fits");
+    let original = state.request_body.clone();
+
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("escaped discovered fields would multiply before the rewrite cap");
+    assert_eq!(reject_parts(&action).0, 413);
+    assert_eq!(state.request_body, original);
+}
+
+#[test]
+fn server_owned_discovery_does_not_reserve_client_tool_fanout() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": [
+            {"type": "tool_search_call", "call_id": "call_ts", "execution": "server", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "call_ts", "status": "completed", "tools": [
+                {"type": "function", "name": "loaded", "parameters": {
+                    "type": "object", "properties": {"payload": {"type": "string", "description": "x".repeat(100_000)}}
+                }}
+            ]}
+        ]
+    }));
+    state.apply_retained_payload_limit(1024 * 1024);
+    assert!(state.can_retain_payload(0));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("server-owned history remains a native passthrough");
 }
 
 #[test]

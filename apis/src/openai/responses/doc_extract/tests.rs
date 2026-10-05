@@ -1470,3 +1470,48 @@ async fn policy_without_state_rejects_document_parse_peak() {
     assert_eq!(rejection.status, 413);
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
+
+#[tokio::test]
+async fn policy_without_state_rejects_raw_body_before_json_parse() {
+    use super::super::AgenticBudgetPolicy;
+
+    let request = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 131072").unwrap()).unwrap(),
+    );
+    // Invalid JSON would otherwise be released by this filter. The classifier's
+    // eightfold raw allowance must apply before this parser allocates too.
+    let original = Bytes::from(vec![b'x'; 16_385]);
+    let mut body = Some(original.clone());
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the raw body exceeds its preparse allowance");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body, Some(original));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn policy_without_state_rejects_dense_short_json_before_parse() {
+    use super::super::AgenticBudgetPolicy;
+
+    let request = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap());
+    let original = Bytes::from(format!(r#"{{"input":[{}]}}"#, vec!["null"; 300].join(",")));
+    assert!(original.len() < 8192, "the wire body fits the eightfold raw allowance");
+    let mut body = Some(original.clone());
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("owned JSON nodes exceed the preparse allowance");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body, Some(original));
+}
