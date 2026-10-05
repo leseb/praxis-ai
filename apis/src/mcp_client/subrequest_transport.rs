@@ -3622,6 +3622,10 @@ mod tests {
     }
 
     /// Mirror the budgeted dispatch transport with explicit control and parse caps.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirror the transport's independent fixture ceilings"
+    )]
     fn budgeted_tool_client(
         callout: McpCallout,
         timeout: Duration,
