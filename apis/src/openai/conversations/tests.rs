@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -25,7 +25,7 @@ use super::{
 use crate::{
     openai::{
         operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter, classify},
-        responses::{DEFAULT_TENANT_ID, state::ResponsesState},
+        responses::{DEFAULT_TENANT_ID, state::ResponsesState, store::ResponseStoreFilter},
     },
     operation::{ApplicationProtocol, Transport},
     store::{
@@ -1650,7 +1650,7 @@ async fn early_body_pre_read_defers_store_write_until_request_filters_run() {
 }
 
 #[tokio::test]
-async fn unmatched_pre_read_body_state_is_discarded_after_classification() {
+async fn unmatched_pre_read_body_bytes_are_discarded_after_classification() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = base_owned_filter_context(&req);
@@ -1667,8 +1667,8 @@ async fn unmatched_pre_read_body_state_is_discarded_after_classification() {
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert!(
-        !ctx.filter_state.contains_key(&7),
-        "unmatched requests must not retain the pre-read body through the upstream response"
+        ctx.filter_state.contains_key(&7),
+        "Responses retains its small request-pipeline placement marker after releasing pre-read bytes"
     );
 }
 
@@ -3606,6 +3606,24 @@ async fn capture_append_owner_for_test(filter: &dyn HttpFilter, ctx: &mut HttpFi
     assert!(matches!(action, FilterAction::Continue));
 }
 
+fn mark_buffered_agentic_done(ctx: &mut HttpFilterContext<'_>) {
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .buffered_canonical_finalized = true;
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "done")
+        .unwrap();
+}
+
+fn finalize_buffered_agentic_state(state: &mut ResponsesState) {
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    assert!(body.is_some(), "the canonical response must have a wire body");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_not_armed_without_conversation_metadata() {
     let (filter, store) = harness();
@@ -3615,6 +3633,97 @@ async fn on_response_not_armed_without_conversation_metadata() {
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_append_rejects_missing_shared_state_before_response_body() {
+    let (filter, store) = harness();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    let policy = crate::openai::responses::AgenticBudgetPolicy::from_config(
+        &serde_yaml::from_str("max_retained_bytes: 67108864").unwrap(),
+    )
+    .unwrap();
+    ctx.extensions.insert(policy);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_append_rejects_known_body_length_before_response_body() {
+    let (filter, store) = harness();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    let mut state = ResponsesState::default();
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 1_024);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, "1025".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_append_does_not_emit_error_after_delivered_terminal() {
+    let (filter, store) = harness();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role": "user", "content": "hello"})],
+        response_object: serde_json::json!({
+            "status": "completed",
+            "output": [{"type": "message", "content": "x".repeat(2_048)}]
+        }),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 128);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut done = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+
+    let action = filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(done.as_deref(), Some(b"data: [DONE]\n\n".as_slice()));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4002,7 +4111,7 @@ async fn on_response_body_skips_empty_body() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_appends_completed_response() {
+async fn on_response_body_appends_completed_response_under_64m_budget() {
     let (filter, store) = harness();
     let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
 
@@ -4016,10 +4125,12 @@ async fn on_response_body_appends_completed_response() {
         "role": "user",
         "content": "hello from append"
     })];
-    ctx.extensions.insert(ResponsesState {
+    let mut state = ResponsesState {
         input: input_items.clone(),
         ..ResponsesState::default()
-    });
+    };
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
     let initiating_owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
@@ -4074,6 +4185,1275 @@ async fn on_response_body_appends_completed_response() {
         items[1]["content"][0]["text"], "hi from model",
         "moved response output text must be unchanged"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_false_buffered_append_rejects_before_response_headers() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"x".repeat(8192)}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1024);
+    ctx.extensions.insert(state);
+    mark_buffered_agentic_done(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("over-budget append must reject the completed response");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "server_error");
+    let items = store
+        .list_conversation_items(
+            &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+            &conv_id,
+            None,
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(items.is_empty(), "rejected append must not persist items");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "header and body callbacks prove one append attempt"
+)]
+async fn buffered_header_append_is_not_retried_after_ambiguous_store_error() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::CommittedThenError(Arc::clone(&committed)),
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(state);
+    mark_buffered_agentic_done(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    assert!(filter.on_response(&mut ctx).await.is_err());
+    assert_eq!(committed.load(Ordering::SeqCst), 1);
+    let mut body = Some(Bytes::from_static(b"{}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(committed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_completed_conversation_turn_skips_append_budget_staging() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        input: Vec::new(),
+        response_object: serde_json::json!({"status":"completed","output":[]}),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap());
+    ctx.extensions.insert(state);
+    mark_buffered_agentic_done(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from_static(b"{\"status\":\"completed\",\"output\":[]}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .list_conversation_items(
+                &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+                &conv_id,
+                None,
+                100,
+                true
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_stale_completed_state_without_loop_rejects_before_header() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        response_object: serde_json::json!({"status":"completed","output":[]}),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 65_536);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    let items = store
+        .list_conversation_items(
+            &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+            &conv_id,
+            None,
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(items.is_empty(), "stale completion must not append unverified output");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_canonical_incomplete_conversation_preserves_partial_response() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        response_object: serde_json::json!({"status":"incomplete","output":[]}),
+        buffered_canonical_finalized: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from_static(b"{\"status\":\"incomplete\",\"output\":[]}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+    assert!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reversed_response_filter_order_persists_before_budgeted_conversation_append() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    assert!(matches!(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_reversed_order", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    finalize_buffered_agentic_state(&mut state);
+    ctx.extensions.insert(state);
+    mark_buffered_agentic_done(&mut ctx);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    // Shipped `[Store, Rehydrate, Conversations]` chains run Conversations
+    // first on the response path. It must wait for the later Store hook.
+    ctx.current_filter_id = Some(0);
+    assert!(matches!(
+        conversations.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_reversed_order")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_reversed_order")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reversed_response_filter_order_rolls_back_after_append_budget_rejection() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    assert!(matches!(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_reversed_budget", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
+    finalize_buffered_agentic_state(&mut state);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    mark_buffered_agentic_done(&mut ctx);
+
+    ctx.current_filter_id = Some(0);
+    assert!(matches!(
+        conversations.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.current_filter_id = Some(1);
+    let FilterAction::Reject(rejection) = response_store.on_response(&mut ctx).await.unwrap() else {
+        panic!("later Store hook must propagate append rejection");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(
+        rejection_body(&rejection)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("during conversation append"),
+        "the response row must have been inserted before the append budget failed"
+    );
+    assert!(
+        store
+            .get_response(&owner, "resp_reversed_budget")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_conditions_excluding_store_do_not_suppress_conversation_append() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_store_excluded", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    let wire_bytes = serde_json::to_vec(&state.response_object).unwrap().len();
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    // Core-private IterationState is unavailable in this synthetic context;
+    // the exact provider length keeps this test focused on round participation.
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, wire_bytes.to_string().parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    // An intermediate IRR response did run Store. Its participation marker
+    // must not count for the completed round excluded by response_conditions.
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().iteration = 1;
+    mark_buffered_agentic_done(&mut ctx);
+
+    ctx.current_filter_id = Some(0);
+    assert!(matches!(
+        conversations.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    // The configured Store's response_conditions exclude this exchange, so
+    // core never calls its response hook. The final readiness hook must end
+    // the request-phase-only handoff without inventing a response write.
+    assert!(matches!(
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_store_excluded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_conditions_excluding_store_allow_streaming_conversation_append() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    drop(response_store.on_request(&mut ctx).await.unwrap());
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_stream_excluded", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    ctx.current_filter_id = Some(0);
+    drop(conversations.on_response(&mut ctx).await.unwrap());
+    assert!(matches!(
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    assert!(matches!(
+        conversations.on_response_body(&mut ctx, &mut terminal, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_stream_excluded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prior_large_stream_buffer_rejects_before_budgeted_fallback_body() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1024);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    ctx.response_body_mode = BodyMode::StreamBuffer {
+        max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES),
+    };
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(
+        store
+            .list_conversation_items(
+                &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+                &conv_id,
+                None,
+                100,
+                true
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_false_streaming_append_replaces_over_budget_completed_terminal() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"x".repeat(8192)}]
+        }),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1024);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(terminal.as_deref().unwrap().starts_with(b"event: error\n"));
+    let items = store
+        .list_conversation_items(
+            &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+            &conv_id,
+            None,
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(items.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_false_append_rejects_sql_message_cache_rebuild_without_new_items() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    store
+        .create_items_and_sync_messages(
+            &owner,
+            &conv_id,
+            &[ConversationItemRecord {
+                item_id: "prior".to_owned(),
+                owner: owner.clone(),
+                conversation_id: conv_id.clone(),
+                item_data: serde_json::json!({
+                    "id":"prior", "type":"message", "role":"user", "status":"completed",
+                    "content":[{"type":"input_text","text":"h".repeat(8192)}]
+                }),
+                created_at: 1,
+                position: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"small"})],
+        response_object: serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"small"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 32_768);
+    ctx.extensions.insert(state);
+    mark_buffered_agentic_done(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("SQL history over budget must reject completed response");
+    };
+    assert_eq!(rejection.status, 502);
+    let items = store
+        .list_conversation_items(&owner, &conv_id, None, 100, true)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1, "transaction must roll back new items");
+    assert_eq!(items[0].item_id, "prior");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_noncanonical_conversation_rejects_before_json_header() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    let FilterAction::Reject(rejection) = filter.on_response(&mut ctx).await.unwrap() else {
+        panic!("unknown buffered append cost must reject before a 200 header");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "server_error");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_budget_failure_removes_only_response_persisted_by_this_exchange() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let response_id = "resp_append_budget_rollback";
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(CONVERSATIONS_STORE_NAME), Arc::clone(&store))
+        .unwrap();
+    registry
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.extensions.insert(registry);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 128);
+    ctx.extensions.insert(state);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    // The response was persisted by another response-header filter in this
+    // exchange. A noncanonical append must reject and roll it back before
+    // the 200 JSON header is committed.
+    store
+        .persist_response_with_pending_approvals_if_absent(
+            &ResponseRecord {
+                id: response_id.to_owned(),
+                owner: owner.clone(),
+                created_at: 1,
+                model: "test".to_owned(),
+                response_object: serde_json::json!({"id":response_id,"status":"completed"}),
+                input: serde_json::json!([]),
+                messages: serde_json::json!([]),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+    ctx.extensions
+        .insert(crate::openai::responses::store::PersistedResponseForConversation(
+            response_id.to_owned(),
+        ));
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(store.get_response(&owner, response_id).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_error_still_terminalizes_conversation_budget_failure() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::None,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    for streaming in [false, true] {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = conv_ctx(&store, &req);
+        ctx.extensions
+            .get_mut::<ResponseStoreRegistry>()
+            .unwrap()
+            .register(
+                &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                Arc::clone(&store),
+            )
+            .unwrap();
+        ctx.current_filter_id = Some(0);
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        ctx.set_metadata("responses.conversation_id", "conv_rollback_failure");
+        if streaming {
+            ctx.set_metadata("openai_responses_format.stream", "true");
+        }
+        let mut state = ResponsesState::default();
+        state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 128);
+        ctx.extensions.insert(state);
+        capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+        let mut response = make_response();
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            (if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            })
+            .parse()
+            .unwrap(),
+        );
+        ctx.response_header = Some(&mut response);
+        ctx.extensions
+            .insert(crate::openai::responses::store::PersistedResponseForConversation(
+                "resp_rollback_failure".to_owned(),
+            ));
+        let header_action = filter.on_response(&mut ctx).await.unwrap();
+        if !streaming {
+            assert!(matches!(header_action, FilterAction::Reject(rejection) if rejection.status == 502));
+            assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+            assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+            continue;
+        }
+        assert!(matches!(header_action, FilterAction::Continue));
+        let mut body = Some(Bytes::from(if streaming {
+            format!(
+                "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"text\":\"{}\"}}]}}}}\n\n",
+                "x".repeat(1024)
+            )
+            .into_bytes()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "status":"completed", "output":[{"type":"message","content":"x".repeat(1024)}]
+            }))
+            .unwrap()
+        }));
+        let action = filter.on_response_body(&mut ctx, &mut body, true);
+        if streaming {
+            assert!(matches!(action, Ok(FilterAction::Continue)));
+            let wire = String::from_utf8_lossy(body.as_ref().unwrap());
+            assert!(wire.contains("event: error"), "{wire}");
+            assert!(!wire.contains("event: response.completed"), "{wire}");
+        }
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_insert_if_absent_collision_preserves_prior_response_events_and_approvals() {
+    let (_, store) = sqlite_harness().await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let prior = ResponseRecord {
+        id: "resp_existing".to_owned(),
+        owner: owner.clone(),
+        created_at: 1,
+        model: "old".to_owned(),
+        response_object: serde_json::json!({"id":"resp_existing","status":"completed","output":[]}),
+        input: serde_json::json!([]),
+        messages: serde_json::json!([]),
+    };
+    let approval = PendingApprovalRecord {
+        approval_id: "approval_existing".to_owned(),
+        server_label: "server".to_owned(),
+        tool_name: "old_tool".to_owned(),
+        arguments: "{\"old\":true}".to_owned(),
+        target_fingerprint: "old_fp".to_owned(),
+    };
+    store
+        .persist_response_with_pending_approvals(&prior, std::slice::from_ref(&approval))
+        .await
+        .unwrap();
+    store
+        .append_events(
+            &owner,
+            &prior.id,
+            &[ResponseEventRecord {
+                response_id: prior.id.clone(),
+                owner: owner.clone(),
+                sequence_number: 1,
+                event_type: "response.completed".to_owned(),
+                payload: b"prior event".to_vec(),
+                terminal: true,
+                created_at: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    let replacement = ResponseRecord {
+        model: "new".to_owned(),
+        ..prior.clone()
+    };
+    assert!(
+        !store
+            .persist_response_with_pending_approvals_if_absent(&replacement, &[])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.get_response(&owner, &prior.id).await.unwrap().unwrap().model,
+        "old"
+    );
+    assert_eq!(
+        store.list_events_after(&owner, &prior.id, None, 10).await.unwrap()[0].payload,
+        b"prior event"
+    );
+    assert_eq!(
+        store
+            .get_pending_approvals(&owner, &prior.id, &["approval_existing"])
+            .await
+            .unwrap()[0]
+            .arguments,
+        approval.arguments
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_append_rejects_near_cap_before_writing_items() {
+    let (filter, store) = harness();
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role": "user", "content": "hello"})],
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 1_024);
+    ctx.extensions.insert(state);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    let header_action = filter.on_response(&mut ctx).await.unwrap();
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "x".repeat(2_048)}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+
+    let action = if matches!(header_action, FilterAction::Continue) {
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap()
+    } else {
+        header_action
+    };
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
+    let mut check = conv_ctx(&store, &req);
+    let FilterAction::Reject(list) = filter.on_request(&mut check).await.unwrap() else {
+        panic!("expected the conversation items list");
+    };
+    assert!(rejection_body(&list)["data"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_append_rolls_back_sqlite_cache_overflow() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    store
+        .create_items_and_sync_messages(
+            &owner,
+            &conv_id,
+            &[ConversationItemRecord {
+                item_id: "prior".to_owned(),
+                owner: owner.clone(),
+                conversation_id: conv_id.clone(),
+                item_data: serde_json::json!({"type": "message", "content": "h".repeat(8_192)}),
+                created_at: 1,
+                position: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role": "user", "content": "small"})],
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 32_768);
+    ctx.extensions.insert(state);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "small"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    let items = store
+        .list_conversation_items(&owner, &conv_id, None, 10, true)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1, "bounded SQL append must roll back new items");
+    assert_eq!(items[0].item_id, "prior");
+}
+
+/// Store can run first on the response body path. Its durable row must be
+/// removed when the later Conversation append fails its aggregate allowance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_store_then_append_failure_removes_response_row() {
+    let (conversations, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    store
+        .create_items_and_sync_messages(
+            &owner,
+            &conv_id,
+            &[ConversationItemRecord {
+                item_id: "prior".to_owned(),
+                owner: owner.clone(),
+                conversation_id: conv_id.clone(),
+                item_data: serde_json::json!({"type": "message", "content": "h".repeat(8_192)}),
+                created_at: 1,
+                position: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    let store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&store_config).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    assert!(matches!(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    let response_id = "resp_append_order_rollback";
+    let response_json = serde_json::json!({
+        "id": response_id,
+        "created_at": 1,
+        "model": "test",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "small"}],
+    });
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role": "user", "content": "small"})],
+        response_object: response_json.clone(),
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 32_768);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    ctx.current_filter_id = Some(0);
+    assert!(matches!(
+        conversations.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    ctx.current_filter_id = Some(1);
+    let FilterAction::Reject(rejection) = response_store.on_response_body(&mut ctx, &mut body, true).unwrap() else {
+        panic!("Store must propagate the bounded Conversation append failure");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(
+        rejection_body(&rejection)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("during conversation append")
+    );
+    assert!(store.get_response(&owner, response_id).await.unwrap().is_none());
+    let items = store
+        .list_conversation_items(&owner, &conv_id, None, 10, true)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1, "failed append must leave only the prior item");
+}
+
+/// Conversations and Store select the same finite transport cap before
+/// response headers commit, for both a loop-finalized and a direct response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercises both finite header handoffs through two filters"
+)]
+async fn budgeted_conversation_and_store_share_finite_wire_cap() {
+    for finalized in [true, false] {
+        let (conversations, store) = sqlite_harness().await;
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = conv_ctx(&store, &req);
+        ctx.extensions
+            .get::<ResponseStoreRegistry>()
+            .unwrap()
+            .register(
+                &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+                Arc::clone(&store),
+            )
+            .unwrap();
+        let config = serde_yaml::from_str(
+            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+        )
+        .unwrap();
+        let response_store = ResponseStoreFilter::from_config(&config).unwrap();
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        ctx.set_metadata("responses.conversation_id", "conv_test");
+        ctx.current_filter_id = Some(1);
+        capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+        ctx.current_filter_id = Some(0);
+        assert!(matches!(
+            response_store.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+        assert!(matches!(
+            response_store
+                .on_request_body(&mut ctx, &mut request_body, true)
+                .await
+                .unwrap(),
+            FilterAction::Continue
+        ));
+
+        let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "test", "input": []}));
+        state.apply_retained_payload_limit(64 * 1024 * 1024);
+        state.response_object = serde_json::json!({
+            "object": "response", "id": "resp_test", "created_at": 1,
+            "status": "completed", "model": "test", "output": []
+        });
+        let mut body = None;
+        if finalized {
+            state.finalize_response_body(&mut body).unwrap();
+        } else {
+            body = Some(Bytes::from(serde_json::to_vec(&state.response_object).unwrap()));
+        }
+        let wire_bytes = body.as_ref().unwrap().len();
+        ctx.extensions.insert(state);
+        let mut response = make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        if !finalized {
+            response
+                .headers
+                .insert(http::header::CONTENT_LENGTH, wire_bytes.to_string().parse().unwrap());
+        }
+        ctx.response_header = Some(&mut response);
+        ctx.current_filter_id = Some(1);
+        assert!(matches!(
+            conversations.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        if !finalized {
+            assert!(matches!(
+                ctx.response_body_mode,
+                BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap == wire_bytes
+            ));
+        }
+        ctx.current_filter_id = Some(0);
+        assert!(matches!(
+            response_store.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(matches!(
+            ctx.response_body_mode,
+            BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap == wire_bytes
+        ));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4206,6 +5586,40 @@ async fn streaming_terminal_propagates_append_failure_before_release() {
             Ok(FilterAction::Continue)
         ),
         "a failure-mode-open terminal must not retry an ambiguous item commit at EOS"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegated_streaming_append_failure_follows_store_error_policy() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::CreateItems,
+        conversation_exists: false,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})],
+        response_object: serde_json::json!({"status":"completed","output":[]}),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    });
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    let action = super::append_after_store_body(&mut ctx, &mut terminal, false);
+    assert!(
+        action.is_err(),
+        "the Store pipeline hook applies its configured failure mode to ordinary append errors"
     );
 }
 
@@ -4660,6 +6074,8 @@ enum AppendFailure {
     MessageSync,
     /// Let the append paths succeed.
     None,
+    /// Simulate a committed write whose acknowledgement is lost.
+    CommittedThenError(Arc<AtomicUsize>),
 }
 
 /// A [`ConversationItemStore`] that fails selected operations on demand.
@@ -4762,16 +6178,30 @@ impl ConversationItemStore for FailingItemStore {
         _conversation_id: &str,
         _items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        match self.append_failure {
+        match &self.append_failure {
             AppendFailure::CreateItems => {
                 return Err(StoreError::Database("mock item insert failure".to_owned()));
             },
             AppendFailure::MessageSync => {
                 return Err(StoreError::Database("mock message sync failure".to_owned()));
             },
+            AppendFailure::CommittedThenError(committed) => {
+                committed.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::Database("mock post-commit failure".to_owned()));
+            },
             AppendFailure::None => {},
         }
         Ok(())
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &crate::StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        _max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages(owner, conversation_id, items).await
     }
 
     async fn list_conversation_items(
@@ -4842,7 +6272,7 @@ impl ConversationItemStore for FailingItemStore {
 // The registry hands the filter a combined backend, so the double must also be a
 // ResponseStore. Only get_conversation is reachable (the facade routes the
 // conversation existence check through the ResponseStore half); it mirrors the
-// ConversationItemStore result. The response methods are never invoked.
+// ConversationItemStore result. The rollback regression injects a delete error.
 #[async_trait::async_trait]
 impl ResponseStore for FailingItemStore {
     async fn get_conversation(
@@ -4871,7 +6301,7 @@ impl ResponseStore for FailingItemStore {
     }
 
     async fn delete_response(&self, _owner: &crate::StateOwner, _id: &str) -> Result<bool, StoreError> {
-        unreachable!("FailingItemStore is a conversations-only test double")
+        Err(StoreError::Unavailable("injected response rollback failure".to_owned()))
     }
 
     async fn record_pending_approvals(
@@ -5689,4 +7119,333 @@ async fn create_conversation_response_field_order_matches_openai() {
     let resp = rejection_body(&rejection);
     let keys: Vec<&String> = resp.as_object().unwrap().keys().collect();
     assert_eq!(keys, &["id", "object", "created_at", "metadata"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_final_gate_must_not_revive_a_conversation_hook_skipped_this_round() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_store_excluded", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    let wire_bytes = serde_json::to_vec(&state.response_object).unwrap().len();
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    // Core-private IterationState is unavailable in this synthetic context;
+    // the exact provider length keeps this test focused on round participation.
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, wire_bytes.to_string().parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    // An intermediate IRR response did run Store. Its participation marker
+    // must not count for the completed round excluded by response_conditions.
+    ctx.current_filter_id = Some(1);
+    assert!(matches!(
+        response_store.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.current_filter_id = Some(0);
+    drop(conversations.on_response(&mut ctx).await.unwrap());
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().iteration = 1;
+    mark_buffered_agentic_done(&mut ctx);
+
+    // This final round excludes Conversations as well as Store by response_conditions.
+    // Its response hook is not called, so the previous round's state is still present.
+    // The configured Store's response_conditions exclude this exchange, so
+    // core never calls its response hook. The final readiness hook must end
+    // the request-phase-only handoff without inventing a response write.
+    assert!(matches!(
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_store_excluded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "Conversations was not selected for this final response"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_outer_stream_append_survives_inner_tool_round() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        ..ResponsesState::default()
+    });
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    // Parent headers are run once by run_streaming_terminal_response.
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    // IRR's next_chunk processes a hosted tool continuation before final output.
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.iteration += 1;
+    state.response_object =
+        serde_json::json!({"status":"completed", "output":[{"type":"message","role":"assistant","content":"answer"}]});
+    state.logical_stream_terminal_emitted = true;
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut terminal, false).unwrap());
+    let items = store
+        .list_conversation_items(&owner, &conv_id, None, 100, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        items.len(),
+        2,
+        "outer Conversations remains selected across inner IRR rounds"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_outer_branch_stream_append_survives_tool_round_probe() {
+    let (conversations, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let mut registry = crate::test_utils::make_ai_registry();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_conversations" => OpenaiConversationsFilter::from_config
+    );
+    let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
+        "
+- filter: openai_response_store
+  backend: sqlite
+  database_url: 'sqlite::memory:'
+  responses_table: test_responses
+  conversations_table: test_conversations
+- filter: headers
+  request_add:
+    - name: X-Probe
+      value: '1'
+  branch_chains:
+    - name: outer-conversations
+      rejoin: next
+      chains:
+        - name: managed-conversations
+          filters:
+            - filter: openai_conversations
+              backend: sqlite
+              database_url: 'sqlite::memory:'
+              conversations_table: test_conversations
+              items_table: test_items
+",
+    )
+    .unwrap();
+    let pipeline = praxis_filter::FilterPipeline::build_with_chains(
+        &mut entries,
+        &registry,
+        &std::collections::HashMap::new(),
+        &praxis_core::config::InsecureOptions::default(),
+    )
+    .unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    assert!(matches!(
+        pipeline.execute_http_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.executed_branch_filters.iter().any(|ran| *ran));
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        pipeline
+            .execute_http_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(1_048_576);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    // The parent pipeline runs this committed header only once, including its branch.
+    drop(pipeline.execute_http_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+    // The inner IRR session advances while producing the parent's streamed body.
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.iteration += 1;
+    state.response_object = serde_json::json!({
+        "id":"resp_outer_branch", "created_at":1, "model":"test", "status":"completed",
+        "output":[{"type":"message","role":"assistant","content":"answer"}]
+    });
+    state.logical_stream_terminal_emitted = true;
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    drop(
+        pipeline
+            .execute_http_response_body(&mut ctx, &mut terminal, false)
+            .unwrap(),
+    );
+    assert!(store.get_response(&owner, "resp_outer_branch").await.unwrap().is_some());
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the outer branch is still selected for the committed stream after an inner tool round"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_excluded_store_survives_tool_round() {
+    let (conversations, store) = sqlite_harness().await;
+    let response_store_config: serde_yaml::Value = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: test_responses\nconversations_table: test_conversations\n",
+    )
+    .unwrap();
+    let response_store = ResponseStoreFilter::from_config(&response_store_config).unwrap();
+    let conv_id = create_test_conversation(conversations.as_ref(), &store, serde_json::json!({})).await;
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .unwrap()
+        .register(
+            &Arc::from(crate::openai::responses::DEFAULT_STORE_NAME),
+            Arc::clone(&store),
+        )
+        .unwrap();
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.current_filter_id = Some(0);
+    capture_append_owner_for_test(conversations.as_ref(), &mut ctx).await;
+    ctx.current_filter_id = Some(1);
+    drop(response_store.on_request(&mut ctx).await.unwrap());
+    let mut request_body = Some(Bytes::from_static(br#"{"model":"test","input":[]}"#));
+    drop(
+        response_store
+            .on_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+    );
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "id":"resp_stream_excluded", "created_at":1, "model":"test", "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    ctx.extensions.insert(state);
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    ctx.current_filter_id = Some(0);
+    drop(conversations.on_response(&mut ctx).await.unwrap());
+    assert!(matches!(
+        crate::openai::responses::finish_unselected_store_conversation_append(&mut ctx)
+            .await
+            .unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().iteration += 1;
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    assert!(matches!(
+        conversations.on_response_body(&mut ctx, &mut terminal, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        store
+            .get_response(&owner, "resp_stream_excluded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_conversation_items(&owner, &conv_id, None, 100, true)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }

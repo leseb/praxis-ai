@@ -28,6 +28,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -287,6 +288,9 @@ def _write_full_flow_config(
     backend_endpoint: str | None = None,
     search_port: int | None = None,
     max_event_bytes: int | None = None,
+    compact_callout_port: int | None = None,
+    retained_limit: int | None = None,
+    skip_agentic_response: bool = False,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     config = _load_example_config(
@@ -316,6 +320,38 @@ def _write_full_flow_config(
         )
         assert config.count(anchor) == 1
         config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
+    if compact_callout_port is not None:
+        anchor = "      - filter: iterative_request_router\n"
+        assert config.count(anchor) == 1
+        config = config.replace(
+            anchor,
+            "      - filter: openai_responses_compact\n"
+            "        allow_pre_security_callout: true\n"
+            f"        inference_url: http://127.0.0.1:{compact_callout_port}/v1/chat/completions\n"
+            "        allow_private_inference_url: true\n"
+            f"        default_model: {VLLM_MODEL}\n"
+            "        on_failure: open\n"
+            "        conditions:\n"
+            "          - unless:\n"
+            "              bound_upstream:\n"
+            "                application_provider: openai\n"
+            + anchor,
+        )
+    if retained_limit is not None:
+        anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
+        assert config.count(anchor) == 1
+        config = config.replace(anchor, anchor + f"                max_retained_bytes: {retained_limit}\n")
+    if skip_agentic_response:
+        anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
+        assert config.count(anchor) == 1
+        config = config.replace(
+            anchor,
+            anchor
+            + "                response_conditions:\n"
+            + "                  - when:\n"
+            + "                      headers:\n"
+            + "                        x-test-run-agentic: \"true\"\n",
+        )
     if compression:
         config = _enable_response_store_compression(config)
 
@@ -844,6 +880,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
     concurrent_barrier: ClassVar[threading.Barrier | None] = None
     terminal_gate: ClassVar[threading.Event | None] = None
     tool_round_count: ClassVar[int] = 0
+    last_response_id: ClassVar[str | None] = None
 
     def log_message(self, fmt, *args):
         pass
@@ -995,6 +1032,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             assert barrier is not None
             barrier.wait(timeout=15)
         response_id = f"resp_sdk_conv_{time.time_ns()}"
+        type(self).last_response_id = response_id
         response = {
             "id": response_id,
             "object": "response",
@@ -1027,6 +1065,11 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                 ]
             ),
         }
+        if "BUDGET-CANONICAL-INCOMPLETE-410" in request_input:
+            response["status"] = "incomplete"
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+            response["output"][0]["status"] = "incomplete"
+            response["output"][0]["content"][0]["text"] = "partial answer"
         if web_call_limit:
             # The full-flow example allows 32 web calls per round. A completed
             # upstream snapshot with 33 calls makes IRR emit an SSE error in
@@ -1061,7 +1104,11 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             content_type = "application/json"
         self.send_response(200)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
+        chunked = "BUDGET-CHUNKED-410" in request_input and not request_body.get("stream")
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         if request_body.get("stream") and (
             "STREAM-DELETE-410" in request_input
@@ -1075,7 +1122,13 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             assert gate.wait(timeout=15), "test did not release the terminal event"
             self.wfile.write(encoded_frames[1] + b"data: [DONE]\n\n")
         else:
-            self.wfile.write(payload)
+            if chunked:
+                for start in range(0, len(payload), 64):
+                    part = payload[start : start + 64]
+                    self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            else:
+                self.wfile.write(payload)
         self.wfile.flush()
 
     def do_POST(self):
@@ -1089,6 +1142,7 @@ class NativeCompactionBackendHandler(BaseHTTPRequestHandler):
     """Deterministic native Responses backend for SDK rehydration coverage."""
 
     requests: ClassVar[list[dict]] = []
+    response_id_prefix: ClassVar[str] = "resp_provider_compaction_sdk_"
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1107,7 +1161,7 @@ class NativeCompactionBackendHandler(BaseHTTPRequestHandler):
             ]
         payload = json.dumps(
             {
-                "id": f"resp_provider_compaction_sdk_{request_number}",
+                "id": f"{type(self).response_id_prefix}{request_number}",
                 "object": "response",
                 "created_at": 1,
                 "model": VLLM_MODEL,
@@ -1795,7 +1849,8 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
 
 
 def _witness_proxy_session(
-    tmp_path_factory, request, search_port=None, max_event_bytes=None
+    tmp_path_factory, request, search_port=None, max_event_bytes=None, retained_limit=None,
+    skip_agentic_response=False,
 ):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
@@ -1806,6 +1861,7 @@ def _witness_proxy_session(
     """
     ResponsesWitnessHandler.forwarded_bodies = []
     ResponsesWitnessHandler.tool_round_count = 0
+    ResponsesWitnessHandler.last_response_id = None
     forwarded = ResponsesWitnessHandler.forwarded_bodies
     backend_port = _free_port()
     server = ThreadingHTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
@@ -1821,6 +1877,8 @@ def _witness_proxy_session(
         backend_endpoint=f"127.0.0.1:{backend_port}",
         search_port=search_port,
         max_event_bytes=max_event_bytes,
+        retained_limit=retained_limit,
+        skip_agentic_response=skip_agentic_response,
     )
     binary = _find_binary()
 
@@ -1864,6 +1922,29 @@ def witness_backend_client(tmp_path_factory, request):
 
 
 @pytest.fixture()
+def witness_budgeted_conversation_client(tmp_path_factory, request):
+    """Full-flow SQLite witness with room for the response but not append staging."""
+    yield from _witness_proxy_session(tmp_path_factory, request, retained_limit=8_192)
+
+
+@pytest.fixture()
+def witness_noncanonical_budgeted_conversation_client(tmp_path_factory, request):
+    """A selected inference response skips agentic canonicalization under a budget."""
+    yield from _witness_proxy_session(
+        tmp_path_factory,
+        request,
+        retained_limit=67_108_864,
+        skip_agentic_response=True,
+    )
+
+
+@pytest.fixture()
+def witness_budgeted_continuation_client(tmp_path_factory, request):
+    """Full-flow SQLite witness at the default 64 MiB retained allowance."""
+    yield from _witness_proxy_session(tmp_path_factory, request, retained_limit=67_108_864)
+
+
+@pytest.fixture()
 def witness_tool_client(tmp_path_factory, request, search_server):
     """Full-flow witness with a deterministic hosted web-search endpoint."""
     yield from _witness_proxy_session(tmp_path_factory, request, search_server)
@@ -1877,10 +1958,353 @@ def witness_replay_limited_tool_client(tmp_path_factory, request, search_server)
     )
 
 
+class DirectBudgetBackendHandler(BaseHTTPRequestHandler):
+    """Serve fixed native Responses bodies without running the IRR step."""
+
+    protocol_version = "HTTP/1.1"
+    terminal_gate: ClassVar[threading.Event | None] = None
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        request_body = json.loads(self.rfile.read(length))
+        model = request_body["model"]
+        if model in {"terminal-stream", "terminal-stream-no-event", "sequence-stream"}:
+            response = {
+                "id": "resp_direct_budget_terminal_stream",
+                "object": "response",
+                "created_at": 1780000000,
+                "model": model,
+                "status": "completed",
+                "output": [],
+            }
+            if model == "sequence-stream":
+                terminal = (
+                    "event: response.in_progress\ndata: "
+                    + json.dumps({
+                        "type": "response.in_progress", "sequence_number": 7,
+                    }, separators=(",", ":"))
+                    + "\n\n"
+                ).encode()
+            else:
+                event_prefix = "event: response.completed\n" if model == "terminal-stream" else ""
+                terminal = (
+                    event_prefix + "data: "
+                    + json.dumps({
+                        "type": "response.completed",
+                        "sequence_number": 1,
+                        "response": response,
+                    }, separators=(",", ":"))
+                    + "\n\n"
+                ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(terminal)
+            self.wfile.flush()
+            gate = type(self).terminal_gate
+            if gate is not None:
+                gate.wait(timeout=10)
+            # This unfinished SSE comment exceeds the direct restore's 64 KiB
+            # retained allowance after the terminal frame is already on wire.
+            try:
+                self.wfile.write(b":" + b"x" * 120_000)
+                self.wfile.flush()
+                time.sleep(0.2)
+                self.wfile.write(b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
+            return
+        size = 50 if model == "chunked" else int(model)
+        response = {
+            "id": f"resp_direct_budget_{model}",
+            "object": "response",
+            "created_at": 1780000000,
+            "model": model,
+            "status": "completed",
+            "output": [{
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "x" * size}],
+            }],
+        }
+        payload = json.dumps(response, separators=(",", ":")).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        if model == "chunked":
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if model == "chunked":
+            self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n")
+        else:
+            self.wfile.write(payload)
+        self.wfile.flush()
+        self.close_connection = True
+
+
+@pytest.fixture()
+def direct_budget_client(tmp_path, request):
+    """Route a Responses request around IRR while retaining its loop policy."""
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), DirectBudgetBackendHandler)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    proxy_port = _free_port()
+    config = _load_example_config(
+        "examples/configs/openai/responses/agentic-loop-fixture.yaml",
+        proxy_port,
+        backend_endpoint=f"127.0.0.1:{backend.server_port}",
+    )
+    budget_param = getattr(request, "param", 16_384)
+    budget_limit, store_response_first = (
+        budget_param if isinstance(budget_param, tuple) else (budget_param, False)
+    )
+    config = config.replace(
+        "max_retained_bytes: 67108864", f"max_retained_bytes: {budget_limit}"
+    )
+    if store_response_first:
+        # Put Store on the first response callback while Rehydrate still
+        # establishes the request's retained state before the direct branch.
+        store_start = config.index("      - filter: openai_response_store\n")
+        rehydrate = "      - filter: openai_responses_rehydrate\n"
+        rehydrate_start = config.index(rehydrate, store_start)
+        config = (
+            config[:store_start]
+            + rehydrate
+            + config[store_start:rehydrate_start]
+            + config[rehydrate_start + len(rehydrate):]
+        )
+    anchor = "      - filter: iterative_request_router\n"
+    assert config.count(anchor) == 1
+    config = config.replace(
+        anchor,
+        "      - filter: request_id\n"
+        "        branch_chains:\n"
+        "          - name: direct\n"
+        "            rejoin: terminal\n"
+        "            chains:\n"
+        "              - name: direct-inline\n"
+        "                filters:\n"
+        "                  - filter: router\n"
+        "                    routes:\n"
+        "                      - path_prefix: \"/\"\n"
+        "                        cluster: direct-backend\n"
+        "                  - filter: load_balancer\n"
+        "                    clusters:\n"
+        "                      - name: direct-backend\n"
+        f"                        endpoints: [\"127.0.0.1:{backend.server_port}\"]\n"
+        + anchor,
+    )
+    config = _patch_store_backend(config, str(tmp_path / "responses.db"))
+    admin_port = _free_port()
+    while admin_port == proxy_port:
+        admin_port = _free_port()
+    config += f'\nadmin:\n  address: "127.0.0.1:{admin_port}"\n'
+    config_path = _persist_config(config)
+    log_path = str(tmp_path / "praxis.log")
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, log_path)
+            yield _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if request.session.testsfailed > 0:
+                print(_read_log_tail(log_path), file=sys.stderr)
+            backend.shutdown()
+            os.unlink(config_path)
+
+
+def test_direct_budget_store_rejects_before_success_headers(direct_budget_client):
+    """A noncanonical direct branch reports a structured budget failure."""
+    client = direct_budget_client
+    with pytest.raises(APIStatusError) as known:
+        client.responses.create(model="3000", input="hello", store=True)
+    assert known.value.status_code == 502
+    assert known.value.response.json()["error"]["type"] == "server_error"
+
+    with pytest.raises(APIStatusError) as unknown:
+        client.responses.create(model="chunked", input="hello", store=True)
+    assert unknown.value.status_code == 502
+    assert unknown.value.response.json()["error"]["type"] == "server_error"
+
+    passthrough = client.responses.create(model="3000", input="hello", store=False)
+    assert passthrough.status == "completed"
+    assert passthrough.output[0].content[0].text == "x" * 3000
+
+
+@pytest.mark.parametrize("direct_budget_client", [32_768], indirect=True)
+def test_direct_budget_store_admits_bounded_known_length(direct_budget_client):
+    """A known safe direct body still reaches persistence with budget headroom."""
+    admitted = direct_budget_client.responses.create(model="10", input="hello", store=True)
+    assert admitted.status == "completed"
+    assert admitted.output[0].content[0].text == "x" * 10
+
+
+@pytest.mark.parametrize("direct_budget_client", [65_536], indirect=True)
+def test_direct_budget_store_persists_bounded_previous_response(direct_budget_client):
+    """A stored direct continuation survives both restoration and persistence."""
+    client = direct_budget_client
+    seed = client.responses.create(model="10", input="seed", store=True)
+    continued = client.responses.create(
+        model="20", input="next", previous_response_id=seed.id, store=True
+    )
+    assert continued.status == "completed"
+    assert continued.previous_response_id == seed.id
+    retrieved = client.responses.retrieve(continued.id)
+    assert retrieved.previous_response_id == seed.id
+
+
+@pytest.mark.parametrize("direct_budget_client", [32_768], indirect=True)
+@pytest.mark.parametrize("model", ["8000", "chunked"])
+@pytest.mark.parametrize("store", [False, True])
+def test_direct_budget_restore_rejects_before_success_headers(direct_budget_client, model, store):
+    """A direct previous-response rewrite reports budget failures as HTTP 502."""
+    client = direct_budget_client
+    seed = client.responses.create(model="10", input="seed", store=True)
+    continued = client.responses.create(
+        model="20", input="next", previous_response_id=seed.id, store=False
+    )
+    assert continued.status == "completed"
+    assert continued.previous_response_id == seed.id
+
+    with pytest.raises(APIStatusError) as failed:
+        client.responses.create(
+            model=model, input="next", previous_response_id=seed.id, store=store
+        )
+    assert failed.value.status_code == 502
+    assert failed.value.response.json()["error"]["type"] == "server_error"
+
+
+@pytest.mark.parametrize("direct_budget_client", [65_536], indirect=True)
+@pytest.mark.parametrize("model", ["terminal-stream", "terminal-stream-no-event"])
+def test_direct_budget_stream_overflow_after_completion_has_one_terminal(direct_budget_client, model):
+    """The direct SSE route closes after a late overflow without an error event."""
+    seed = direct_budget_client.responses.create(model="10", input="seed", store=True)
+    url = f"{str(direct_budget_client.base_url).rstrip('/')}/responses"
+    wire = bytearray()
+    transport_failed = False
+    terminal_marker = b"event: response.completed" if model == "terminal-stream" else b'"type":"response.completed"'
+    gate = threading.Event()
+    DirectBudgetBackendHandler.terminal_gate = gate
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            try:
+                with client.stream(
+                    "POST", url,
+                    headers={"Content-Type": "application/json", **TRUSTED_OWNER_HEADERS},
+                    json={
+                        "model": model, "input": "next", "stream": True,
+                        "store": False, "previous_response_id": seed.id,
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    for chunk in response.iter_raw():
+                        wire.extend(chunk)
+                        if terminal_marker in wire and b"\n\n" in wire:
+                            gate.set()  # The provider may now send the oversized tail.
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                transport_failed = True  # The filter aborts the committed transport.
+    finally:
+        gate.set()
+        DirectBudgetBackendHandler.terminal_gate = None
+    assert transport_failed, "the over-budget stream must end with a transport error"
+    assert wire.count(terminal_marker) == 1
+    assert b"event: error" not in wire
+    assert b"event: response.failed" not in wire
+    assert b"x" * 128 not in wire, "the rejected comment cannot leak downstream"
+
+
+@pytest.mark.parametrize("direct_budget_client", [(65_536, True)], indirect=True)
+def test_direct_store_stream_overflow_after_completion_closes_wire(direct_budget_client):
+    """Store cannot append an error after forwarding a direct SSE completion."""
+    seed = direct_budget_client.responses.create(model="10", input="seed", store=True)
+    url = f"{str(direct_budget_client.base_url).rstrip('/')}/responses"
+    wire = bytearray()
+    transport_failed = False
+    gate = threading.Event()
+    DirectBudgetBackendHandler.terminal_gate = gate
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            try:
+                with client.stream(
+                    "POST", url,
+                    headers={"Content-Type": "application/json", **TRUSTED_OWNER_HEADERS},
+                    json={
+                        "model": "terminal-stream", "input": "next", "stream": True,
+                        "store": True, "previous_response_id": seed.id,
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    for chunk in response.iter_raw():
+                        wire.extend(chunk)
+                        if b"event: response.completed" in wire and b"\n\n" in wire:
+                            gate.set()
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                transport_failed = True
+    finally:
+        gate.set()
+        DirectBudgetBackendHandler.terminal_gate = None
+    assert transport_failed, "late Store exhaustion must abort the committed stream"
+    assert wire.count(b"event: response.completed") == 1
+    assert b"event: error" not in wire
+    assert b"event: response.failed" not in wire
+    assert b"x" * 128 not in wire
+    with pytest.raises(NotFoundError):
+        direct_budget_client.responses.retrieve("resp_direct_budget_terminal_stream")
+
+
+@pytest.mark.parametrize("direct_budget_client", [(65_536, True)], indirect=True)
+def test_direct_store_stream_budget_error_follows_provider_sequence(direct_budget_client):
+    """A local Store error follows the last admitted provider SSE sequence."""
+    seed = direct_budget_client.responses.create(model="10", input="seed", store=True)
+    url = f"{str(direct_budget_client.base_url).rstrip('/')}/responses"
+    wire = bytearray()
+    gate = threading.Event()
+    DirectBudgetBackendHandler.terminal_gate = gate
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            with client.stream(
+                "POST", url,
+                headers={"Content-Type": "application/json", **TRUSTED_OWNER_HEADERS},
+                json={
+                    "model": "sequence-stream", "input": "next", "stream": True,
+                    "store": True, "previous_response_id": seed.id,
+                },
+            ) as response:
+                assert response.status_code == 200
+                for chunk in response.iter_raw():
+                    wire.extend(chunk)
+                    if b"event: response.in_progress" in wire and b"\n\n" in wire:
+                        gate.set()
+    finally:
+        gate.set()
+        DirectBudgetBackendHandler.terminal_gate = None
+    assert wire.count(b"event: response.in_progress") == 1
+    assert wire.count(b"event: error") == 1
+    assert b'"sequence_number":8' in wire
+    assert b"x" * 128 not in wire
+
+
 @pytest.fixture()
 def provider_compaction_client(tmp_path_factory, request):
     """Function-scoped native Responses backend with a provider compaction."""
     NativeCompactionBackendHandler.requests = []
+    NativeCompactionBackendHandler.response_id_prefix = "resp_provider_compaction_sdk_"
     requests = NativeCompactionBackendHandler.requests
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), NativeCompactionBackendHandler)
@@ -1923,6 +2347,53 @@ def provider_compaction_client(tmp_path_factory, request):
                     f"\n=== Provider compaction Praxis logs ===\n{f.read()}",
                     file=sys.stderr,
                 )
+        os.unlink(config_path)
+
+
+@pytest.fixture()
+def usage_less_compact_client(tmp_path_factory, request, compaction_server):
+    """Native Responses continuation with no stored usage and an armed budget."""
+    NativeCompactionBackendHandler.requests = []
+    # PostgreSQL SDK runs share one database across these two fixtures.
+    NativeCompactionBackendHandler.response_id_prefix = "resp_usage_less_compaction_sdk_"
+    CompactionHandler.requests = []
+    backend_port = _free_port()
+    backend = HTTPServer(("127.0.0.1", backend_port), NativeCompactionBackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-usage-less-compact")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        compact_callout_port=compaction_server,
+        retained_limit=262_144,
+    )
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS), db_path
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        if request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== Usage-less compact Praxis logs ===\n{f.read()}", file=sys.stderr)
         os.unlink(config_path)
 
 
@@ -2493,6 +2964,137 @@ class TestOpenAIResponsesVLLM:
             "client even though it strips the id from the rehydrated upstream "
             f"request; got: {second.previous_response_id!r}"
         )
+
+    def test_buffered_store_false_conversation_appends_before_body(self, witness_backend_client):
+        """The full-flow IRR has canonical output when the outer header hook runs."""
+        client, _ = witness_backend_client
+        conversation = client.conversations.create()
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="BUFFERED-STORE-FALSE-410",
+                conversation=conversation.id,
+                store=False,
+            )
+            assert response.status == "completed"
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+            ]
+            assert "BUFFERED-STORE-FALSE-410" in items.data[0].content[0].text
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_budgeted_noncanonical_conversation_rejects_before_success_headers(
+        self, witness_noncanonical_budgeted_conversation_client
+    ):
+        """A skipped agentic response has unknown append cost at the 200 header.
+
+        The safe policy rejects even a small body when the aggregate budget is
+        armed, because SQL/cache staging cannot be proven before commitment.
+        """
+        client, forwarded = witness_noncanonical_budgeted_conversation_client
+        conversation = client.conversations.create()
+        try:
+            with pytest.raises(APIStatusError) as exc_info:
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="NONCANONICAL-APPEND-HEADER-410",
+                    conversation=conversation.id,
+                    store=False,
+                )
+            assert exc_info.value.status_code == 502
+            assert exc_info.value.response.json()["error"]["type"] == "server_error"
+            assert forwarded, "the backend response must reach the header hook"
+            assert client.conversations.items.list(conversation.id).data == []
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @pytest.mark.parametrize("store", [False, True])
+    def test_budgeted_canonical_incomplete_conversation_keeps_partial_response(
+        self, witness_budgeted_continuation_client, store
+    ):
+        """A finalized incomplete response needs no append and keeps its 200 wire."""
+        client, _ = witness_budgeted_continuation_client
+        conversation = client.conversations.create()
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="BUDGET-CANONICAL-INCOMPLETE-410",
+                conversation=conversation.id,
+                store=store,
+                max_output_tokens=1,
+            )
+            assert response.status == "incomplete"
+            assert response.output_text == "partial answer"
+            assert client.conversations.items.list(conversation.id).data == []
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_budgeted_previous_response_id_continuation_keeps_small_completion(
+        self, witness_budgeted_continuation_client
+    ):
+        """A rehydrate buffer ceiling must not reject an admitted small body."""
+        client, _ = witness_budgeted_continuation_client
+        first = client.responses.create(
+            model="sdk-conversation-stream", input="BUDGET-PREVIOUS-BASE-410", store=True
+        )
+        assert first.status == "completed"
+        second = client.responses.create(
+            model="sdk-conversation-stream",
+            input="BUDGET-PREVIOUS-NEXT-410",
+            previous_response_id=first.id,
+            store=True,
+        )
+        assert second.status == "completed"
+        assert second.previous_response_id == first.id
+
+    def test_buffered_store_true_conversation_persists_before_append(self, witness_backend_client):
+        """Header persistence and append both complete before buffered delivery."""
+        client, _ = witness_backend_client
+        conversation = client.conversations.create()
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="BUFFERED-STORE-TRUE-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert response.status == "completed"
+            assert client.responses.retrieve(response.id).id == response.id
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+            ]
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_budgeted_chunked_store_true_conversation_rejects_before_commit(
+        self, witness_budgeted_conversation_client
+    ):
+        """A chunked native completion returns Responses 502 without durable success."""
+        client, _ = witness_budgeted_conversation_client
+        conversation = client.conversations.create()
+        try:
+            with pytest.raises(APIStatusError) as exc_info:
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="BUDGET-CHUNKED-410",
+                    conversation=conversation.id,
+                    store=True,
+                )
+            assert exc_info.value.status_code == 502
+            assert exc_info.value.response.json()["error"]["type"] == "server_error"
+            assert client.conversations.items.list(conversation.id).data == []
+            response_id = ResponsesWitnessHandler.last_response_id
+            assert response_id is not None
+            with pytest.raises(APIStatusError) as retrieval:
+                client.responses.retrieve(response_id)
+            assert retrieval.value.status_code == 404
+        finally:
+            client.conversations.delete(conversation.id)
 
     def test_streamed_conversation_append_and_follow_up(self, witness_backend_client):
         """The shipped full-flow graph appends a streamed turn before completion.
@@ -4075,6 +4677,41 @@ class TestResponsesCompactionVLLM:
         assert second.output_text
         assert len(CompactionHandler.requests) == request_count
 
+    def test_usage_less_rehydration_rejects_tokenizer_peak_before_callout(
+        self, usage_less_compact_client
+    ):
+        client, _ = usage_less_compact_client
+        conversation = client.conversations.create()
+        try:
+            first = client.responses.create(
+                model=VLLM_MODEL,
+                input="abcdefghijklmnopqrstuvwxyz0123456789" * 90,
+                conversation=conversation.id,
+                store=True,
+            )
+            assert first.usage is None, "backend intentionally omits usage"
+            backend_calls = len(NativeCompactionBackendHandler.requests)
+            callouts = len(CompactionHandler.requests)
+            persisted_before = len(client.conversations.items.list(conversation.id).data)
+            assert persisted_before == 2
+
+            with pytest.raises(APIStatusError) as exc_info:
+                client.responses.create(
+                    model=VLLM_MODEL,
+                    input="continue",
+                    conversation=conversation.id,
+                    context_management=[{"type": "compaction", "compact_threshold": 1000}],
+                    store=True,
+                )
+
+            assert exc_info.value.status_code == 413
+            assert "during compaction" in str(exc_info.value)
+            assert len(NativeCompactionBackendHandler.requests) == backend_calls
+            assert len(CompactionHandler.requests) == callouts
+            assert len(client.conversations.items.list(conversation.id).data) == persisted_before
+        finally:
+            client.conversations.delete(conversation.id)
+
     @requires_real_inference
     def test_over_threshold_compacts_rehydrated_history(
         self,
@@ -4938,6 +5575,91 @@ def _assert_multi_round_usage_and_trace(response, *, transport):
     )
 
 
+class CompatBudgetBackendHandler(BaseHTTPRequestHandler):
+    """Return a small private call beside an oversized buffered response."""
+
+    requests: ClassVar[int] = 0
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        type(self).requests += 1
+        payload = json.dumps({
+            "id": "resp_compat_budget",
+            "object": "response",
+            "status": "completed",
+            "model": "test-model",
+            "output": [{
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "run_python", "arguments": '{"input":"print(1)"}',
+            }],
+            "payload": "x" * (256 * 1024),
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@pytest.fixture()
+def client_tool_compat_budget_client(tmp_path, request):
+    """SDK proxy with a 64 KiB loop budget and deterministic rich-tool output."""
+    CompatBudgetBackendHandler.requests = 0
+    backend = HTTPServer(("127.0.0.1", 0), CompatBudgetBackendHandler)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    port = _free_port()
+    config = _load_example_config(
+        CLIENT_TOOL_COMPAT_CONFIG_PATH,
+        port,
+        backend_endpoint=f"127.0.0.1:{backend.server_port}",
+        db_path=str(tmp_path / "responses.db"),
+    )
+    anchor = "                max_infer_iters: 4\n"
+    assert config.count(anchor) == 1, "compat example loop configuration changed"
+    config = config.replace(anchor, anchor + "                max_retained_bytes: 65536\n", 1)
+    config_path = _persist_config(config)
+    log_path = str(tmp_path / "praxis.log")
+    log_file = open(log_path, "w")
+    proc = subprocess.Popen([_find_binary(), "-c", config_path], stdout=log_file, stderr=subprocess.STDOUT)
+    started = False
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(port, timeout=60)
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        backend.server_close()
+        if not started or request.session.testsfailed > 0:
+            print(f"\n=== Client tool budget Praxis logs ===\n{_read_log_tail(log_path)}", file=sys.stderr)
+        os.unlink(config_path)
+
+
+def test_client_tool_compat_provider_restoration_budget_rejects_through_sdk(client_tool_compat_budget_client):
+    """Provider-side restoration overflow is 502 and cannot persist a response."""
+    with pytest.raises(APIStatusError) as exc_info:
+        client_tool_compat_budget_client.responses.create(
+            model="test-model",
+            input="x",
+            tools=[{"type": "custom", "name": "run_python", "format": {"type": "text"}}],
+            store=True,
+        )
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.response.json()["error"]["type"] == "server_error"
+    assert CompatBudgetBackendHandler.requests == 1, "inference occurred before restoration failed"
+    with pytest.raises(NotFoundError):
+        client_tool_compat_budget_client.responses.retrieve("resp_compat_budget")
+
+
 class TestClientToolCompatVLLM:
     """Issue #1131: rich Codex client tools round-trip through a function-only
     vLLM Responses backend via ``openai_client_tool_compat``.
@@ -5355,28 +6077,63 @@ class TestClientToolCompatChatVLLM:
 
 
 class RetainedToolSearchBackendHandler(BaseHTTPRequestHandler):
-    """Return a hosted search item that fits once but exceeds three owners."""
+    """Return fixed hosted-search or numeric-heavy responses for budget checks."""
 
     requests: ClassVar[int] = 0
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(length)
+        request_body = self.rfile.read(length)
         type(self).requests += 1
+        if b"NUMERIC-PARSE-GUARD" in request_body:
+            numbers = b",".join([b"1e15"] * 1_024)
+            payload = (
+                b'{"id":"resp_numeric_budget","object":"response",'
+                b'"status":"completed","output":[],"numbers":['
+                + numbers
+                + b"]}"
+            )
+        else:
+            payload = json.dumps(
+                {
+                    "id": "resp_tool_search_budget",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "tool_search_call",
+                            "id": "tsc_budget",
+                            "status": "completed",
+                            "results": [{"description": "x" * 5_000}],
+                        }
+                    ],
+                }
+            ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class RetainedFileMetadataHandler(BaseHTTPRequestHandler):
+    """Report an oversized file without serving its content."""
+
+    metadata_requests: ClassVar[int] = 0
+    content_requests: ClassVar[int] = 0
+
+    def do_GET(self):
+        if self.path.endswith("/content"):
+            type(self).content_requests += 1
+            self.send_response(500)
+            self.end_headers()
+            return
+        type(self).metadata_requests += 1
         payload = json.dumps(
-            {
-                "id": "resp_tool_search_budget",
-                "object": "response",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "tool_search_call",
-                        "id": "tsc_budget",
-                        "status": "completed",
-                        "results": [{"description": "x" * 5_000}],
-                    }
-                ],
-            }
+            {"id": "file-budget", "filename": "budget.txt", "content_type": "text/plain", "bytes": 49_152}
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -5392,9 +6149,14 @@ class RetainedToolSearchBackendHandler(BaseHTTPRequestHandler):
 def retained_tool_search_client(tmp_path, request):
     """OpenAI SDK client backed by a fixed, oversized hosted search result."""
     RetainedToolSearchBackendHandler.requests = 0
+    RetainedFileMetadataHandler.metadata_requests = 0
+    RetainedFileMetadataHandler.content_requests = 0
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), RetainedToolSearchBackendHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    files_port = _free_port()
+    files_server = HTTPServer(("127.0.0.1", files_port), RetainedFileMetadataHandler)
+    threading.Thread(target=files_server.serve_forever, daemon=True).start()
 
     proxy_port = _free_port()
     with open("examples/configs/openai/responses/agentic-loop-overflow-fixture.yaml") as f:
@@ -5438,6 +6200,35 @@ def retained_tool_search_client(tmp_path, request):
     if store_filters not in config:
         raise RuntimeError("retained overflow fixture's store filters changed")
     config = config.replace(store_filters, "", 1)
+    config = config.replace(
+        "      - filter: openai_mcp_tool_resolve\n",
+        "      - filter: openai_file_resolve\n"
+        f'        files_api_url: "http://127.0.0.1:{files_port}"\n'
+        "        allow_pre_security_callout: true\n\n"
+        "      - filter: openai_mcp_tool_resolve\n",
+        1,
+    )
+    if getattr(request, "param", None) == "doc_extract":
+        config = config.replace(
+            "      - filter: openai_mcp_tool_resolve\n",
+            "      - filter: openai_doc_extract\n"
+            "        allow_pre_security_callout: true\n\n"
+            "      - filter: openai_mcp_tool_resolve\n",
+            1,
+        )
+    if getattr(request, "param", None) == "file":
+        # The Files API callout stages up to 128 KiB of transport bytes before
+        # applying its shared cap. Keep this case large enough to reach
+        # metadata, while its declared 48 KiB file still exceeds that cap.
+        config = config.replace("max_retained_bytes: 16384", "max_retained_bytes: 262144", 1)
+    config = config.replace(
+        "  allow_private_endpoints: true # example proxies to local backends",
+        "  allow_private_endpoints: true # example proxies to local backends\n"
+        "  allow_private_upstreams: true # stubbed Files API callouts",
+        1,
+    )
+    if getattr(request, "param", None) == "file_metadata":
+        config = config.replace("max_retained_bytes: 16384", "max_retained_bytes: 196608", 1)
     config_path = _persist_config(config)
     log_path = str(tmp_path / "praxis.log")
     log_file = open(log_path, "w")
@@ -5466,9 +6257,370 @@ def retained_tool_search_client(tmp_path, request):
         log_file.close()
         server.shutdown()
         server.server_close()
+        files_server.shutdown()
+        files_server.server_close()
         if not started or request.session.testsfailed > 0:
             print(f"\n=== Retained tool search Praxis logs ===\n{_read_log_tail(log_path)}", file=sys.stderr)
         os.unlink(config_path)
+
+
+@pytest.mark.parametrize(
+    "scenario", [
+        "direct", "buffered_middle", "empty_stream", "buffered_sse",
+        "translated", "header_suppressed", "translated_header_suppressed",
+    ]
+)
+def test_file_budget_failure_after_irr_stream_commit_is_terminal_sse(
+    tmp_path, scenario
+):
+    """Only an actually streamed IRR response changes the later error wire format."""
+
+    class StubHandler(BaseHTTPRequestHandler):
+        paths: ClassVar[list[str]] = []
+        empty_stream: ClassVar[bool] = scenario == "empty_stream"
+
+        def do_GET(self):
+            self.paths.append(self.path)
+            if self.path != "/v1/files/file-budget":
+                self.send_error(500, "unexpected content fetch")
+                return
+            payload = json.dumps(
+                {"filename": "a.txt", "content_type": "text/plain", "bytes": 49152}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            self.paths.append("POST " + self.path)
+            self.rfile.read(int(self.headers["Content-Length"]))
+            if scenario.startswith("translated"):
+                payload = (
+                    b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
+                    b'"created":1,"model":"m","choices":[{"index":0,'
+                    b'"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"chatcmpl-file-budget","object":"chat.completion.chunk",'
+                    b'"created":1,"model":"m","choices":[{"index":0,'
+                    b'"delta":{},"finish_reason":"stop"}]}\n\n'
+                    b'data: [DONE]\n\n'
+                )
+            else:
+                payload = (
+                    b'event: response.created\ndata: {"type":"response.created",'
+                    b'"response":{"id":"resp_file_budget","object":"response",'
+                    b'"status":"in_progress","output":[]}}\n\n'
+                )
+            if self.empty_stream:
+                payload = b""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    stub = ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+    thread = threading.Thread(target=stub.serve_forever, daemon=True)
+    thread.start()
+    proxy_port = _free_port()
+    config = f"""
+listeners:
+  - name: file-budget-stream
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [file-budget-stream]
+filter_chains:
+  - name: file-budget-stream
+    filters:
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: first
+        max_iterations: 2
+        steps:
+          - name: first
+            filters:
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{stub.server_port}"]
+            on_result:
+              - default: true
+                next: resolve
+          - name: resolve
+            filters:
+              - filter: openai_responses_format
+              - filter: openai_file_resolve
+                files_api_url: "http://127.0.0.1:{stub.server_port}"
+                allow_pre_security_callout: true
+              - filter: openai_stream_events
+              - filter: openai_agentic_loop
+                max_infer_iters: 1
+                # Leave room for the Files API transport's 128 KiB staging
+                # while keeping the declared 48 KiB file over the shared cap.
+                max_retained_bytes: 262144
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{stub.server_port}"]
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true
+"""
+    if scenario.startswith("translated"):
+        config = config.replace(
+            "              - filter: openai_responses_proxy\n",
+            "              - filter: openai_stream_events\n"
+            "              - filter: responses_to_chat_completions\n",
+            1,
+        )
+    if scenario.endswith("header_suppressed"):
+        first = config.index("          - name: first\n")
+        transition = config.index("            on_result:\n", first)
+        config = config[:transition] + config[transition:].replace(
+            "              - default: true\n                next: resolve",
+            "              - status: [200]\n                next: resolve",
+            1,
+        )
+    if scenario in {"buffered_middle", "empty_stream"}:
+        config = config.replace("max_iterations: 2", "max_iterations: 3", 1)
+        config = config.replace("next: resolve", "next: middle", 1)
+        config = config.replace(
+            "          - name: resolve\n",
+            """          - name: middle
+            filters:
+              - filter: static_response
+                status: 200
+                body: '{}'
+                headers:
+                  - name: Content-Type
+                    value: application/json
+            on_result:
+              - default: true
+                next: resolve
+          - name: resolve
+""",
+            1,
+        )
+    if scenario == "buffered_sse":
+        first = config.index("          - name: first\n")
+        filters_start = config.index("            filters:\n", first)
+        filters_end = config.index("            on_result:\n", filters_start)
+        config = (
+            config[:filters_start]
+            + """            filters:
+              - filter: static_response
+                status: 200
+                body: 'ignored'
+                headers:
+                  - name: Content-Type
+                    value: text/event-stream
+"""
+            + config[filters_end:]
+        )
+    config_path = _persist_config(config)
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, str(log_path))
+            response = httpx.post(
+                f"http://127.0.0.1:{proxy_port}/v1/responses",
+                json={
+                    "model": "m",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_file", "file_id": "file-budget"}],
+                        }
+                    ],
+                    "store": False,
+                    "stream": scenario != "buffered_sse",
+                },
+                timeout=20,
+            )
+            if scenario in {"buffered_sse", "header_suppressed", "translated_header_suppressed"}:
+                assert response.status_code == 502, response.text
+                assert response.headers["content-type"].startswith("application/json")
+                assert response.json()["error"]["type"] == "server_error"
+            else:
+                assert response.status_code == 200, response.text
+                assert response.headers["content-type"].startswith("text/event-stream")
+                frames = [frame for frame in response.text.split("\n\n") if frame]
+                event_names = [frame.split("\n", 1)[0] for frame in frames]
+                if scenario == "translated":
+                    assert "event: response.created" in event_names, response.text
+                    assert event_names[-1] == "event: error", response.text
+                else:
+                    expected = [] if scenario == "empty_stream" else ["event: response.created"]
+                    assert event_names == [*expected, "event: error"], response.text
+                error = json.loads(frames[-1].split("data: ", 1)[1])
+                assert error["type"] == "error"
+                assert error["code"] == "server_error"
+                assert "agentic retained payload exceeded" in error["message"]
+                assert "{\"error\":" not in response.text
+            assert StubHandler.paths.count("POST /v1/responses") == (
+                0 if scenario == "buffered_sse" else 1
+            )
+            assert StubHandler.paths.count("/v1/files/file-budget") == 1
+            assert "/v1/files/file-budget/content" not in StubHandler.paths
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stub.shutdown()
+            stub.server_close()
+            os.unlink(config_path)
+            if proc.returncode not in (0, -2):
+                print(_read_log_tail(str(log_path)), file=sys.stderr)
+
+
+def test_chat_budget_failure_without_logical_finalizer_is_terminal_sdk_sse(tmp_path):
+    """A skipped logical finalizer cannot turn a committed Chat stream into truncated 200."""
+
+    class ChatSseHandler(BaseHTTPRequestHandler):
+        requests: ClassVar[int] = 0
+
+        def do_POST(self):
+            type(self).requests += 1
+            self.rfile.read(int(self.headers["Content-Length"]))
+            first = (
+                b'data: {"id":"chatcmpl-budget","object":"chat.completion.chunk",'
+                b'"created":1,"model":"m","choices":[{"index":0,'
+                b'"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n'
+            )
+            second = (
+                "data: "
+                + json.dumps(
+                    {
+                        "id": "chatcmpl-budget",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "m",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "x" * 16_384},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                + "\n\n"
+            ).encode()
+            done = b"data: [DONE]\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(first) + len(second) + len(done)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            time.sleep(0.1)
+            self.wfile.write(second)
+            self.wfile.write(done)
+
+        def log_message(self, *_args):
+            pass
+
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), ChatSseHandler)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    proxy_port = _free_port()
+    config = f"""
+listeners:
+  - name: chat-budget-no-finalizer
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [chat-budget-no-finalizer]
+filter_chains:
+  - name: chat-budget-no-finalizer
+    filters:
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+                conditions:
+                  - when:
+                      path_prefix: "/never"
+              - filter: openai_agentic_loop
+                max_infer_iters: 1
+                max_retained_bytes: 65536
+                conditions:
+                  - when:
+                      path_prefix: "/never"
+              - filter: responses_to_chat_completions
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: stub
+              - filter: load_balancer
+                clusters:
+                  - name: stub
+                    endpoints: ["127.0.0.1:{backend.server_port}"]
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+"""
+    config_path = _persist_config(config)
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc, str(log_path))
+            client = _make_openai_client(proxy_port)
+            events = list(
+                client.responses.create(model="m", input="hi", stream=True, store=False)
+            )
+            event_types = [event.type for event in events]
+            assert ChatSseHandler.requests == 1
+            assert event_types[0] == "response.created", event_types
+            assert event_types[-1] == "error", event_types
+            assert "response.completed" not in event_types, event_types
+            sequences = [event.sequence_number for event in events]
+            assert sequences == list(range(len(sequences))), sequences
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            backend.shutdown()
+            backend.server_close()
+            os.unlink(config_path)
+            if proc.returncode not in (0, -2):
+                print(_read_log_tail(str(log_path)), file=sys.stderr)
 
 
 class TestAgenticLoopVLLM:
@@ -5513,6 +6665,96 @@ class TestAgenticLoopVLLM:
         assert "agentic retained payload exceeded" in exc_info.value.response.text
         assert RetainedToolSearchBackendHandler.requests == 1
 
+    def test_numeric_normalization_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A short exponent-heavy wire response cannot bypass the parsed-owner bound."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input="NUMERIC-PARSE-GUARD",
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 502
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedToolSearchBackendHandler.requests == 1
+
+    @pytest.mark.parametrize("retained_tool_search_client", ["file"], indirect=True)
+    def test_initial_file_resolution_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A small budget rejects before staging a Files API transport read."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file-budget"}],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedFileMetadataHandler.metadata_requests == 0
+        assert RetainedFileMetadataHandler.content_requests == 0
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    @pytest.mark.parametrize("retained_tool_search_client", ["file_metadata"], indirect=True)
+    def test_file_metadata_budget_rejects_before_content_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """A larger budget admits metadata, then blocks oversized content."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file-budget"}],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedFileMetadataHandler.metadata_requests == 1
+        assert RetainedFileMetadataHandler.content_requests == 0
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    @pytest.mark.parametrize("retained_tool_search_client", ["doc_extract"], indirect=True)
+    def test_document_extraction_budget_rejects_through_sdk(
+        self, retained_tool_search_client
+    ):
+        """Escaped extracted text cannot multiply beyond the shared budget."""
+        file_data = "data:text/plain;base64," + base64.b64encode(b"\x01" * 256).decode()
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "filename": "controls.txt",
+                                "file_data": file_data,
+                            }
+                        ],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert "during document extraction" in exc_info.value.response.text
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    @requires_real_inference
     def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
         """The example's explicit 64 MiB aggregate budget admits an ordinary response."""
         response = agentic_client.responses.create(
@@ -5525,6 +6767,7 @@ class TestAgenticLoopVLLM:
         assert response.status in ("completed", "incomplete")
         assert response.output
 
+    @requires_real_inference
     def test_explicit_retained_budget_streaming_happy_path(self, agentic_client):
         """The same explicit budget preserves the normal logical SSE lifecycle."""
         stream = agentic_client.responses.create(

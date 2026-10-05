@@ -83,6 +83,50 @@ fn responses_to_chat_completions_translates_request_and_response() {
 }
 
 #[test]
+fn buffered_chat_translation_budget_rejects_before_persisting() {
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl_budget", "object": "chat.completion", "model": "gpt-4.1-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "x".repeat(64 * 1024)},
+            "finish_reason": "stop"}]
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
+    let db = TempSqlite::new("buffered_chat_translation_budget");
+    let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
+    // Admit the compact outbound Chat request while rejecting the 64 KiB response.
+    let yaml = yaml.replace(
+        "              - filter: responses_to_chat_completions",
+        "              - filter: openai_agentic_loop\n                max_infer_iters: 1\n                max_retained_bytes: 65536\n\n              - filter: responses_to_chat_completions",
+    );
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url());
+    let yaml = patch_yaml(&yaml, free_port(), &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("budgeted example should parse");
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1-mini", "input": "Hello", "stream": false, "store": true
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error should be JSON");
+    assert_eq!(parse_status(&raw), 502, "response-side budget must fail closed: {raw}");
+    assert_eq!(body["error"]["type"], "server_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("during buffered Chat translation")),
+        "the converter must reject before another filter handles the oversized body: {body}"
+    );
+    assert_eq!(backend.requests().len(), 1);
+    let rows: i64 = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let pool = sqlx::SqlitePool::connect(db.url()).await.unwrap();
+        sqlx::query_scalar("SELECT COUNT(*) FROM openai_responses")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    });
+    assert_eq!(rows, 0, "a rejected translated response must not be stored");
+}
+
+#[test]
 fn responses_to_chat_completions_rejects_malformed_input_before_upstream() {
     let backend = StatefulCapturingBackend::new(vec![(200, r#"{}"#.to_owned())]).start_with_shutdown();
     let proxy_port = free_port();

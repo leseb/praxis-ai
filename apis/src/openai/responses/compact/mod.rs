@@ -49,17 +49,20 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
+use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
+    agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
+    bound_body_outcome, bounded_json_size,
     error::responses_error_rejection,
     is_explicit_compact_request,
-    state::{ResponsesState, mark_local_compaction_item},
+    state::{ResponsesState, mark_local_compaction_item, retained_json_bytes, retained_json_values_bytes},
 };
 use crate::{
     callout_policy::OnFailure,
@@ -74,6 +77,18 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
+/// Conservative live-owner reserve for the pinned tiktoken fallback. Its
+/// large-piece BPE path holds 32-byte states, a growable merge heap, token
+/// vectors, and regex workspace alongside both formatted conversation strings.
+const TOKENIZER_STAGING_MULTIPLIER: usize = 160;
+
+/// Budget exhaustion must bypass the configured ordinary callout fail-open policy.
+enum ReactiveCompactionError {
+    /// The aggregate retained-payload admission failed.
+    RetainedBudget,
+    /// The ordinary callout policy returned a filter action.
+    Rejection(FilterAction),
+}
 
 /// Minimum allowed `compact_threshold` for compaction (1,000 tokens).
 const MIN_COMPACT_THRESHOLD: u64 = 1_000; // 1,000 tokens
@@ -94,11 +109,11 @@ pub use crate::openai::translation::chat_completions::DEFAULT_SUMMARY_PREFIX;
 
 /// Parsed compaction parameters from the request's `context_management`.
 #[derive(Debug, Eq, PartialEq)]
-struct CompactionParams {
+struct CompactionParams<'a> {
     /// Token threshold above which compaction triggers.
     compact_threshold: u64,
     /// Optional model override for the summarization call.
-    compaction_model: Option<String>,
+    compaction_model: Option<&'a str>,
 }
 
 /// Result of a successful summarization callout.
@@ -107,6 +122,42 @@ struct Summarization {
     content: String,
     /// The callout's Chat Completions `usage` object, when reported.
     usage: Option<Value>,
+}
+
+/// Borrow the conversation when serializing the outbound summary request.
+/// This avoids a second JSON value tree containing the whole prompt.
+#[derive(Serialize)]
+struct SummarizationRequest<'a> {
+    /// Model selected for the summarization call.
+    model: &'a str,
+    /// System instructions and user conversation, borrowed until serialization.
+    messages: [SummarizationMessage<'a>; 2],
+}
+
+/// One borrowed Chat Completions message in the outbound request.
+#[derive(Serialize)]
+struct SummarizationMessage<'a> {
+    /// Chat Completions role.
+    role: &'static str,
+    /// Message text.
+    content: &'a str,
+}
+
+/// Describe the outbound request without copying the conversation.
+fn summarization_request<'a>(model: &'a str, system: &'a str, conversation: &'a str) -> SummarizationRequest<'a> {
+    SummarizationRequest {
+        model,
+        messages: [
+            SummarizationMessage {
+                role: "system",
+                content: system,
+            },
+            SummarizationMessage {
+                role: "user",
+                content: conversation,
+            },
+        ],
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -204,26 +255,134 @@ impl CompactFilter {
     }
 
     /// Run the summarization callout and return the summary text.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "callout admission, transport limit, and parse staging form one owner lifetime"
+    )]
     async fn execute_compaction(
         &self,
         state: &ResponsesState,
-        params: &CompactionParams,
+        params: &CompactionParams<'_>,
         conversation_text: &str,
-    ) -> Result<Option<String>, FilterAction> {
-        let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
+        preflight_response_limit: Option<usize>,
+    ) -> Result<Option<String>, ReactiveCompactionError> {
+        let model = params.compaction_model.unwrap_or(&self.config.default_model);
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
-        let request = build_summarization_request(conversation_text, instructions, model);
+        let system_bytes = instructions
+            .map_or(Some(SUMMARIZATION_SYSTEM_PROMPT.len()), |inst| {
+                inst.len()
+                    .checked_add(2)?
+                    .checked_add(SUMMARIZATION_SYSTEM_PROMPT.len())
+            })
+            .ok_or(ReactiveCompactionError::RetainedBudget)?;
+        let system_staging = conversation_text
+            .len()
+            .checked_add(system_bytes)
+            .ok_or(ReactiveCompactionError::RetainedBudget)?;
+        if !state.can_retain_payload(system_staging) {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
+        let system = summarization_system_content(instructions);
+        let request_shape = summarization_request(model, &system, conversation_text);
+        let request_bytes = if let Some(limit) = state.retained_payload_limit() {
+            bounded_json_size(&request_shape, limit)
+                .ok()
+                .flatten()
+                .ok_or(ReactiveCompactionError::RetainedBudget)?
+        } else {
+            0
+        };
+        let request_staging = request_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(system_staging))
+            .ok_or(ReactiveCompactionError::RetainedBudget)?;
+        if !state.can_retain_payload(request_staging) {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
+        let request = build_summarization_request_from_shape(&request_shape);
+        let aggregate_response_limit = if let Some(limit) = state.retained_payload_limit() {
+            let retained = state
+                .retained_payload_bytes_bounded(limit)
+                .ok_or(ReactiveCompactionError::RetainedBudget)?;
+            let available = limit
+                .checked_sub(retained)
+                .and_then(|bytes| bytes.checked_sub(conversation_text.len()))
+                .and_then(|bytes| bytes.checked_sub(system.len()))
+                .and_then(|bytes| bytes.checked_sub(request_bytes.checked_mul(2)?))
+                .and_then(|bytes| bytes.checked_sub(subrequest::MAX_TRANSPORT_STAGING_BYTES))
+                .ok_or(ReactiveCompactionError::RetainedBudget)?;
+            // The buffered client can hold its Vec and old capacity during
+            // growth while Pingora still owns a full transport chunk.
+            let aggregate_read_limit = available / 3;
+            if aggregate_read_limit == 0 {
+                return Err(ReactiveCompactionError::RetainedBudget);
+            }
+            aggregate_read_limit.min(MAX_SUMMARIZATION_RESPONSE_BYTES)
+        } else {
+            MAX_SUMMARIZATION_RESPONSE_BYTES
+        };
+        let response_limit = preflight_response_limit
+            .unwrap_or(MAX_SUMMARIZATION_RESPONSE_BYTES)
+            .min(aggregate_response_limit);
+        // A hit on the independent 1 MiB summarizer cap still follows the
+        // configured callout failure policy. Only a tighter aggregate cap is
+        // a retained-payload failure.
+        let aggregate_controls_response = response_limit < MAX_SUMMARIZATION_RESPONSE_BYTES;
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
         let result = subrequest::execute_url(
             &self.client,
             &self.config.inference_url,
             request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
+            response_limit,
             timeout,
             self.config.address_policy,
         )
         .await;
-        Ok(self.handle_subrequest_result(result)?.map(|s| s.content))
+        if state.retained_payload_limit().is_some() {
+            // The transport already bounds an unsuccessful response body. It
+            // is never parsed, so preserve the configured callout policy.
+            match &result {
+                Ok(resp) if (200..300).contains(&(resp.status as usize)) => {
+                    let parsed = buffered_parsed_json_bytes_upper_bound(&resp.body)
+                        .ok_or(ReactiveCompactionError::RetainedBudget)?;
+                    let staging = parsed
+                        .checked_mul(3)
+                        .and_then(|bytes| bytes.checked_add(resp.body.len()))
+                        .and_then(|bytes| bytes.checked_add(conversation_text.len()))
+                        .and_then(|bytes| bytes.checked_add(system.len()))
+                        .and_then(|bytes| bytes.checked_add(request_bytes))
+                        .ok_or(ReactiveCompactionError::RetainedBudget)?;
+                    if !state.can_retain_payload(staging) {
+                        return Err(ReactiveCompactionError::RetainedBudget);
+                    }
+                },
+                Err(subrequest::SubRequestError::ResponseTooLarge { limit, .. })
+                    if aggregate_controls_response && *limit == response_limit =>
+                {
+                    return Err(ReactiveCompactionError::RetainedBudget);
+                },
+                _ => {},
+            }
+        }
+        Ok(self
+            .handle_reactive_subrequest_result(result, state.retained_payload_limit().map(|_| response_limit))?
+            .map(|s| s.content))
+    }
+
+    /// Admit the raw, parsed, and extracted response owners before JSON parsing.
+    fn handle_reactive_subrequest_result(
+        &self,
+        result: Result<subrequest::SubResponse, subrequest::SubRequestError>,
+        response_limit: Option<usize>,
+    ) -> Result<Option<Summarization>, ReactiveCompactionError> {
+        if let (Some(limit), Ok(resp)) = (response_limit, &result)
+            && (200..300).contains(&(resp.status as usize))
+            && !reactive_summarization_response_fits(&resp.body, limit)
+        {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
+        self.handle_subrequest_result(result)
+            .map_err(ReactiveCompactionError::Rejection)
     }
 
     /// Map a subrequest result to a parsed summarization or a filter action.
@@ -285,29 +444,55 @@ impl CompactFilter {
     /// Apply compaction results: replace the conversation history with
     /// the compaction item. The compacted messages are persisted by the
     /// normal response store filter as part of the eventual response.
-    fn apply_compaction(&self, ctx: &mut HttpFilterContext<'_>, summary: &str) {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preflight and replacement share the compaction item owner lifetime"
+    )]
+    fn apply_compaction(&self, ctx: &mut HttpFilterContext<'_>, summary: &str) -> Result<(), ReactiveCompactionError> {
+        let item_bound = summary
+            .len()
+            .checked_add(2)
+            .map(|bytes| bytes / 3)
+            .and_then(|bytes| bytes.checked_mul(4))
+            .and_then(|bytes| bytes.checked_add(self.config.summary_prefix.len().checked_mul(6)?))
+            .and_then(|bytes| bytes.checked_add(256))
+            .ok_or(ReactiveCompactionError::RetainedBudget)?;
+        let staging = item_bound
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(summary.len()))
+            .ok_or(ReactiveCompactionError::RetainedBudget)?;
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| !state.can_retain_payload(staging))
+        {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
         let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             warn!("ResponsesState missing in apply_compaction");
-            return;
+            return Ok(());
         };
+        let Some(staging) = summary
+            .len()
+            .checked_add(self.config.summary_prefix.len())
+            .and_then(|bytes| bytes.checked_mul(8))
+            .and_then(|bytes| bytes.checked_add(compaction_id.len().saturating_mul(8)))
+            .and_then(|bytes| bytes.checked_add(512))
+        else {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        };
+        if !state.can_retain_payload(staging) {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
         replace_messages(
             state,
             &build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
         );
-    }
-
-    /// Check the threshold and run summarization if it is exceeded.
-    async fn check_and_summarize(&self, state: &ResponsesState) -> Result<Option<String>, FilterAction> {
-        let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return Ok(None),
-            Err(msg) => {
-                let rej = responses_error_rejection(400, "invalid_request_error", &msg);
-                return Err(FilterAction::Reject(rej));
-            },
-        };
-        self.execute_compaction(state, &params, &conversation_text).await
+        if !state.can_retain_payload(0) {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
+        Ok(())
     }
 
     /// Handle an explicit `POST /v1/responses/compact` request.
@@ -367,6 +552,10 @@ impl HttpFilter for CompactFilter {
         BodyAccess::ReadOnly
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
@@ -377,6 +566,10 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential reactive compaction admission and dispatch"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -398,19 +591,169 @@ impl HttpFilter for CompactFilter {
         if !ensure_compactable_state(ctx) {
             return Ok(FilterAction::Release);
         }
+        if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>().copied()
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            state.apply_retained_payload_limit(policy.max_retained_bytes());
+        }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             warn!("ResponsesState missing after ensure_compactable_state");
             return Ok(FilterAction::Release);
         };
-        let summary = match self.check_and_summarize(state).await {
-            Ok(Some(summary)) => summary,
-            Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
-            Err(action) => return Ok(action),
+        let params = match extract_compaction_config(&state.context_management) {
+            Ok(Some(params)) => params,
+            Ok(None) => return Ok(FilterAction::Release),
+            Err(message) => {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    400,
+                    "invalid_request_error",
+                    &message,
+                )));
+            },
         };
-        self.apply_compaction(ctx, &summary);
+        if previous_usage_total(state).is_some_and(|total| total <= params.compact_threshold) {
+            return Ok(FilterAction::Release);
+        }
+        if !reactive_conversation_fits(state) {
+            return Ok(reject_compaction_budget(ctx));
+        }
+        if !reactive_compaction_text_fits(state) {
+            return Ok(reject_compaction_budget(ctx));
+        }
+        let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return Ok(FilterAction::Release),
+            Err(message) => {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    400,
+                    "invalid_request_error",
+                    &message,
+                )));
+            },
+        };
+        let Ok(response_limit) = reactive_compaction_response_limit(state, &conversation_text, &params, &self.config)
+        else {
+            return Ok(reject_compaction_budget(ctx));
+        };
+        let summary = match self
+            .execute_compaction(state, &params, &conversation_text, response_limit)
+            .await
+        {
+            Ok(Some(summary)) => summary,
+            Ok(None) | Err(ReactiveCompactionError::Rejection(FilterAction::Release)) => {
+                return Ok(FilterAction::Release);
+            },
+            Err(ReactiveCompactionError::RetainedBudget) => return Ok(reject_compaction_budget(ctx)),
+            Err(ReactiveCompactionError::Rejection(action)) => return Ok(action),
+        };
+        if self.apply_compaction(ctx, &summary).is_err() {
+            return Ok(reject_compaction_budget(ctx));
+        }
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        // An explicit compact response is terminal and belongs to the
+        // pre-read lifecycle. The bound phase only handles rehydrated turns.
+        if is_explicit_compact_request(ctx) {
+            return Ok(BoundUpstreamBodyOutcome::Continue);
+        }
+        bound_body_outcome(self.on_request_body(ctx, body, true).await?)
+    }
+}
+
+/// Reserve formatted conversation, joined content parts, and the worst-case
+/// token vector before formatting or tokenizing. A no-op threshold check does
+/// not reserve a callout response it will never receive.
+fn reactive_compaction_text_fits(state: &ResponsesState) -> bool {
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let Some(history) = retained_json_values_bytes(&state.messages) else {
+        return false;
+    };
+    let Some(request) = retained_json_bytes(&state.request_body) else {
+        return false;
+    };
+    let text = history
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(state.messages.len().checked_mul(64)?))
+        .and_then(|bytes| bytes.checked_add(512));
+    // A token vector can contain one machine word per input byte. Other copies
+    // cover conversation text, joined parts, and context overhead.
+    let staging = text.and_then(|text| {
+        text.checked_mul(16)
+            .and_then(|bytes| bytes.checked_add(request.checked_mul(16)?))
+    });
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Reserve escaped JSON request copies and buffered transport owners before
+/// dispatching the summarizer. Successful bodies are separately admitted for
+/// parsed-tree staging before they are decoded.
+#[expect(clippy::too_many_lines, reason = "checked reservation accounts for each live owner")]
+fn reactive_compaction_response_limit(
+    state: &ResponsesState,
+    conversation_text: &str,
+    params: &CompactionParams<'_>,
+    config: &ValidatedConfig,
+) -> Result<Option<usize>, ()> {
+    let Some(limit) = state.retained_payload_limit() else {
+        return Ok(None);
+    };
+    let current = state.retained_payload_bytes_bounded(limit).ok_or(())?;
+    let model = params.compaction_model.unwrap_or(&config.default_model);
+    let instructions = state
+        .request_body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    let request = conversation_text
+        .len()
+        .checked_add(instructions)
+        .and_then(|bytes| bytes.checked_add(model.len()))
+        .and_then(|bytes| bytes.checked_add(SUMMARIZATION_SYSTEM_PROMPT.len()))
+        .and_then(|bytes| bytes.checked_mul(12))
+        .and_then(|bytes| bytes.checked_add(1_024))
+        .ok_or(())?;
+    let staging = request
+        .checked_add(conversation_text.len())
+        .and_then(|bytes| bytes.checked_add(subrequest::MAX_TRANSPORT_STAGING_BYTES))
+        .ok_or(())?;
+    let remaining = limit
+        .checked_sub(current)
+        .and_then(|bytes| bytes.checked_sub(staging))
+        .ok_or(())?;
+    let response_limit = (remaining / 3).min(MAX_SUMMARIZATION_RESPONSE_BYTES);
+    if response_limit == 0 {
+        return Err(());
+    }
+    Ok(Some(response_limit))
+}
+
+/// The reactive response allowance reserves four raw-body lengths. A parsed
+/// JSON tree can expand numeric tokens, while summary text and usage are copied
+/// out of that tree before it is dropped. Their individual compact sizes are
+/// each bounded by the normalized size of the whole tree.
+fn reactive_summarization_response_fits(body: &[u8], response_limit: usize) -> bool {
+    buffered_parsed_json_bytes_upper_bound(body)
+        .and_then(|normalized| normalized.checked_mul(3))
+        .and_then(|owners| owners.checked_add(body.len()))
+        .zip(response_limit.checked_mul(4))
+        .is_some_and(|(peak, reserved)| peak <= reserved)
+}
+
+/// Use the shared request-phase rejection for a compaction admission failure.
+fn reject_compaction_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    super::budget_error::reject_request(
+        ctx,
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during compaction",
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -420,6 +763,38 @@ impl HttpFilter for CompactFilter {
 /// Returns `true` when compaction should proceed.
 fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
     is_compactable(ctx.extensions.get::<ResponsesState>())
+}
+
+/// Admit the history text and token-count fallback owners before any string
+/// or array-content join is allocated. JSON string lengths bound the decoded
+/// content; fixed per-item headroom covers role labels and formatting.
+fn reactive_conversation_fits(state: &ResponsesState) -> bool {
+    let Some(limit) = state.retained_payload_limit() else {
+        return true;
+    };
+    let Ok(Some(params)) = extract_compaction_config(&state.context_management) else {
+        return true;
+    };
+    if previous_usage_total(state).is_some_and(|tokens| !exceeds_threshold(tokens, &params)) {
+        return true;
+    }
+    let staging = (|| {
+        let messages = bounded_json_size(&state.messages, limit).ok().flatten()?;
+        let per_item = state.messages.len().checked_mul(128)?;
+        let text = messages.checked_add(per_item)?;
+        if previous_usage_total(state).is_some() {
+            return text.checked_mul(2);
+        }
+        let request_body = bounded_json_size(&state.request_body, limit).ok().flatten()?;
+        // With no stored usage, tiktoken materializes its token Vec and BPE
+        // workspace while the conversation, overhead, and full text are live.
+        // Request JSON bounds the decoded instructions and serialized tools;
+        // 64 bytes cover their labels and the join separators.
+        text.checked_add(request_body)?
+            .checked_add(64)?
+            .checked_mul(TOKENIZER_STAGING_MULTIPLIER)
+    })();
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
 /// Reject the request when a compaction config is present but invalid.
@@ -477,10 +852,10 @@ fn is_compactable(state: Option<&ResponsesState>) -> bool {
 /// The check is reactive: the token count reflects the *previous*
 /// turn's usage, not the current one. If the previous turn exceeded
 /// the threshold, we compact before sending this turn.
-fn should_compact(
-    state: &ResponsesState,
+fn should_compact<'a>(
+    state: &'a ResponsesState,
     tiktoken_encoding: &str,
-) -> Result<Option<(CompactionParams, String)>, String> {
+) -> Result<Option<(CompactionParams<'a>, String)>, String> {
     let Some(params) = extract_compaction_config(&state.context_management)? else {
         return Ok(None);
     };
@@ -511,7 +886,7 @@ fn should_compact(
 }
 
 /// Log and return whether `token_count` exceeds the compaction threshold.
-fn exceeds_threshold(token_count: u64, params: &CompactionParams) -> bool {
+fn exceeds_threshold(token_count: u64, params: &CompactionParams<'_>) -> bool {
     if token_count <= params.compact_threshold {
         debug!(
             token_count,
@@ -828,7 +1203,7 @@ fn reject_compact(status: u16, code: &str, message: &str) -> FilterAction {
 /// - `Ok(Some(params))` if a valid compaction entry is present.
 /// - `Err(msg)` if `context_management` is present but not an array, or a compaction entry has an invalid
 ///   `compact_threshold` or `compaction_model`.
-fn extract_compaction_config(context_management: &Option<Value>) -> Result<Option<CompactionParams>, String> {
+fn extract_compaction_config(context_management: &Option<Value>) -> Result<Option<CompactionParams<'_>>, String> {
     // Absent or explicit null: OpenAI treats both as "no context management".
     let Some(value) = context_management.as_ref().filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -845,7 +1220,7 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Result<Optio
 }
 
 /// Parse a single `{"type": "compaction", ...}` entry into [`CompactionParams`].
-fn parse_compaction_entry(entry: &Value) -> Result<CompactionParams, String> {
+fn parse_compaction_entry(entry: &Value) -> Result<CompactionParams<'_>, String> {
     let err_msg = "compact_threshold must be an integer of at least 1000";
     let raw_threshold = entry.get("compact_threshold").ok_or_else(|| err_msg.to_owned())?;
     let compact_threshold = raw_threshold.as_u64().ok_or_else(|| err_msg.to_owned())?;
@@ -855,8 +1230,7 @@ fn parse_compaction_entry(entry: &Value) -> Result<CompactionParams, String> {
     let compaction_model = match entry.get("compaction_model") {
         Some(m) => Some(
             m.as_str()
-                .ok_or_else(|| "compaction_model must be a string".to_owned())?
-                .to_owned(),
+                .ok_or_else(|| "compaction_model must be a string".to_owned())?,
         ),
         None => None,
     };
@@ -916,20 +1290,21 @@ fn get_token_count(conversation_text: &str, tiktoken_encoding: &str) -> Option<u
 /// }
 /// ```
 fn build_summarization_request(conversation_text: &str, instructions: Option<&str>, model: &str) -> SubRequest {
-    let system_content = match instructions {
+    let system_content = summarization_system_content(instructions);
+    build_summarization_request_from_shape(&summarization_request(model, &system_content, conversation_text))
+}
+
+/// Build the system prompt once, after any active aggregate budget admits it.
+fn summarization_system_content(instructions: Option<&str>) -> String {
+    match instructions {
         Some(inst) => format!("{inst}\n\n{SUMMARIZATION_SYSTEM_PROMPT}"),
         None => SUMMARIZATION_SYSTEM_PROMPT.to_owned(),
-    };
+    }
+}
 
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": conversation_text}
-        ]
-    });
-
-    let body_bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+/// Serialize only the outbound wire buffer; the prompt remains borrowed.
+fn build_summarization_request_from_shape(shape: &SummarizationRequest<'_>) -> SubRequest {
+    let body_bytes = Bytes::from(serde_json::to_vec(shape).unwrap_or_default());
 
     let mut headers = http::HeaderMap::new();
     headers.insert(

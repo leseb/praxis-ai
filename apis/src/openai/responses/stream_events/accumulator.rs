@@ -97,7 +97,8 @@ pub(super) fn accumulate_response_object(
         // Completed calls stay in the response's output array until the loop
         // moves that array to its canonical accumulated owner.
         state.tool_calls.clear();
-        state.response_object = response;
+        state.mark_tool_calls_changed();
+        state.replace_response_object(response);
         state.local_completion_response_template = Value::Null;
         had_prior_usage
     };

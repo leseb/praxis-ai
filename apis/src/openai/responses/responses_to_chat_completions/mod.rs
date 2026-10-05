@@ -38,8 +38,9 @@ use self::{
     stream::{SnapshotInputs, StreamConverter},
 };
 use super::{
+    ObservedResponsesSse,
     body_limits::rewritten_body_too_large_rejection,
-    enforce_agentic_stream_guard,
+    bounded_json_size, enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
     stream_events::RETAINED_PAYLOAD_OVERFLOW_MESSAGE,
@@ -72,6 +73,39 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 
 /// Marker for a streaming Chat Completions SSE response.
 const RESPONSE_TRANSFORM_STREAM: &str = "stream";
+
+/// Error sent when Chat translation cannot fit simultaneous live owners.
+const CHAT_BUDGET_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat translation";
+/// Maximum count of transient copies of one outbound source during lowering.
+const OUTBOUND_SOURCE_COPIES: usize = 6;
+/// Fixed serialization and object overhead reserved for outbound lowering.
+const OUTBOUND_FIXED_BYTES: usize = 4_096;
+
+/// Response-side error when a finite Chat response cannot be translated within
+/// the request-wide retained-payload budget.
+const FINITE_TRANSLATION_OVERFLOW_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during buffered Chat translation";
+
+/// One compact `{"text":"x"}` part expands to a 64-byte Responses
+/// `output_text` item. Reserve that full schema for the translated tree and
+/// both old and new wire Vec capacities at a growth boundary. Every part is a
+/// JSON object, so counting all structural objects is conservative.
+const FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES: usize = 64 * 3;
+/// Reserve per-array framing and copied capacity during finite translation.
+const FINITE_TRANSLATION_ARRAY_EXPANSION_BYTES: usize = 64 * 3;
+/// Reserve per-string escaping and copied capacity during finite translation.
+const FINITE_TRANSLATION_STRING_EXPANSION_BYTES: usize = 64 * 3;
+
+/// `serde_json` can normalize `1e15` (four wire bytes) to
+/// `1000000000000000.0` (eighteen bytes). Reserve the expansion in the
+/// provider tree, translated tree, and output Vec with additional headroom.
+const FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES: usize = 64;
+
+/// A compact function tool gains `description`, `parameters`, and `strict`
+/// when echoed in the Responses resource. Their fixed JSON fields add at most
+/// 64 bytes to the translated tree and each live wire Vec allocation.
+const FINITE_TRANSLATION_FUNCTION_TOOL_EXPANSION_BYTES: usize = 64 * 4;
 
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
@@ -187,12 +221,18 @@ impl ResponsesToChatCompletionsFilter {
     /// Build and size-check the owned Chat Completions request body.
     fn translated_request_bytes(
         &self,
-        ctx: &HttpFilterContext<'_>,
+        ctx: &mut HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, SelectedUpstreamBodyOutcome>, FilterError> {
+        if !outbound_source_fits(ctx) {
+            return Ok(Err(chat_request_budget_failure(ctx)));
+        }
         let translated = match translate_canonical_state(ctx, &self.config.reasoning) {
             Ok(value) => value,
             Err(outcome) => return Ok(Err(outcome)),
         };
+        if !outbound_wire_fits(ctx, &translated) {
+            return Ok(Err(chat_request_budget_failure(ctx)));
+        }
         let serialized = serde_json::to_vec(&translated)
             .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
@@ -259,6 +299,10 @@ impl ResponsesToChatCompletionsFilter {
         clippy::unnecessary_wraps,
         reason = "mirrors the fallible response dispatch handlers so on_response can return every branch uniformly with `?`/`return`"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "installs headers and converter before stream commitment"
+    )]
     fn install_stream_converter(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let streaming_requested = request_is_streaming(ctx);
         let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
@@ -301,6 +345,12 @@ impl ResponsesToChatCompletionsFilter {
         let mut converter = StreamConverter::new(response_id, created_at, self.config.stream_limits());
         if let Some(state) = ctx.extensions.get::<ResponsesState>() {
             converter.set_echo_projection(&state.request_body, &state.tools, state.original_tool_choice.as_ref());
+            if state.retained_payload_limit().is_some() && converter.echo_projection().is_none() {
+                return Ok(FilterAction::Reject(super::budget_error::response_rejection(
+                    ctx,
+                    CHAT_BUDGET_MESSAGE,
+                )));
+            }
         }
         ctx.insert_filter_state(converter);
         Ok(FilterAction::Continue)
@@ -336,10 +386,25 @@ impl ResponsesToChatCompletionsFilter {
         let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
             return Ok(FilterAction::Continue);
         };
+        if converter.failed_terminal_emitted() {
+            *body = None;
+            if end_of_stream {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.retained_chat_converter_bytes = 0;
+                }
+            } else {
+                ctx.insert_filter_state(converter);
+            }
+            return Ok(FilterAction::Continue);
+        }
+        // stream_events may have accepted the converter's terminal but still
+        // hold it for logical-stream finalization. Only the unarmed path has
+        // actually delivered that terminal to the client.
+        let completed_terminal_already_delivered = converter.successful_terminal_emitted()
+            && ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true");
         let incoming_bytes = body.as_ref().map_or(0, Bytes::len);
         if !converter_construction_fits(ctx, &mut converter, incoming_bytes) {
-            record_converter_budget_failure(ctx, body);
-            return Ok(FilterAction::Continue);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
         }
         let now = ctx.time_source.now().as_secs();
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -360,15 +425,13 @@ impl ResponsesToChatCompletionsFilter {
         if let Some(chunk) = body.take() {
             converter.push_into(&chunk, &inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                record_converter_budget_failure(ctx, body);
-                return Ok(FilterAction::Continue);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
             }
         }
         if end_of_stream {
             converter.finish_into(&inputs, &mut out)?;
             if converter.callback_budget_failed() {
-                record_converter_budget_failure(ctx, body);
-                return Ok(FilterAction::Continue);
+                return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
             }
         }
 
@@ -382,16 +445,48 @@ impl ResponsesToChatCompletionsFilter {
             })
         });
         if !admitted {
-            record_converter_budget_failure(ctx, body);
-            return Ok(FilterAction::Continue);
+            return stream_converter_budget_failure(ctx, body, completed_terminal_already_delivered);
         }
 
+        if ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) != Some("true") {
+            // When stream_events is skipped, this converter owns the wire SSE
+            // sequence. Save only successfully admitted events so a later
+            // bounded fallback error continues the delivered sequence.
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.logical_stream_sequence = converter.next_sequence_number();
+            }
+        }
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
             ctx.insert_filter_state(converter);
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Once a successful terminal was delivered, an oversized later callback can
+/// only fail the transport. Emitting an SSE error would create a second terminal.
+fn stream_converter_budget_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    completed_terminal_already_delivered: bool,
+) -> Result<FilterAction, FilterError> {
+    if completed_terminal_already_delivered {
+        *body = None;
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.discard_payload_for_budget_error();
+            state.retained_chat_converter_bytes = 0;
+        }
+        #[cfg(feature = "store")]
+        super::store::discard_retained_request_payload(ctx);
+        ctx.set_metadata("responses.skip_persist", "true");
+        return Err(
+            "responses_to_chat_completions: provider bytes after a terminal exceeded the retained payload budget"
+                .into(),
+        );
+    }
+    record_converter_budget_failure(ctx, body);
+    Ok(FilterAction::Continue)
 }
 
 /// Reserve independently retained converter state and the peak produced by a
@@ -482,10 +577,13 @@ fn converter_budget_remaining(
         return Some(usize::MAX);
     };
     let stable = converter.shared_stable_bytes(state, limit)?;
+    let current_output = converter.current_output_bytes(state, limit)?;
     limit
         .checked_sub(stable)
         .and_then(|remaining| remaining.checked_add(state.retained_chat_converter_bytes))
-        .and_then(|measurement_limit| state.stream_changing_payload_bytes_bounded_with_cached_output(measurement_limit))
+        .and_then(|measurement_limit| {
+            state.chat_stream_changing_payload_bytes_bounded_with_current_output(measurement_limit, current_output)
+        })
         .and_then(|changing| stable.checked_add(changing))
         .and_then(|total| total.checked_sub(state.retained_chat_converter_bytes))
         .and_then(|total| total.checked_add(replacement_bytes))
@@ -496,7 +594,9 @@ fn converter_budget_remaining(
 /// A translated stream has committed HTTP 200. Keep only the bounded logical
 /// error path; later provider chunks are dropped by `transform_stream_response`.
 fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+    let finalizer_armed = ctx.get_metadata(super::STREAM_ERROR_FINALIZER_ARMED_KEY) == Some("true");
     *body = None;
+    ctx.set_metadata("responses.skip_persist", "true");
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.discard_payload_for_budget_error();
         state.retained_chat_converter_bytes = 0;
@@ -505,6 +605,190 @@ fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut O
     #[cfg(feature = "store")]
     super::store::discard_retained_request_payload(ctx);
     super::fs_end_stream_with_error_ctx(ctx, "server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    if !finalizer_armed {
+        // Conditional pipelines can translate a committed Chat SSE stream
+        // without stream_events. There is then no later callback to turn the
+        // recorded error into wire bytes, so emit its fixed-size terminal now.
+        *body = Some(super::stream_events::encode_retained_payload_error(ctx));
+    }
+}
+
+/// Admission before `responses_state_to_chat_request` allocates messages and
+/// another JSON tree. Source fields replaced by the translator are counted
+/// once, while six copies cover converted messages and Vec growth.
+fn outbound_source_fits(ctx: &HttpFilterContext<'_>) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let source = (|| {
+        let request_bytes = super::state::retained_json_bytes(&state.request_body)?;
+        let replaced = ["input", "tools", "tool_choice"]
+            .into_iter()
+            .try_fold(0_usize, |total, key| {
+                total.checked_add(
+                    state
+                        .request_body
+                        .get(key)
+                        .map_or(Some(0), super::state::retained_json_bytes)?,
+                )
+            })?;
+        request_bytes
+            .checked_sub(replaced)?
+            .checked_add(super::state::retained_json_bytes(&state.messages)?)?
+            .checked_add(super::state::retained_json_bytes(state.request_tools())?)?
+            .checked_add(super::state::retained_json_bytes(state.request_tool_choice())?)
+    })();
+    source
+        .and_then(|bytes| bytes.checked_mul(OUTBOUND_SOURCE_COPIES))
+        .and_then(|bytes| bytes.checked_add(OUTBOUND_FIXED_BYTES))
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// The translated tree remains live while its serialized Vec grows.
+fn outbound_wire_fits(ctx: &HttpFilterContext<'_>, translated: &serde_json::Value) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    super::state::retained_json_bytes(translated)
+        .and_then(|bytes| bytes.checked_mul(4))
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Reject a translated Chat request before selecting an upstream body.
+fn chat_request_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstreamBodyOutcome {
+    SelectedUpstreamBodyOutcome::Reject(super::budget_error::request_rejection(ctx, CHAT_BUDGET_MESSAGE))
+}
+
+/// Reserve the provider parse tree, translated resource, serialized wire body,
+/// and request fields echoed into the resource before creating any of them.
+/// The same bound protects finite provider-error normalization, which also
+/// parses the full provider body before building a replacement wire response.
+fn finite_translation_fits(ctx: &HttpFilterContext<'_>, body: &[u8]) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return true;
+    };
+    let staging = (|| {
+        let (echo, normalized_tool_expansion) = finite_translation_echo_bytes(state, limit)?;
+        let response_id_bytes = ctx
+            .get_metadata("responses.response_id")
+            .or(state.response_id.as_deref())
+            .map_or(0, str::len);
+        let (objects, arrays, strings, numbers) = json_structure_counts(body)?;
+        let object_expansion = objects.checked_mul(FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES)?;
+        let array_expansion = arrays.checked_mul(FINITE_TRANSLATION_ARRAY_EXPANSION_BYTES)?;
+        let string_expansion = strings.checked_mul(FINITE_TRANSLATION_STRING_EXPANSION_BYTES)?;
+        let number_expansion = numbers.checked_mul(FINITE_TRANSLATION_NUMBER_EXPANSION_BYTES)?;
+        // Function-call IDs can be emitted as both `id` and `call_id`.
+        // During serialization, the wire Vec can hold both its old and new
+        // capacities. Ten raw-sized owners cover the provider tree, translated
+        // ID copies, and this observed worst-case doubling peak.
+        body.len()
+            .checked_mul(10)?
+            .checked_add(object_expansion)?
+            .checked_add(array_expansion)?
+            .checked_add(string_expansion)?
+            .checked_add(number_expansion)?
+            .checked_add(echo.checked_mul(4)?)?
+            .checked_add(normalized_tool_expansion)?
+            .checked_add(response_id_bytes.checked_mul(12)?)?
+            // Even a minimal resource has about 1 KiB of fixed fields. Keep
+            // that schema live in the translated tree and both old/new wire
+            // Vec allocations at a growth boundary.
+            .checked_add(1024 * 3)
+    })();
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Count request fields copied onto the resource and the additional fixed
+/// fields added while normalizing compact function-tool declarations.
+fn finite_translation_echo_bytes(state: &ResponsesState, limit: usize) -> Option<(usize, usize)> {
+    let choice = state.original_tool_choice.as_ref().unwrap_or(&state.tool_choice);
+    let request_echo = bounded_json_size(&state.request_body, limit).ok().flatten()?;
+    let tools_echo = bounded_json_size(&state.tools, limit).ok().flatten()?;
+    let choice_echo = bounded_json_size(choice, limit).ok().flatten()?;
+    let echo = request_echo.checked_add(tools_echo)?.checked_add(choice_echo)?;
+    let function_tools = state
+        .tools
+        .iter()
+        .filter(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+        .count();
+    let normalized_tool_expansion = function_tools.checked_mul(FINITE_TRANSLATION_FUNCTION_TOOL_EXPANSION_BYTES)?;
+    Some((echo, normalized_tool_expansion))
+}
+
+/// Count structural objects and numeric tokens without allocating or mistaking
+/// their bytes inside JSON strings for payload structure. Invalid JSON still
+/// reaches provider-response validation unless its projection is over budget.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass JSON structure scanner avoids a tree copy"
+)]
+fn json_structure_counts(body: &[u8]) -> Option<(usize, usize, usize, usize)> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_number = false;
+    let mut objects = 0_usize;
+    let mut arrays = 0_usize;
+    let mut strings = 0_usize;
+    let mut numbers = 0_usize;
+    for &byte in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+            in_number = false;
+            strings = strings.checked_add(1)?;
+        } else if byte == b'{' {
+            objects = objects.checked_add(1)?;
+            in_number = false;
+        } else if byte == b'[' {
+            arrays = arrays.checked_add(1)?;
+            in_number = false;
+        } else if byte == b'-' || byte.is_ascii_digit() {
+            if !in_number {
+                numbers = numbers.checked_add(1)?;
+            }
+            in_number = true;
+        } else if !in_number || !matches!(byte, b'.' | b'e' | b'E' | b'+') {
+            in_number = false;
+        }
+    }
+    Some((objects, arrays, strings, numbers))
+}
+
+/// A finite provider response can arrive after an earlier streamed round has
+/// committed the client response. End that stream in band; otherwise reject
+/// the uncommitted response as a server error.
+fn finite_translation_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> FilterAction {
+    if ctx.extensions.get::<ObservedResponsesSse>().is_some()
+        || ctx
+            .extensions
+            .get::<praxis_filter::ClientResponseHeadersCommitted>()
+            .is_some()
+    {
+        record_converter_budget_failure(ctx, body);
+        return FilterAction::Continue;
+    }
+    *body = None;
+    FilterAction::Reject(super::budget_error::response_rejection(
+        ctx,
+        FINITE_TRANSLATION_OVERFLOW_MESSAGE,
+    ))
 }
 
 #[expect(
@@ -581,11 +865,33 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
-        // Buffer the finite response up to the absolute ceiling; the
-        // pipeline's body_limits decides the real raw cap.
-        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        // Cap the raw buffered owner before parsing creates more owned trees.
+        // A later client-tool restore has no transformed wire length at this
+        // header phase, so leave enough headroom for its conservative peak.
+        let finite_cap = ctx.extensions.get::<ResponsesState>().map(|state| {
+            state.retained_payload_limit().map(|limit| {
+                state
+                    .retained_payload_bytes_bounded(limit)
+                    .and_then(|current| limit.checked_sub(current))
+                    .map_or(0, |remaining| {
+                        remaining / if state.client_tool_echo.is_some() { 512 } else { 8 }
+                    })
+            })
         });
+        if finite_cap == Some(Some(0)) {
+            return Ok(FilterAction::Reject(super::budget_error::response_rejection(
+                ctx,
+                FINITE_TRANSLATION_OVERFLOW_MESSAGE,
+            )));
+        }
+        ctx.response_body_mode = BodyMode::StreamBuffer {
+            max_bytes: Some(
+                finite_cap
+                    .flatten()
+                    .unwrap_or(MAX_JSON_BODY_BYTES)
+                    .min(MAX_JSON_BODY_BYTES),
+            ),
+        };
         prepare_transformed_response_headers(ctx);
 
         Ok(FilterAction::Continue)
@@ -602,9 +908,23 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         }
 
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
+            Some(RESPONSE_TRANSFORM_STREAM) => {
+                let action = Self::transform_stream_response(ctx, body, end_of_stream)?;
+                // Record a real translated SSE payload when the stream has not
+                // already terminated or been suppressed by the router.
+                if ctx.get_metadata("responses.stream_completion").is_none()
+                    && ctx.extensions.get::<praxis_filter::StreamBodySuppressed>().is_none()
+                    && body.as_ref().is_some_and(|bytes| !bytes.is_empty())
+                {
+                    ctx.extensions.insert(ObservedResponsesSse);
+                }
+                Ok(action)
+            },
             Some(_) => {
                 if end_of_stream {
+                    if !finite_translation_fits(ctx, body.as_deref().unwrap_or_default()) {
+                        return Ok(finite_translation_budget_failure(ctx, body));
+                    }
                     self.transform_finite_response(ctx, body)?;
                 }
                 Ok(FilterAction::Continue)
