@@ -29,13 +29,33 @@ use crate::{
     is_event_stream_content_type,
     openai::{
         operation_classifier::OpenAiOperationMatch,
-        responses::{bound_body_outcome, state::ResponsesState},
+        responses::{
+            AgenticBudgetPolicy, bound_body_outcome, buffered_parsed_json_bytes_upper_bound,
+            error::responses_error_rejection,
+            state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
+            store::{
+                PersistedResponseForConversation, ResponseRound, request_persistence_armed, response_round,
+                store_response_header_skipped, trusted_identity_content_length,
+            },
+        },
     },
     operation::Transport,
     service::conversations::build_item_records,
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, ResponseStoreRegistry},
+    store::{OwnerScopedResponseStore, ResponseStoreRegistry, StoreError},
 };
+
+/// Error exposed when append-back would exceed the request-wide allowance.
+const APPEND_BUDGET_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during conversation append";
+
+/// Separate aggregate admission failure from a durable backend failure.
+enum AppendError {
+    /// A request-wide retained owner would exceed its admitted allowance.
+    Budget,
+    /// The backend rejected an otherwise admitted write.
+    Store(FilterError),
+}
 
 // -----------------------------------------------------------------------------
 // OpenaiConversationsFilter
@@ -78,18 +98,94 @@ struct ConversationRequestState {
 
     /// Full body captured by an early pre-read pass.
     deferred_body: Option<Bytes>,
+
+    /// The request hook's pipeline placement survives IRR's extension swap
+    /// into the parent response context.
+    outside_router_at_request: Option<bool>,
 }
 
 /// Per-request response-phase state that controls whether append-back
 /// should run during `on_response_body`.
 struct ConversationResponseState {
+    /// The response attempt whose hook selected this append. Request extensions
+    /// outlive intermediate IRR responses, including skipped later rounds.
+    round: ResponseRound,
     /// A deferred streaming terminal is followed by a separate EOS callback.
     /// Even failure-mode-open paths must not retry a possibly committed write.
     append_attempted: bool,
     /// Owner captured before response body buffering is armed.
     append_owner: Option<StateOwner>,
-    /// The response uses the composed SSE terminal instead of buffered JSON.
-    streaming: bool,
+    /// Whether this is buffered JSON or an SSE header selected by a branch or
+    /// by the outer response pipeline.
+    delivery: ResponseDelivery,
+}
+
+/// Response lifecycle that controls how long the selected append remains live.
+#[derive(Clone, Copy)]
+enum ResponseDelivery {
+    /// Buffered JSON must match the current response round.
+    Buffered,
+    /// A branch SSE selection must match the current response round.
+    BranchStream,
+    /// The committed outer SSE header remains selected through tool rounds.
+    OuterStream,
+}
+
+/// A configured response store must write its record before conversation
+/// append-back, regardless of the two filters' order in the pipeline.
+fn awaiting_response_store(ctx: &HttpFilterContext<'_>) -> bool {
+    request_persistence_armed(ctx)
+        && !store_response_header_skipped(ctx)
+        && ctx.extensions.get::<PersistedResponseForConversation>().is_none()
+}
+
+/// Finish a header append after a later response-store hook persisted the
+/// canonical response. A store hook that runs first leaves the ordinary
+/// Conversations response hook to do this work instead. Ordinary backend
+/// errors follow the Store hook's failure mode; request-wide budget errors
+/// remain explicit terminal actions regardless of failure mode.
+pub(crate) async fn append_after_store_response(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    if !conversation_response_selected(ctx) {
+        return Ok(FilterAction::Continue);
+    }
+    OpenaiConversationsFilter.on_response(ctx).await
+}
+
+/// Finish a body append after the response-store terminal hook persisted its
+/// record and replay events, before the terminal body is released. Ordinary
+/// backend errors follow the Store hook's failure mode.
+pub(crate) fn append_after_store_body(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+) -> Result<FilterAction, FilterError> {
+    if !conversation_body_selected(ctx) {
+        return Ok(FilterAction::Continue);
+    }
+    OpenaiConversationsFilter.on_response_body(ctx, body, end_of_stream)
+}
+
+/// A deferred append is eligible only when Conversations ran on this response.
+pub(crate) fn conversation_response_selected(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ConversationResponseState>()
+        .is_some_and(|state| state.round == response_round(ctx))
+}
+
+/// An outer SSE header is selected once and remains live while inner agentic
+/// continuations advance their own iteration and detach IRR's iteration state.
+fn conversation_body_selected(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<ConversationResponseState>().is_some_and(|state| {
+        matches!(state.delivery, ResponseDelivery::OuterStream) || state.round == response_round(ctx)
+    })
+}
+
+/// Use the request hook's pipeline placement, which IRR does not swap with
+/// response extensions when a nested stream becomes the parent response.
+fn is_outer_response_filter(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_filter_state::<ConversationRequestState>()
+        .and_then(|state| state.outside_router_at_request)
+        .unwrap_or_else(|| response_round(ctx).is_outside_router())
 }
 
 /// Owner captured on the request path before inference begins.
@@ -195,7 +291,14 @@ impl OpenaiConversationsFilter {
     /// Drop a body captured during pre-read when header classification shows
     /// that this filter will not handle the request locally.
     fn discard_request_state(ctx: &mut HttpFilterContext<'_>) {
-        drop(ctx.remove_filter_state::<ConversationRequestState>());
+        if let Some(mut state) = ctx.remove_filter_state::<ConversationRequestState>() {
+            state.deferred_body = None;
+            // Only Responses can need the request-pipeline placement at the
+            // eventual response header. Local Conversations CRUD is complete.
+            if ctx.request.method == http::Method::POST && ctx.request.uri.path() == "/v1/responses" {
+                ctx.insert_filter_state(state);
+            }
+        }
     }
 
     /// Recover a matched parameter from the immutable original request path.
@@ -363,12 +466,16 @@ impl OpenaiConversationsFilter {
         conversation_id: &str,
         ctx: &HttpFilterContext<'_>,
         items: Vec<Value>,
-    ) -> Result<(), FilterError> {
-        let store = resolve_store(ctx, owner)
-            .ok_or_else(|| FilterError::from("openai_conversations: store unavailable for append-back"))?;
+        body_bytes: usize,
+    ) -> Result<(), AppendError> {
+        let store = resolve_store(ctx, owner).ok_or_else(|| {
+            AppendError::Store(FilterError::from(
+                "openai_conversations: store unavailable for append-back",
+            ))
+        })?;
 
         let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| handle.block_on(persist_items(&store, conversation_id, ctx, items)))
+        tokio::task::block_in_place(|| handle.block_on(persist_items(&store, conversation_id, ctx, items, body_bytes)))
     }
 }
 
@@ -409,6 +516,13 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if ctx.current_filter_id.is_some() {
+            let mut state = ctx
+                .remove_filter_state::<ConversationRequestState>()
+                .unwrap_or_default();
+            state.outside_router_at_request = Some(ctx.extensions.get::<praxis_filter::IterationState>().is_none());
+            ctx.insert_filter_state(state);
+        }
         if let Err(action) = capture_append_owner(ctx) {
             return Ok(action);
         }
@@ -493,10 +607,11 @@ impl HttpFilter for OpenaiConversationsFilter {
     )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !should_append_back(ctx) {
-            ctx.insert_filter_state(ConversationResponseState {
+            ctx.extensions.insert(ConversationResponseState {
+                round: response_round(ctx),
                 append_attempted: false,
                 append_owner: None,
-                streaming: false,
+                delivery: ResponseDelivery::Buffered,
             });
             return Ok(FilterAction::Continue);
         }
@@ -520,40 +635,144 @@ impl HttpFilter for OpenaiConversationsFilter {
             trace!("conversation append-back skipped (non-2xx or unsupported response content type)");
         }
         if armed {
+            if budgeted_append_state_missing(ctx) {
+                return Ok(conversation_budget_failure(ctx, false, &mut None));
+            }
             let owner = ctx
                 .extensions
                 .get::<CapturedAppendOwner>()
                 .map(|captured| captured.0.clone())
                 .ok_or_else(|| FilterError::from("openai_conversations: append-back owner was not captured"))?;
-            ctx.insert_filter_state(ConversationResponseState {
+            // A delegated retry runs under Store or readiness's filter ID.
+            // Keep the originating Conversations hook's placement for this
+            // round rather than classifying the delegating filter.
+            let delivery = if !is_stream {
+                ResponseDelivery::Buffered
+            } else if ctx
+                .extensions
+                .get::<ConversationResponseState>()
+                .filter(|state| state.round == response_round(ctx))
+                .map_or_else(
+                    || is_outer_response_filter(ctx),
+                    |state| matches!(state.delivery, ResponseDelivery::OuterStream),
+                )
+            {
+                ResponseDelivery::OuterStream
+            } else {
+                ResponseDelivery::BranchStream
+            };
+            ctx.extensions.insert(ConversationResponseState {
+                round: response_round(ctx),
                 append_attempted: false,
                 append_owner: Some(owner),
-                streaming: is_stream,
+                delivery,
             });
             if is_json {
-                ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                    max_bytes: Some(MAX_JSON_BODY_BYTES),
-                });
+                // An agentic terminal has already been canonicalized by the
+                // inner IRR before the outer response header hooks run. For a
+                // budgeted conversation turn, append here so a rejection can
+                // carry a Responses JSON body before headers are committed.
+                if ctx
+                    .extensions
+                    .get::<ResponsesState>()
+                    .is_some_and(|state| state.retained_payload_limit().is_some())
+                {
+                    let completed = crate::openai::responses::buffered_canonical_completed(ctx);
+                    if completed {
+                        if awaiting_response_store(ctx) {
+                            return Ok(FilterAction::Continue);
+                        }
+                        let mut no_body = None;
+                        if !canonical_append_is_empty(ctx) {
+                            let wire_bytes = ctx
+                                .extensions
+                                .get::<ResponsesState>()
+                                .and_then(|state| retained_json_bytes(&state.response_object))
+                                .ok_or_else(|| FilterError::from("openai_conversations: response size overflow"))?;
+                            if !append_extraction_fits(ctx, &no_body, true) {
+                                return Ok(conversation_budget_failure(ctx, false, &mut no_body));
+                            }
+                            let append_owner = ctx
+                                .extensions
+                                .get::<ConversationResponseState>()
+                                .and_then(|state| state.append_owner.clone())
+                                .ok_or_else(|| FilterError::from("openai_conversations: append owner missing"))?;
+                            let items = extract_streaming_append_back_items(ctx, append_owner)
+                                .ok_or_else(|| FilterError::from("openai_conversations: append items missing"))?;
+                            if !append_record_construction_fits(ctx, &items.all_items) {
+                                return Ok(conversation_budget_failure(ctx, false, &mut no_body));
+                            }
+                            let store = resolve_store(ctx, &items.owner).ok_or_else(|| {
+                                FilterError::from("openai_conversations: store unavailable for append-back")
+                            })?;
+                            match persist_items(&store, &items.conversation_id, ctx, items.all_items, wire_bytes).await
+                            {
+                                Ok(()) => {},
+                                Err(AppendError::Budget) => {
+                                    return Ok(conversation_budget_failure(ctx, false, &mut no_body));
+                                },
+                                Err(AppendError::Store(error)) => return Err(error),
+                            }
+                        }
+                        if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
+                            state.append_attempted = true;
+                        }
+                    } else if ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+                        state.buffered_canonical_finalized
+                            && matches!(
+                                state.response_object.get("status").and_then(Value::as_str),
+                                Some("incomplete" | "failed")
+                            )
+                    }) {
+                        // The finalized turn has no successful assistant item
+                        // to append. Preserve its admitted partial/error body.
+                        if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
+                            state.append_attempted = true;
+                        }
+                    } else {
+                        // A selected branch may skip the agentic loop. Bound
+                        // its independent finite body before core buffers it.
+                        let Some(max_bytes) = buffered_response_headroom(ctx)
+                            .and_then(|headroom| finite_conversation_buffer_cap(ctx, headroom))
+                        else {
+                            return Ok(conversation_budget_failure(ctx, false, &mut None));
+                        };
+                        ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                            max_bytes: Some(max_bytes),
+                        });
+                    }
+                } else {
+                    ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                        max_bytes: Some(MAX_JSON_BODY_BYTES),
+                    });
+                }
             }
         } else {
-            ctx.insert_filter_state(ConversationResponseState {
+            ctx.extensions.insert(ConversationResponseState {
+                round: response_round(ctx),
                 append_attempted: false,
                 append_owner: None,
-                streaming: false,
+                delivery: ResponseDelivery::Buffered,
             });
         }
 
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "terminal append and rollback decisions share one callback"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        let response_state = ctx.get_filter_state::<ConversationResponseState>();
-        if response_state.is_none_or(|state| state.append_owner.is_none() || state.append_attempted) {
+        let response_state = ctx.extensions.get::<ConversationResponseState>();
+        if !conversation_body_selected(ctx)
+            || response_state.is_none_or(|state| state.append_owner.is_none() || state.append_attempted)
+        {
             // This filter is composed with other response-body consumers, such
             // as `openai_response_store`. Releasing here drains a shared
             // StreamBuffer before those filters see end-of-stream, which can
@@ -562,14 +781,17 @@ impl HttpFilter for OpenaiConversationsFilter {
             // leave release ownership to the pipeline as a whole.
             return Ok(FilterAction::Continue);
         }
-        let streaming = response_state.is_some_and(|state| state.streaming);
+        let streaming = response_state.is_some_and(|state| !matches!(state.delivery, ResponseDelivery::Buffered));
+
+        if awaiting_response_store(ctx) {
+            return Ok(FilterAction::Continue);
+        }
 
         if streaming {
-            // Deferred terminals are delivered in this non-EOS chunk. Local
-            // completions leave the flag unset and carry the full terminal in
-            // a single IRR chunk before the empty EOS callback. A completed-looking
-            // state without either frame must not append after a failed stream.
-            if !streaming_terminal_emitted(ctx) && !contains_completed_terminal(body) {
+            // Append only while the successful terminal is still in this
+            // callback. A later [DONE] or EOS cannot replace bytes already
+            // delivered to the client with an admission error.
+            if !contains_completed_terminal(body) {
                 return Ok(FilterAction::Continue);
             }
         } else if !end_of_stream {
@@ -579,6 +801,20 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
+        if budgeted_append_state_missing(ctx) {
+            return Ok(conversation_budget_failure(ctx, streaming, body));
+        }
+
+        if canonical_append_is_empty(ctx) {
+            if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
+                state.append_attempted = true;
+            }
+            return Ok(FilterAction::Continue);
+        }
+
+        if !append_extraction_fits(ctx, body, streaming) {
+            return Ok(conversation_budget_failure(ctx, streaming, body));
+        }
         let items = if streaming {
             extract_streaming_append_back_items(ctx, append_owner)
         } else {
@@ -587,6 +823,9 @@ impl HttpFilter for OpenaiConversationsFilter {
         let Some(items) = items else {
             return Ok(FilterAction::Continue);
         };
+        if !append_record_construction_fits(ctx, &items.all_items) {
+            return Ok(conversation_budget_failure(ctx, streaming, body));
+        }
 
         let conv_id = items.conversation_id;
         // Append before the completed JSON body or streaming terminal frame is
@@ -596,11 +835,23 @@ impl HttpFilter for OpenaiConversationsFilter {
         // `failure_mode: open` is an explicit operator opt-out of that guarantee:
         // the pipeline logs this error and releases the terminal even though
         // items were lost. Item insertion and cache rebuild are transactional.
-        if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
+        if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
             state.append_attempted = true;
         }
-        Self::append_items_blocking(&items.owner, &conv_id, ctx, items.all_items)
-            .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
+        match Self::append_items_blocking(
+            &items.owner,
+            &conv_id,
+            ctx,
+            items.all_items,
+            body.as_ref().map_or(0, Bytes::len),
+        ) {
+            Ok(()) => {},
+            Err(AppendError::Budget) => return Ok(conversation_budget_failure(ctx, streaming, body)),
+            Err(AppendError::Store(error)) => {
+                warn!(error = %error, conversation_id = %conv_id, "conversation append-back failed");
+                return Err(error);
+            },
+        }
 
         Ok(FilterAction::Continue)
     }
@@ -626,12 +877,230 @@ fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(|state| state.logical_stream_terminal_emitted)
 }
 
+/// Prove no append records exist only after the loop finalized this turn.
+fn canonical_append_is_empty(ctx: &HttpFilterContext<'_>) -> bool {
+    crate::openai::responses::buffered_canonical_completed(ctx)
+        && ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            state.input.is_empty()
+                && state
+                    .response_object
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+        })
+}
+
 /// Check the canonical local-completion frame delivered as one IRR chunk. The
 /// composer writes this ASCII event header in one chunk; no SSE body is accumulated.
 fn contains_completed_terminal(body: &Option<Bytes>) -> bool {
     const EVENT_HEADER: &[u8] = b"event: response.completed\n";
     body.as_deref()
         .is_some_and(|chunk| chunk.windows(EVENT_HEADER.len()).any(|window| window == EVENT_HEADER))
+}
+
+/// A listener-wide agentic budget cannot be bypassed by a response path that
+/// lost its shared state before append-back.
+fn budgeted_append_state_missing(ctx: &HttpFilterContext<'_>) -> bool {
+    let policy = ctx.extensions.get::<AgenticBudgetPolicy>();
+    if policy.is_none() && ctx.get_metadata("responses.retained_budget_active") != Some("true") {
+        return false;
+    }
+    ctx.extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+        .is_none_or(|limit| policy.is_some_and(|policy| limit > policy.max_retained_bytes()))
+}
+
+/// Bound the extra framework JSON buffer by unused request allowance.
+fn buffered_response_headroom(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let limit = state.retained_payload_limit()?;
+    let current = state.retained_payload_bytes_bounded(limit)?;
+    limit.checked_sub(current).map(|bytes| bytes.min(MAX_JSON_BODY_BYTES))
+}
+
+/// Choose the finite transport cap before Store runs. The loop's finalizer
+/// publishes an exact wire length and digest; a direct response may instead
+/// use one trusted identity-coded Content-Length. Preserve any prior narrower
+/// buffer when no exact length is known because core only ratchets caps upward.
+fn finite_conversation_buffer_cap(ctx: &HttpFilterContext<'_>, headroom: usize) -> Option<usize> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let exact = if state.buffered_canonical_finalized {
+        state.buffered_canonical_body_digest?;
+        Some(state.buffered_canonical_wire_bytes?)
+    } else if ctx.extensions.get::<praxis_filter::IterationState>().is_none() {
+        ctx.response_header
+            .as_ref()
+            .and_then(|response| trusted_identity_content_length(&response.headers))
+    } else {
+        None
+    };
+    let cap = exact.unwrap_or(headroom);
+    if cap == 0 || cap > headroom {
+        return None;
+    }
+    if ctx
+        .response_header
+        .as_ref()
+        .and_then(|response| response.headers.get(http::header::CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > cap)
+    {
+        return None;
+    }
+    compatible_finite_buffer_cap(ctx, cap, exact.is_some())
+}
+
+/// Core only ratchets a response buffer upward. An exact wire admission must
+/// match an earlier buffer; a headroom cap may retain an earlier narrower one.
+fn compatible_finite_buffer_cap(ctx: &HttpFilterContext<'_>, cap: usize, exact: bool) -> Option<usize> {
+    match &ctx.response_body_mode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(existing),
+        } if *existing > cap || (exact && *existing != cap) => None,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(existing),
+        } => Some(*existing),
+        BodyMode::StreamBuffer { max_bytes: None } => None,
+        _ => Some(cap),
+    }
+}
+
+/// Admit every new JSON owner before parsing buffered output or cloning the
+/// canonical streaming output. The body remains live during this operation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "both buffered parsing and canonical clone owners need one admission"
+)]
+fn append_extraction_fits(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>, streaming: bool) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let input_bytes = retained_json_values_bytes(&state.input);
+    let staging = if streaming {
+        let output_bytes = state
+            .response_object
+            .get("output")
+            .and_then(Value::as_array)
+            .map_or(Some(0), |output| retained_json_values_bytes(output));
+        input_bytes
+            .and_then(|bytes| bytes.checked_add(output_bytes?))
+            .and_then(|bytes| {
+                if body.is_none() {
+                    bytes.checked_add(retained_json_bytes(&state.response_object)?)
+                } else {
+                    Some(bytes)
+                }
+            })
+    } else {
+        let Some(bytes) = body.as_ref() else {
+            return true;
+        };
+        input_bytes.and_then(|input| input.checked_add(buffered_parsed_json_bytes_upper_bound(bytes)?))
+    };
+    staging
+        .and_then(|bytes| bytes.checked_add(body.as_ref().map_or(0, Bytes::len)))
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Record normalization can add IDs, statuses, and structured message parts.
+/// Admit that transient expansion before consuming the extracted item vector.
+fn append_record_construction_fits(ctx: &HttpFilterContext<'_>, items: &[Value]) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    retained_json_values_bytes(items)
+        .and_then(|bytes| bytes.checked_mul(4))
+        .and_then(|bytes| bytes.checked_add(items.len().checked_mul(512)?))
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Hold normalized records and their SQL serialization/bind while reserving
+/// the remaining allowance for the full owner-scoped cache rebuild.
+fn append_rebuild_allowance(
+    ctx: &HttpFilterContext<'_>,
+    records: &[crate::store::ConversationItemRecord],
+    body_bytes: usize,
+) -> Result<Option<usize>, AppendError> {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Ok(None);
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return Ok(None);
+    };
+    let record_bytes = records.iter().try_fold(0_usize, |used, record| {
+        used.checked_add(retained_json_bytes(&record.item_data)?)?
+            .checked_add(record.item_id.len())?
+            .checked_add(record.conversation_id.len())?
+            .checked_add(record.owner.tenant_id().len())?
+            .checked_add(record.owner.issuer().len())?
+            .checked_add(record.owner.subject().len())
+    });
+    let staging = record_bytes
+        .and_then(|bytes| bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(body_bytes))
+        .ok_or(AppendError::Budget)?;
+    let current = state.retained_payload_bytes_bounded(limit).ok_or(AppendError::Budget)?;
+    let remaining = limit
+        .checked_sub(current)
+        .and_then(|bytes| bytes.checked_sub(staging))
+        .ok_or(AppendError::Budget)?;
+    Ok(Some(remaining))
+}
+
+/// Suppress success and remove a response persisted earlier in this exchange.
+/// A marker is installed only after the Responses store's own durable write.
+#[expect(
+    clippy::too_many_lines,
+    reason = "rollback and terminal wire error must be sequenced together"
+)]
+fn conversation_budget_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    streaming: bool,
+    body: &mut Option<Bytes>,
+) -> FilterAction {
+    if let Some(marker) = ctx.extensions.remove::<PersistedResponseForConversation>() {
+        let rollback = (|| -> Result<(), FilterError> {
+            let owner = ctx
+                .extensions
+                .get::<CapturedAppendOwner>()
+                .ok_or_else(|| FilterError::from("openai_conversations: append owner missing for rollback"))?;
+            let store = ctx
+                .extensions
+                .get::<ResponseStoreRegistry>()
+                .and_then(|registry| registry.get_scoped(crate::openai::responses::DEFAULT_STORE_NAME, &owner.0))
+                .ok_or_else(|| FilterError::from("openai_conversations: response store missing for rollback"))?;
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| handle.block_on(store.delete_response(&marker.0)))
+                .map_err(|error| -> FilterError { Box::new(error) })?;
+            Ok(())
+        })();
+        if let Err(error) = rollback {
+            // Cleanup is best effort: a failed delete cannot turn an admitted
+            // budget failure back into a client-visible completed response.
+            warn!(%error, "response rollback failed after conversation budget denial");
+        }
+    }
+    if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
+        state.append_attempted = true;
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    if streaming {
+        crate::openai::responses::fs_end_stream_with_error_ctx(ctx, "server_error", APPEND_BUDGET_MESSAGE);
+        *body = crate::openai::responses::stream_events::encode_local_error(ctx, "server_error", APPEND_BUDGET_MESSAGE);
+        return FilterAction::Continue;
+    }
+    FilterAction::Reject(responses_error_rejection(502, "server_error", APPEND_BUDGET_MESSAGE))
 }
 
 // -----------------------------------------------------------------------------
@@ -739,23 +1208,33 @@ async fn persist_items(
     conversation_id: &str,
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
-) -> Result<(), FilterError> {
+    body_bytes: usize,
+) -> Result<(), AppendError> {
     let created_at = handlers::current_timestamp(ctx);
 
     let records = build_item_records(store.owner(), conversation_id, created_at, 0, items, || {
         handlers::generated_item_id(ctx)
     })
-    .map_err(|e| -> FilterError { Box::new(e) })?;
+    .map_err(|e| AppendError::Store(Box::new(e)))?;
 
     if records.is_empty() {
         return Ok(());
     }
 
     let count = records.len();
-    store
-        .create_items_and_sync_messages(conversation_id, &records)
-        .await
-        .map_err(|e| -> FilterError { Box::new(e) })?;
+    let allowance = append_rebuild_allowance(ctx, &records, body_bytes)?;
+    let result = if let Some(max_rebuild_bytes) = allowance {
+        store
+            .create_items_and_sync_messages_bounded(conversation_id, &records, max_rebuild_bytes)
+            .await
+    } else {
+        store.create_items_and_sync_messages(conversation_id, &records).await
+    };
+    match result {
+        Ok(()) => {},
+        Err(StoreError::PayloadTooLarge) => return Err(AppendError::Budget),
+        Err(error) => return Err(AppendError::Store(Box::new(error))),
+    }
 
     debug!(conversation_id, count, "conversation items appended from response");
 
@@ -797,6 +1276,35 @@ fn reject_classifier_unavailable() -> Rejection {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streamed_response_uses_request_pipeline_placement_after_extension_handoff() {
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(ConversationRequestState {
+            deferred_body: Some(Bytes::from_static(b"discard me")),
+            ..ConversationRequestState::default()
+        });
+        assert!(matches!(
+            OpenaiConversationsFilter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(is_outer_response_filter(&ctx));
+        assert!(
+            ctx.get_filter_state::<ConversationRequestState>()
+                .unwrap()
+                .deferred_body
+                .is_none()
+        );
+
+        // The nested step's extensions can also be stripped before its
+        // response hook. It must remain a step selection in that context.
+        let mut state = ctx.remove_filter_state::<ConversationRequestState>().unwrap();
+        state.outside_router_at_request = Some(false);
+        ctx.insert_filter_state(state);
+        assert!(!is_outer_response_filter(&ctx));
+    }
 
     #[test]
     fn reject_store_unavailable_returns_500_server_error() {

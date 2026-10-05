@@ -65,6 +65,14 @@ impl HttpFilter for StoreReadinessGateFilter {
         Ok(Self::readiness_action(ctx))
     }
 
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let Some(rejection) = praxis_ai_apis::openai::final_conversation_buffer_budget_rejection(ctx) {
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Reject(rejection));
+        }
+        praxis_ai_apis::openai::finish_unselected_store_conversation_append(ctx).await
+    }
+
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,

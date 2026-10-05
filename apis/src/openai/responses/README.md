@@ -39,10 +39,10 @@ Body-phase columns show `Access / Mode` when the hook is implemented. When ordin
 | `openai_mcp_dispatch` | ✓ | ReadOnly / StreamBuffer | — | — | — | — |
 | `openai_mcp_tool_resolve` | ✓ | ReadWrite / StreamBuffer | ReadWrite / StreamBuffer | — | — | — |
 | `openai_response_store` | ✓ | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | ✓ | ReadOnly / Stream |
-| `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — | — | — |
+| `openai_responses_compact` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | — | — |
 | `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — | — | — |
 | `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — | — | — |
-| `openai_responses_proxy` | — | None / StreamBuffer | — | ReadWrite / StreamBuffer | — | — |
+| `openai_responses_proxy` | — | None / StreamBuffer | — | ReadWrite / StreamBuffer | ✓ | ReadOnly / Stream |
 | `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | ✓ | ReadWrite / Stream |
 | `openai_responses_request` | — | ReadOnly / StreamBuffer | — | — | — | — |
 | `openai_responses_validate` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | — | ReadOnly / Stream |

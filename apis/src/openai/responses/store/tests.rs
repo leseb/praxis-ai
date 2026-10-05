@@ -4,6 +4,7 @@
 //! Unit tests for the `openai_response_store` filter.
 
 use std::{
+    fmt::Write as _,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     sync::Arc,
@@ -28,8 +29,8 @@ use crate::{
     },
     service::responses::{ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items},
     store::{
-        DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
-        SqliteResponseStore,
+        CompressionAlgorithm, DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _,
+        ResponseStoreRegistry, SqliteResponseStore, StoreCompressionConfig,
     },
 };
 
@@ -302,7 +303,7 @@ fn response_body_mode_defaults_to_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() {
+async fn on_response_selects_bounded_stream_buffer_for_non_streaming_responses() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -310,9 +311,25 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "false");
 
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    let mut response = crate::test_utils::make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue), "request should continue");
+    assert!(matches!(action, FilterAction::Continue), "response should continue");
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::Stream,
+        "request phase must defer the finite cap"
+    );
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "response should continue");
     assert_eq!(
         ctx.response_body_mode,
         BodyMode::StreamBuffer {
@@ -320,6 +337,73 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
         },
         "non-streaming Responses requests should remain bounded"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_caps_direct_buffer_at_trusted_length() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut state = ResponsesState {
+        input: vec![json!({"role": "user", "content": "Hello"})],
+        ..ResponsesState::default()
+    };
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 8_192);
+    ctx.extensions.insert(state);
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    resp.headers.insert(http::header::CONTENT_LENGTH, "32".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer { max_bytes: Some(32) },
+        "the finite store buffer must not exceed its admitted wire length"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_rejects_known_body_larger_than_shared_headroom() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut state = ResponsesState::default();
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 1_024);
+    ctx.extensions.insert(state);
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    resp.headers
+        .insert(http::header::CONTENT_LENGTH, "1025".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let FilterAction::Reject(rejection) = filter.on_response(&mut ctx).await.unwrap() else {
+        panic!("known response body above the shared cap must be rejected before commit");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 // -----------------------------------------------------------------------------
@@ -1617,6 +1701,96 @@ async fn streaming_events_persist_at_terminal_seam() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercises exact-budget zstd persistence and replay"
+)]
+async fn compressed_stream_replay_persists_at_exact_aggregate_staging_bound() {
+    let filter = make_filter();
+    let codec = StoreCompressionConfig {
+        algorithm: CompressionAlgorithm::Zstd,
+        level: None,
+    };
+    let store = Arc::new(
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_zstd_replay_responses",
+            "test_zstd_replay_conversations",
+            None,
+            None,
+            Some(&codec),
+        )
+        .await
+        .unwrap(),
+    );
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<SqliteResponseStore>::clone(&store);
+    let response_id = "resp_zstd_replay";
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, response_id, false).await;
+
+    let mut wire = String::new();
+    let mut payload_bytes = 0_usize;
+    for sequence_number in 0..16 {
+        let payload = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": sequence_number,
+            "delta": "x".repeat(4_096),
+        })
+        .to_string();
+        payload_bytes += payload.len();
+        write!(wire, "event: response.output_text.delta\ndata: {payload}\n\n").unwrap();
+    }
+    let terminal = json!({"type": "response.completed", "sequence_number": 16}).to_string();
+    payload_bytes += terminal.len();
+    write!(wire, "event: response.completed\ndata: {terminal}\n\n").unwrap();
+    let mut chunk = Some(Bytes::from(wire));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap(),
+        FilterAction::Release
+    ));
+
+    let replay_count = 17_usize;
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&state.response_object).unwrap();
+    let history_bytes = crate::openai::responses::state::retained_json_values_bytes(&state.persisted_messages).unwrap();
+    let captured_bytes = super::filter::retained_request_payload_bytes(&ctx).unwrap();
+    let staging = response_bytes * 6
+        + history_bytes * 3
+        + super::filter::encoded_column_headroom(response_bytes, history_bytes, 0).unwrap()
+        + captured_bytes
+        + response_id.len() * replay_count
+        + payload_bytes * 2
+        + (payload_bytes >> 8)
+        + replay_count * 64;
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.apply_retained_payload_limit(baseline + staging);
+    state.logical_stream_terminal_emitted = true;
+    let mut eos = None;
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut eos, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(eos.is_none(), "exactly admitted persistence emits no budget error");
+
+    let owner = crate::test_utils::test_owner("default");
+    assert!(store.get_response(&owner, response_id).await.unwrap().is_some());
+    let replay = store.list_events_after(&owner, response_id, None, 32).await.unwrap();
+    assert_eq!(replay.len(), replay_count);
+    assert!(replay.last().unwrap().terminal);
+    assert_eq!(
+        replay[0].payload,
+        json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 0,
+            "delta": "x".repeat(4_096),
+        })
+        .to_string()
+        .as_bytes()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_event_flush_failure_fails_closed() {
     let filter = make_filter();
     // Record upserts succeed; the event-log append fails.
@@ -1829,6 +2003,42 @@ async fn on_response_body_continues_when_terminal_body_is_none() {
         matches!(action, FilterAction::Continue),
         "should skip terminal response with no body"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_stream_without_responses_state_preserves_terminal_chunk() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers.insert(
+        http::header::CONTENT_TYPE,
+        "text/event-stream".parse().expect("valid content type"),
+    );
+    ctx.response_header = Some(&mut resp);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.expect("headers accepted"),
+        FilterAction::Continue
+    ));
+
+    let terminal = Bytes::from_static(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n");
+    let mut body = Some(terminal.clone());
+    assert!(matches!(
+        filter
+            .on_response_body(&mut ctx, &mut body, true)
+            .expect("terminal accepted"),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        body,
+        Some(terminal),
+        "Store must forward a native terminal it cannot persist"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

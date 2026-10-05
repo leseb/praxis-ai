@@ -23,8 +23,9 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -35,6 +36,7 @@ use rmcp::{RoleClient, service::RunningService};
 use tokio::sync::oneshot;
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
+use crate::openai::responses::state::retained_json_bytes;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -112,6 +114,13 @@ pub(crate) struct PooledSession {
     signal_state: Arc<TransportSignalState>,
     /// Immutable result limit baked into this session's transport.
     payload_limit: usize,
+    /// Immutable initialize ceiling baked into this session's transport.
+    initialize_limit: usize,
+    /// Immutable JSON parse ceiling baked into this session's transport.
+    preparse_peak_limit: Option<usize>,
+    /// Bound for the standalone GET parser while rmcp keeps polling this
+    /// session after a successful tool call.
+    stream_retained_reserve: Option<NonZeroUsize>,
     /// Instant when the session most recently entered the idle pool.
     last_used: Instant,
     /// Guard that disarms the idle cancellation task when taken or closed.
@@ -125,11 +134,20 @@ impl PooledSession {
         service: RunningService<RoleClient, ()>,
         signal_state: Arc<TransportSignalState>,
         payload_limit: usize,
+        initialize_limit: usize,
+        preparse_peak_limit: Option<usize>,
     ) -> Self {
         Self {
             service,
             signal_state,
             payload_limit,
+            initialize_limit,
+            preparse_peak_limit,
+            stream_retained_reserve: super::subrequest_transport::tool_stream_retained_reserve(
+                payload_limit,
+                initialize_limit,
+            )
+            .and_then(NonZeroUsize::new),
             last_used: Instant::now(),
             idle_timer: None,
         }
@@ -138,6 +156,28 @@ impl PooledSession {
     /// The running rmcp client service used for issuing a tool request.
     pub(crate) fn service(&self) -> &RunningService<RoleClient, ()> {
         &self.service
+    }
+
+    /// Peer metadata, a possible GET parser, one serialized control reply,
+    /// and the future buffered DELETE remain charged from parking through
+    /// background cleanup. Closing must not need new headroom after an idle
+    /// timeout or terminal drain.
+    fn retained_payload_bytes(&self) -> Option<usize> {
+        let info = self.service.peer_info()?;
+        retained_json_bytes(info.as_ref())?
+            .checked_add(self.stream_retained_reserve?.get())?
+            .checked_add(super::subrequest_transport::tool_delete_retained_reserve(
+                self.initialize_limit,
+            )?)?
+            .checked_add(super::subrequest_transport::tool_control_retained_reserve(
+                self.initialize_limit,
+            )?)
+    }
+
+    #[cfg(test)]
+    /// Let pool tests simulate idle GET traffic after the session is parked.
+    pub(crate) fn signal_state_for_test(&self) -> Arc<TransportSignalState> {
+        Arc::clone(&self.signal_state)
     }
 
     /// Start a new call-error generation, isolating this request from any
@@ -212,6 +252,13 @@ impl PooledSession {
         self.close_with_timeout(MAX_CLOSE_WAIT).await;
     }
 
+    /// A detached pool close keeps its charge until rmcp's cleanup task exits.
+    /// `close_with_timeout` can return while rmcp still owns peer information.
+    async fn close_fully(mut self) {
+        let _claimed_before_idle_timeout = self.unpark();
+        drop(self.service.close().await);
+    }
+
     /// Close without waiting past an active tool call's absolute deadline.
     pub(crate) async fn close_before(self, deadline: tokio::time::Instant) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -262,6 +309,16 @@ pub(crate) struct McpSessionPool {
 struct PoolInner {
     /// Idle sessions grouped by opaque dispatcher + target identity.
     sessions: Mutex<HashMap<McpPoolKey, Vec<PooledSession>>>,
+    /// Weak charges for sessions moved to bounded background closure. The
+    /// close task owns the strong charge until its rmcp service is dropped.
+    closing: Mutex<Vec<Weak<ClosingCharge>>>,
+}
+
+/// Snapshot of independently owned metadata retained by a closing session.
+/// `None` keeps aggregate admission fail-closed if a size cannot be measured.
+struct ClosingCharge {
+    /// Snapshot of the session's bounded live payload, or unknown on overflow.
+    bytes: Option<usize>,
 }
 
 impl Drop for PoolInner {
@@ -292,13 +349,78 @@ impl McpSessionPool {
         Self {
             inner: Arc::new(PoolInner {
                 sessions: Mutex::new(HashMap::new()),
+                closing: Mutex::new(Vec::new()),
             }),
         }
     }
 
+    /// Payload retained by parked rmcp peer information, pool identities, and
+    /// a possible incomplete standalone GET SSE event.
+    /// rmcp keeps initialize `instructions` and `_meta` in `peer_info`; read the
+    /// live value so a transparent reinitialization cannot leave a stale charge.
+    pub(crate) fn retained_payload_parts(&self) -> Option<(usize, usize)> {
+        let parked = self.lock().iter().try_fold(0_usize, |used, (key, sessions)| {
+            let used = used.checked_add(key.target_fingerprint.len())?;
+            sessions.iter().try_fold(used, |used, session| {
+                used.checked_add(session.retained_payload_bytes()?)
+            })
+        })?;
+        let mut closing_entries = self
+            .inner
+            .closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        closing_entries.retain(|charge| charge.strong_count() > 0);
+        let closing = closing_entries.iter().try_fold(0_usize, |used, weak| {
+            weak.upgrade()
+                .map_or(Some(used), |charge| used.checked_add(charge.bytes?))
+        })?;
+        drop(closing_entries);
+        Some((parked, closing))
+    }
+
+    /// Payload retained by sessions waiting for background cleanup.
+    pub(crate) fn retained_closing_payload_bytes(&self) -> Option<usize> {
+        let mut closing = self
+            .inner
+            .closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        closing.retain(|charge| charge.strong_count() > 0);
+        closing.iter().try_fold(0_usize, |used, weak| {
+            weak.upgrade()
+                .map_or(Some(used), |charge| used.checked_add(charge.bytes?))
+        })
+    }
+
+    /// Payload retained by parked and closing sessions.
+    #[cfg(test)]
+    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
+        let (parked, closing) = self.retained_payload_parts()?;
+        parked.checked_add(closing)
+    }
+
     /// Take one compatible session and return all unusable entries separately
     /// so the caller can close them outside the synchronous mutex boundary.
+    #[cfg(test)]
     pub(crate) fn checkout(&self, key: &McpPoolKey, payload_limit: usize) -> PoolCheckout {
+        self.checkout_with_limits(key, payload_limit, super::MAX_CONTROL_RESPONSE_BYTES, None, false)
+    }
+
+    /// Checkout binds every immutable transport limit, preventing a session
+    /// initialized under a different budget from being reused.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pool identity, wire, control, parse, and budget mode must match the live transport"
+    )]
+    pub(crate) fn checkout_with_limits(
+        &self,
+        key: &McpPoolKey,
+        payload_limit: usize,
+        initialize_limit: usize,
+        preparse_peak_limit: Option<usize>,
+        budgeted: bool,
+    ) -> PoolCheckout {
         let mut map = self.lock();
         let Some(stack) = map.get_mut(key) else {
             return PoolCheckout {
@@ -315,6 +437,10 @@ impl McpSessionPool {
             if session.is_none()
                 && idle_timer_disarmed
                 && candidate.payload_limit == payload_limit
+                && candidate.initialize_limit == initialize_limit
+                && candidate.preparse_peak_limit == preparse_peak_limit
+                && candidate.signal_state.has_get_stream_budget() == budgeted
+                && !candidate.signal_state.get_stream_exhausted()
                 && !candidate.is_closed()
                 && !candidate.is_expired_at(now)
             {
@@ -337,7 +463,11 @@ impl McpSessionPool {
         if let Some(existing) = map.get_mut(&key) {
             let mut retained = Vec::with_capacity(existing.len());
             for prior in std::mem::take(existing) {
-                if prior.payload_limit == session.payload_limit {
+                if prior.payload_limit == session.payload_limit
+                    && prior.initialize_limit == session.initialize_limit
+                    && prior.preparse_peak_limit == session.preparse_peak_limit
+                    && prior.signal_state.has_get_stream_budget() == session.signal_state.has_get_stream_budget()
+                {
                     retained.push(prior);
                 } else {
                     rejected.push(prior);
@@ -367,7 +497,39 @@ impl McpSessionPool {
 
     /// Remove every idle session and schedule bounded graceful closure.
     pub(crate) fn drain_in_background(&self) {
-        close_sessions_in_background(self.take_all());
+        self.close_sessions_in_background(self.take_all());
+    }
+
+    /// Keep rejected sessions charged until their bounded DELETE completes.
+    pub(crate) fn close_sessions_in_background(&self, sessions: Vec<PooledSession>) {
+        if sessions.is_empty() {
+            return;
+        }
+        let tracked: Vec<_> = sessions
+            .into_iter()
+            .map(|session| {
+                let charge = Arc::new(ClosingCharge {
+                    bytes: session.retained_payload_bytes(),
+                });
+                (session, charge)
+            })
+            .collect();
+        {
+            let mut closing = self
+                .inner
+                .closing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            closing.retain(|entry| entry.strong_count() > 0);
+            closing.extend(tracked.iter().map(|(_, charge)| Arc::downgrade(charge)));
+        }
+        drop(tokio::spawn(async move {
+            join_all(tracked.into_iter().map(|(session, charge)| async move {
+                session.close_fully().await;
+                drop(charge);
+            }))
+            .await;
+        }));
     }
 
     #[cfg(test)]
@@ -410,25 +572,90 @@ pub(crate) async fn close_sessions(sessions: Vec<PooledSession>) {
     join_all(sessions.into_iter().map(PooledSession::close)).await;
 }
 
-/// Explicitly close rejected sessions in the background.
-///
-/// Rejected idle sessions have not received the current tool call, so their
-/// best-effort DELETE must not consume that call's delivery deadline. Each
-/// close remains bounded by [`MAX_CLOSE_WAIT`].
-pub(crate) fn close_sessions_in_background(sessions: Vec<PooledSession>) {
-    if sessions.is_empty() {
-        return;
-    }
-    drop(tokio::spawn(close_sessions(sessions)));
-}
-
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
+    use rmcp::{
+        service::{RxJsonRpcMessage, TxJsonRpcMessage},
+        transport::Transport,
+    };
+
     use super::*;
+
+    /// A close that outlives the outer five-second wait in rmcp's timed API.
+    struct GatedClose {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Transport<RoleClient> for GatedClose {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            _: TxJsonRpcMessage<RoleClient>,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            std::future::ready(Ok(()))
+        }
+
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test keeps rmcp cleanup gated past the timed-close boundary"
+    )]
+    async fn closing_charge_waits_for_rmcp_task_past_outer_close_timeout() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let service = rmcp::service::serve_directly::<RoleClient, _, _, _, _>(
+            (),
+            GatedClose {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            },
+            Some(rmcp::model::ServerConfig::default().into()),
+        );
+        let session = PooledSession::new(service, Arc::new(TransportSignalState::new(None)), 1_024, 1_024, None);
+        let pool = McpSessionPool::new();
+        pool.close_sessions_in_background(vec![session]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .is_ok(),
+            "rmcp transport close must begin"
+        );
+
+        // rmcp's close_with_timeout would detach its JoinHandle after five
+        // seconds even though this transport still owns the initialized peer.
+        tokio::time::sleep(MAX_CLOSE_WAIT + Duration::from_millis(250)).await;
+        assert!(pool.retained_payload_bytes().is_some_and(|bytes| bytes > 0));
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pool.retained_payload_bytes() != Some(0) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok(),
+            "charge must clear when the rmcp cleanup task exits"
+        );
+    }
 
     #[test]
     fn empty_fingerprint_has_no_pool_key() {

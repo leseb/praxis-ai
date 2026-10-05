@@ -8,7 +8,7 @@
 //! applies. A matched request is then deserialized exactly once, and
 //! that one parsed value produces every downstream fact: the classification
 //! metadata, the promoted headers and filter results, the proxy-owned
-//! identifiers, and [`ResponsesState`].
+//! identifiers, and [`super::state::ResponsesState`].
 //!
 //! Create requests with `background=true` or a non-null `prompt` are rejected,
 //! because Praxis does not implement the asynchronous Responses lifecycle or
@@ -49,12 +49,10 @@ use praxis_filter::{
 use tracing::{debug, trace};
 
 use super::{
-    agentic_loop::AgenticBudgetPolicy,
     config::{ResponsesFormatConfig, build_config},
-    error::{responses_error_rejection, responses_error_rejection_with_code},
-    extract_conversation_id,
+    error::responses_error_rejection_with_code,
+    extract_conversation_id, insert_budgeted_responses_state,
     routes::{self as responses_routes, ResponsesOperation},
-    state::ResponsesState,
 };
 use crate::{
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
@@ -157,11 +155,9 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return publish_bodyless_operation(ctx, &self.config);
         }
 
-        // The consolidated path owns the same pre-parse admission boundary as
-        // the legacy format filter. Reject before JSON and state allocate.
-        if matched.operation == ResponsesOperation::CreateResponse
-            && let Some(action) = super::initial_budget_rejection(ctx, body.as_deref().unwrap_or_default())
-        {
+        // The consolidated path owns the first pre-parse admission boundary
+        // for create and history-bearing operations.
+        if let Some(action) = super::initial_budget_rejection(ctx, body.as_deref().unwrap_or_default()) {
             return Ok(action);
         }
 
@@ -258,7 +254,7 @@ fn publish_request_facts(
     let conversation_id = resolve_conversation_id(ctx, &parsed);
 
     enrich_context(ctx, classified, &response_id, &conversation_id);
-    if let Err(action) = insert_responses_state(ctx, parsed, &response_id) {
+    if let Err(action) = insert_budgeted_responses_state(ctx, parsed, &response_id) {
         return Ok(Some(action));
     }
 
@@ -463,37 +459,4 @@ fn enrich_context(
     ctx.set_metadata("responses.stream", if stream { "true" } else { "false" });
 
     trace!(store, background, stream, "request facts published");
-}
-
-/// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(
-    ctx: &mut HttpFilterContext<'_>,
-    parsed: serde_json::Value,
-    response_id: &str,
-) -> Result<(), FilterAction> {
-    let mut state = ResponsesState::from_request_body(parsed);
-    state.response_id = Some(response_id.to_owned());
-    #[cfg(feature = "store")]
-    {
-        state.set_retained_external_payload_bytes(
-            super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX),
-        );
-        state.store_persist_armed = super::store::request_persistence_armed(ctx);
-    }
-    if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
-        state.apply_retained_payload_limit(policy.max_retained_bytes());
-        if !state.can_retain_payload(0) {
-            #[cfg(feature = "store")]
-            super::store::discard_retained_request_payload(ctx);
-            return Err(FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-            )));
-        }
-    }
-    ctx.extensions.insert(state);
-    #[cfg(feature = "store")]
-    super::store::mark_retained_request_payload_charged(ctx);
-    Ok(())
 }

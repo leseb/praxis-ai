@@ -28,7 +28,7 @@ pub use config::store_ref_config;
 #[cfg(feature = "openai-conversations")]
 pub use filter::OpenaiConversationsFilter;
 #[cfg(feature = "openai-conversations")]
-pub(crate) use filter::capture_validated_append_owner;
+pub(crate) use filter::{append_after_store_body, append_after_store_response, capture_validated_append_owner};
 #[cfg(feature = "openai-conversations")]
 pub use openapi::implementation_openapi_json;
 pub use routes::{ConversationOperation, ConversationOperationSpec, operation_specs};
