@@ -1479,26 +1479,72 @@ fn aggregate_lowered_streaming_backstops_are_terminal() {
 }
 
 #[test]
-fn budgeted_get_json_parse_overflow_is_a_shared_budget_failure() {
+fn budgeted_control_json_parse_overflow_uses_the_transport_cap() {
     let mut options = execution_options(false, std::time::Duration::from_secs(1));
-    options.max_result_bytes = 16 * 1024;
-    options.configured_max_result_bytes = 16 * 1024;
-    options.max_control_response_bytes = 1_024;
+    options.max_result_bytes = 8_192;
+    options.configured_max_result_bytes = 8_192;
+    options.max_control_response_bytes = 6_877;
     options.aggregate_result_policy = super::McpAggregateResultPolicy::Budgeted;
     let admitted_payload = result_payload_limit(options.max_result_bytes);
+    let control_cap =
+        crate::mcp_client::tool_control_response_cap(admitted_payload, options.max_control_response_bytes);
+    assert_eq!(control_cap, 2_048);
+    assert!(control_cap < options.max_control_response_bytes);
     let stream_cap = crate::mcp_client::tool_stream_cumulative_cap(
         crate::mcp_client::tool_result_wire_cap(admitted_payload),
-        admitted_payload.min(options.max_control_response_bytes),
+        control_cap,
     );
-    let parse_cap = (options.max_control_response_bytes * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
-        .min(stream_cap * 12);
-    let error = crate::mcp_client::McpClientError::ResponseTooLarge {
-        url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
-        limit: parse_cap,
-        kind: crate::mcp_client::McpResponseLimitKind::GetStream,
-    };
-    let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, admitted_payload);
-    assert!(super::aggregate_result_limit_exceeded(&result, &options));
+    let control_parse_cap = control_cap * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER;
+    let get_parse_cap = control_parse_cap.min(stream_cap * 12);
+    assert!(
+        get_parse_cap
+            < (options.max_control_response_bytes * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
+                .min(stream_cap * 12)
+    );
+    for (limit, kind) in [
+        (control_parse_cap, crate::mcp_client::McpResponseLimitKind::Initialize),
+        (control_parse_cap, crate::mcp_client::McpResponseLimitKind::Control),
+        (get_parse_cap, crate::mcp_client::McpResponseLimitKind::GetStream),
+    ] {
+        let error = crate::mcp_client::McpClientError::ResponseTooLarge {
+            url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
+            limit,
+            kind,
+        };
+        let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, admitted_payload);
+        assert!(
+            super::aggregate_result_limit_exceeded(&result, &options),
+            "{kind:?} parse cap must be terminal"
+        );
+    }
+}
+
+#[test]
+fn budgeted_raw_control_and_get_caps_are_shared_budget_failures() {
+    let mut options = execution_options(false, std::time::Duration::from_secs(1));
+    options.max_result_bytes = 8_192;
+    options.configured_max_result_bytes = 8_192;
+    options.max_control_response_bytes = 6_877;
+    options.aggregate_result_policy = super::McpAggregateResultPolicy::Budgeted;
+    let payload = result_payload_limit(options.max_result_bytes);
+    let control = crate::mcp_client::tool_control_response_cap(payload, options.max_control_response_bytes);
+    let get = crate::mcp_client::tool_stream_cumulative_cap(crate::mcp_client::tool_result_wire_cap(payload), control);
+    for (limit, kind) in [
+        (control, crate::mcp_client::McpResponseLimitKind::Initialize),
+        (control, crate::mcp_client::McpResponseLimitKind::Control),
+        (get, crate::mcp_client::McpResponseLimitKind::GetStream),
+    ] {
+        let error = crate::mcp_client::McpClientError::ResponseTooLarge {
+            url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
+            limit,
+            kind,
+        };
+        let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, payload);
+        assert!(
+            super::aggregate_result_limit_exceeded(&result, &options),
+            "{kind:?} wire cap must be terminal"
+        );
+    }
 }
 
 #[test]
@@ -1509,20 +1555,16 @@ fn configured_streaming_backstops_remain_recoverable() {
     options.aggregate_result_policy = super::McpAggregateResultPolicy::PerCallConstrained;
     let configured_payload = result_payload_limit(options.configured_max_result_bytes);
     let configured_wire = crate::mcp_client::tool_result_wire_cap(configured_payload);
+    let configured_get =
+        crate::mcp_client::tool_stream_cumulative_cap(configured_wire, crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES);
     for (limit, kind) in [
         (
             configured_payload * 2,
             crate::mcp_client::McpResponseLimitKind::Initialize,
         ),
         (configured_wire * 2, crate::mcp_client::McpResponseLimitKind::Tool),
-        (
-            configured_wire + configured_payload,
-            crate::mcp_client::McpResponseLimitKind::GetStream,
-        ),
-        (
-            (configured_wire + configured_payload) * 2,
-            crate::mcp_client::McpResponseLimitKind::GetStream,
-        ),
+        (configured_get, crate::mcp_client::McpResponseLimitKind::GetStream),
+        (configured_get * 2, crate::mcp_client::McpResponseLimitKind::GetStream),
     ] {
         let error = crate::mcp_client::McpClientError::ResponseTooLarge {
             url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
@@ -1538,16 +1580,16 @@ fn configured_streaming_backstops_remain_recoverable() {
 }
 
 #[test]
-fn fixed_control_cap_does_not_alias_aggregate_initialize_backstop() {
+fn budgeted_control_backstop_uses_the_effective_transport_ceiling() {
     let mut options = execution_options(false, std::time::Duration::from_secs(1));
     options.max_result_bytes = 2 * 1_048_576;
     options.configured_max_result_bytes = 4 * 1_048_576;
     options.aggregate_result_policy = super::McpAggregateResultPolicy::PerCallConstrained;
     let limit = crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES;
     assert_eq!(result_payload_limit(options.max_result_bytes) * 2, limit);
-    for (kind, terminal) in [
-        (crate::mcp_client::McpResponseLimitKind::Control, false),
-        (crate::mcp_client::McpResponseLimitKind::Initialize, true),
+    for kind in [
+        crate::mcp_client::McpResponseLimitKind::Control,
+        crate::mcp_client::McpResponseLimitKind::Initialize,
     ] {
         let error = crate::mcp_client::McpClientError::ResponseTooLarge {
             url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
@@ -1555,7 +1597,10 @@ fn fixed_control_cap_does_not_alias_aggregate_initialize_backstop() {
             kind,
         };
         let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, options.max_result_bytes);
-        assert_eq!(super::aggregate_result_limit_exceeded(&result, &options), terminal);
+        assert!(
+            super::aggregate_result_limit_exceeded(&result, &options),
+            "{kind:?} shares the lowered budgeted control ceiling"
+        );
     }
 }
 
