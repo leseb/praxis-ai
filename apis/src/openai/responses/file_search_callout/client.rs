@@ -67,8 +67,8 @@ const RESPONSE_ADMISSION_WIRE_MULTIPLIER: usize = 4;
 /// Decoded-storage headroom reserved for each response in one execution.
 const RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES: usize = 65_536; // 64 KiB
 
-/// Conservative fixed storage charge for one retained result.
-const DECODED_RESULT_BYTES: usize = 256;
+/// Charge a result slot plus both Vec buffers during geometric growth.
+const DECODED_RESULT_BYTES: usize = 512;
 
 /// Conservative fixed storage charge for one retained content chunk.
 const DECODED_CONTENT_CHUNK_BYTES: usize = 128;
@@ -578,10 +578,10 @@ impl FileSearchClient {
         }
     }
 
-    /// Search with a request-scoped ceiling for decoded result payload.
-    /// Collected bodies, parser scratch, and decoded values coexist. Reserve
-    /// the same worst-case amount used by process-wide response admission
-    /// before a callout is scheduled.
+    /// Search with a request-scoped ceiling for callout request and result payload.
+    /// Request bodies remain owned while the concurrent callouts run. Reserve
+    /// half the available bytes for those bodies; the other half covers
+    /// collected responses, parser scratch, and decoded results.
     #[expect(
         clippy::too_many_lines,
         clippy::too_many_arguments,
@@ -597,11 +597,17 @@ impl FileSearchClient {
     ) -> SearchBatch {
         let mut batch = SearchBatch::new(call_count);
         let mut consumed_response_bytes = 0_usize;
+        let mut consumed_decoded_bytes = 0_usize;
         let mut deadline_recorded = false;
         let mut next_spec = 0_usize;
         let execution_started = Instant::now();
+        let (response_allowance, request_allowance) = search_execution_allowances(max_decoded_bytes);
         let (total_response_limit, retained_payload_controls_limit) =
-            retained_response_body_limit(self.max_total_response_bytes, max_decoded_bytes, specs.len());
+            retained_response_body_limit(self.max_total_response_bytes, response_allowance, specs.len());
+        // Raw response bodies can coexist with decoded results.
+        // Reserve their aggregate ceiling, then share the remainder among concurrent decodes.
+        let decoded_response_limit =
+            (response_allowance != usize::MAX).then(|| response_allowance.saturating_sub(total_response_limit));
         if total_response_limit == 0 {
             append_budget_failures(
                 &mut batch.failures,
@@ -692,6 +698,11 @@ impl FileSearchClient {
                 per_response_limit,
                 execution_timeout,
             );
+            // Every body in this chunk can be live at once. The bounded writer
+            // enforces this per-call share before extending its owned Vec.
+            let request_body_limit = MAX_SEARCH_REQUEST_BYTES.min(request_allowance / chunk.len());
+            let per_response_decoded_limit =
+                decoded_response_limit.map(|limit| limit.saturating_sub(consumed_decoded_bytes) / chunk.len());
             let futures = chunk.iter().map(|spec| {
                 self.search_one(
                     spec,
@@ -705,15 +716,19 @@ impl FileSearchClient {
                     allow_private,
                     per_response_limit,
                     retained_payload_controls_per_response_limit,
+                    request_body_limit,
+                    per_response_decoded_limit,
                 )
             });
             let chunk_results = futures::future::join_all(futures).await;
             let chunk_failed = merge_chunk_results(
                 &mut batch,
                 &mut consumed_response_bytes,
+                &mut consumed_decoded_bytes,
                 chunk,
                 chunk_results,
                 total_response_limit,
+                decoded_response_limit,
                 retained_payload_controls_limit,
             );
 
@@ -763,9 +778,11 @@ impl FileSearchClient {
         allow_private: bool,
         per_response_limit: usize,
         retained_payload_controls_per_response_limit: bool,
+        request_body_limit: usize,
+        decoded_limit: Option<usize>,
     ) -> Result<SearchResponse, FileSearchError> {
         deadline_remaining(execution_timeout, execution_started, spec.store_id)?;
-        let request = self.build_request(spec, execution_started, execution_timeout)?;
+        let request = self.build_request(spec, execution_started, execution_timeout, request_body_limit)?;
         deadline_remaining(execution_timeout, execution_started, spec.store_id)?;
         let body = self
             .execute_request(
@@ -790,6 +807,7 @@ impl FileSearchClient {
             body,
             spec.store_id,
             result_limit(spec.max_num_results),
+            decoded_limit,
             execution_started,
             execution_timeout,
             response_admission,
@@ -833,6 +851,7 @@ impl FileSearchClient {
         spec: &SearchSpec<'_>,
         execution_started: Instant,
         execution_timeout: Duration,
+        request_body_limit: usize,
     ) -> Result<PreparedSearchRequest, FileSearchError> {
         let url = self.search_url(spec.store_id)?;
         if spec.query.len() > MAX_QUERY_BYTES {
@@ -845,7 +864,13 @@ impl FileSearchClient {
         let request_body =
             VectorStoreSearchRequest::new(spec.filters, spec.max_num_results, spec.query, spec.ranking_options)
                 .map_err(|message| request_error(spec.store_id, message))?;
-        let body = serialize_bounded_request(&request_body, spec.store_id, execution_started, execution_timeout)?;
+        let body = serialize_bounded_request(
+            &request_body,
+            spec.store_id,
+            execution_started,
+            execution_timeout,
+            request_body_limit,
+        )?;
 
         Ok(PreparedSearchRequest { body, url })
     }
@@ -1091,6 +1116,9 @@ struct SearchResponse {
     /// Successful response bytes consumed from the aggregate budget.
     body_bytes: usize,
 
+    /// Decoded result storage charged before constructing owned values.
+    decoded_bytes: usize,
+
     /// Parsed search results.
     data: Vec<SearchResult>,
 }
@@ -1119,25 +1147,42 @@ struct ResponseAdmission {
 /// briefly coexist, so `RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES` also provides
 /// headroom for the duplicate allocations and parser scratch during that handoff.
 struct DecodedBudget {
+    /// Initial allowance, used to report the charge retained by this response.
+    initial: usize,
+
     /// Bytes that may still be represented by owned decoded values.
     remaining: usize,
+
+    /// Validation stopped because the decoded allowance was exhausted.
+    exceeded: bool,
+
+    /// The request-wide allowance selected the effective cap.
+    shared_controls: bool,
 }
 
 impl DecodedBudget {
     /// Create the per-response decoded allocation allowance.
-    fn for_body(body_bytes: usize) -> Result<Self, &'static str> {
-        let remaining = body_bytes
+    fn for_body(body_bytes: usize, shared_limit: Option<usize>) -> Result<Self, &'static str> {
+        let local_limit = body_bytes
             .checked_add(RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES)
             .ok_or("decoded response budget is too large")?;
-        Ok(Self { remaining })
+        let shared_controls = shared_limit.is_some_and(|limit| limit <= local_limit);
+        let initial = shared_limit.map_or(local_limit, |limit| limit.min(local_limit));
+        Ok(Self {
+            initial,
+            remaining: initial,
+            exceeded: false,
+            shared_controls,
+        })
     }
 
     /// Reserve a conservative amount before constructing an owned value.
     fn charge(&mut self, bytes: usize) -> Result<(), &'static str> {
-        self.remaining = self
-            .remaining
-            .checked_sub(bytes)
-            .ok_or("decoded response exceeds its allocation budget")?;
+        let Some(remaining) = self.remaining.checked_sub(bytes) else {
+            self.exceeded = true;
+            return Err("decoded response exceeds its allocation budget");
+        };
+        self.remaining = remaining;
         Ok(())
     }
 
@@ -1296,7 +1341,8 @@ impl<'de> Visitor<'de> for SearchResultsVisitor<'_> {
     where
         A: SeqAccess<'de>,
     {
-        let mut retained = Vec::with_capacity(MAX_NUM_RESULTS);
+        // The first result is validated and charged before the vector allocates.
+        let mut retained = Vec::new();
         while let Some(raw) = seq.next_element::<&'de RawValue>()? {
             if retained.len() < MAX_NUM_RESULTS {
                 validate_search_result(raw.get(), Some(self.decoded_budget))
@@ -1862,6 +1908,9 @@ struct BoundedRequestWriter {
     /// Serialized bytes retained so far.
     body: Vec<u8>,
 
+    /// Maximum bytes this request may own while its concurrent chunk runs.
+    max_bytes: usize,
+
     /// Whether serialization attempted to cross the limit.
     exceeded: bool,
 
@@ -1877,9 +1926,10 @@ struct BoundedRequestWriter {
 
 impl BoundedRequestWriter {
     /// Create an empty bounded request buffer.
-    fn new(execution_started: Instant, timeout: Duration) -> Self {
+    fn new(execution_started: Instant, timeout: Duration, max_bytes: usize) -> Self {
         Self {
             body: Vec::new(),
+            max_bytes,
             exceeded: false,
             deadline_elapsed: false,
             execution_started,
@@ -1897,7 +1947,7 @@ impl io::Write for BoundedRequestWriter {
                 "search request deadline exceeded",
             ));
         }
-        let remaining = MAX_SEARCH_REQUEST_BYTES.saturating_sub(self.body.len());
+        let remaining = self.max_bytes.saturating_sub(self.body.len());
         if buf.len() > remaining {
             self.exceeded = true;
             return Err(io::Error::other("search request body limit exceeded"));
@@ -2031,13 +2081,17 @@ fn serialize_bounded_request(
     store_id: &str,
     execution_started: Instant,
     timeout: Duration,
+    request_body_limit: usize,
 ) -> Result<Vec<u8>, FileSearchError> {
-    let mut writer = BoundedRequestWriter::new(execution_started, timeout);
+    let mut writer = BoundedRequestWriter::new(execution_started, timeout, request_body_limit);
     let serialized = serde_json::to_writer(&mut writer, request);
     if writer.deadline_elapsed {
         return Err(execution_deadline_error(store_id));
     }
     if writer.exceeded {
+        if request_body_limit < MAX_SEARCH_REQUEST_BYTES {
+            return Err(aggregate_limit_error(store_id, request_body_limit, true));
+        }
         return Err(request_error(
             store_id,
             format!("search request exceeds {MAX_SEARCH_REQUEST_BYTES} byte limit"),
@@ -2114,6 +2168,7 @@ async fn parse_response_body_with_deadline(
     body: Bytes,
     store_id: &str,
     result_limit: usize,
+    decoded_limit: Option<usize>,
     execution_started: Instant,
     timeout: Duration,
     response_admission: Arc<ResponseAdmission>,
@@ -2129,7 +2184,7 @@ async fn parse_response_body_with_deadline(
     let mut task = tokio::task::spawn_blocking(move || {
         let _response_admission = response_admission;
         let _decode_slot = decode_slot;
-        parse_response_body(&body, &parse_store_id, result_limit)
+        parse_response_body(&body, &parse_store_id, result_limit, decoded_limit)
     });
     match tokio::time::timeout(remaining, &mut task).await {
         Ok(Ok(result)) => result,
@@ -2145,33 +2200,84 @@ async fn parse_response_body_with_deadline(
 }
 
 /// Parse one API response without retaining its response buffer.
-fn parse_response_body(body: &[u8], store_id: &str, result_limit: usize) -> Result<SearchResponse, FileSearchError> {
+fn parse_response_body(
+    body: &[u8],
+    store_id: &str,
+    result_limit: usize,
+    decoded_limit: Option<usize>,
+) -> Result<SearchResponse, FileSearchError> {
     let body_bytes = body.len();
-    let data = deserialize_search_results(body, result_limit).map_err(|error| FileSearchError::Deserialize {
+    let (data, decoded_bytes) =
+        deserialize_search_results(body, result_limit, decoded_limit).map_err(|error| match error {
+            SearchDecodeError::SharedBudget => aggregate_limit_error(store_id, decoded_limit.unwrap_or(0), true),
+            SearchDecodeError::LocalBudget => FileSearchError::Deserialize {
+                body_bytes,
+                line: 0,
+                column: 0,
+                store_id: store_id.to_owned(),
+            },
+            SearchDecodeError::Json(error) => FileSearchError::Deserialize {
+                body_bytes,
+                line: error.line(),
+                column: error.column(),
+                store_id: store_id.to_owned(),
+            },
+        })?;
+    Ok(SearchResponse {
         body_bytes,
-        line: error.line(),
-        column: error.column(),
-        store_id: store_id.to_owned(),
-    })?;
-    Ok(SearchResponse { body_bytes, data })
+        decoded_bytes,
+        data,
+    })
+}
+
+/// Distinguish request-wide admission from malformed provider JSON.
+enum SearchDecodeError {
+    /// The request-wide decoded allowance was exhausted.
+    SharedBudget,
+    /// The existing per-response decoder cap was exhausted.
+    LocalBudget,
+    /// Provider JSON was malformed or did not match the response schema.
+    Json(serde_json::Error),
 }
 
 /// Deserialize the response page, apply file-ID fixups, and retain top-k.
-fn deserialize_search_results(body: &[u8], result_limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
+fn deserialize_search_results(
+    body: &[u8],
+    result_limit: usize,
+    decoded_limit: Option<usize>,
+) -> Result<(Vec<SearchResult>, usize), SearchDecodeError> {
+    // This lexical pass runs before serde can create any owned JSON value.
+    // The raw body has separate admission; only normalized growth may consume
+    // the decoded allowance. The borrowed result walk below accounts for the
+    // owned tree and vector slots before they are constructed.
+    if let Some(limit) = decoded_limit
+        && crate::openai::responses::buffered_parsed_json_bytes_upper_bound(body)
+            .is_none_or(|bound| bound > body.len().saturating_add(limit))
+    {
+        return Err(SearchDecodeError::SharedBudget);
+    }
     let mut decoded_budget =
-        DecodedBudget::for_body(body.len()).map_err(|message| serde_json::Error::io(io::Error::other(message)))?;
+        DecodedBudget::for_body(body.len(), decoded_limit).map_err(|_message| SearchDecodeError::LocalBudget)?;
     let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let mut data = SearchResponseSeed {
+    let parsed = SearchResponseSeed {
         decoded_budget: &mut decoded_budget,
     }
-    .deserialize(&mut deserializer)?;
-    deserializer.end()?;
+    .deserialize(&mut deserializer)
+    .and_then(|data| deserializer.end().map(|()| data));
+    let mut data = match parsed {
+        Ok(data) => data,
+        Err(_error) if decoded_budget.exceeded && decoded_budget.shared_controls => {
+            return Err(SearchDecodeError::SharedBudget);
+        },
+        Err(_error) if decoded_budget.exceeded => return Err(SearchDecodeError::LocalBudget),
+        Err(error) => return Err(SearchDecodeError::Json(error)),
+    };
     for result in &mut data {
         fixup_file_id(result);
     }
     data.sort_by(|left, right| right.score.total_cmp(&left.score));
     data.truncate(result_limit);
-    Ok(data)
+    Ok((data, decoded_budget.initial - decoded_budget.remaining))
 }
 
 /// Validate one borrowed result without allocating its typed representation.
@@ -2214,9 +2320,11 @@ fn fixup_file_id(result: &mut SearchResult) {
 fn merge_chunk_results(
     batch: &mut SearchBatch,
     consumed_bytes: &mut usize,
+    consumed_decoded_bytes: &mut usize,
     specs: &[SearchSpec<'_>],
     results: Vec<Result<SearchResponse, FileSearchError>>,
     total_limit: usize,
+    decoded_limit: Option<usize>,
     retained_payload_controls_limit: bool,
 ) -> bool {
     let mut failed = false;
@@ -2224,9 +2332,11 @@ fn merge_chunk_results(
         let result = merge_search_result(
             batch,
             consumed_bytes,
+            consumed_decoded_bytes,
             spec,
             result,
             total_limit,
+            decoded_limit,
             retained_payload_controls_limit,
         );
         if let Err(error) = result {
@@ -2243,14 +2353,17 @@ fn merge_chunk_results(
 /// Account for and retain only the top results from one response.
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "tracks response admission and aggregate accounting together"
 )]
 fn merge_search_result(
     batch: &mut SearchBatch,
     consumed_bytes: &mut usize,
+    consumed_decoded_bytes: &mut usize,
     spec: &SearchSpec<'_>,
     response: Result<SearchResponse, FileSearchError>,
     total_limit: usize,
+    decoded_limit: Option<usize>,
     retained_payload_controls_limit: bool,
 ) -> Result<(), FileSearchError> {
     let body_bytes = match &response {
@@ -2270,7 +2383,16 @@ fn merge_search_result(
         .ok_or_else(|| aggregate_limit_error(spec.store_id, total_limit, retained_payload_controls_limit))?;
     *consumed_bytes = total;
 
-    let SearchResponse { body_bytes: _, data } = response?;
+    let SearchResponse {
+        body_bytes: _,
+        decoded_bytes,
+        data,
+    } = response?;
+    let total_decoded = consumed_decoded_bytes
+        .checked_add(decoded_bytes)
+        .filter(|total| decoded_limit.is_none_or(|limit| *total <= limit))
+        .ok_or_else(|| aggregate_limit_error(spec.store_id, decoded_limit.unwrap_or(total_limit), true))?;
+    *consumed_decoded_bytes = total_decoded;
     {
         let results = batch
             .results_by_call
@@ -2340,6 +2462,16 @@ fn aggregate_limit_error(store_id: &str, limit: usize, retained_payload: bool) -
     }
 }
 
+/// Reserve simultaneous outgoing request bodies before response admission.
+/// An absent request-wide budget keeps the independent file-search ceilings.
+fn search_execution_allowances(available_bytes: usize) -> (usize, usize) {
+    if available_bytes == usize::MAX {
+        return (usize::MAX, usize::MAX);
+    }
+    let request_allowance = available_bytes / 2;
+    (available_bytes - request_allowance, request_allowance)
+}
+
 /// Intersect the configured response ceiling with the request-wide allowance.
 /// The decoder may retain up to one body-sized allocation plus fixed per-page
 /// storage while the wire body and parser-owned values are still live.
@@ -2407,23 +2539,31 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use serde_json::{Value, json};
 
     use super::{
-        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_ADMISSION_WIRE_MULTIPLIER,
-        RESPONSE_BODY_BUDGET_UNIT_BYTES, RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchFailure,
-        SearchResult, SearchSpec, VectorStoreSearchRequest, append_unprocessed_deadline_failures,
-        deserialize_search_results, merge_top_results, parse_response_body, response_admission_units,
-        retained_payload_controls_per_call, retained_response_body_limit,
+        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, MAX_SEARCH_REQUEST_BYTES,
+        RESPONSE_ADMISSION_WIRE_MULTIPLIER, RESPONSE_BODY_BUDGET_UNIT_BYTES, RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES,
+        SearchBatch, SearchDecodeError, SearchFailure, SearchResult, SearchSpec, VectorStoreSearchRequest,
+        append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results, parse_response_body,
+        response_admission_units, retained_payload_controls_per_call, retained_response_body_limit,
+        search_execution_allowances, serialize_bounded_request,
     };
 
     const MINIMAL_RESULT: &[u8] = br#"{"content":[],"file_id":"","filename":"","score":0}"#;
 
     fn decode(body: &[u8], limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
-        deserialize_search_results(body, limit)
+        deserialize_search_results(body, limit, None)
+            .map(|(results, _decoded_bytes)| results)
+            .map_err(|error| match error {
+                SearchDecodeError::SharedBudget | SearchDecodeError::LocalBudget => {
+                    serde_json::Error::io(std::io::Error::other("decoded response budget"))
+                },
+                SearchDecodeError::Json(error) => error,
+            })
     }
 
     fn result(file_id: &str, score: f64) -> SearchResult {
@@ -2508,6 +2648,108 @@ mod tests {
         let (limit, retained_controls) = retained_response_body_limit(1_048_576, available, 3);
         assert!(retained_controls);
         assert!(limit * RESPONSE_ADMISSION_WIRE_MULTIPLIER + 3 * RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES <= available);
+    }
+
+    #[test]
+    fn retained_budget_rejects_search_request_body_before_it_is_allocated() {
+        let query = "q".repeat(60 * 1_024);
+        let request = VectorStoreSearchRequest::new(None, None, &query, None).expect("valid search request");
+        let (response_allowance, request_allowance) = search_execution_allowances(6_000);
+        assert_eq!(
+            response_allowance + request_allowance,
+            6_000,
+            "all shared headroom must be partitioned"
+        );
+        let request_body_limit = MAX_SEARCH_REQUEST_BYTES.min(request_allowance);
+        let failure = serialize_bounded_request(
+            &request,
+            "vs-test",
+            Instant::now(),
+            Duration::from_secs(1),
+            request_body_limit,
+        )
+        .expect_err("a 60 KiB query cannot allocate its body under 6 KiB of shared headroom");
+        assert!(
+            matches!(
+                failure,
+                FileSearchError::AggregateLimit {
+                    retained_payload: true,
+                    ..
+                }
+            ),
+            "the pre-dial failure must reach the shared retained-budget path"
+        );
+    }
+
+    #[test]
+    fn retained_budget_preserves_ordinary_concurrent_search_requests() {
+        let query = "q".repeat(60 * 1_024);
+        let request = VectorStoreSearchRequest::new(None, None, &query, None).expect("valid search request");
+        let (_, normal_request_allowance) = search_execution_allowances(64 * 1_024 * 1_024);
+        let ordinary_body = serialize_bounded_request(
+            &request,
+            "vs-test",
+            Instant::now(),
+            Duration::from_secs(1),
+            MAX_SEARCH_REQUEST_BYTES.min(normal_request_allowance / 8),
+        )
+        .expect("the same query must fit alongside eight normal budgeted callouts");
+        assert!(
+            ordinary_body.len() > 6_000,
+            "the regression body must exceed the tight request budget"
+        );
+        assert!(
+            ordinary_body.len() <= MAX_SEARCH_REQUEST_BYTES,
+            "the independent request ceiling still applies"
+        );
+
+        let (_, tight_request_allowance) = search_execution_allowances(6_000);
+        let concurrent_cap = MAX_SEARCH_REQUEST_BYTES.min(tight_request_allowance / 8);
+        assert!(
+            concurrent_cap * 8 <= tight_request_allowance,
+            "all eight live request bodies must fit together"
+        );
+    }
+
+    #[test]
+    fn numeric_search_result_expansion_is_rejected_before_owned_decode() {
+        let numbers = vec!["1e15"; 450].join(",");
+        let body = format!(
+            "{{\"data\":[{{\"attributes\":{{\"values\":[{numbers}]}},\"content\":[],\"file_id\":\"file-a\",\"filename\":\"a.txt\",\"score\":1}}]}}"
+        );
+        let decoded_cap = 3_000;
+        assert!(body.len() < decoded_cap);
+
+        let decoded = decode(body.as_bytes(), 1).expect("valid provider response");
+        let retained = crate::openai::responses::state::retained_json_bytes(decoded.first().expect("one result"))
+            .expect("bounded result size");
+        assert!(retained > decoded_cap);
+        drop(decoded);
+
+        let mut result = None;
+        let allocations = allocation_counter::measure(|| {
+            result = Some(parse_response_body(body.as_bytes(), "store-a", 1, Some(decoded_cap)));
+        });
+        assert!(matches!(
+            result.expect("decoder ran"),
+            Err(FileSearchError::AggregateLimit {
+                retained_payload: true,
+                ..
+            })
+        ));
+        assert!(
+            allocations.bytes_max < 3_000,
+            "rejection must precede owned decode: {allocations:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_search_result_fits_shared_decoded_allowance() {
+        let body = br#"{"data":[{"content":[],"file_id":"file-a","filename":"a.txt","score":1}]}"#;
+        let parsed = parse_response_body(body, "store-a", 1, Some(3_000))
+            .expect("ordinary result fits the decoded half of a 6 KiB allowance");
+        assert_eq!(parsed.data.len(), 1);
+        assert!(parsed.decoded_bytes <= 3_000);
     }
 
     #[test]
@@ -2812,6 +3054,10 @@ mod tests {
             decode(&body, 1).is_err(),
             "retained chunk storage must not exceed body bytes plus fixed headroom"
         );
+        assert!(matches!(
+            parse_response_body(&body, "store-a", 1, Some(1_000_000)),
+            Err(FileSearchError::Deserialize { .. })
+        ));
     }
 
     #[test]
@@ -2848,7 +3094,7 @@ mod tests {
     #[test]
     fn decode_error_retains_only_location_metadata() {
         let body = br#"{"data":[{"content":[{"type":"text","text":"x"}],"file_id":"file-a","filename":"a.txt","score":"NaN"}]}"#;
-        let error = parse_response_body(body, "store-a", 10).expect_err("invalid response must fail");
+        let error = parse_response_body(body, "store-a", 10, None).expect_err("invalid response must fail");
         let rendered = error.to_string();
 
         assert!(rendered.len() < 256, "error must be compact");

@@ -114,7 +114,7 @@ pub(super) fn accumulate_response_object(
         if let Some(Value::Array(output)) = response.get("output") {
             replace_completed_tool_calls(state, output);
         }
-        state.response_object = response;
+        state.replace_response_object(response);
         state.local_completion_response_template = Value::Null;
         had_prior_usage
     };
@@ -126,6 +126,7 @@ pub(super) fn accumulate_response_object(
 
 /// Replace incremental function calls from the authoritative terminal output.
 fn replace_completed_tool_calls(state: &mut ResponsesState, output: &[Value]) {
+    state.mark_tool_calls_changed();
     state.tool_calls.clear();
     state.tool_calls.extend(
         output
@@ -312,6 +313,7 @@ fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &
     // growth the byte budget must charge.
     let retained_bytes = crate::json_body::serialized_len(&tool_call).unwrap_or(0);
     upsert_tool_call(&mut state.tool_calls, tool_call);
+    state.mark_tool_calls_changed();
     retained_bytes
 }
 

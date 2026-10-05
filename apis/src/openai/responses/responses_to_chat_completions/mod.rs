@@ -74,9 +74,12 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// Marker for a streaming Chat Completions SSE response.
 const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 
+/// Error sent when Chat translation cannot fit simultaneous live owners.
 const CHAT_BUDGET_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat translation";
+/// Maximum count of transient copies of one outbound source during lowering.
 const OUTBOUND_SOURCE_COPIES: usize = 6;
+/// Fixed serialization and object overhead reserved for outbound lowering.
 const OUTBOUND_FIXED_BYTES: usize = 4_096;
 
 /// Response-side error when a finite Chat response cannot be translated within
@@ -89,7 +92,9 @@ const FINITE_TRANSLATION_OVERFLOW_MESSAGE: &str =
 /// both old and new wire Vec capacities at a growth boundary. Every part is a
 /// JSON object, so counting all structural objects is conservative.
 const FINITE_TRANSLATION_OBJECT_EXPANSION_BYTES: usize = 64 * 3;
+/// Reserve per-array framing and copied capacity during finite translation.
 const FINITE_TRANSLATION_ARRAY_EXPANSION_BYTES: usize = 64 * 3;
+/// Reserve per-string escaping and copied capacity during finite translation.
 const FINITE_TRANSLATION_STRING_EXPANSION_BYTES: usize = 64 * 3;
 
 /// `serde_json` can normalize `1e15` (four wire bytes) to
@@ -293,6 +298,10 @@ impl ResponsesToChatCompletionsFilter {
     #[expect(
         clippy::unnecessary_wraps,
         reason = "mirrors the fallible response dispatch handlers so on_response can return every branch uniformly with `?`/`return`"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "installs headers and converter before stream commitment"
     )]
     fn install_stream_converter(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let streaming_requested = request_is_streaming(ctx);
@@ -644,6 +653,7 @@ fn outbound_wire_fits(ctx: &HttpFilterContext<'_>, translated: &serde_json::Valu
         .is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
+/// Reject a translated Chat request before selecting an upstream body.
 fn chat_request_budget_failure(ctx: &mut HttpFilterContext<'_>) -> SelectedUpstreamBodyOutcome {
     SelectedUpstreamBodyOutcome::Reject(super::budget_error::request_rejection(ctx, CHAT_BUDGET_MESSAGE))
 }
@@ -711,6 +721,10 @@ fn finite_translation_echo_bytes(state: &ResponsesState, limit: usize) -> Option
 /// Count structural objects and numeric tokens without allocating or mistaking
 /// their bytes inside JSON strings for payload structure. Invalid JSON still
 /// reaches provider-response validation unless its projection is over budget.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass JSON structure scanner avoids a tree copy"
+)]
 fn json_structure_counts(body: &[u8]) -> Option<(usize, usize, usize, usize)> {
     let mut in_string = false;
     let mut escaped = false;
@@ -845,13 +859,16 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
         // Cap the raw buffered owner before parsing creates more owned trees.
+        // A later client-tool restore has no transformed wire length at this
+        // header phase, so leave enough headroom for its conservative peak.
         let finite_cap = ctx.extensions.get::<ResponsesState>().map(|state| {
             state.retained_payload_limit().map(|limit| {
                 state
                     .retained_payload_bytes_bounded(limit)
                     .and_then(|current| limit.checked_sub(current))
-                    .map(|remaining| remaining / 8)
-                    .unwrap_or(0)
+                    .map_or(0, |remaining| {
+                        remaining / if state.client_tool_echo.is_some() { 512 } else { 8 }
+                    })
             })
         });
         if finite_cap == Some(Some(0)) {

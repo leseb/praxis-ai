@@ -85,6 +85,10 @@ const MAX_QUERIES_PER_CALL: usize = 64;
 /// inference round and are not persisted into rehydration history.
 const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 
+/// Fixed bridge fields, call identifiers, and bounded template bookkeeping
+/// retained while a joined query is formatted.
+const QUERY_FORMATTING_FIXED_BYTES: usize = 1_024;
+
 /// Dispatches the loop owner's pending file-search assignments against a vector
 /// store API compatible backend.
 ///
@@ -1171,7 +1175,9 @@ fn file_search_state_accounting_failure() -> DispatchFailure {
 /// staged/final owners, with room for the canonical result wrapper. Model
 /// bridges have three simultaneous owners while formatting (the rendered
 /// string, the bridge value, and its staged/final state owner), so the model
-/// budget is capped to one third of the remaining aggregate allowance.
+/// budget is capped to one third of the remaining aggregate allowance. The
+/// joined query and its JSON argument copies need a separate reservation:
+/// JSON escaping can expand each query byte to six bytes.
 #[expect(
     clippy::too_many_lines,
     reason = "preflight accounts each transient owner before formatting"
@@ -1205,6 +1211,28 @@ fn reserve_file_search_formatting(
     let non_model_bytes = batch_bytes
         .checked_add(public_bytes)
         .and_then(|bytes| bytes.checked_add(plan_bytes))
+        .ok_or_else(file_search_state_accounting_failure)?;
+
+    // The plan already owns each original query. Formatting also owns the
+    // joined query, a temporary serde_json query value, and its serialized
+    // argument (at most six escaped bytes per input byte). The empty bridge
+    // drops before the final bridge is built, and only one call is formatted
+    // at a time, so reserve the largest joined query rather than their sum.
+    // Do this before join_queries_bounded or either bridge allocates.
+    let query_formatting_bytes = if plan.calls.is_empty() {
+        0
+    } else {
+        plan.calls
+            .iter()
+            .map(|call| joined_query_size(&call.queries).0)
+            .max()
+            .unwrap_or_default()
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(QUERY_FORMATTING_FIXED_BYTES))
+            .ok_or_else(file_search_state_accounting_failure)?
+    };
+    let non_model_bytes = non_model_bytes
+        .checked_add(query_formatting_bytes)
         .ok_or_else(file_search_state_accounting_failure)?;
 
     let model_bytes = match state.retained_payload_limit() {
@@ -1285,16 +1313,18 @@ impl BridgeBudget<'_> {
     /// Reserve exact structural and metadata bytes, then render chunks once.
     #[expect(clippy::too_many_lines, reason = "one ordered format and exact-budget transaction")]
     fn format(self, results: &[client::SearchResult], include_public_results: bool) -> BudgetedSearchResults {
-        let empty_model_messages = model_context_messages(
-            self.source_id,
-            self.output_index,
-            self.response_identity_hash,
-            self.query,
-            "",
-        );
-        let structural_bytes = bounded_json_size(&empty_model_messages, self.remaining_model_bytes)
-            .ok()
-            .flatten();
+        let structural_bytes = {
+            let empty_model_messages = model_context_messages(
+                self.source_id,
+                self.output_index,
+                self.response_identity_hash,
+                self.query,
+                "",
+            );
+            bounded_json_size(&empty_model_messages, self.remaining_model_bytes)
+                .ok()
+                .flatten()
+        };
         let max_context_bytes = structural_bytes
             .and_then(|bytes| self.remaining_model_bytes.checked_sub(bytes))
             .unwrap_or_default();
@@ -1563,7 +1593,9 @@ fn bounded_string_copy(value: &str, max_bytes: usize) -> String {
 /// Join model-facing query metadata without duplicating more than one query's
 /// maximum outbound byte allowance.
 fn join_queries_bounded(queries: &[String]) -> (String, bool) {
-    let mut joined = String::new();
+    let (joined_size, truncated) = joined_query_size(queries);
+    // A known exact capacity avoids a transient old-plus-grown String owner.
+    let mut joined = String::with_capacity(joined_size);
     for query in queries {
         let separator_bytes = usize::from(!joined.is_empty());
         let Some(next_len) = joined
@@ -1571,17 +1603,36 @@ fn join_queries_bounded(queries: &[String]) -> (String, bool) {
             .checked_add(separator_bytes)
             .and_then(|length| length.checked_add(query.len()))
         else {
-            return (joined, true);
+            break;
         };
-        if next_len > MAX_QUERY_BYTES {
-            return (joined, true);
+        if next_len > joined_size {
+            break;
         }
         if separator_bytes != 0 {
             joined.push('\n');
         }
         joined.push_str(query);
     }
-    (joined, false)
+    (joined, truncated)
+}
+
+/// Project the same bounded join without allocating its second query owner.
+fn joined_query_size(queries: &[String]) -> (usize, bool) {
+    let mut joined_size = 0_usize;
+    for query in queries {
+        let separator_bytes = usize::from(joined_size != 0);
+        let Some(next_size) = joined_size
+            .checked_add(separator_bytes)
+            .and_then(|size| size.checked_add(query.len()))
+        else {
+            return (joined_size, true);
+        };
+        if next_size > MAX_QUERY_BYTES {
+            return (joined_size, true);
+        }
+        joined_size = next_size;
+    }
+    (joined_size, false)
 }
 
 /// Return whether one output item still requires local file-search execution.

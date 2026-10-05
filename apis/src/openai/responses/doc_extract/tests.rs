@@ -959,7 +959,7 @@ async fn aggregate_budget_preflights_extraction_before_state_initialization() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     set_responses_metadata(&mut ctx);
-    let config = serde_yaml::from_str("max_retained_bytes: 131072").unwrap();
+    let config = serde_yaml::from_str("max_retained_bytes: 100000").unwrap();
     let policy = AgenticBudgetPolicy::from_config(&config).unwrap();
     ctx.extensions.insert(policy);
     let body_json = responses_body(&serde_json::json!([
@@ -968,6 +968,10 @@ async fn aggregate_budget_preflights_extraction_before_state_initialization() {
         ]}
     ]));
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let raw = body.as_ref().unwrap();
+    assert!(super::super::initial_json_parse_peak_bytes(raw).unwrap() <= 100_000);
+    assert!(projected_extraction_peak(&ctx, &body_json, raw.len()).unwrap() > 100_000);
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
@@ -1570,4 +1574,135 @@ async fn rejects_when_state_body_exceeds_max_rewritten_body_bytes() {
         },
         _ => panic!("expected rejection when state body (with large history) exceeds max_rewritten_body_bytes"),
     }
+}
+
+#[tokio::test]
+async fn retained_budget_rejects_document_expansion_before_dispatch_or_persistence() {
+    use super::super::{AgenticBudgetPolicy, state::ResponsesState};
+
+    let request = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap());
+    let input = responses_body(&serde_json::json!([{
+        "role":"user", "content":[{
+            "type":"input_file", "filename":"a.txt", "file_data":text_file_data(&"\0".repeat(3600))
+        }]
+    }]));
+    let original = serde_json::to_vec(&input).unwrap();
+    let mut state = ResponsesState::from_request_body(input);
+    state.apply_retained_payload_limit(65_536);
+    state.store_persist_armed = true;
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("document expansion must fail before inference");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(!state.store_persist_armed);
+    assert_eq!(
+        body.unwrap().as_ref(),
+        original,
+        "rejected request must not publish rewritten wire"
+    );
+}
+
+#[tokio::test]
+async fn retained_budget_admits_small_document_with_wire_copy() {
+    use super::super::{AgenticBudgetPolicy, state::ResponsesState};
+
+    let request = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap());
+    let input = responses_body(&serde_json::json!([{
+        "role":"user", "content":[{
+            "type":"input_file", "filename":"a.txt", "file_data":text_file_data("hello")
+        }]
+    }]));
+    ctx.extensions.insert(ResponsesState::from_request_body(input.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&input).unwrap()));
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_payload_limit(), Some(65_536));
+    assert!(state.can_retain_payload(body.as_ref().unwrap().len()));
+    assert_eq!(state.request_body["input"][0]["content"][0]["type"], "input_text");
+}
+
+#[tokio::test]
+async fn policy_without_state_rejects_document_parse_peak() {
+    use super::super::AgenticBudgetPolicy;
+
+    let request = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let input = responses_body(&serde_json::json!([{
+        "role":"user", "content":[{
+            "type":"input_file", "filename":"a.txt", "file_data":text_file_data(&"x".repeat(3000))
+        }]
+    }]));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&input).unwrap()));
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("pipeline policy must apply before state exists");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn policy_without_state_rejects_raw_body_before_json_parse() {
+    use super::super::AgenticBudgetPolicy;
+
+    let request = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 131072").unwrap()).unwrap(),
+    );
+    // Invalid JSON would otherwise be released by this filter. The classifier's
+    // eightfold raw allowance must apply before this parser allocates too.
+    let original = Bytes::from(vec![b'x'; 16_385]);
+    let mut body = Some(original.clone());
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the raw body exceeds its preparse allowance");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body, Some(original));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn policy_without_state_rejects_dense_short_json_before_parse() {
+    use super::super::AgenticBudgetPolicy;
+
+    let request = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    set_responses_metadata(&mut ctx);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap());
+    let original = Bytes::from(format!(r#"{{"input":[{}]}}"#, vec!["null"; 300].join(",")));
+    assert!(original.len() < 8192, "the wire body fits the eightfold raw allowance");
+    let mut body = Some(original.clone());
+
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("owned JSON nodes exceed the preparse allowance");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body, Some(original));
 }

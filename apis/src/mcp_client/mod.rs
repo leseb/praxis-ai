@@ -86,6 +86,10 @@ pub(crate) struct McpConnectorContext<'a> {
 /// tools averaging 32 KiB) so well-behaved servers are never rejected.
 pub(crate) const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
 
+/// Raw control response, parsed JSON, and retained rmcp peer metadata can
+/// coexist. Budgeted dispatch reserves this many bytes per admitted wire byte.
+pub(crate) const MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER: usize = 256;
+
 // -----------------------------------------------------------------------------
 // McpDisplayUrl
 // -----------------------------------------------------------------------------
@@ -465,6 +469,7 @@ pub(crate) async fn call_tool(
         arguments,
         timeout,
         max_result_bytes,
+        MAX_CONTROL_RESPONSE_BYTES,
         callout,
     )
     .await
@@ -484,10 +489,6 @@ pub(crate) async fn call_tool(
     clippy::too_many_arguments,
     reason = "mirrors the tool-call boundary's forwarded-header + connector context inputs"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "rmcp initialization and signal setup form one session boundary"
-)]
 async fn open_tool_session(
     server_url: &str,
     headers: Option<&serde_json::Value>,
@@ -498,15 +499,19 @@ async fn open_tool_session(
     timeout: Duration,
     max_result_bytes: usize,
     initialize_limit: usize,
+    control_response_bytes: usize,
+    preparse_peak_limit: Option<usize>,
     budgeted: bool,
     callout: &McpCallout,
     display_url: &McpDisplayUrl,
 ) -> Result<PooledSession, McpClientError> {
-    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool(
+    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool_with_budget(
         callout.clone(),
         timeout,
         max_result_bytes,
         initialize_limit,
+        control_response_bytes,
+        preparse_peak_limit,
         budgeted,
         connector_context.map(|context| context.owner.clone()),
     );
@@ -535,15 +540,15 @@ async fn open_tool_session(
         service,
         signal_state,
         max_result_bytes,
-        initialize_limit,
+        initialize_limit.min(control_response_bytes),
     ))
 }
 
 /// Issue one `tools/call` on an already-initialized session without closing it.
 ///
-/// Under an aggregate budget, `initialize` uses the admitted payload cap with
-/// a 1 KiB floor; otherwise it retains the 1 MiB control ceiling. The
-/// `tools/call` result uses `max_result_bytes` (expanded for JSON escaping).
+/// `initialize` uses the control ceiling; the `tools/call` result is bounded to
+/// the configured `max_result_bytes` cap (expanded for worst-case JSON string
+/// escaping) before deserialization, applied inside the session's transport.
 async fn invoke_tool(
     session: &PooledSession,
     signal: &Arc<OnceLock<subrequest_transport::TransportSignal>>,
@@ -586,11 +591,11 @@ async fn invoke_tool(
 /// with a non-404 status therefore surfaces an error rather than opening a fresh
 /// session automatically. Fresh sessions are pooled on success and closed on any
 /// error; a `None` pool never reuses or retains a session.
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "trusted forwarded headers and optional pooling extend the existing API"
+    reason = "preserves the unbudgeted MCP call API in tests"
 )]
-#[cfg(test)]
 pub(crate) async fn call_tool_with_forwarded_headers(
     pool: Option<(&McpSessionPool, &McpPoolKey)>,
     server_url: &str,
@@ -603,9 +608,10 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     arguments: serde_json::Value,
     timeout: Duration,
     max_result_bytes: usize,
+    max_control_response_bytes: usize,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
-    call_tool_with_forwarded_headers_bounded_initialize(
+    call_tool_with_forwarded_headers_with_budget(
         pool.map(|(pool, key)| (pool, Some(key))),
         server_url,
         headers,
@@ -617,25 +623,26 @@ pub(crate) async fn call_tool_with_forwarded_headers(
         arguments,
         timeout,
         max_result_bytes,
-        MAX_CONTROL_RESPONSE_BYTES,
+        max_control_response_bytes,
+        max_control_response_bytes,
+        None,
         false,
         callout,
     )
     .await
 }
 
-/// The aggregate-budget variant caps initialization before rmcp retains its
-/// peer information. Unbudgeted callers use the established control ceiling.
+/// Budgeted variant: reserve the raw wire and rmcp parse peak before decoding.
 #[expect(
     clippy::too_many_arguments,
-    reason = "tool and initialization ceilings are distinct transport limits"
+    reason = "trusted forwarded headers and optional pooling extend the existing API"
 )]
 #[expect(
     clippy::too_many_lines,
-    reason = "reused and fresh sessions share one call lifecycle"
+    reason = "reuse attempt and fresh open share one boundary with distinct cleanup on each exit"
 )]
 #[expect(clippy::large_stack_frames, reason = "rmcp session setup owns its callout state")]
-pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
+pub(crate) async fn call_tool_with_forwarded_headers_with_budget(
     pool: Option<(&McpSessionPool, Option<&McpPoolKey>)>,
     server_url: &str,
     headers: Option<&serde_json::Value>,
@@ -648,10 +655,11 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     timeout: Duration,
     max_result_bytes: usize,
     initialize_limit: usize,
+    control_response_bytes: usize,
+    preparse_peak_limit: Option<usize>,
     budgeted: bool,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
-    let initialize_limit = initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES);
     let display_url = parse_display_url(server_url);
     let deadline = tokio::time::Instant::now() + timeout;
     // 1. Reuse a warm session for this exact identity, if one exists. A reused session only ever existed after a prior
@@ -660,7 +668,12 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
     if let Some((pool, Some(key))) = pool {
-        let checkout = pool.checkout_with_initialize_limit(key, max_result_bytes, initialize_limit, budgeted);
+        let checkout = pool.checkout_with_initialize_limit(
+            key,
+            max_result_bytes,
+            initialize_limit.min(control_response_bytes),
+            budgeted,
+        );
         pool.close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
             let signal = session.begin_call();
@@ -708,6 +721,8 @@ pub(crate) async fn call_tool_with_forwarded_headers_bounded_initialize(
             timeout,
             max_result_bytes,
             initialize_limit,
+            control_response_bytes,
+            preparse_peak_limit,
             budgeted,
             callout,
             &display_url,
@@ -773,6 +788,48 @@ async fn close_failed_tool_session(
     } else {
         session.close_before(deadline).await;
     }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exercise the bounded MCP call API with test transport fixtures"
+)]
+async fn call_tool_with_forwarded_headers_bounded_initialize(
+    pool: Option<(&McpSessionPool, Option<&McpPoolKey>)>,
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout: Duration,
+    max_result_bytes: usize,
+    initialize_limit: usize,
+    budgeted: bool,
+    callout: &McpCallout,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    call_tool_with_forwarded_headers_with_budget(
+        pool,
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+        tool_name,
+        arguments,
+        timeout,
+        max_result_bytes,
+        initialize_limit,
+        initialize_limit,
+        budgeted.then_some(max_result_bytes.saturating_mul(8)),
+        budgeted,
+        callout,
+    )
+    .await
 }
 
 /// Cap on pagination rounds to prevent infinite loops from
