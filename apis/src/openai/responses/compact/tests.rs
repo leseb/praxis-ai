@@ -148,7 +148,7 @@ fn extract_compaction_config_with_model_override() {
     }]));
     let params = extract_compaction_config(&cm).unwrap().unwrap();
     assert_eq!(params.compact_threshold, 100_000);
-    assert_eq!(params.compaction_model.as_deref(), Some("gpt-4o"));
+    assert_eq!(params.compaction_model, Some("gpt-4o"));
 }
 
 #[test]
@@ -781,6 +781,480 @@ fn make_filter(on_failure: &str) -> CompactFilter {
         client: subrequest::isolated_client(1),
         config: validated,
     }
+}
+
+#[tokio::test]
+async fn reactive_budget_rejects_before_summarization_even_with_fail_open() {
+    let filter = make_filter("open");
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.history_rehydrated = true;
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    state.apply_retained_payload_limit(4096);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"input":"hello"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("aggregate exhaustion must reject before the callout");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn reactive_noop_does_not_reserve_a_callout() {
+    let filter = make_filter("open");
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.history_rehydrated = true;
+    state.previous_usage = Some(json!({"total_tokens": 10}));
+    state.apply_retained_payload_limit(4096);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"input":"hello"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Release
+    ));
+}
+
+#[test]
+fn reactive_budget_allows_a_bounded_small_callout() {
+    let filter = make_filter("closed");
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "hello"}));
+    state.apply_retained_payload_limit(2 * 1024 * 1024);
+    let params = CompactionParams {
+        compact_threshold: 1000,
+        compaction_model: None,
+    };
+
+    assert!(
+        reactive_compaction_text_fits(&state),
+        "small conversation should fit before formatting"
+    );
+    let response_limit = reactive_compaction_response_limit(&state, "hello", &params, &filter.config)
+        .expect("small request should fit")
+        .expect("configured budget should cap the response");
+    assert!(
+        response_limit > 0,
+        "bounded callout should retain a usable response allowance"
+    );
+    assert!(
+        response_limit <= MAX_SUMMARIZATION_RESPONSE_BYTES,
+        "aggregate allowance must preserve the existing callout cap"
+    );
+}
+
+#[tokio::test]
+async fn reactive_compaction_normal_response_cap_keeps_fail_open_policy() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "summary callout did not start");
+                    std::thread::park_timeout(Duration::from_millis(5));
+                },
+                Err(error) => panic!("summary stub accept failed: {error}"),
+            }
+        };
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut received = [0_u8; 4096];
+        drop(socket.read(&mut received));
+        let body = vec![b'x'; MAX_SUMMARIZATION_RESPONSE_BYTES + 1];
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        drop(socket.write_all(headers.as_bytes()));
+        drop(socket.write_all(&body));
+    });
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{address}/v1/chat/completions");
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hello"}));
+    state.apply_retained_payload_limit(16 * 1024 * 1024);
+    let params = CompactionParams {
+        compact_threshold: 1000,
+        compaction_model: None,
+    };
+    let preflight = reactive_compaction_response_limit(&state, "hello", &params, &filter.config).unwrap();
+    assert_eq!(preflight, Some(MAX_SUMMARIZATION_RESPONSE_BYTES));
+
+    let result = filter.execute_compaction(&state, &params, "hello", preflight).await;
+
+    server.join().unwrap();
+    assert!(
+        matches!(result, Ok(None)),
+        "ordinary cap failure must skip compaction in open mode"
+    );
+}
+
+/// A bounded non-2xx body is never parsed as a summary. Numeric tokens in its
+/// error payload must not turn the ordinary fail-open policy into a budget error.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "runs a bounded HTTP error through the real compaction callout"
+)]
+async fn reactive_compaction_numeric_error_body_keeps_fail_open_policy() {
+    use std::io::{Read as _, Write as _};
+
+    let body = format!("{{\"error\":[{}]}}", vec!["1e15"; 10_000].join(",")).into_bytes();
+    assert!(
+        buffered_parsed_json_bytes_upper_bound(&body).unwrap() * 3 + body.len() > 524_288,
+        "the successful-response parse staging would exceed the shared limit"
+    );
+    let wire_bytes = body.len();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "summary callout did not start");
+                    std::thread::park_timeout(Duration::from_millis(5));
+                },
+                Err(error) => panic!("summary stub accept failed: {error}"),
+            }
+        };
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut received = [0_u8; 4096];
+        drop(socket.read(&mut received));
+        let headers = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).unwrap();
+        socket.write_all(&body).unwrap();
+    });
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{address}/v1/chat/completions");
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hello"}));
+    state.apply_retained_payload_limit(524_288);
+    let params = CompactionParams {
+        compact_threshold: 1000,
+        compaction_model: None,
+    };
+    let response_limit = reactive_compaction_response_limit(&state, "hello", &params, &filter.config)
+        .unwrap()
+        .unwrap();
+    assert!(
+        response_limit >= wire_bytes,
+        "the wire body must fit the transport allowance"
+    );
+
+    let result = filter
+        .execute_compaction(&state, &params, "hello", Some(response_limit))
+        .await;
+
+    server.join().unwrap();
+    assert!(matches!(result, Ok(None)), "non-2xx must follow on_failure: open");
+}
+
+#[tokio::test]
+async fn reactive_compaction_aggregate_cap_rejects_oversized_summary_even_fail_open() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(5));
+                },
+                Err(error) => panic!("summary stub accept failed: {error}"),
+            }
+        };
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut received = [0_u8; 4096];
+        drop(socket.read(&mut received));
+        let body = serde_json::to_vec(&json!({
+            "choices": [{"message": {"content": "y".repeat(131_072)}}]
+        }))
+        .unwrap();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        drop(socket.write_all(headers.as_bytes()));
+        drop(socket.write_all(&body));
+        true
+    });
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{address}/v1/chat/completions");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({
+        "model": "m",
+        "input": [{"role":"user","content":"new turn"}],
+        "context_management": [{"type":"compaction","compact_threshold":1000}],
+        "store": false
+    });
+    let mut state = ResponsesState::from_request_body(original.clone());
+    state.history_rehydrated = true;
+    state.messages = vec![json!({"role":"user","content":"x ".repeat(4096)})];
+    state.persisted_messages = state.messages.clone();
+    state.previous_usage = Some(json!({"total_tokens":2000}));
+    state.apply_retained_payload_limit(524_288);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        server.join().unwrap(),
+        "summary callout should be admitted up to the bounded read cap"
+    );
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
+        "{action:?}"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn reactive_compaction_rejects_compaction_item_peak_before_allocation() {
+    let filter = make_filter("open");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    let original = json!({"model":"m","input":"new turn"});
+    let mut state = ResponsesState::from_request_body(original);
+    state.apply_retained_payload_limit(32_768);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let result = filter.apply_compaction(&mut ctx, &"summary".repeat(4096));
+    assert!(matches!(result, Err(ReactiveCompactionError::RetainedBudget)));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(0));
+}
+
+#[tokio::test]
+async fn reactive_compaction_rejects_before_callout_without_transport_headroom() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({
+        "model": "m",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}],
+        "store": false
+    });
+    let mut state = ResponsesState::from_request_body(original.clone());
+    state.history_rehydrated = true;
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    state.apply_retained_payload_limit(65_536);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn reactive_compaction_rejects_usage_less_tokenizer_peak_before_callout() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut filter = make_filter("open");
+    filter.config.inference_url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({
+        "model": "m",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}],
+        "store": false
+    });
+    let mut state = ResponsesState::from_request_body(original.clone());
+    state.history_rehydrated = true;
+    state.messages = vec![json!({
+        "role": "user",
+        "content": "abcdefghijklmnopqrstuvwxyz0123456789".repeat(128)
+    })];
+    state.apply_retained_payload_limit(262_144);
+    assert!(state.previous_usage.is_none());
+    assert!(state.can_retain_payload(16_384), "old text-only reserve would pass");
+    assert!(!reactive_conversation_fits(&state));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn reactive_compaction_preflight_borrows_model_before_admission() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hello",
+        "context_management": [{
+            "type": "compaction",
+            "compact_threshold": 1000,
+            "compaction_model": "m".repeat(4096)
+        }]
+    }));
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    let base = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(65_536);
+    state
+        .accumulated_output
+        .push(Value::String("p".repeat(65_536 - base - 1024 - 2)));
+    assert_eq!(state.retained_payload_bytes(), Some(65_536 - 1024));
+    let allocations = allocation_counter::measure(|| {
+        assert!(reactive_conversation_fits(&state));
+    });
+    assert!(
+        allocations.bytes_max <= 1024,
+        "compaction preflight allocated before admission: {allocations:?}"
+    );
+}
+
+async fn assert_callout_failure_remains_open(status: u16, summary_bytes: usize, client_limit: usize, budget: usize) {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = [0_u8; 4096];
+        drop(socket.read(&mut request));
+        let response_body = serde_json::to_vec(&json!({
+            "choices": [{"message": {"content": "x".repeat(summary_bytes)}}]
+        }))
+        .unwrap();
+        let headers = format!(
+            "HTTP/1.1 {status} Review\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        );
+        drop(socket.write_all(headers.as_bytes()));
+        drop(socket.write_all(&response_body));
+    });
+    let mut filter = make_filter("open");
+    filter.client = SubRequestClient::with_max_response_bytes(crate::test_utils::connector(1), client_limit);
+    filter.config.inference_url = format!("http://{address}/v1/chat/completions");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let original = json!({
+        "model": "m",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}],
+        "store": false
+    });
+    let mut state = ResponsesState::from_request_body(original.clone());
+    state.history_rehydrated = true;
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    state.apply_retained_payload_limit(budget);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    server.join().unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a non-budget callout failure must remain open: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn reactive_compaction_non_success_body_does_not_reserve_json_parse() {
+    assert_callout_failure_remains_open(503, 250_000, usize::MAX, 1_048_576).await;
+}
+
+#[tokio::test]
+async fn reactive_compaction_independent_response_ceiling_remains_fail_open() {
+    assert_callout_failure_remains_open(200, 8192, 4096, 262_144).await;
+}
+
+#[test]
+fn reactive_compaction_rejects_numeric_expansion_before_parsing() {
+    let filter = make_filter("open");
+    let mut state = ResponsesState::from_request_body(json!({"model":"gpt-4o", "input":"hello"}));
+    state.apply_retained_payload_limit(2_097_152);
+    let params = CompactionParams {
+        compact_threshold: 1_000,
+        compaction_model: None,
+    };
+    let cap = reactive_compaction_response_limit(&state, "hello", &params, &filter.config)
+        .unwrap()
+        .unwrap();
+    let raw = format!(
+        r#"{{"choices":[{{"message":{{"content":"summary"}}}}],"usage":{{"values":[{}]}}}}"#,
+        vec!["1e15"; 85_000].join(",")
+    );
+    assert!(raw.len() < cap, "the transport body cap admits this valid response");
+    assert!(parse_summarization_response(raw.as_bytes()).is_ok());
+    let response = subrequest::SubResponse {
+        status: 200,
+        headers: http::HeaderMap::new(),
+        body: Bytes::from(raw),
+    };
+    assert!(matches!(
+        filter.handle_reactive_subrequest_result(Ok(response), Some(cap)),
+        Err(ReactiveCompactionError::RetainedBudget)
+    ));
+}
+
+#[test]
+fn reactive_compaction_accepts_ordinary_summary_within_response_allowance() {
+    let filter = make_filter("open");
+    let response = subrequest::SubResponse {
+        status: 200,
+        headers: http::HeaderMap::new(),
+        body: Bytes::from_static(br#"{"choices":[{"message":{"content":"summary"}}],"usage":{"total_tokens":10}}"#),
+    };
+    assert!(matches!(
+        filter.handle_reactive_subrequest_result(Ok(response), Some(256)),
+        Ok(Some(summary)) if summary.content == "summary"
+    ));
 }
 
 #[test]

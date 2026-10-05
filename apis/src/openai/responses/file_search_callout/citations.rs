@@ -56,6 +56,14 @@ struct CitationExtraction {
     removals: Vec<RemovedRange>,
 }
 
+/// Bound the old and replacement Vec buffers that can coexist during growth.
+fn vec_growth_peak_bytes<T>(len: usize) -> Option<usize> {
+    if len == 0 {
+        return Some(0);
+    }
+    len.checked_mul(3)?.max(4).checked_mul(size_of::<T>())
+}
+
 /// Response-wide allocation and work budget for citation rewriting.
 struct CitationBudget {
     /// Existing and generated annotations still allowed.
@@ -287,7 +295,8 @@ pub(crate) fn annotation_staging_bytes(
             })?;
             let mut remaining = text;
             let mut modifies_text = false;
-            let mut removed_markers = 0_usize;
+            let mut removed_count = 0_usize;
+            let mut generated_count = 0_usize;
             while let Some(marker_start) = remaining.find("<|file-") {
                 markers_remaining = markers_remaining.checked_sub(1).ok_or(CitationRewriteError {
                     budget: "marker",
@@ -303,10 +312,17 @@ pub(crate) fn annotation_staging_bytes(
                     continue;
                 }
                 modifies_text = true;
-                removed_markers = removed_markers.saturating_add(1);
+                removed_count = removed_count.checked_add(1).ok_or(CitationRewriteError {
+                    budget: "payload byte",
+                    limit: usize::MAX,
+                })?;
                 if let Some(filename) = citation_files.get(file_id)
                     && filename.len() <= MAX_FILENAME_BYTES
                 {
+                    generated_count = generated_count.checked_add(1).ok_or(CitationRewriteError {
+                        budget: "payload byte",
+                        limit: usize::MAX,
+                    })?;
                     annotations_remaining = annotations_remaining.checked_sub(1).ok_or(CitationRewriteError {
                         budget: "annotation",
                         limit: MAX_CITATION_ANNOTATIONS,
@@ -324,7 +340,6 @@ pub(crate) fn annotation_staging_bytes(
                                 limit: usize::MAX,
                             })?,
                         )
-                        .and_then(|bytes| bytes.checked_add(size_of::<Value>() * 2))
                         .ok_or(CitationRewriteError {
                             budget: "payload byte",
                             limit: usize::MAX,
@@ -334,27 +349,40 @@ pub(crate) fn annotation_staging_bytes(
             }
             if modifies_text {
                 let existing = part.get("annotations").and_then(Value::as_array).map_or(0, Vec::len);
-                if existing > 0 {
-                    // Existing offsets need one removal range per marker. Vec
-                    // growth can retain both capacities during reallocation.
-                    staging = staging
-                        .checked_add(removed_markers.checked_mul(size_of::<RemovedRange>() * 2).ok_or(
-                            CitationRewriteError {
-                                budget: "payload byte",
-                                limit: usize::MAX,
-                            },
-                        )?)
-                        .ok_or(CitationRewriteError {
-                            budget: "payload byte",
-                            limit: usize::MAX,
-                        })?;
-                }
                 annotations_remaining = annotations_remaining
                     .checked_sub(existing)
                     .ok_or(CitationRewriteError {
                         budget: "annotation",
                         limit: MAX_CITATION_ANNOTATIONS,
                     })?;
+                // Extraction retains both scratch vectors while merging generated
+                // annotations into the existing array. Each Vec can briefly own
+                // its old and replacement buffers at a growth boundary.
+                let merge_count = existing.checked_add(generated_count).ok_or(CitationRewriteError {
+                    budget: "payload byte",
+                    limit: usize::MAX,
+                })?;
+                let scratch = (if existing > 0 {
+                    vec_growth_peak_bytes::<RemovedRange>(removed_count)
+                } else {
+                    Some(0)
+                })
+                .and_then(|bytes| bytes.checked_add(vec_growth_peak_bytes::<Value>(generated_count)?))
+                .and_then(|bytes| {
+                    if generated_count == 0 {
+                        Some(bytes)
+                    } else {
+                        bytes.checked_add(vec_growth_peak_bytes::<Value>(merge_count)?)
+                    }
+                })
+                .ok_or(CitationRewriteError {
+                    budget: "payload byte",
+                    limit: usize::MAX,
+                })?;
+                staging = staging.checked_add(scratch).ok_or(CitationRewriteError {
+                    budget: "payload byte",
+                    limit: usize::MAX,
+                })?;
             }
         }
     }
@@ -607,6 +635,31 @@ mod tests {
         let (cleaned, annotations) = extract_citations("Answer <|file-missing|>.", &HashMap::new());
         assert_eq!(cleaned, "Answer.");
         assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn staging_bounds_removal_vector_growth_for_unknown_markers() {
+        let files = HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]);
+        let text = "<|file-unknown|>".repeat(2_049);
+        let output = vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": text.clone(),
+                "annotations": [{"type": "file_path", "file_id": "file-known", "index": 0}]
+            }]
+        })];
+        let staging = annotation_staging_bytes(&output, &files).unwrap();
+        let allocations = allocation_counter::measure(|| {
+            let extracted = extract_citations_bounded(&text, &files, &mut CitationBudget::default(), true).unwrap();
+            assert_eq!(extracted.removals.len(), 2_049);
+            assert!(extracted.annotations.is_empty());
+        });
+        assert!(
+            staging >= usize::try_from(allocations.bytes_max).unwrap(),
+            "preflight must reserve the old and new removal buffers: {staging} < {allocations:?}"
+        );
     }
 
     #[test]

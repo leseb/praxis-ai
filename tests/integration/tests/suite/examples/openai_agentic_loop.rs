@@ -24,6 +24,7 @@ use praxis_test_utils::{
     free_port, http_get, http_send, json_post, load_example_config, parse_body, parse_status, patch_yaml,
     start_mcp_mock_server_with_config, start_proxy,
 };
+use sqlx::Row as _;
 
 // -----------------------------------------------------------------------------
 // Pipeline Build
@@ -114,8 +115,8 @@ fn oversized_stored_history_returns_413_before_replay_or_inference() {
     assert_eq!(model.requests().len(), 1, "oversized history must not reach inference");
 }
 
-#[test]
-fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
+#[tokio::test]
+async fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
     let model_response = serde_json::json!({
         "id": "resp_retained_overflow",
         "object": "response",
@@ -165,8 +166,88 @@ fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
         0,
         "overflow must stop before tool execution"
     );
-    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_retained_overflow", None);
-    assert_eq!(status, 404, "failed response must not be stored");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let stored: i64 = sqlx::query("SELECT COUNT(*) AS n FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("count query should run")
+        .get("n");
+    pool.close().await;
+    assert_eq!(stored, 0, "failed response must not be stored under its generated ID");
+}
+
+#[tokio::test]
+async fn aggregate_mcp_transport_overflow_stops_remaining_calls_and_persistence() {
+    let first_response = serde_json::json!({
+        "id": "resp_mcp_transport_budget",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call", "id": "fc_large", "call_id": "call_large",
+                "name": "weather__get_weather", "arguments": "{}", "status": "completed"
+            },
+            {
+                "type": "function_call", "id": "fc_later", "call_id": "call_later",
+                "name": "weather__get_weather", "arguments": "{}", "status": "completed"
+            }
+        ]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_unexpected_mcp_continuation",
+        "object": "response",
+        "status": "completed",
+        "output": []
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, second_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        sse_tool_results: true,
+        oversized_sse_bytes: Some(262_144),
+        ..McpMockConfig::default()
+    });
+    let db = TempSqlite::new("agentic_mcp_transport_budget");
+    // Reserve two possible parked GET streams, then trip the admitted wire
+    // ceiling on the first result before the second call executes.
+    let config = load_retained_budget_config_with_limit(free_port(), model.port(), db.url(), 4_194_304);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Check the weather twice.",
+        "parallel_tool_calls": false,
+        "store": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "{raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(mcp.method_count("tools/call"), 1, "later call must not execute");
+    assert_eq!(model.requests().len(), 1, "overflow must not resume inference");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let stored: i64 = sqlx::query("SELECT COUNT(*) AS n FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("count query should run")
+        .get("n");
+    pool.close().await;
+    assert_eq!(stored, 0, "overflow must not persist a response under its generated ID");
 }
 
 #[test]
@@ -598,6 +679,8 @@ fn round_trip_captures_tool_and_model_requests() {
     let first_response = serde_json::json!({
         "id": "resp_1",
         "object": "response",
+        "created_at": 1_000,
+        "model": "gpt-4.1",
         "status": "completed",
         "output": [{
             "type": "function_call",
@@ -611,6 +694,8 @@ fn round_trip_captures_tool_and_model_requests() {
     let second_response = serde_json::json!({
         "id": "resp_2",
         "object": "response",
+        "created_at": 1_001,
+        "model": "gpt-4.1",
         "status": "completed",
         "output": [{
             "type": "message",
@@ -640,7 +725,8 @@ fn round_trip_captures_tool_and_model_requests() {
     });
 
     let proxy_port = free_port();
-    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port());
+    let db = TempSqlite::new("round_trip_captures_tool_and_model_requests");
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
@@ -1377,7 +1463,8 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         ..McpMockConfig::default()
     });
     let proxy_port = free_port();
-    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model_port);
+    let db = TempSqlite::new("streaming_mcp_round_trip");
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model_port, db.url());
     let proxy = start_proxy(&config);
     let request = serde_json::json!({
         "model": "gpt-4.1",
@@ -2567,16 +2654,14 @@ fn two_tool_rounds_accumulate_output_and_usage() {
         "model backend should receive exactly three requests"
     );
 
-    // Session reuse (#1019): both dispatch rounds target the same MCP server, so
-    // they share one initialized session. The server therefore sees a single
-    // dispatch handshake covering both tools/call rounds; the only other
-    // initialize/tools/list pair comes from tool discovery
-    // (openai_mcp_tool_resolve), which runs once. Without session reuse each round
-    // would re-handshake, yielding initialize == 3.
+    // Budgeted MCP calls close each session after the call so peer metadata
+    // cannot remain outside the request's retained-payload accounting. Tool
+    // discovery initializes once, and the two dispatch rounds each initialize
+    // their own call-local session.
     assert_eq!(
         mcp.method_count("initialize"),
-        2,
-        "one discovery handshake + one reused dispatch handshake across both rounds"
+        3,
+        "one discovery handshake + one call-local handshake per dispatch round"
     );
     assert_eq!(
         mcp.method_count("tools/list"),
@@ -3073,6 +3158,98 @@ fn deferred_connector_loads_on_tool_search_then_dispatches() {
         listed_tools.iter().all(|tool| tool.get("input_schema").is_some()),
         "client listing tools require Responses input_schema: {listing}"
     );
+}
+
+#[test]
+fn deferred_connector_approval_resumes_with_same_target() {
+    let search_response = serde_json::json!({
+        "id": "resp_deferred_search",
+        "object": "response",
+        "created_at": 1000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "tool_search_call", "id": "tsc_deferred", "status": "completed"}]
+    });
+    let call_response = serde_json::json!({
+        "id": "resp_deferred_call",
+        "object": "response",
+        "created_at": 1001,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_deferred",
+            "call_id": "call_deferred",
+            "name": "drive__search",
+            "arguments": r#"{"query":"reports"}"#,
+            "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_deferred_final",
+        "object": "response",
+        "created_at": 1002,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Found quarterly reports."}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, search_response.to_string()),
+        (200, call_response.to_string()),
+        (200, final_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("search").with_description("Search files")],
+        ..McpMockConfig::default()
+    });
+    let db = TempSqlite::new("deferred_approval");
+    let proxy_port = free_port();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let config = load_deferred_approval_config(proxy_port, model.port(), db.url(), &mcp_url);
+    let proxy = start_proxy(&config);
+
+    let eager = serde_json::json!({
+        "type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+        "allowed_tools": ["search"], "require_approval": "always"
+    });
+    let deferred = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Find quarterly reports",
+        "tools": [{"type": "tool_search"}, {
+            "type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+            "defer_loading": true, "allowed_tools": ["search"], "require_approval": "always"
+        }]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &deferred.to_string()));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "deferred request should pause for approval: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let approval = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "mcp_approval_request")
+        .expect("deferred call should request approval");
+    let approval_id = approval["id"].as_str().unwrap();
+    let previous_response_id = response["id"].as_str().unwrap();
+    assert_eq!(mcp.method_count("tools/call"), 0, "approval must pause execution");
+
+    // A fresh request must resolve the same connector eagerly to rebuild its
+    // private tool map before the pending approval can be matched.
+    let followup = approval_followup(previous_response_id, approval_id, true, &serde_json::json!([eager]));
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(parse_status(&raw), 200, "same-target approval should resume: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["id"], "resp_deferred_final");
+    assert_eq!(mcp.tool_call_count("search"), 1, "approved deferred tool executes once");
+    assert_eq!(model.requests().len(), 3, "search, call, then approved result");
 }
 
 #[test]
@@ -7772,11 +7949,23 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
 }
 
 fn load_retained_budget_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    load_retained_budget_config_with_limit(proxy_port, model_port, db_url, 4_096)
+}
+
+fn load_retained_budget_config_with_limit(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replace("max_retained_bytes: 67108864", "max_retained_bytes: 4096");
+    let yaml = yaml.replace(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+    );
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse retained-budget agentic config")
 }
@@ -7908,11 +8097,16 @@ fn load_loopback_mcp_config_with_connectors(
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP connector config")
 }
 
-fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+fn load_loopback_mcp_config_without_rehydrate(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = yaml.replacen("      - filter: openai_responses_rehydrate\n", "", 1);
     assert!(
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
@@ -7930,6 +8124,27 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
+}
+
+/// Persist approval state while resolving one configured connector through the
+/// example pipeline's deferred `tool_search` path.
+fn load_deferred_approval_config(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    mcp_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replacen(
+        "          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
+        &format!("          - id: corp_drive\n            server_url: {mcp_url}\n"),
+        1,
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse deferred approval config")
 }
 
 /// Like [`load_approval_config`] but with the `openai_response_store` backend

@@ -201,7 +201,7 @@ use super::{
     },
     state::{
         DispatchFailure, FileSearchAssignment, McpApprovalState, OutputAssignment, ResponsesState, SynthesisKind,
-        current_round_file_search_admissions, tool_search_discovery_is_within_budget,
+        current_round_file_search_admissions, current_round_tool_call_admissions,
     },
     stream_events::{encode_local_completion, encode_local_error},
     usage::merge_usage,
@@ -211,7 +211,7 @@ use super::{
 use super::{
     mcp_classify::{McpDisposition, classify_mcp},
     mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    openai_mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
+    openai_mcp_tool_resolve::{MAX_FUNCTION_NAME_LEN, McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
 
@@ -259,6 +259,16 @@ const META_STATUS: &str = "responses.status";
 /// continuation overflow returns HTTP 502. Once SSE is committed, overflow
 /// emits one `error` event with no `response.completed` or `[DONE]`, and the
 /// failed response is not persisted.
+/// Finite Responses storage and Conversation append bound their response body
+/// buffer to the remaining allowance at the response-header boundary. A
+/// `Content-Length` above that allowance is rejected with HTTP 502 before the
+/// body is read. Without an accurate length, the body buffer still enforces
+/// the cap as chunks arrive; a post-header overflow closes the response.
+/// When client-tool restoration is armed, its finite response buffer reserves
+/// a conservative 256-times raw-body allowance plus echoed-tool overhead
+/// before headers commit. An unframed response may therefore reach its buffer
+/// cap well before the aggregate retained-payload limit; a response larger
+/// than that cap closes after headers rather than exposing lowered tool names.
 ///
 /// # YAML
 ///
@@ -443,6 +453,11 @@ impl HttpFilter for AgenticLoopFilter {
             return finish_incomplete_round(ctx, state, body);
         }
 
+        // Ownership classification builds a reverse MCP name index. Reserve
+        // its owned keys and encoder scratch before either classification pass.
+        if !mcp_tool_index_fits(&state) {
+            return finish_response_failure(ctx, state, &retained_payload_failure(), true);
+        }
         if has_mixed_function_call_ownership(&state) {
             return reject_mixed_ownership_round(ctx, state);
         }
@@ -452,7 +467,7 @@ impl HttpFilter for AgenticLoopFilter {
             return finish_response_failure(ctx, state, &failure, retained_budget_failure);
         }
 
-        if !state.can_retain_payload(0) {
+        if !state.can_retain_payload(0) || !mcp_tool_index_fits(&state) {
             if request_is_streaming(&state) {
                 state.discard_payload_for_budget_error();
             }
@@ -532,33 +547,33 @@ pub(crate) fn finish_request_after_deferred_dispatch(
 
 /// Apply the request-wide retained-payload limit before any local dispatcher
 /// side effect or upstream inference request.
-#[expect(clippy::too_many_lines, reason = "shared initial and continuation budget admission")]
 fn admit_retained_payload_budget(
     ctx: &mut HttpFilterContext<'_>,
     configured_limit: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
+    // Keep the budget obligation visible to response hooks even if an IRR
+    // extension handoff loses ResponsesState before conversation append-back.
+    ctx.set_metadata("responses.retained_budget_active", "true");
     #[cfg(feature = "store")]
     let store_payload_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
     #[cfg(not(feature = "store"))]
     let store_payload_bytes = 0;
-    let mut retained_overflow = None;
+    let mut retained_overflow = false;
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.apply_retained_payload_limit(configured_limit);
         state.set_retained_external_payload_bytes(store_payload_bytes);
         if !state.can_retain_payload(0) {
-            let initial = state.iteration == 0;
-            let streaming = request_is_streaming(state);
             state.discard_payload_for_budget_error();
-            retained_overflow = Some((initial, streaming));
+            retained_overflow = true;
         }
     }
     #[cfg(feature = "store")]
     if ctx.extensions.get::<ResponsesState>().is_some() {
         super::store::mark_retained_request_payload_charged(ctx);
     }
-    let Some((initial, streaming)) = retained_overflow else {
+    if !retained_overflow {
         return Ok(None);
-    };
+    }
 
     ctx.set_metadata("responses.skip_persist", "true");
     set_action(ctx, ACTION_DONE)?;
@@ -566,32 +581,10 @@ fn admit_retained_payload_budget(
     // Drop the sibling store snapshot at the same boundary as the shared state.
     #[cfg(feature = "store")]
     super::store::discard_retained_request_payload(ctx);
-    if initial {
-        return Ok(Some(FilterAction::Reject(responses_error_rejection(
-            413,
-            "invalid_request_error",
-            "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-        ))));
-    }
-    if streaming {
-        let body = encode_local_error(
-            ctx,
-            "server_error",
-            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
-        );
-        let mut rejection = Rejection::status(200)
-            .with_header("content-type", "text/event-stream")
-            .preserving_keepalive();
-        if let Some(body) = body {
-            rejection = rejection.with_body(body);
-        }
-        return Ok(Some(FilterAction::Reject(rejection)));
-    }
-    Ok(Some(FilterAction::Reject(responses_error_rejection(
-        502,
-        "server_error",
+    Ok(Some(super::budget_error::reject_request(
+        ctx,
         "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
-    ))))
+    )))
 }
 
 /// Apply dispatcher-specific response validation before the sole loop decision.
@@ -728,14 +721,16 @@ fn convert_dispatch_failure(
         // `encode_local_error`). Only skip persistence of the failed round.
         ctx.set_metadata("responses.skip_persist", "true");
     }
-    #[cfg(feature = "store")]
     let retained_budget_failure = state.retained_payload_failed;
     ctx.extensions.insert(state);
-    #[cfg(feature = "store")]
-    if retained_budget_failure {
-        super::store::discard_retained_request_payload(ctx);
-    }
     set_action(ctx, ACTION_DONE)?;
+
+    if retained_budget_failure {
+        return Ok(FilterAction::Reject(super::budget_error::request_rejection(
+            ctx,
+            &failure.message,
+        )));
+    }
 
     if streaming {
         let body = encode_local_error(ctx, failure.code, &failure.message);
@@ -811,6 +806,7 @@ fn prepare_streamed_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesStat
     if !super::streamed_round_is_dispatchable(ctx, state) {
         collect_streaming_output_items(state)?;
         state.tool_calls.clear();
+        state.mark_tool_calls_changed();
         state.tool_search_calls.clear();
         state.web_search_calls.clear();
         // No dispatcher runs on a non-dispatchable (terminal) round, so drop the
@@ -832,6 +828,7 @@ fn end_stream_with_error(
     message: &str,
 ) -> Result<(), FilterError> {
     state.tool_calls.clear();
+    state.mark_tool_calls_changed();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
@@ -849,15 +846,25 @@ fn end_stream_with_error(
 /// re-entry, reset `tool_choice`. Header replay has already happened during
 /// body pre-read, before request filters and routing inspect the headers.
 fn prepare_iteration(state: &mut ResponsesState) {
+    state.buffered_canonical_finalized = false;
+    state.buffered_canonical_wire_bytes = None;
+    state.buffered_canonical_parsed_bound_bytes = None;
+    state.buffered_canonical_body_digest = None;
     state.tool_calls.clear();
     #[cfg(feature = "openai-mcp-tools")]
     state.approved_tool_calls.clear();
+    state.mark_tool_calls_changed();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
 
     if state.iteration > 0 {
         let original = std::mem::replace(&mut state.tool_choice, json!("auto"));
-        state.original_tool_choice.get_or_insert(original);
+        if state.original_tool_choice.is_none() {
+            state.original_tool_choice = Some(original);
+            // An explicit `"auto"` leaves request_body unchanged, but the
+            // preserved original is a new owner in the stable stream charge.
+            state.mark_replay_stable_payload_changed();
+        }
         set_request_body_field(state, "tool_choice", json!("auto"));
     }
 }
@@ -992,6 +999,38 @@ fn has_dispatchable_calls(state: &ResponsesState) -> bool {
         || has_dispatchable_mcp_work(state)
 }
 
+/// Both agentic ownership predicates build a temporary reverse MCP name index.
+/// Admission must be rechecked after dispatcher preparation can grow the state.
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_tool_index_fits(state: &ResponsesState) -> bool {
+    (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty())
+        || mcp_tool_index_charge(state).is_some_and(|charge| state.can_retain_payload(charge))
+}
+
+/// Account for the index's owned encoded names and its largest in-flight raw
+/// and sanitized encoder strings without allocating them first.
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_tool_index_charge(state: &ResponsesState) -> Option<usize> {
+    if state.retained_payload_limit().is_none() {
+        return Some(0);
+    }
+    let (names, largest_raw) =
+        state
+            .mcp_tool_map
+            .keys()
+            .try_fold((0_usize, 0_usize), |(names, largest_raw), (server, tool)| {
+                let raw = server.len().checked_add(2)?.checked_add(tool.len())?;
+                Some((names.checked_add(raw.min(MAX_FUNCTION_NAME_LEN))?, largest_raw.max(raw)))
+            })?;
+    names.checked_add(largest_raw.checked_mul(2)?)
+}
+
+#[cfg(not(feature = "openai-mcp-tools"))]
+/// Without MCP tool resolution there is no reverse index to allocate.
+const fn mcp_tool_index_fits(_state: &ResponsesState) -> bool {
+    true
+}
+
 /// Whether deferred MCP discovery is pending or a recorded call resolves to a
 /// configured MCP tool (auto or approval-required).
 #[cfg(feature = "openai-mcp-tools")]
@@ -1073,34 +1112,40 @@ fn evaluate_loop_decision(
 /// remaining `max_tool_calls` budget, and drop them from dispatch.
 #[expect(
     clippy::too_many_lines,
-    reason = "updates canonical output and the matching persisted round"
+    reason = "updates admitted selections, canonical output, and matching persisted history"
 )]
 fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
-    if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
+    if state.tool_search_calls.is_empty() {
         return;
     }
+    let selected = state.selected_tool_search_calls();
+    let admissions = current_round_tool_call_admissions(state, &selected);
     let round_start = state.current_round_output_start.unwrap_or(0);
-    let selected: Vec<(usize, &str)> = state
-        .tool_search_calls
-        .iter()
-        .filter_map(|assignment| {
-            (assignment.output_index >= round_start)
-                .then(|| {
-                    assignment
-                        .resolve(&state.accumulated_output, "tool_search_call")
-                        .map(|_| (assignment.output_index, assignment.item_id.as_str()))
-                })
-                .flatten()
-        })
-        .collect();
-    if selected.is_empty() {
-        state.tool_search_calls.clear();
+    let mut admitted = Vec::new();
+    let mut denied = Vec::new();
+    let mut decision = admissions.into_iter();
+    for assignment in std::mem::take(&mut state.tool_search_calls) {
+        if assignment.output_index < round_start
+            || assignment
+                .resolve(&state.accumulated_output, "tool_search_call")
+                .is_none()
+        {
+            continue;
+        }
+        if decision.next() == Some(true) {
+            admitted.push(assignment);
+        } else {
+            denied.push(assignment);
+        }
+    }
+    state.tool_search_calls = admitted;
+    if denied.is_empty() {
         return;
     }
-    for (output_index, _) in &selected {
+    for assignment in &denied {
         if let Some(obj) = state
             .accumulated_output
-            .get_mut(*output_index)
+            .get_mut(assignment.output_index)
             .and_then(Value::as_object_mut)
         {
             obj.insert("status".to_owned(), json!("incomplete"));
@@ -1110,8 +1155,8 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     // `tool_search_call` in history. Walk backward so a reused provider ID in
     // an earlier round cannot retroactively change that round's stored output.
     let mut pending = HashMap::<&str, usize>::new();
-    for (_, item_id) in selected {
-        *pending.entry(item_id).or_default() += 1;
+    for assignment in &denied {
+        *pending.entry(assignment.item_id.as_str()).or_default() += 1;
     }
     let mut remaining: usize = pending.values().sum();
     for item in state.persisted_messages.iter_mut().rev() {
@@ -1135,7 +1180,6 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
         }
     }
     state.mark_replay_stable_payload_changed();
-    state.tool_search_calls.clear();
 }
 
 /// Remove representation metadata after replacing a buffered response body.
@@ -1176,6 +1220,62 @@ fn end_at_iteration_limit(
 // Body Parsing
 // -----------------------------------------------------------------------------
 
+/// Upper bound on compact JSON bytes after parsing a native response.
+///
+/// `serde_json` can expand exponent or decimal-form numbers while serializing
+/// its parsed `Value` (for example, `1e15` becomes `1000000000000000.0`, and
+/// rounding can turn a plain decimal into a longer exponent form). Its current
+/// finite-float formatter has a 24-byte buffer. Scan number tokens outside
+/// strings without allocating so the parsed tree is admitted before creation.
+/// Integers below 20 bytes retain their spelling length; `-0` is special.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass lexical bound skips quoted number-like text"
+)]
+pub(crate) fn buffered_parsed_json_bytes_upper_bound(body: &[u8]) -> Option<usize> {
+    const MAX_FORMATTED_NUMBER_BYTES: usize = 24;
+    let mut extra = 0_usize;
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(&byte) = body.get(index) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte != b'-' && !byte.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut may_normalize = false;
+        while let Some(&number_byte) = body.get(index) {
+            if !matches!(number_byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+                break;
+            }
+            may_normalize |= matches!(number_byte, b'e' | b'E' | b'.');
+            index += 1;
+        }
+        let token = body.get(start..index)?;
+        if may_normalize || token.len() >= 20 || token == b"-0" {
+            extra = extra.checked_add(MAX_FORMATTED_NUMBER_BYTES.saturating_sub(token.len()))?;
+        }
+    }
+    body.len().checked_add(extra)
+}
+
 /// Extract completed function-call items from a non-streaming response body
 /// and populate `state.tool_calls` and `state.messages`.
 #[expect(
@@ -1184,26 +1284,29 @@ fn end_at_iteration_limit(
 )]
 fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     // The framework owns and separately bounds the raw response body. Only the
-    // parsed response and the copies retained by agentic-loop state belong in
-    // this aggregate budget. The body length is an allocation-free upper bound
-    // for the parsed value's compact JSON payload, so reserve that projection
-    // before serde allocates it. The exact retained-owner accounting below runs
-    // after normalization and ID insertion without charging the framework body.
-    if !state.can_retain_payload(body.len()) {
+    // parsed response and copies retained by agentic-loop state belong in this
+    // aggregate budget. Numeric normalization can expand compact JSON beyond
+    // the wire length, so reserve a checked upper bound before serde allocates.
+    let parsed_bound = if state.retained_payload_limit().is_some() {
+        buffered_parsed_json_bytes_upper_bound(body).ok_or_else(retained_payload_failure)?
+    } else {
+        body.len()
+    };
+    if !state.can_retain_payload(parsed_bound) {
         return Err(retained_payload_failure());
     }
     let response = serde_json::from_slice::<Value>(body)
         .ok()
         .filter(is_responses_api_output);
     let Some(mut response) = response else {
-        state.response_object = Value::Null;
+        state.replace_response_object(Value::Null);
         state.tool_calls.clear();
+        state.mark_tool_calls_changed();
         return Ok(());
     };
     let normalization_staging = output_normalization_staging_bytes(&response, has_file_search_tool(state))
         .ok_or_else(retained_payload_failure)?;
-    if !body
-        .len()
+    if !parsed_bound
         .checked_add(normalization_staging)
         .is_some_and(|bytes| state.can_retain_payload(bytes))
     {
@@ -1229,7 +1332,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
         merge_usage(&mut state.usage, usage);
     }
     collect_output_items(&mut response, state, &private_indices);
-    state.response_object = response;
+    state.replace_response_object(response);
     Ok(())
 }
 
@@ -1311,13 +1414,16 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
             Some("tool_search_call") => usize::from(is_completed_output_item(item)),
             _ => 0,
         };
-        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
-            .filter(|id| !state.provider_compaction_ids.contains(*id))
-            .map_or(0, str::len);
+        // A provider compaction item also copies its ID into the replay set.
+        let replay_id_bytes = if item.get("type").and_then(Value::as_str) == Some("compaction") {
+            item.get("id").and_then(Value::as_str).map_or(0, str::len)
+        } else {
+            0
+        };
         let Some(total) = bytes
             .checked_mul(copies)
             .and_then(|bytes| bytes.checked_add(dispatch_assignment_id_bytes(item)))
-            .and_then(|bytes| bytes.checked_add(id_bytes))
+            .and_then(|bytes| bytes.checked_add(replay_id_bytes))
             .and_then(|bytes| copied_item_bytes.checked_add(bytes))
         else {
             return false;
@@ -1354,10 +1460,12 @@ fn retained_payload_failure() -> DispatchFailure {
 /// Bound payload allocated while provider output is normalized in place.
 ///
 /// Private file-search translation parses the arguments JSON and clones its
-/// decoded queries before removing the original argument string. Two argument
-/// lengths cover the parsed tree plus decoded-query owner; call-id copies and
-/// fixed rewritten fields are charged separately. Synthetic public IDs are
-/// bounded without formatting them first.
+/// decoded queries before removing the original argument string. The parsed
+/// tree can expand scientific numbers even though the outer response stores
+/// the arguments as a string. Reserve that projected tree and one argument
+/// length for decoded-query copies; call-id copies and fixed rewritten fields
+/// are charged separately. Synthetic public IDs are bounded without formatting
+/// them first.
 fn output_normalization_staging_bytes(response: &Value, translate_file_search: bool) -> Option<usize> {
     let Some(output) = response.get("output").and_then(Value::as_array) else {
         return Some(0);
@@ -1365,10 +1473,11 @@ fn output_normalization_staging_bytes(response: &Value, translate_file_search: b
     output.iter().try_fold(0_usize, |used, item| {
         let mut added = 0_usize;
         if translate_file_search && is_file_search_function_call(item) {
-            let arguments = item.get("arguments").and_then(Value::as_str).map_or(0, str::len);
+            let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+            let parsed_arguments = buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())?;
             let call_id = item.get("call_id").and_then(Value::as_str).map_or(0, str::len);
-            added = arguments
-                .checked_mul(2)?
+            added = parsed_arguments
+                .checked_add(arguments.len())?
                 .checked_add(call_id.checked_mul(2)?)?
                 .checked_add(256)?;
         }
@@ -1469,13 +1578,14 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
     };
     let output = std::mem::take(output);
     state.current_round_output_start = Some(state.accumulated_output.len());
-    let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
+    let mut pending_file_search: Vec<(usize, usize, SynthesisKind)> = Vec::new();
     for (round_index, item) in output.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") if is_dispatchable_function_call(&item) => {
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.tool_calls.push(assignment);
+                    state.mark_tool_calls_changed();
                 }
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
@@ -1527,6 +1637,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 // `FileSearchAssignment`; openai_file_search_callout drains those
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
+                let persisted_index = state.persisted_messages.len();
                 state.persisted_messages.push(item.clone());
                 if is_pending_file_search_call(&item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
@@ -1534,7 +1645,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                     } else {
                         SynthesisKind::Native
                     };
-                    pending_file_search.push((absolute_index, synthesis));
+                    pending_file_search.push((absolute_index, persisted_index, synthesis));
                 }
             },
             _ => {},
@@ -1566,19 +1677,20 @@ fn mark_provider_history(state: &mut ResponsesState) {
 /// call is terminalized to `incomplete` in place and no assignment is recorded —
 /// leaving `has_dispatchable_calls` free to exit the loop. The dispatcher applies
 /// only its independent per-continuation server cap to the recorded assignments.
-fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usize, SynthesisKind)>) {
+fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usize, usize, SynthesisKind)>) {
     if pending.is_empty() {
         return;
     }
     let mut candidates = Vec::with_capacity(pending.len());
-    for (output_index, synthesis) in pending {
+    let mut selected = Vec::with_capacity(pending.len());
+    for (output_index, persisted_index, synthesis) in pending {
         let Some(item_id) = state
             .accumulated_output
             .get(output_index)
             .and_then(|item| item.get("id"))
             .and_then(Value::as_str)
         else {
-            terminalize_file_search_item(state, output_index);
+            terminalize_file_search_item(state, output_index, persisted_index);
             continue;
         };
         candidates.push(FileSearchAssignment {
@@ -1586,26 +1698,36 @@ fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usiz
             item_id: item_id.to_owned(),
             synthesis,
         });
+        selected.push(persisted_index);
     }
     let admissions = current_round_file_search_admissions(state, &candidates);
-    for (index, assignment) in candidates.into_iter().enumerate() {
+    for (index, (assignment, persisted_index)) in candidates.into_iter().zip(selected).enumerate() {
         let admitted = admissions.get(index).copied().unwrap_or(false);
         if admitted {
             state.file_search_assignments.push(assignment);
         } else {
-            terminalize_file_search_item(state, assignment.output_index);
+            terminalize_file_search_item(state, assignment.output_index, persisted_index);
         }
     }
 }
 
-/// Mark the `file_search_call` at `index` in `accumulated_output` `incomplete`,
-/// dropping any partial results, when it cannot be dispatched.
-fn terminalize_file_search_item(state: &mut ResponsesState, index: usize) {
-    if let Some(item) = state.accumulated_output.get_mut(index)
-        && let Some(object) = item.as_object_mut()
+/// Mark both independently retained copies of a rejected file search incomplete.
+fn terminalize_file_search_item(state: &mut ResponsesState, output_index: usize, persisted_index: usize) {
+    let mut changed = false;
+    for item in [
+        state.accumulated_output.get_mut(output_index),
+        state.persisted_messages.get_mut(persisted_index),
+    ]
+    .into_iter()
+    .flatten()
     {
-        object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
-        object.remove("results");
+        if let Some(object) = item.as_object_mut() {
+            object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
+            object.remove("results");
+            changed = true;
+        }
+    }
+    if changed {
         state.mark_replay_stable_payload_changed();
     }
 }
@@ -1642,6 +1764,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
     // The stream accumulator owns only the response tree. Build dispatch
     // selections after normalization and the ownership transfer below.
     state.tool_calls.clear();
+    state.mark_tool_calls_changed();
     // Stamp stable synthetic IDs on any id-less streamed items before draining the
     // round into the accumulator (issue #955), mirroring the buffered path.
     ensure_public_output_item_ids_in_response(&mut state.response_object);
@@ -1654,7 +1777,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
     // Move the round out (leaving a valid `[]`), so each item is routed to its
     // last consumer by move; only earlier consumers of a shared item clone.
     let round = std::mem::take(state.output_items_mut());
-    let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
+    let mut pending_file_search: Vec<(usize, usize, SynthesisKind)> = Vec::new();
     for (round_index, item) in round.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
@@ -1717,7 +1840,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
                     state.pending_local_tool_synthesis.push((absolute_index, synthesis));
                 }
                 if is_pending_file_search_call(&item) {
-                    pending_file_search.push((absolute_index, synthesis));
+                    pending_file_search.push((absolute_index, state.persisted_messages.len(), synthesis));
                 }
                 state.persisted_messages.push(item.clone());
                 state.accumulated_output.push(item);
@@ -1746,6 +1869,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), Disp
     }
     record_file_search_assignments(state, pending_file_search);
     mark_provider_history(state);
+    state.mark_current_output_changed();
     Ok(())
 }
 
@@ -1798,13 +1922,15 @@ fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
             Some("tool_search_call") if is_completed_output_item(item) => 2,
             _ => 1,
         };
-        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
-            .filter(|id| !state.provider_compaction_ids.contains(*id))
-            .map_or(0, str::len);
+        let replay_id_bytes = if item.get("type").and_then(Value::as_str) == Some("compaction") {
+            item.get("id").and_then(Value::as_str).map_or(0, str::len)
+        } else {
+            0
+        };
         let Some(total) = bytes
             .checked_mul(copies)
             .and_then(|bytes| bytes.checked_add(dispatch_assignment_id_bytes(item)))
-            .and_then(|bytes| bytes.checked_add(id_bytes))
+            .and_then(|bytes| bytes.checked_add(replay_id_bytes))
             .and_then(|bytes| added.checked_add(bytes))
         else {
             return false;
@@ -1832,6 +1958,7 @@ fn clear_round_dispatch_state(state: &mut ResponsesState) {
     state.tool_calls.clear();
     #[cfg(feature = "openai-mcp-tools")]
     state.approved_tool_calls.clear();
+    state.mark_tool_calls_changed();
     state.web_search_calls.clear();
     state.tool_search_calls.clear();
     state.file_search_assignments.clear();

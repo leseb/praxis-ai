@@ -1417,6 +1417,66 @@ async fn an_explicit_null_conversation_is_treated_as_absent() {
 }
 
 #[tokio::test]
+async fn input_tokens_history_with_budget_rehydrates_without_create_state() {
+    let registry = setup_registry(MockStore::with_conversation("conv_count", json!([])));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"m","input":"count me","conversation":"conv_count"}"#,
+    ));
+
+    let request_filter =
+        crate::openai::responses::request::OpenaiResponsesRequestFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    assert!(matches!(
+        request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Release
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "unexpected rehydrate action: {action:?}"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.history_rehydrated)
+    );
+}
+
+#[tokio::test]
+async fn input_tokens_history_with_budget_rejects_oversized_store_row() {
+    let registry = setup_registry(MockStore::with_conversation(
+        "conv_large",
+        json!([{"role": "user", "content": "x".repeat(8_000)}]),
+    ));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"m","input":"count me","conversation":"conv_large"}"#,
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
 async fn non_create_operations_rehydrate_small_history_with_agentic_budget() {
     let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap())
         .expect("valid budget policy");
@@ -1847,7 +1907,238 @@ async fn restores_previous_response_id_into_response_body() {
 }
 
 #[tokio::test]
-async fn finite_restore_rejects_before_copying_a_near_limit_response() {
+async fn budgeted_direct_restore_admits_framed_response_with_policy_only() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let original = br#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    response.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&original.len().to_string()).unwrap(),
+    );
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.extensions
+        .insert(setup_registry(MockStore::with_status("resp_prev", "completed")));
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        RehydrateFilter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_limit()
+            .is_some()
+    );
+    let store_config = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: responses\nconversations_table: conversations\n",
+    )
+    .unwrap();
+    let store_filter = super::super::store::ResponseStoreFilter::from_config(&store_config).unwrap();
+    assert!(matches!(
+        store_filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer { max_bytes: Some(max) } if max == original.len()
+    ));
+    let mut body = Some(Bytes::from_static(original));
+    assert!(matches!(
+        RehydrateFilter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(restored["previous_response_id"], "resp_prev");
+}
+
+#[tokio::test]
+async fn budgeted_canonical_restore_accepts_finalized_body_without_content_length() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(1 << 20);
+    state.response_object = json!({
+        "id": "resp_new",
+        "object": "response",
+        "status": "completed",
+        "previous_response_id": null,
+        "output": [],
+    });
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    assert!(state.buffered_canonical_finalized);
+    let canonical_wire_bytes = state.buffered_canonical_wire_bytes.unwrap();
+    ctx.extensions.insert(state);
+    ctx.extensions
+        .insert(setup_registry(MockStore::with_status("resp_prev", "completed")));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        RehydrateFilter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let store_config = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: responses\nconversations_table: conversations\n",
+    )
+    .unwrap();
+    let store_filter = super::super::store::ResponseStoreFilter::from_config(&store_config).unwrap();
+    assert!(matches!(
+        store_filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        store_filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer { max_bytes: Some(max) } if max == canonical_wire_bytes
+    ));
+    assert!(matches!(
+        RehydrateFilter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        store_filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(restored["previous_response_id"], "resp_prev");
+}
+
+#[tokio::test]
+async fn finalized_restore_rejects_near_budget_before_headers() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(1 << 20);
+    state.response_object = json!({
+        "id": "resp_new", "object": "response", "status": "completed",
+        "previous_response_id": null, "output": [{"text": "x".repeat(1024)}],
+    });
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    let retained = state.retained_payload_bytes().unwrap();
+    let wire = state.buffered_canonical_wire_bytes.unwrap();
+    let parsed = state.buffered_canonical_parsed_bound_bytes.unwrap();
+    let header_peak = parsed * 5 + "resp_prev".len() * 12 + 128 + wire * 2;
+    state.apply_retained_payload_limit(retained + header_peak - 1);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    let action = RehydrateFilter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finalized_numeric_restore_header_admission_survives_body_phase() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(1 << 20);
+    state.response_object = json!({
+        "id": "resp_new", "object": "response", "status": "completed",
+        "previous_response_id": null, "output": [],
+        "created_at": 12_345_678_901_234_567_890_u64,
+    });
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    let retained = state.retained_payload_bytes().unwrap();
+    let wire = state.buffered_canonical_wire_bytes.unwrap();
+    let parsed = state.buffered_canonical_parsed_bound_bytes.unwrap();
+    assert!(parsed > wire, "numeric scanner must exceed the canonical wire length");
+    state.apply_retained_payload_limit(retained + parsed * 5 + "resp_prev".len() * 12 + 128 + wire * 2);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        RehydrateFilter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches_finalized_restore_admission(
+        &ctx,
+        body.as_deref().unwrap(),
+        "resp_prev"
+    ));
+    let mut changed = body.as_deref().unwrap().to_vec();
+    let id_start = changed.windows(8).position(|bytes| bytes == b"resp_new").unwrap();
+    changed[id_start] = b'R';
+    assert_eq!(changed.len(), body.as_ref().unwrap().len());
+    assert!(!matches_finalized_restore_admission(&ctx, &changed, "resp_prev"));
+    assert!(matches!(
+        RehydrateFilter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(restored["previous_response_id"], "resp_prev");
+}
+
+#[tokio::test]
+async fn finalized_store_rejects_near_budget_before_headers() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(setup_registry(MockStore::with_status("resp_prev", "completed")));
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(1 << 20);
+    state.response_object = json!({
+        "id": "resp_new", "object": "response", "status": "completed",
+        "previous_response_id": null, "output": [{"text": "x".repeat(1024)}],
+    });
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    let retained = state.retained_payload_bytes().unwrap();
+    let wire = state.buffered_canonical_wire_bytes.unwrap();
+    state.apply_retained_payload_limit(retained + wire * 2);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    let store_config = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nresponses_table: responses\nconversations_table: conversations\n",
+    )
+    .unwrap();
+    let store_filter = super::super::store::ResponseStoreFilter::from_config(&store_config).unwrap();
+
+    let action = store_filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn budgeted_direct_restore_rejects_unframed_response_before_headers() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(1 << 20);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    let action = RehydrateFilter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_restore_rejects_near_limit_response_before_headers() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut response = json_ok_response();
@@ -1864,25 +2155,115 @@ async fn finite_restore_rejects_before_copying_a_near_limit_response() {
     .unwrap();
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(baseline + body_bytes.len() * 2);
+    // This exercises the body-phase backstop after an already admitted
+    // canonical response, rather than the direct-route header admission.
+    state.buffered_canonical_finalized = true;
+    ctx.extensions.insert(state);
+    response.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&body_bytes.len().to_string()).unwrap(),
+    );
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 502),
+        other => panic!("expected pre-header budget rejection, got {other:?}"),
+    }
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_restore_reserves_numeric_normalization_before_parsing() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    let numeric_values = vec!["1e9"; 10_000].join(",");
+    let body_bytes = format!(
+        "{{\"id\":\"resp_new\",\"object\":\"response\",\"previous_response_id\":null,\"output\":[{numeric_values}]}}"
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    // Five raw-body owners plus the two possible framework wire buffers fit.
+    let raw_only_reservation = body_bytes.len() * 7 + "resp_prev".len() * 12 + 128;
+    state.apply_retained_payload_limit(baseline + raw_only_reservation);
+    state.buffered_canonical_finalized = true;
+    ctx.extensions.insert(state);
+    response.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&body_bytes.len().to_string()).unwrap(),
+    );
+    ctx.response_header = Some(&mut response);
+    // The trusted wire length is small enough for a raw-only reservation, but
+    // numeric normalization needs more space. Reject before client headers.
+    let FilterAction::Reject(rejection) = filter.on_response(&mut ctx).await.unwrap() else {
+        panic!("expected preheader normalization budget rejection");
+    };
+    assert_eq!(rejection.status, 502);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn direct_finite_restore_rejects_before_success_headers() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, "8250".parse().unwrap());
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(32_768);
     ctx.extensions.insert(state);
     ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn direct_finite_restore_rejects_unknown_framing_before_headers() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(32_768);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 502
+    ));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn canonical_incomplete_restore_keeps_existing_header_path() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(32_768);
+    state.response_object = json!({"id":"resp_new","object":"response","status":"incomplete"});
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    assert!(body.is_some());
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
     assert!(matches!(
         filter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-
-    let mut body = Some(Bytes::from(body_bytes.clone()));
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    match action {
-        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 502),
-        other => panic!("expected response-side budget rejection, got {other:?}"),
-    }
-    assert_eq!(
-        body.as_deref(),
-        Some(body_bytes.as_slice()),
-        "the rejected body was not rewritten"
-    );
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.get_filter_state::<RestorePreviousResponseId>().is_some());
 }
 
 #[tokio::test]
@@ -2008,6 +2389,300 @@ fn sse_ok_response() -> praxis_filter::Response {
         http::HeaderValue::from_static("text/event-stream"),
     );
     response
+}
+
+#[tokio::test]
+async fn budgeted_direct_sse_restore_admits_stream() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.response_header = Some(&mut response);
+
+    assert!(matches!(
+        RehydrateFilter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from_static(
+        b"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":0,\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\n\n",
+    ));
+    assert!(matches!(
+        RehydrateFilter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        std::str::from_utf8(body.as_ref().unwrap())
+            .unwrap()
+            .contains("resp_prev")
+    );
+}
+
+#[tokio::test]
+async fn budgeted_partial_frame_callbacks_do_not_rescan_prompt() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({
+        "input": "x".repeat(1 << 20),
+        "stream": true,
+        "previous_response_id": "resp_prev",
+    }));
+    state.history_rehydrated = true;
+    state.apply_retained_payload_limit(64 << 20);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        RehydrateFilter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let mut body = Some(Bytes::from_static(b"data: abc"));
+        assert!(matches!(
+            RehydrateFilter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(body.is_none());
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "200 partial SSE callbacks with a stable prompt took {elapsed:?}"
+    );
+}
+
+#[test]
+fn streaming_restore_cache_remeasures_changed_request_and_output() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "short", "previous_response_id": "resp_prev"}));
+    state.apply_retained_payload_limit(4_096);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state.request_body = json!({"input": "x".repeat(4_096)});
+    state.mark_replay_stable_payload_changed();
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+
+    state.request_body = json!({"input": "short", "previous_response_id": "resp_prev"});
+    state.mark_replay_stable_payload_changed();
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+    state.input.push(json!("x".repeat(4_096)));
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+    state.input.truncate(1);
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+    state.accumulated_output.push(json!({"text": "x".repeat(4_096)}));
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+}
+
+#[test]
+fn streaming_restore_cache_remeasures_same_length_prior_output_replacement() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi", "previous_response_id": "resp_prev"}));
+    state.accumulated_output.push(json!({"output": "small"}));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 128);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    let first = streaming_restore_budget(&mut armed, Some(&state)).unwrap().unwrap();
+    assert_eq!(
+        first.current, baseline,
+        "cached meter must count prior output exactly once"
+    );
+
+    state.accumulated_output[0] = json!({"output": "x".repeat(4_096)});
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert!(
+        streaming_restore_budget(&mut armed, Some(&state)).is_err(),
+        "same-length prior-output replacement must invalidate the cached charge"
+    );
+
+    state.accumulated_output[0] = json!({"output": "small"});
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(
+        streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current,
+        baseline
+    );
+}
+
+#[test]
+fn streaming_restore_cache_remeasures_same_length_deferred_connector_replacement() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi", "previous_response_id": "resp_prev"}));
+    state
+        .deferred_mcp
+        .push(crate::openai::responses::state::DeferredMcpConnector {
+            authorization: None,
+            allowed_tools: None,
+            connector_id: "connector".to_owned(),
+            headers: Some(json!({"X-Header": "small"})),
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: None,
+            server_label: "server".to_owned(),
+            server_url: "https://example.com/mcp".to_owned(),
+            timeout: std::time::Duration::from_secs(5),
+        });
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 128);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert_eq!(
+        streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current,
+        baseline
+    );
+
+    state.deferred_mcp.get_mut(0).unwrap().headers = Some(json!({"X-Header": "x".repeat(4_096)}));
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(state.deferred_mcp.len(), 1);
+    assert!(
+        streaming_restore_budget(&mut armed, Some(&state)).is_err(),
+        "same-length descriptor replacement must invalidate the cached charge"
+    );
+
+    state.deferred_mcp.get_mut(0).unwrap().headers = Some(json!({"X-Header": "small"}));
+    state.mark_replay_stable_payload_changed();
+    assert_eq!(
+        streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current,
+        baseline
+    );
+}
+
+#[test]
+fn streaming_restore_budget_reuses_large_prior_output_across_small_callbacks() {
+    fn measure(prior_output_bytes: usize) -> std::time::Duration {
+        let mut state = ResponsesState::from_request_body(json!({"input": "hi", "previous_response_id": "resp_prev"}));
+        state
+            .accumulated_output
+            .push(json!({"output": "x".repeat(prior_output_bytes)}));
+        state.apply_retained_payload_limit(64 << 20);
+        let mut armed = armed_stream(1 << 20, "resp_prev");
+        let expected = streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current;
+        assert_eq!(expected, state.retained_payload_bytes().unwrap());
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            let measured = streaming_restore_budget(&mut armed, Some(&state))
+                .unwrap()
+                .unwrap()
+                .current;
+            assert_eq!(std::hint::black_box(measured), expected);
+        }
+        started.elapsed()
+    }
+
+    let small = measure(1);
+    let large = measure(1_000_000);
+    assert!(
+        large <= small * 20 + std::time::Duration::from_millis(100),
+        "200 cached checks with 1 MiB of unchanged prior output took {large:?} versus {small:?} for a small item"
+    );
+}
+
+#[test]
+fn streaming_restore_cache_remeasures_changed_tool_snapshots() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "short", "previous_response_id": "resp_prev"}));
+    state.apply_retained_payload_limit(4_096);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "tool".to_owned()),
+        json!({"schema": "x".repeat(4_096)}),
+    );
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+    state.mcp_tool_map.clear();
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state.client_tool_echo = Some(crate::openai::responses::state::ClientToolEcho {
+        tools: vec![json!({"name": "x".repeat(4_096)})],
+        tool_choice: json!("auto"),
+    });
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_err());
+    state.client_tool_echo = None;
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+}
+
+#[test]
+fn streaming_restore_cache_remeasures_same_shape_response_object_edits() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "short", "previous_response_id": "resp_prev"}));
+    state.replace_response_object(json!({"output": [{"text": "small"}]}));
+    state.apply_retained_payload_limit(4_096);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+
+    state
+        .output_items_mut()
+        .get_mut(0)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("text".to_owned(), json!("x".repeat(4_096)));
+    assert!(
+        streaming_restore_budget(&mut armed, Some(&state)).is_err(),
+        "the same output array shape must not reuse a stale response charge"
+    );
+}
+
+#[test]
+fn streaming_restore_cache_remeasures_completed_call_id_replacement() {
+    let mut state = ResponsesState::from_request_body(json!({"input":"short", "previous_response_id":"resp_prev"}));
+    state.select_test_output("function_call", vec![json!({"id":"short", "arguments":"small"})]);
+    state.mark_tool_calls_changed();
+    state.apply_retained_payload_limit(4_096);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+    assert!(armed.tool_calls_charge.is_some());
+
+    state.tool_calls[0].item_id = "x".repeat(4_096);
+    state.mark_tool_calls_changed();
+    assert!(
+        streaming_restore_budget(&mut armed, Some(&state)).is_err(),
+        "an in-place call replacement must invalidate the cached charge"
+    );
+    state.tool_calls[0].item_id = "short".to_owned();
+    state.mark_tool_calls_changed();
+    assert!(streaming_restore_budget(&mut armed, Some(&state)).is_ok());
+}
+
+#[test]
+#[expect(clippy::print_stderr, reason = "reports matched Rehydrate budget-meter timing")]
+fn streaming_restore_cache_reuses_large_completed_call_charge() {
+    let mut state = ResponsesState::from_request_body(json!({"input":"hi", "previous_response_id":"resp_prev"}));
+    state.select_test_output(
+        "function_call",
+        vec![json!({"id":"x".repeat(1_000_000), "arguments":"{}"})],
+    );
+    state.mark_tool_calls_changed();
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    let expected = streaming_restore_budget(&mut armed, Some(&state))
+        .unwrap()
+        .unwrap()
+        .current;
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let measured = streaming_restore_budget(&mut armed, Some(&state))
+            .unwrap()
+            .unwrap()
+            .current;
+        assert_eq!(measured, expected);
+    }
+    eprintln!(
+        "200 Rehydrate budget checks with 1MiB completed call: {:?}",
+        started.elapsed()
+    );
 }
 
 /// Re-parse assembled SSE output bytes into frames for assertions.
@@ -2140,6 +2815,286 @@ async fn streaming_restore_emits_one_error_before_near_limit_frame_rewrite() {
 }
 
 #[tokio::test]
+async fn direct_stream_restore_error_follows_forwarded_provider_sequences() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 4_096);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let created = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_new\",\"previous_response_id\":null}}\n\n";
+    let mut body = Some(Bytes::from_static(created));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(parse_sse_frames(body.as_ref().unwrap()).len(), 1);
+
+    let delta = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"Hi\"}\n\n";
+    let mut body = Some(Bytes::from_static(delta));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(parse_sse_frames(body.as_ref().unwrap()).len(), 1);
+
+    let completed = format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({
+            "type":"response.completed", "sequence_number":2,
+            "response":{"id":"resp_new","previous_response_id":null,"output":"x".repeat(8_000)}
+        })
+    );
+    let mut body = Some(Bytes::from(completed));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let error = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(error.len(), 1);
+    assert_eq!(error[0].event_type.as_deref(), Some("error"));
+    let payload: Value = serde_json::from_slice(&error[0].data).unwrap();
+    assert_eq!(payload["sequence_number"], 2);
+}
+
+#[tokio::test]
+async fn direct_stream_restore_overflow_after_forwarded_terminal_tears_down_transport() {
+    for (terminal, event_header) in [
+        ("response.completed", true),
+        ("response.incomplete", true),
+        ("response.failed", true),
+        ("response.cancelled", true),
+        ("error", true),
+        ("response.completed", false),
+    ] {
+        let filter = default_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut response = sse_ok_response();
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.current_filter_id = Some(0);
+        let mut state = rehydrated_state("resp_prev");
+        state.request_body["stream"] = json!(true);
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(baseline + 4_096);
+        ctx.extensions.insert(state);
+        ctx.response_header = Some(&mut response);
+        assert!(matches!(
+            filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+
+        let event = if event_header {
+            format!("event: {terminal}\n")
+        } else {
+            String::new()
+        };
+        let frame = format!(
+            "{event}data: {}\n\n",
+            json!({
+                "type": terminal,
+                "sequence_number": 7,
+                "response": {"id": "resp_new", "object": "response", "previous_response_id": null}
+            })
+        );
+        let mut body = Some(Bytes::from(frame));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        let forwarded = parse_sse_frames(body.as_ref().expect("terminal frame is forwarded"));
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].event_type.as_deref(), event_header.then_some(terminal));
+
+        let admitted_comment = Bytes::from_static(b": keepalive\n\n");
+        let mut body = Some(admitted_comment.clone());
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert_eq!(
+            body,
+            Some(admitted_comment),
+            "{terminal}: a small trailing comment stays on the wire"
+        );
+
+        // A trailing comment is permitted by SSE framing, but this chunk is too
+        // large for the retained payload budget. No second terminal can follow.
+        let mut later = Some(Bytes::from(format!(":{}", "x".repeat(8_000))));
+        assert!(
+            filter.on_response_body(&mut ctx, &mut later, false).is_err(),
+            "{terminal}: overflow after the forwarded terminal must tear down the transport"
+        );
+        assert!(later.is_none(), "{terminal}: no budget error may enter the body");
+        // Praxis may be configured to continue after a filter error. Even then,
+        // no later provider chunk may escape once this response was aborted.
+        later = Some(Bytes::from_static(b"data: {\"provider_private\":true}\n\n"));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut later, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(later.is_none(), "{terminal}: later chunks must remain suppressed");
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    }
+}
+
+#[tokio::test]
+async fn rejected_chunk_does_not_count_terminal_or_sequence_it_never_forwarded() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 4_096);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    // The first frame is complete, but the second is an oversized partial.
+    // Admission rejects the whole chunk, so neither provider frame is sent.
+    let chunk = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":0}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"{}",
+        "x".repeat(8_000)
+    );
+    let mut body = Some(Bytes::from(chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let frames = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+    let error: Value = serde_json::from_slice(&frames[0].data).unwrap();
+    assert_eq!(error["sequence_number"], 0);
+}
+
+#[test]
+fn terminal_probe_uses_last_sse_event_field() {
+    assert!(frame_sequence_and_terminal(b"event: response.created\nevent: response.completed\ndata: {}\n\n").1);
+    assert!(
+        !frame_sequence_and_terminal(b"event: response.completed\nevent: response.output_text.delta\ndata: {}\n\n").1
+    );
+    assert!(!frame_sequence_and_terminal(b": response.completed\ndata: {}\n\n").1);
+    assert!(frame_sequence_and_terminal(b"data: {\"type\":\"response.completed\"}\n\n").1);
+    assert!(frame_sequence_and_terminal(b"data: {\"ty\\u0070e\":\"response.comple\\u0074ed\"}\n\n").1);
+    assert!(frame_sequence_and_terminal(b"data: {\"type\":\ndata: \"response.completed\"}\n\n").1);
+    assert!(
+        !frame_sequence_and_terminal(
+            b"data: {\"nested\":{\"type\":\"response.completed\"},\"type\":\"response.output_text.delta\"}\n\n"
+        )
+        .1
+    );
+    assert!(
+        !frame_sequence_and_terminal(b"event: response.completed\n\n").1,
+        "an event-only SSE frame is not dispatched to the client"
+    );
+}
+
+#[tokio::test]
+async fn streaming_restore_reserves_exponent_normalization_before_rewrite() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let numbers = vec!["1e15"; 10_000].join(",");
+    let frame = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":0,\"response\":{{\"id\":\"resp_new\",\"previous_response_id\":null,\"output\":[{numbers}]}}}}\n\n"
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + frame.len() * 10);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from(frame));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let frames = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+}
+
+#[test]
+fn sse_normalization_bound_excludes_comment_quotes() {
+    let numbers = vec!["1e15"; 1_000].join(",");
+    let frame = format!(
+        ": \"\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"object\":\"response\",\"output\":[{numbers}]}}}}\n\n"
+    );
+    let joined = join_sse_data_payload(frame.as_bytes()).unwrap();
+    let parsed: Value = serde_json::from_slice(&joined).unwrap();
+    let normalized = serde_json::to_vec(&parsed).unwrap();
+    assert!(
+        joined_sse_json_bytes_upper_bound(frame.as_bytes()).unwrap() >= normalized.len(),
+        "an arbitrary quote in an SSE comment cannot hide JSON number expansion"
+    );
+
+    let multiline = b"data: {\"output\":[1e15,\ndata: 2e15]}\n\n";
+    let joined = join_sse_data_payload(multiline).unwrap();
+    let parsed: Value = serde_json::from_slice(&joined).unwrap();
+    let normalized = serde_json::to_vec(&parsed).unwrap();
+    assert!(
+        joined_sse_json_bytes_upper_bound(multiline).unwrap() >= normalized.len(),
+        "the inserted newline between data fields remains in the bound"
+    );
+}
+
+#[tokio::test]
+async fn streaming_restore_rejects_comment_masked_number_expansion_before_rewrite() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    let numbers = vec!["1e15"; 10_000].join(",");
+    let frame = format!(
+        ": \"\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":7,\"response\":{{\"id\":\"resp_new\",\"object\":\"response\",\"previous_response_id\":null,\"output\":[{numbers}]}}}}\n\n"
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + frame.len() * 10);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::from(frame));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let frames = parse_sse_frames(body.as_ref().unwrap());
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn buffered_rewrite_reserves_later_plain_frame_output_growth() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -2234,6 +3189,20 @@ fn response_key_probe_skips_comments_and_preserves_escaped_keys() {
     ));
 }
 
+#[test]
+fn forwarded_sequence_probe_reads_only_top_level_integer() {
+    assert_eq!(
+        frame_sequence_and_terminal(
+            b"data: {\"nested\":{\"sequence_number\":99},\"sequence_numb\\u0065r\":7,\"delta\":\"sequence_number: 100\"}\n\n"
+        ).0,
+        Some(7)
+    );
+    assert_eq!(
+        frame_sequence_and_terminal(b"data: {\"nested\":{\"sequence_number\":99}}\n\n").0,
+        None
+    );
+}
+
 #[tokio::test]
 async fn streaming_restore_forwards_nested_response_with_no_rewrite_headroom() {
     let filter = default_filter();
@@ -2277,44 +3246,65 @@ async fn streaming_restore_forwards_nested_response_with_no_rewrite_headroom() {
 
 #[test]
 fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
+    fn fits(armed: &mut RestorePreviousResponseIdStream, state: &ResponsesState) -> bool {
+        streaming_restore_budget(armed, Some(state)).is_ok_and(|budget| streaming_restore_fits(budget, 0, 16))
+    }
+
     let mut state = rehydrated_state("resp_prev");
     state.messages.push(json!("h".repeat(32_000)));
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(baseline + 128);
-    let mut stable_budget = None;
-    assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
-    let cached = stable_budget.unwrap();
+    let mut armed = armed_stream(MAX_JSON_BODY_BYTES, "resp_prev");
+    assert!(fits(&mut armed, &state));
+    let cached = armed.stable_payload.unwrap();
+
+    state.retained_stream_parser_bytes = 120;
+    assert!(cached.matches(&state, state.retained_payload_limit().unwrap()));
+    assert!(
+        !fits(&mut armed, &state),
+        "a cached output charge must still include the live stream parser"
+    );
+    state.retained_stream_parser_bytes = 0;
 
     // Dispatch can append history after a round has already advanced. The
     // cache must refresh even when the logical iteration did not change.
     state.messages.push(json!("new".repeat(80)));
-    assert!(!cached.matches(&state));
-    assert!(!streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
+    assert!(!cached.matches(&state, state.retained_payload_limit().unwrap()));
+    assert!(!fits(&mut armed, &state));
 
     state.messages.pop();
     state.retained_stream_parser_bytes = 80;
     state.accumulated_output.push(json!("o".repeat(80)));
-    assert!(cached.matches(&state));
+    assert!(!cached.matches(&state, state.retained_payload_limit().unwrap()));
     assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
-        "the changing meter must include parser bytes and canonical output"
+        !fits(&mut armed, &state),
+        "the stable output cache and changing meter must include output and parser bytes"
     );
 
     state.retained_stream_parser_bytes = 0;
     state.accumulated_output.clear();
     state.messages[0] = json!("h".repeat(33_000));
     state.mark_replay_stable_payload_changed();
-    assert!(!cached.matches(&state));
+    assert!(!cached.matches(&state, state.retained_payload_limit().unwrap()));
     assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        !fits(&mut armed, &state),
         "an in-place history replacement must invalidate the cached charge"
     );
 
     state.messages[0] = json!("h".repeat(32_000));
     state.replay_stable_payload_revision = None;
+    assert!(!fits(&mut armed, &state), "an exhausted revision must fail closed");
     assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
-        "an exhausted revision must fail closed"
+        !cached.matches(&state, state.retained_payload_limit().unwrap()),
+        "an exhausted revision must invalidate the earlier charge"
+    );
+    state.replay_stable_payload_revision = Some(1);
+    state.current_output_revision = Some(u64::MAX);
+    state.mark_current_output_changed();
+    assert_eq!(state.current_output_revision, None);
+    assert!(
+        !fits(&mut armed, &state),
+        "an exhausted current-output revision must also fail closed"
     );
 }
 
@@ -3422,7 +4412,11 @@ fn armed_stream(max_buffer_bytes: usize, prev_id: &str) -> RestorePreviousRespon
         scan_at_line_start: true,
         max_buffer_bytes,
         previous_response_id: prev_id.to_owned(),
-        stable_budget: None,
+        last_forwarded_sequence: None,
+        forwarded_terminal: false,
+        stable_payload: None,
+        response_object_charge: None,
+        tool_calls_charge: None,
     }
 }
 

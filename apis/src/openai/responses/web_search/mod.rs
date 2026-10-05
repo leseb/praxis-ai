@@ -1050,7 +1050,9 @@ fn web_search_response_limit(
     let prior = web_search_results_bytes(prior_results)?.checked_mul(32)?;
     let request = query.len().checked_mul(8)?.checked_add(4_096)?;
     let available = limit.checked_sub(current)?.checked_sub(prior)?.checked_sub(request)?;
-    let response_limit = available / 32;
+    // The buffered transport can stage and copy a full chunk before its
+    // response-length check, even when the derived limit is only a few bytes.
+    let response_limit = available.checked_sub(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES)? / 32;
     (response_limit > 0).then_some(response_limit.min(MAX_SEARCH_RESPONSE_BYTES))
 }
 

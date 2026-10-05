@@ -95,8 +95,10 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     responses_are_owner_scoped(backend).await;
     response_id_is_globally_unique(backend).await;
     approvals_consume_all_or_nothing(backend).await;
+    approval_payload_size_is_scoped(backend).await;
     approvals_require_an_owner_matched_response(backend).await;
     persist_pairs_response_and_approvals(backend).await;
+    insert_if_absent_preserves_prior_response(backend).await;
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
@@ -277,6 +279,103 @@ async fn approvals_consume_all_or_nothing(backend: &dyn PersistedStateBackend) {
     );
 }
 
+/// The size-only query sees exactly the issuing owner's matching records.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear owner and issuing-response scope contract assertions"
+)]
+async fn approval_payload_size_is_scoped(backend: &dyn PersistedStateBackend) {
+    let issuing_owner = owner("approval-size");
+    let other_owner = owner("approval-size-other");
+    let first_response = "resp_approval_size_first";
+    let second_response = "resp_approval_size_second";
+    let third_response = "resp_approval_size_third";
+    for (response_id, response_owner) in [
+        (first_response, &issuing_owner),
+        (second_response, &other_owner),
+        (third_response, &issuing_owner),
+    ] {
+        backend
+            .upsert_response(&ResponseRecord {
+                id: response_id.to_owned(),
+                owner: response_owner.clone(),
+                created_at: 1,
+                model: "m".to_owned(),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .expect("upsert issuing response for size query");
+    }
+    let mut first = approval("shared-approval");
+    first.arguments = "☃".repeat(32);
+    let mut second = approval("shared-approval");
+    second.arguments = "x".repeat(1024);
+    let mut third = approval("shared-approval");
+    third.arguments = "y".repeat(2048);
+    backend
+        .record_pending_approvals(&issuing_owner, first_response, std::slice::from_ref(&first), 1)
+        .await
+        .expect("record first pending approval");
+    backend
+        .record_pending_approvals(&other_owner, second_response, std::slice::from_ref(&second), 1)
+        .await
+        .expect("record second pending approval");
+    backend
+        .record_pending_approvals(&issuing_owner, third_response, std::slice::from_ref(&third), 1)
+        .await
+        .expect("record third pending approval");
+
+    let bytes = |record: &PendingApprovalRecord| {
+        record.approval_id.len()
+            + record.server_label.len()
+            + record.tool_name.len()
+            + record.arguments.len()
+            + record.target_fingerprint.len()
+    };
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, first_response, &["shared-approval", "missing"])
+            .await
+            .expect("size first approval"),
+        bytes(&first),
+        "size query must count UTF-8 bytes only for matching rows"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&other_owner, second_response, &["shared-approval"])
+            .await
+            .expect("size second approval"),
+        bytes(&second),
+        "a matching ID in another owner scope has an independent size"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, third_response, &["shared-approval"])
+            .await
+            .expect("size same-owner approval under another response"),
+        bytes(&third),
+        "the same approval ID under another issuing response has an independent size"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, second_response, &["shared-approval"])
+            .await
+            .expect("size cross-owner approval"),
+        0,
+        "another owner's issuing response must not expose its pending payload"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, first_response, &["missing"])
+            .await
+            .expect("size absent approval"),
+        0,
+        "an absent ID contributes no stored payload"
+    );
+}
+
 /// Approval rows cannot exist without an issuing response owned by the caller.
 #[expect(clippy::too_many_lines, reason = "linear parent and owner contract assertions")]
 async fn approvals_require_an_owner_matched_response(backend: &dyn PersistedStateBackend) {
@@ -373,6 +472,85 @@ async fn persist_pairs_response_and_approvals(backend: &dyn PersistedStateBacken
             .expect("get after delete")
             .is_empty(),
         "approval orphaned after its response was deleted"
+    );
+}
+
+/// A rollback candidate must never replace a preexisting response or its
+/// approvals, including when a provider reuses an ID for the same owner.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks same-owner and cross-owner collisions with approvals"
+)]
+async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateBackend) {
+    let first_owner = owner("insert-first");
+    let second_owner = owner("insert-second");
+    let original = ResponseRecord {
+        id: "resp_insert_once".to_owned(),
+        owner: first_owner.clone(),
+        created_at: 1,
+        model: "old".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "old"}),
+        input: serde_json::json!([]),
+        messages: serde_json::json!([]),
+    };
+    assert!(
+        backend
+            .persist_response_with_pending_approvals_if_absent(&original, &[approval("pa_old")])
+            .await
+            .expect("first insert"),
+        "new response must insert"
+    );
+    let replacement = ResponseRecord {
+        model: "new".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "new"}),
+        ..original.clone()
+    };
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(&replacement, &[approval("pa_new")])
+            .await
+            .expect("same-owner collision"),
+        "same-owner collision must not replace the existing response"
+    );
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(
+                &ResponseRecord {
+                    owner: second_owner.clone(),
+                    ..replacement
+                },
+                &[approval("pa_other")],
+            )
+            .await
+            .expect("cross-owner collision"),
+        "cross-owner collision must not replace the existing response"
+    );
+    let stored = backend
+        .get_response(&first_owner, &original.id)
+        .await
+        .expect("get original")
+        .expect("original retained");
+    assert_eq!(
+        stored.response_object.get("marker"),
+        Some(&serde_json::json!("old")),
+        "same-owner collision changed the original response"
+    );
+    assert!(
+        backend
+            .get_response(&second_owner, &original.id)
+            .await
+            .expect("get other")
+            .is_none(),
+        "cross-owner collision leaked the original response"
+    );
+    assert_eq!(
+        backend
+            .get_pending_approvals(&first_owner, &original.id, &["pa_old", "pa_new", "pa_other"])
+            .await
+            .expect("get approvals")
+            .len(),
+        1,
+        "collisions must not write replacement approvals"
     );
 }
 

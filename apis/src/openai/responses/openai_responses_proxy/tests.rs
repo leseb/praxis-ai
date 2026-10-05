@@ -13,7 +13,7 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::super::state::ResponsesState;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::test_utils::{make_filter_context, make_filter_context_without_subrequest_client, make_request};
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -779,6 +779,250 @@ async fn rejects_selected_rebuild_above_effective_request_body_limit() {
         Some(&original),
         "an oversized selected projection must not be committed to the upstream body"
     );
+}
+
+#[tokio::test]
+async fn request_body_rewrite_rejects_before_copying_over_budget_history() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    state
+        .messages
+        .push(json!({"role": "assistant", "content": "x".repeat(1_024)}));
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    ctx.extensions.insert(state);
+    let original = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_ref(), Some(&original));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn request_body_rewrite_allows_small_budgeted_continuation() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    state.messages.push(json!({"role": "assistant", "content": "done"}));
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 4_096);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn selected_rewrite_rejects_before_copying_over_budget_history() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    state
+        .messages
+        .push(json!({"role": "assistant", "content": "x".repeat(1_024)}));
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    ctx.extensions.insert(state);
+    let original = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(original.clone());
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_ref(), Some(&original));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn selected_rewrite_allows_small_budgeted_continuation() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    state.messages.push(json!({"role": "assistant", "content": "done"}));
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 4_096);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn native_selected_rebuild_reserves_owned_input_before_serialization() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context_without_subrequest_client(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    let message = json!({"role": "assistant", "content": "x".repeat(16_384)});
+    state.messages.push(message.clone());
+    state.persisted_messages.push(message);
+    state.mark_request_body_for_rebuild();
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    ctx.extensions.insert(state);
+    let original = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(original.clone());
+
+    let action = make_filter()
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_ref(), Some(&original));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn native_selected_rebuild_continues_when_rewrite_owners_fit() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context_without_subrequest_client(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    state.messages.push(json!({"role": "assistant", "content": "done"}));
+    state.mark_request_body_for_rebuild();
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 16_384);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+
+    let action = make_filter()
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn native_selected_rebuild_reserves_each_duplicate_input_replacement() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context_without_subrequest_client(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request);
+    state.iteration = 1;
+    state
+        .messages
+        .push(json!({"role": "assistant", "content": "x".repeat(16_384)}));
+    state.mark_request_body_for_rebuild();
+    let original = Bytes::from(format!(
+        "{{\"model\":\"m\",{}\"input\":\"hi\"}}",
+        "\"input\":\"hi\",".repeat(11)
+    ));
+    let members = super::scan_top_level_object(&original).unwrap();
+    let unbounded = (super::ResponsesProxyFilter {
+        config: super::ResponsesProxyConfig::default(),
+    })
+    .serialize_selected_body(
+        &original,
+        &members,
+        &state,
+        true,
+        super::selected_input_messages(&original, &members).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        unbounded
+            .windows(b"\"input\":".len())
+            .filter(|window| *window == b"\"input\":")
+            .count(),
+        12
+    );
+    assert!(unbounded.len() > 150_000);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 150_000);
+    ctx.extensions.insert(state);
+    let mut body = Some(original.clone());
+
+    let action = make_filter()
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_ref(), Some(&original));
+}
+
+#[tokio::test]
+async fn native_selected_rebuild_reserves_local_compaction_translation() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context_without_subrequest_client(&req);
+    let request = json!({"model": "m", "input": "hi"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(vec![1_u8; 16_384]);
+    state.messages.push(json!({
+        "type": "compaction",
+        "id": "local",
+        "encrypted_content": encoded,
+        "_praxis_local_compaction": true,
+    }));
+    state.mark_request_body_for_rebuild();
+    let original = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let members = super::scan_top_level_object(&original).unwrap();
+    let expanded = (super::ResponsesProxyFilter {
+        config: super::ResponsesProxyConfig::default(),
+    })
+    .serialize_selected_body(
+        &original,
+        &members,
+        &state,
+        true,
+        super::selected_input_messages(&original, &members).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(expanded.len() > 98_000);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 190_000);
+    ctx.extensions.insert(state);
+    let mut body = Some(original.clone());
+
+    let action = make_filter()
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 502));
+    assert_eq!(body.as_ref(), Some(&original));
 }
 
 #[test]

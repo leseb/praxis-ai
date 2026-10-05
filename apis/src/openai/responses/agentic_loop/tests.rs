@@ -715,6 +715,22 @@ async fn tool_choice_reset_after_first_iteration() {
     );
 }
 
+#[test]
+fn explicit_auto_tool_choice_invalidates_stable_charge_on_reentry() {
+    let mut state = ResponsesState::from_request_body(json!({"input":[], "tool_choice":"auto"}));
+    state.iteration = 1;
+    let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+    let revision_before = state.replay_stable_payload_revision;
+
+    super::prepare_iteration(&mut state);
+
+    assert_eq!(state.tool_choice, json!("auto"));
+    assert_eq!(state.original_tool_choice, Some(json!("auto")));
+    assert_eq!(state.request_body["tool_choice"], "auto");
+    assert!(state.replay_stable_payload_revision > revision_before);
+    assert!(state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap() > stable_before);
+}
+
 // -----------------------------------------------------------------------------
 // on_request_body: Content-Type on Re-entry
 // -----------------------------------------------------------------------------
@@ -1166,6 +1182,74 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
         "a streamed SSE error must not serialize JSON onto the committed stream"
     );
     assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn streamed_mcp_ownership_index_rejects_near_retained_limit() {
+    let make_state = || {
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": "test",
+            "stream": true
+        }));
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "lookup".to_owned()),
+            json!({"server_label": "server", "require_approval": "never"}),
+        );
+        for index in 0..128 {
+            state.mcp_tool_map.insert(
+                (
+                    format!("other_server_{index}"),
+                    "long_tool_name_for_index_budget".to_owned(),
+                ),
+                json!({"require_approval": "never"}),
+            );
+        }
+        let call = json!({
+            "type": "function_call",
+            "id": "fc_lookup",
+            "call_id": "call_lookup",
+            "name": "server__lookup",
+            "arguments": "{}",
+            "status": "completed"
+        });
+        // The SSE parser keeps calls in the response output until the agentic
+        // collector moves them into the canonical accumulator and selects IDs.
+        state.response_object = json!({
+            "id": "resp_index_budget",
+            "object": "response",
+            "status": "completed",
+            "output": [call]
+        });
+        state
+    };
+
+    // Measure the state after the streaming collector moves the output. The
+    // reverse index is a separate allocation even though the state still fits.
+    let mut projected = make_state();
+    super::collect_streaming_output_items(&mut projected).unwrap();
+    projected.apply_retained_payload_limit(usize::MAX);
+    let retained = projected.retained_payload_bytes().unwrap();
+    let index_charge = super::mcp_tool_index_charge(&projected).unwrap();
+    let limit = retained + index_charge - 1;
+    assert!(index_charge > 4_096);
+    assert!(limit > retained);
+
+    let mut state = make_state();
+    state.apply_retained_payload_limit(limit);
+    assert!(state.can_retain_payload(0), "the request itself fits before indexing");
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "done");
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[test]
@@ -2723,6 +2807,51 @@ fn hosted_tool_search_does_not_loop_when_max_tool_calls_is_exhausted() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn hosted_tool_search_cap_keeps_only_first_of_two_calls() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.max_tool_calls = Some(1);
+    state.deferred_mcp.push(pending_deferred_connector());
+    ctx.extensions.insert(state);
+    let response = json!({
+        "id": "resp_two_searches",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {"type": "tool_search_call", "id": "ts_first", "status": "completed"},
+            {"type": "tool_search_call", "id": "ts_second", "status": "completed"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "loop");
+    let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
+    assert_eq!(state.tool_search_calls.len(), 1);
+    assert_eq!(state.tool_search_calls[0].item_id, "ts_first");
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    let stored_calls: Vec<_> = state
+        .persisted_messages
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_call"))
+        .collect();
+    assert_eq!(stored_calls.len(), 2);
+    assert_eq!(stored_calls[0]["status"], "completed");
+    assert_eq!(stored_calls[1]["status"], "incomplete");
+    let mut public_body = None;
+    state.finalize_response_body(&mut public_body).unwrap();
+    let public: Value = serde_json::from_slice(public_body.as_ref().unwrap()).unwrap();
+    assert_eq!(public["output"][0]["status"], "completed");
+    assert_eq!(public["output"][1]["status"], "incomplete");
+}
+
 #[test]
 fn incomplete_tool_search_call_is_not_queued_for_deferred_discovery() {
     let filter = make_filter();
@@ -3227,6 +3356,74 @@ fn appends_streamed_provider_compaction_to_replay_state() {
     assert_eq!(state.accumulated_output[0]["id"], "cmp_streamed");
 }
 
+fn large_provider_compaction_response() -> Value {
+    json!({
+        "object": "response",
+        "output": [{"type": "compaction", "id": "cmp_1", "encrypted_content": "x".repeat(4_096)}]
+    })
+}
+
+#[test]
+fn buffered_compaction_preflights_all_replay_owners() {
+    let response = large_provider_compaction_response();
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut limited = ResponsesState::default();
+    limited.apply_retained_payload_limit(10_000);
+    assert!(
+        super::extract_tool_calls_from_body(&body, &mut limited).is_err(),
+        "buffered compaction must reject before cloning all replay owners"
+    );
+    assert!(
+        limited.accumulated_output.is_empty(),
+        "rejected output must not enter replay state"
+    );
+
+    let mut admitted = ResponsesState::default();
+    admitted.apply_retained_payload_limit(20_000);
+    super::extract_tool_calls_from_body(&body, &mut admitted).unwrap();
+    assert!(
+        admitted.retained_payload_bytes().unwrap() <= 20_000,
+        "admitted buffered state must fit its limit"
+    );
+    assert!(
+        admitted.provider_compaction_ids.contains("cmp_1"),
+        "compaction ID must remain replayable"
+    );
+}
+
+#[test]
+fn streamed_compaction_preflights_all_replay_owners() {
+    let response = large_provider_compaction_response();
+    let mut limited = ResponsesState {
+        response_object: response.clone(),
+        ..ResponsesState::default()
+    };
+    limited.apply_retained_payload_limit(10_000);
+    assert!(
+        super::collect_streaming_output_items(&mut limited).is_err(),
+        "streamed compaction must reject before cloning all replay owners"
+    );
+    assert!(
+        limited.retained_payload_failed,
+        "over-budget streamed state must fail closed"
+    );
+
+    let mut admitted = ResponsesState {
+        response_object: response,
+        ..ResponsesState::default()
+    };
+    admitted.apply_retained_payload_limit(20_000);
+    super::collect_streaming_output_items(&mut admitted).unwrap();
+    assert!(
+        admitted.retained_payload_bytes().unwrap() <= 20_000,
+        "admitted streamed state must fit its limit"
+    );
+    assert!(
+        admitted.provider_compaction_ids.contains("cmp_1"),
+        "compaction ID must remain replayable"
+    );
+}
+
 /// Regression (#955): the sole owner stamps a stable synthetic id on every
 /// id-less output item before accumulation, so the public response never ships an
 /// item without an id. A private `function_call(name=file_search)` that arrives
@@ -3403,6 +3600,29 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     );
 }
 
+/// An approval admission failure on the first request has not committed SSE
+/// headers, even when the client asked for a stream.
+#[tokio::test]
+async fn initial_retained_dispatch_failure_uses_http_413() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "test", "stream": true}));
+    state.fail_retained_payload_budget();
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "approval exceeds retained budget".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let FilterAction::Reject(response) = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap() else {
+        panic!("budget failure must reject before inference");
+    };
+    assert_eq!(response.status, 413);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
 /// A locally-detected security-context failure preempts a generic dispatch failure:
 /// the loop owner converts `security_failure` BEFORE `dispatch_failure`, so the client
 /// sees the 401 security terminal, never the 502 dispatch terminal.
@@ -3544,6 +3764,30 @@ async fn on_request_rejects_oversized_initial_state_with_413() {
     assert!(state.messages.is_empty());
     assert!(state.persisted_messages.is_empty());
     assert!(state.response_object.is_null());
+}
+
+#[tokio::test]
+#[cfg(feature = "openai-conversations")]
+async fn conversation_append_is_admitted_with_room_for_bounded_append() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 67108864").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", "conv_123");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o", "input": "small", "conversation": "conv_123"
+    }));
+    state.store_persist_armed = true;
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_payload_limit(), Some(64 * 1024 * 1024));
+    assert!(!state.retained_payload_failed);
 }
 
 #[tokio::test]
@@ -3807,6 +4051,95 @@ fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
 }
 
 #[test]
+fn buffered_numeric_projection_counts_normalization_only_outside_strings() {
+    let ordinary = br#"{"quoted":"1e15","escaped":"\\\"1e15","numbers":[1,2,3]}"#;
+    assert_eq!(
+        super::buffered_parsed_json_bytes_upper_bound(ordinary),
+        Some(ordinary.len())
+    );
+
+    let scientific = br#"{"object":"response","output":[],"numbers":[1e15,-0,18446744073709551616]}"#;
+    let parsed: Value = serde_json::from_slice(scientific).unwrap();
+    let exact = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let bound = super::buffered_parsed_json_bytes_upper_bound(scientific).unwrap();
+    assert!(
+        bound >= exact,
+        "numeric normalization must fit the pre-parse reservation"
+    );
+    assert!(
+        bound > scientific.len(),
+        "scientific notation expands in the parsed owner"
+    );
+}
+
+#[test]
+fn buffered_numeric_projection_covers_plain_decimal_float_expansion() {
+    let wire = format!(r#"{{"numbers":[{}]}}"#, vec!["12345678901234567.0"; 1_000].join(","));
+    let parsed: Value = serde_json::from_str(&wire).unwrap();
+    let normalized = serde_json::to_vec(&parsed).unwrap();
+    let bound = super::buffered_parsed_json_bytes_upper_bound(wire.as_bytes()).unwrap();
+    assert!(normalized.len() > wire.len());
+    assert!(
+        bound >= normalized.len(),
+        "decimal float normalization must fit the pre-parse reservation"
+    );
+}
+
+#[test]
+fn private_file_search_normalization_reserves_nested_numeric_expansion() {
+    // The outer response stores arguments as a string. Parsing that string
+    // creates a second JSON owner whose scientific numbers become much larger.
+    let arguments = format!(r#"{{"query":"q","ignored":[{}]}}"#, vec!["1e15"; 5_000].join(","));
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "name": "file_search",
+            "call_id": "call_numeric",
+            "arguments": arguments,
+        }],
+    });
+    let nested: Value = serde_json::from_str(&arguments).unwrap();
+    let nested_bytes = super::super::state::retained_json_bytes(&nested).unwrap();
+    assert!(nested_bytes > arguments.len() * 2);
+
+    let staging = super::output_normalization_staging_bytes(&response, true).unwrap();
+    assert!(
+        staging >= nested_bytes + arguments.len(),
+        "staging must cover the parsed argument tree and a possible query copy"
+    );
+}
+
+#[test]
+fn buffered_numeric_expansion_rejects_before_parsed_tree_allocation() {
+    let numbers = vec!["1e15"; 1_024].join(",");
+    let body = Bytes::from(format!(r#"{{"object":"response","output":[],"numbers":[{numbers}]}}"#));
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let parsed_bytes = super::super::state::retained_json_bytes(&parsed).unwrap();
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+    let limit = baseline + body.len() + 1;
+    assert!(parsed_bytes > body.len() + 1);
+
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(body.len()),
+        "the old raw-length guard would admit parsing"
+    );
+    let mut rejected = false;
+    let allocation = allocation_counter::measure(|| {
+        rejected = super::extract_tool_calls_from_body(&body, &mut state).is_err();
+    });
+    assert!(rejected);
+    assert!(
+        allocation.bytes_total < 1_024,
+        "numeric-heavy Value must be rejected before it is allocated: {allocation:?}"
+    );
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
 fn buffered_usage_projection_rejects_before_copying_large_usage() {
     let body = Bytes::from(
         serde_json::to_vec(&json!({
@@ -3914,6 +4247,88 @@ fn file_search_argument_normalization_is_reserved_before_allocation() {
     let failure = super::extract_tool_calls_from_body(&body, &mut state).unwrap_err();
 
     assert_eq!(failure.status, 502);
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
+fn over_budget_file_search_reconciles_persisted_history_in_both_collectors() {
+    let file = json!({
+        "type": "file_search_call",
+        "id": "fs_over_budget",
+        "status": "searching",
+        "results": [{"file_id": "file_partial"}]
+    });
+
+    for streaming in [false, true] {
+        let mut state = ResponsesState {
+            max_tool_calls: Some(0),
+            ..ResponsesState::default()
+        };
+        if streaming {
+            state.response_object = json!({"output": [file.clone()]});
+            super::collect_streaming_output_items(&mut state).unwrap();
+        } else {
+            let response = json!({"output": [file.clone()]});
+            super::collect_output_items(&response, &mut state, &[]);
+        }
+
+        assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+        assert!(state.accumulated_output[0].get("results").is_none());
+        assert_eq!(state.persisted_messages[0]["status"], "incomplete");
+        assert!(state.persisted_messages[0].get("results").is_none());
+        assert!(state.file_search_assignments.is_empty());
+    }
+}
+
+#[test]
+fn over_budget_file_search_with_reused_id_updates_only_rejected_history_item() {
+    let mut state = ResponsesState {
+        max_tool_calls: Some(1),
+        ..ResponsesState::default()
+    };
+    let response = json!({"output": [
+        {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["first"]},
+        {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["second"]}
+    ]});
+
+    super::collect_output_items(&response, &mut state, &[]);
+
+    assert_eq!(state.file_search_assignments.len(), 1);
+    assert_eq!(state.persisted_messages[0]["status"], "searching");
+    assert_eq!(state.persisted_messages[0]["results"], json!(["first"]));
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert_eq!(state.persisted_messages[1]["status"], "incomplete");
+    assert!(state.persisted_messages[1].get("results").is_none());
+}
+
+#[test]
+fn file_search_numeric_arguments_reject_before_nested_parse() {
+    let arguments = format!(r#"{{"query":"x","unused":[{}]}}"#, vec!["1e15"; 2_000].join(","));
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "name": "file_search",
+            "call_id": "call_1",
+            "arguments": arguments,
+        }]
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let parsed_arguments: Value = serde_json::from_str(&arguments).unwrap();
+    let parsed_bytes = super::super::state::retained_json_bytes(&parsed_arguments).unwrap();
+    assert!(parsed_bytes > arguments.len() * 2);
+    assert!(
+        super::output_normalization_staging_bytes(&response, true).unwrap() >= parsed_bytes + arguments.len(),
+        "the preflight must include normalized nested arguments and query copies"
+    );
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "test", "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}], "input": "Hi"
+    }));
+    state.apply_retained_payload_limit(32_768);
+    assert!(state.can_retain_payload(body.len()));
+    assert!(super::extract_tool_calls_from_body(&body, &mut state).is_err());
     assert!(state.response_object.is_null());
     assert!(state.accumulated_output.is_empty());
 }

@@ -153,12 +153,35 @@ async fn create_request_rejects_raw_body_before_state_allocation() {
     let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(
         error["error"]["message"],
-        "raw request body exceeds the 512-byte limit derived from openai_agentic_loop.max_retained_bytes"
+        "request body exceeds the 512-byte admission limit derived from openai_agentic_loop.max_retained_bytes"
     );
     assert!(
         ctx.extensions.get::<ResponsesState>().is_none(),
         "state that exceeds the request budget must not be published"
     );
+}
+
+#[tokio::test]
+async fn create_request_rejects_numeric_expansion_before_state_allocation() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context_without_subrequest_client(&request);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 24000").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let numbers = vec!["1e15"; 500].join(",");
+    let raw = format!(
+        r#"{{"model":"test","input":[{{"type":"tool_search_output","tools":[{{"type":"function","name":"pick","parameters":{{"type":"number","enum":[{numbers}]}}}}]}}]}}"#
+    );
+    assert!(raw.len() < 3_000);
+    let mut body = Some(Bytes::from(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("numeric normalization must be rejected before state initialization");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
 }
 
 /// Classification once moved `model` out of the parsed value, which a shared
@@ -617,4 +640,65 @@ fn the_filter_declares_bounded_buffering() {
         filter.request_body_mode(),
         BodyMode::StreamBuffer { max_bytes: Some(_) }
     ));
+}
+
+#[test]
+fn numeric_json_expansion_is_rejected_before_create_body_parse() {
+    let request = create_request();
+    let mut ctx = make_filter_context_without_subrequest_client(&request);
+    let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap();
+    ctx.extensions.insert(policy);
+
+    let wire = format!(
+        r#"{{"model":"m","input":[{{"role":"user","content":"hi","extra":[{}]}}]}}"#,
+        vec!["1e15"; 1_500].join(",")
+    );
+    assert!(wire.len() * super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER <= 65_536);
+    let parsed = serde_json::from_str(&wire).unwrap();
+    let state = ResponsesState::from_request_body(parsed);
+    assert!(state.retained_payload_bytes().unwrap() > 65_536);
+
+    assert!(matches!(
+        super::super::initial_budget_rejection(&ctx, wire.as_bytes()),
+        Some(FilterAction::Reject(response)) if response.status == 413
+    ));
+}
+
+#[tokio::test]
+async fn token_count_history_numeric_expansion_is_rejected_before_first_parse() {
+    let request = make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = make_filter_context_without_subrequest_client(&request);
+    let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 32768").unwrap()).unwrap();
+    ctx.extensions.insert(policy);
+    let wire = format!(
+        r#"{{"model":"m","input":"hi","prev\u0069ous_response_id":"resp_x","tools":[{{"type":"function","name":"f","parameters":{{"enum":[{}]}}}}]}}"#,
+        vec!["1e15"; 250].join(",")
+    );
+    assert!(wire.len() < 4_096);
+    let parsed: serde_json::Value = serde_json::from_str(&wire).unwrap();
+    assert!(super::super::state::retained_json_bytes(&parsed).unwrap() > 4_096);
+
+    let filter = default_filter();
+    let mut body = Some(Bytes::from(wire));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
+async fn token_count_without_history_keeps_its_normal_body_allowance() {
+    let request = make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = make_filter_context_without_subrequest_client(&request);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model":"m","input":"x".repeat(1_024)})).unwrap(),
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
 }

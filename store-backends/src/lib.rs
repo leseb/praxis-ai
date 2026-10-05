@@ -38,6 +38,26 @@ pub use postgres_tls::PgTlsConfig;
 pub(crate) use praxis_ai_store::PoolConfig;
 #[cfg(feature = "postgres")]
 pub(crate) use praxis_ai_store::SslMode;
+
+/// Bound the full SQL message-cache rebuild before loading any item rows.
+/// JSON number normalization can expand a three-byte token to 24 bytes;
+/// rows, temporary decoded strings, parsed values, serialized cache, and the
+/// SQL argument can coexist. The row allowance covers array separators and
+/// per-row SQL decoding payload.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn conversation_rebuild_fits(raw_bytes: i64, row_count: i64, max_bytes: usize) -> bool {
+    let Ok(raw_bytes) = usize::try_from(raw_bytes) else {
+        return false;
+    };
+    let Ok(row_count) = usize::try_from(row_count) else {
+        return false;
+    };
+    raw_bytes
+        .checked_mul(26)
+        .and_then(|bytes| bytes.checked_add(row_count.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(4))
+        .is_some_and(|bytes| bytes <= max_bytes)
+}
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) use praxis_ai_store::compression;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
