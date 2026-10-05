@@ -711,6 +711,11 @@ impl HttpFilter for OpenaiConversationsFilter {
                             let store = resolve_store(ctx, &items.owner).ok_or_else(|| {
                                 FilterError::from("openai_conversations: store unavailable for append-back")
                             })?;
+                            // A backend may commit and then report an error. Under
+                            // fail-open, the body hook must not append again.
+                            if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
+                                state.append_attempted = true;
+                            }
                             match persist_items(&store, &items.conversation_id, ctx, items.all_items, wire_bytes).await
                             {
                                 Ok(()) => {},

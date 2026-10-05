@@ -2135,6 +2135,9 @@ impl HttpFilter for ResponseStoreFilter {
                     Ok(parts) => parts,
                     Err(action) => return Ok(action),
                 };
+                // The request snapshot is consumed. If the backend reports an
+                // ambiguous write error, fail-open must not retry on the body hook.
+                ctx.extensions.insert(BufferedResponsePersistenceAttempted);
                 let Some(record) = build_streaming_record(ctx, persist.owner, persist.request_input) else {
                     return Ok(FilterAction::Reject(reject_store_error()));
                 };
@@ -2152,7 +2155,6 @@ impl HttpFilter for ResponseStoreFilter {
                 if !inserted {
                     return Ok(persistence_budget_failure(ctx, false, &mut None));
                 }
-                ctx.extensions.insert(BufferedResponsePersistenceAttempted);
                 #[cfg(feature = "openai-conversations")]
                 ctx.extensions.insert(StoreResponseHeaderRan(response_round(ctx)));
                 #[cfg(feature = "openai-conversations")]

@@ -1188,6 +1188,27 @@ impl crate::store::ResponseStore for RecordingResponseStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        _approvals: &[crate::store::PendingApprovalRecord],
+    ) -> Result<bool, crate::store::StoreError> {
+        self.upserts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            return Err(crate::store::StoreError::Unavailable(
+                "recording store: forced failure".to_owned(),
+            ));
+        }
+        let mut records = self.records.lock().expect("records mutex should not be poisoned");
+        match records.entry(record.id.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(record.clone());
+                Ok(true)
+            },
+        }
+    }
+
     async fn get_response(
         &self,
         owner: &crate::StateOwner,
@@ -1558,6 +1579,56 @@ async fn streaming_terminal_fail_open_error_is_not_retried_at_eos() {
     let mut eos_body = None;
     let eos_action = filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap();
     assert!(matches!(eos_action, FilterAction::Continue));
+    assert_eq!(store.upsert_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "header error and body callback share one request context"
+)]
+async fn buffered_header_persist_error_is_not_retried_on_body() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(true));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_recording_store(&mut ctx, store_dyn);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let response = json!({
+        "id": "resp_header_retry",
+        "created_at": 1_719_900_100_i64,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": []
+    });
+    let mut state = ResponsesState {
+        response_object: response,
+        buffered_canonical_finalized: true,
+        buffered_canonical_wire_bytes: Some(256),
+        buffered_canonical_parsed_bound_bytes: Some(256),
+        buffered_canonical_body_digest: Some([0; 32]),
+        ..Default::default()
+    };
+    state.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(state);
+    let mut headers = crate::test_utils::make_response();
+    headers
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut headers);
+
+    assert!(filter.on_response(&mut ctx).await.is_err());
+    assert_eq!(store.upsert_count(), 1);
+    let mut body = Some(Bytes::from_static(b"{}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
     assert_eq!(store.upsert_count(), 1);
 }
 
