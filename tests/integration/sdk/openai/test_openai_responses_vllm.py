@@ -5639,6 +5639,11 @@ def retained_tool_search_client(tmp_path, request):
             "      - filter: openai_mcp_tool_resolve\n",
             1,
         )
+    if getattr(request, "param", None) == "file":
+        # The Files API callout stages up to 128 KiB of transport bytes before
+        # applying its shared cap. Keep this case large enough to reach
+        # metadata, while its declared 48 KiB file still exceeds that cap.
+        config = config.replace("max_retained_bytes: 16384", "max_retained_bytes: 262144", 1)
     config = config.replace(
         "  allow_private_endpoints: true # example proxies to local backends",
         "  allow_private_endpoints: true # example proxies to local backends\n"
@@ -5970,6 +5975,7 @@ class TestAgenticLoopVLLM:
         assert "agentic retained payload exceeded" in exc_info.value.response.text
         assert RetainedToolSearchBackendHandler.requests == 1
 
+    @pytest.mark.parametrize("retained_tool_search_client", ["file"], indirect=True)
     def test_initial_file_resolution_budget_rejects_through_sdk(
         self, retained_tool_search_client
     ):
