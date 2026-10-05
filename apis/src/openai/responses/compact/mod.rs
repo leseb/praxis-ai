@@ -341,6 +341,8 @@ impl CompactFilter {
         )
         .await;
         if state.retained_payload_limit().is_some() {
+            // The transport already bounds an unsuccessful response body. It
+            // is never parsed, so preserve the configured callout policy.
             match &result {
                 Ok(resp) if (200..300).contains(&(resp.status as usize)) => {
                     let parsed = buffered_parsed_json_bytes_upper_bound(&resp.body)
