@@ -1396,6 +1396,10 @@ impl StreamableHttpClient for McpSubrequestClient {
 
 /// The streaming executor can return a buffered fallback under its 2×
 /// backstop. Enforce the actual per-message cap before rmcp parses it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors buffered classification while carrying the independent response cap"
+)]
 fn classify_bounded_buffered_post_response(
     response: SubResponse,
     message: &ClientJsonRpcMessage,
