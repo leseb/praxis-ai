@@ -2238,6 +2238,32 @@ mod tests {
 
     use super::*;
 
+    fn current_output_bytes(state: &ResponsesState) -> usize {
+        retained_json_bytes(&state.response_object).unwrap()
+            + retained_json_bytes(&state.local_completion_response_template).unwrap()
+            + retained_json_values_bytes(&state.tool_calls).unwrap()
+    }
+
+    fn parser_changing_bytes(state: &ResponsesState, max_bytes: usize) -> Option<usize> {
+        let response_object_bytes = retained_json_bytes(&state.response_object)?;
+        let tool_calls_bytes = retained_json_values_bytes(&state.tool_calls)?;
+        state.stream_changing_payload_bytes_bounded_with_response_object_size(
+            max_bytes,
+            response_object_bytes,
+            Some(tool_calls_bytes),
+        )
+    }
+
+    fn store_changing_bytes(state: &ResponsesState, max_bytes: usize, _current_output_bytes: usize) -> Option<usize> {
+        let response_object_bytes = retained_json_bytes(&state.response_object)?;
+        let tool_calls_bytes = retained_json_values_bytes(&state.tool_calls)?;
+        state.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(
+            max_bytes,
+            Some(response_object_bytes),
+            Some(tool_calls_bytes),
+        )
+    }
+
     #[test]
     fn retained_payload_admits_below_and_at_limit_but_rejects_above() {
         let item = json!({"payload": "abc"});
@@ -2468,18 +2494,14 @@ mod tests {
     fn tool_choice_copies_are_charged_once_in_stream_stable_baseline() {
         let mut state = ResponsesState::default();
         let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
-        let changing_before = state
-            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
-            .unwrap();
+        let changing_before = parser_changing_bytes(&state, usize::MAX).unwrap();
         let large_choice = json!({"type":"allowed_tools","tools":["x".repeat(32_000)]});
         state.tool_choice = large_choice.clone();
         state.original_tool_choice = Some(large_choice);
         state.mark_replay_stable_payload_changed();
 
         let stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
-        let changing = state
-            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
-            .unwrap();
+        let changing = parser_changing_bytes(&state, usize::MAX).unwrap();
         assert!(
             stable > stable_before + 64_000,
             "both owned tool-choice values join the stable charge"
@@ -2500,9 +2522,7 @@ mod tests {
     fn unchanged_context_fields_use_the_stream_stable_charge() {
         let mut state = ResponsesState::default();
         let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
-        let changing_before = state
-            .stream_changing_payload_bytes_bounded_for_parser(usize::MAX)
-            .unwrap();
+        let changing_before = parser_changing_bytes(&state, usize::MAX).unwrap();
         state.context_management = Some(json!({"context": "c".repeat(1_048_576)}));
         state.conversation = Some(json!({"id": "v".repeat(4_096)}));
         state.previous_usage = Some(json!({"note": "p".repeat(4_096)}));
@@ -2511,19 +2531,16 @@ mod tests {
         let stable = state.stream_stable_payload_bytes_bounded(1_200_000).unwrap();
         let current_output = current_output_bytes(&state);
         assert!(stable > stable_before + 1_048_576);
-        assert_eq!(
-            state.stream_changing_payload_bytes_bounded_for_parser(usize::MAX),
-            Some(changing_before)
-        );
+        assert_eq!(parser_changing_bytes(&state, usize::MAX), Some(changing_before));
         assert_eq!(state.retained_payload_bytes().unwrap(), stable + changing_before);
 
         let started = std::time::Instant::now();
         for _ in 0..100 {
             for changing in [
-                state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+                parser_changing_bytes(&state, 1_024),
                 state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
                 #[cfg(feature = "store")]
-                state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+                store_changing_bytes(&state, 1_024, current_output),
             ] {
                 assert_eq!(changing, Some(changing_before));
             }
@@ -2554,10 +2571,10 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..200 {
             let changing = [
-                state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+                parser_changing_bytes(&state, 1_024),
                 state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
                 #[cfg(feature = "store")]
-                state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+                store_changing_bytes(&state, 1_024, current_output),
             ];
             for charge in changing {
                 assert_eq!(stable + charge.unwrap(), full);
@@ -2574,7 +2591,7 @@ mod tests {
     fn resolved_mcp_definitions_are_measured_once_in_stream_stable_charge() {
         let mut state = ResponsesState::default();
         let baseline_stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
-        let baseline_changing = state.stream_changing_payload_bytes_bounded_for_parser(1_024).unwrap();
+        let baseline_changing = parser_changing_bytes(&state, 1_024).unwrap();
         let definition = json!({"description": "x".repeat(1_048_576)});
         let map_bytes = "server".len() + "tool".len() + retained_json_bytes(&definition).unwrap();
         state
@@ -2586,10 +2603,10 @@ mod tests {
         assert_eq!(stable, baseline_stable + map_bytes);
         let current_output = current_output_bytes(&state);
         for changing in [
-            state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+            parser_changing_bytes(&state, 1_024),
             state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
             #[cfg(feature = "store")]
-            state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+            store_changing_bytes(&state, 1_024, current_output),
         ] {
             assert_eq!(changing, Some(baseline_changing));
         }
@@ -2604,7 +2621,7 @@ mod tests {
     fn deferred_mcp_payload_is_measured_once_in_stream_stable_charge() {
         let mut state = ResponsesState::default();
         let baseline_stable = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
-        let baseline_changing = state.stream_changing_payload_bytes_bounded_for_parser(1_024).unwrap();
+        let baseline_changing = parser_changing_bytes(&state, 1_024).unwrap();
         let allowed_tools = json!({"names": ["x".repeat(1_048_576)]});
         let headers = json!({"x-tenant": "team"});
         let approval = json!({"never": ["lookup"]});
@@ -2631,7 +2648,7 @@ mod tests {
         let policy_bytes = {
             state.mcp_connector_context_policy =
                 McpConnectorContextPolicy::new(Some("credential-slot"), Some("assertion-slot"));
-            state.mcp_connector_context_policy.retained_payload_bytes().unwrap()
+            "credential-slot".len() + "assertion-slot".len()
         };
         #[cfg(not(feature = "openai-mcp-tools"))]
         let policy_bytes = 0;
@@ -2643,10 +2660,10 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..100 {
             for changing in [
-                state.stream_changing_payload_bytes_bounded_for_parser(1_024),
+                parser_changing_bytes(&state, 1_024),
                 state.chat_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
                 #[cfg(feature = "store")]
-                state.store_stream_changing_payload_bytes_bounded_with_current_output(1_024, current_output),
+                store_changing_bytes(&state, 1_024, current_output),
             ] {
                 assert_eq!(changing, Some(baseline_changing));
             }

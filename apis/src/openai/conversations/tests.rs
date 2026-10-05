@@ -4138,17 +4138,25 @@ async fn on_response_body_appends_completed_response_under_64m_budget() {
         crate::StateOwner::from_trusted_parts(DEFAULT_TENANT_ID, initiating_owner.issuer(), "other-subject").unwrap();
     ctx.extensions.insert(replaced_owner);
 
-    let mut resp = make_response();
-    resp.headers
-        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
-    ctx.response_header = Some(&mut resp);
-    drop(filter.on_response(&mut ctx).await.unwrap());
-
     let response_json = serde_json::json!({
         "status": "completed",
         "output": [{"type": "message", "role": "assistant", "content": "hi from model"}]
     });
-    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let response_bytes = serde_json::to_vec(&response_json).unwrap();
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    resp.headers.insert(
+        http::header::CONTENT_LENGTH,
+        response_bytes.len().to_string().parse().unwrap(),
+    );
+    ctx.response_header = Some(&mut resp);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::from(response_bytes));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
@@ -5238,19 +5246,24 @@ async fn budgeted_append_rolls_back_sqlite_cache_overflow() {
     state.apply_retained_payload_limit(baseline + 32_768);
     ctx.extensions.insert(state);
     drop(filter.on_request(&mut ctx).await.unwrap());
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "small"}]
+    });
+    let response_bytes = serde_json::to_vec(&response_json).unwrap();
     let mut resp = make_response();
     resp.headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    resp.headers.insert(
+        http::header::CONTENT_LENGTH,
+        response_bytes.len().to_string().parse().unwrap(),
+    );
     ctx.response_header = Some(&mut resp);
     assert!(matches!(
         filter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    let response_json = serde_json::json!({
-        "status": "completed",
-        "output": [{"type": "message", "role": "assistant", "content": "small"}]
-    });
-    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let mut body = Some(Bytes::from(response_bytes));
 
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
@@ -5338,6 +5351,11 @@ async fn budgeted_store_then_append_failure_removes_response_row() {
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    let response_bytes = serde_json::to_vec(&response_json).unwrap();
+    response.headers.insert(
+        http::header::CONTENT_LENGTH,
+        response_bytes.len().to_string().parse().unwrap(),
+    );
     ctx.response_header = Some(&mut response);
     ctx.current_filter_id = Some(0);
     assert!(matches!(
@@ -5345,7 +5363,7 @@ async fn budgeted_store_then_append_failure_removes_response_row() {
         FilterAction::Continue
     ));
 
-    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let mut body = Some(Bytes::from(response_bytes));
     ctx.current_filter_id = Some(1);
     let FilterAction::Reject(rejection) = response_store.on_response_body(&mut ctx, &mut body, true).unwrap() else {
         panic!("Store must propagate the bounded Conversation append failure");

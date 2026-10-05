@@ -172,7 +172,7 @@ impl HttpFilter for DocExtractFilter {
         // The raw body and request state remain live during that parse, so
         // admit this independent owner against the current request budget.
         if !parsed_body_fits(ctx, raw) {
-            return Ok(reject_aggregate_extraction(ctx));
+            return Ok(reject_retained_extraction_budget(ctx));
         }
 
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
