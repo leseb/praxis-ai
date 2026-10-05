@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -4228,6 +4228,51 @@ async fn store_false_buffered_append_rejects_before_response_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "header and body callbacks prove one append attempt"
+)]
+async fn buffered_header_append_is_not_retried_after_ambiguous_store_error() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::CommittedThenError(Arc::clone(&committed)),
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"question"})],
+        response_object: serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"answer"}]
+        }),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(state);
+    mark_buffered_agentic_done(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+
+    assert!(filter.on_response(&mut ctx).await.is_err());
+    assert_eq!(committed.load(Ordering::SeqCst), 1);
+    let mut body = Some(Bytes::from_static(b"{}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(committed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_completed_conversation_turn_skips_append_budget_staging() {
     let (filter, store) = sqlite_harness().await;
     let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
@@ -6027,6 +6072,8 @@ enum AppendFailure {
     MessageSync,
     /// Let the append paths succeed.
     None,
+    /// Simulate a committed write whose acknowledgement is lost.
+    CommittedThenError(Arc<AtomicUsize>),
 }
 
 /// A [`ConversationItemStore`] that fails selected operations on demand.
@@ -6136,9 +6183,23 @@ impl ConversationItemStore for FailingItemStore {
             AppendFailure::MessageSync => {
                 return Err(StoreError::Database("mock message sync failure".to_owned()));
             },
+            AppendFailure::CommittedThenError(ref committed) => {
+                committed.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::Database("mock post-commit failure".to_owned()));
+            },
             AppendFailure::None => {},
         }
         Ok(())
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &crate::StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        _max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages(owner, conversation_id, items).await
     }
 
     async fn list_conversation_items(

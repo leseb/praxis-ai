@@ -265,6 +265,20 @@ pub(crate) enum McpClientError {
         kind: McpResponseLimitKind,
     },
 
+    /// A response fit its wire ceiling but exceeded the request-wide JSON
+    /// parse reservation before rmcp could allocate its message tree.
+    #[error("mcp server {url} returned JSON exceeding the {limit} byte parse limit")]
+    JsonPreparseTooLarge {
+        /// Server URL (credential-safe).
+        url: McpDisplayUrl,
+
+        /// The admitted parsed-owner ceiling.
+        limit: usize,
+
+        /// Exchange whose JSON response was being parsed.
+        kind: McpResponseLimitKind,
+    },
+
     /// MCP server URL is invalid or resolves to a blocked address.
     #[error("mcp server URL blocked (SSRF): {url}: {reason}")]
     SsrfBlocked {
@@ -518,17 +532,16 @@ async fn open_tool_session(
     );
     let signal = mcp_client.signal_handle();
     let signal_state = mcp_client.signal_state();
-    let transport = StreamableHttpClientTransport::with_client(
-        mcp_client,
-        build_transport_config_with_forwarded_headers(
-            server_url,
-            headers,
-            authorization,
-            forwarded_header_names,
-            forwarded_headers,
-            connector_context,
-        )?,
-    );
+    let config = build_transport_config_with_forwarded_headers(
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+    )?;
+    let transport_config_bytes = transport_config_retained_charge(&config);
+    let transport = StreamableHttpClientTransport::with_client(mcp_client, config);
     // A pre-serve initialization failure owns no `RunningService`; dropping the
     // failed `serve` future drops its transport without starting the worker.
     let service = Box::pin(().serve(transport)).await.map_err(|_source| {
@@ -543,7 +556,22 @@ async fn open_tool_session(
         max_result_bytes,
         tool_control_response_cap(initialize_limit, control_response_bytes),
         preparse_peak_limit,
+        transport_config_bytes,
     ))
+}
+
+/// rmcp retains its transport config and may clone header values into a live
+/// GET request and a reserved close POST. Its URI is `Arc<str>` and shares the
+/// backing bytes across those clones.
+fn transport_config_retained_charge(config: &StreamableHttpClientTransportConfig) -> Option<usize> {
+    let header_bytes = config.custom_headers.iter().try_fold(
+        config.auth_header.as_ref().map_or(0, String::len),
+        |used, (name, value)| {
+            used.checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())
+        },
+    )?;
+    config.uri.len().checked_add(header_bytes.checked_mul(3)?)
 }
 
 /// Issue one `tools/call` on an already-initialized session without closing it.

@@ -2853,11 +2853,13 @@ async fn budgeted_background_delete_charges_its_buffered_response_while_in_fligh
     let fingerprint = "small-delete";
     let key = McpPoolKey::new(McpPoolNamespace::new(), fingerprint.to_owned()).unwrap();
     let callout = McpCallout::fabricated(true).unwrap();
+    let headers = serde_json::json!({"x-client-credential": "h".repeat(256)});
+    let authorization = "t".repeat(512);
     let result = call_tool_with_forwarded_headers_bounded_initialize(
         Some((&pool, Some(&key))),
         &url,
-        None,
-        None,
+        Some(&headers),
+        Some(&authorization),
         &[],
         None,
         None,
@@ -2880,7 +2882,14 @@ async fn budgeted_background_delete_charges_its_buffered_response_while_in_fligh
     let session = checkout.session.expect("warm session must be reusable");
     let peer_bytes =
         crate::openai::responses::state::retained_json_bytes(session.service().peer_info().unwrap().as_ref()).unwrap();
+    let config_bytes = url.len()
+        + 3 * ("x-client-credential".len()
+            + 256
+            + http::header::AUTHORIZATION.as_str().len()
+            + "Bearer ".len()
+            + authorization.len());
     let expected = peer_bytes
+        + config_bytes
         + tool_stream_retained_reserve(256, 1_024).unwrap()
         + tool_delete_retained_reserve(1_024).unwrap()
         + tool_control_retained_reserve(1_024).unwrap();
@@ -3492,6 +3501,6 @@ async fn budgeted_minimum_result_limit_reaches_tool_after_initialize() {
     assert_eq!(method_count(&methods, "tools/call"), 1);
     assert!(matches!(
         result,
-        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+        Err(McpClientError::JsonPreparseTooLarge { limit: 2_048, .. })
     ));
 }
