@@ -286,6 +286,37 @@ fn history_selector_probe_handles_escaped_keys_without_allocating_payload() {
     assert!(may_rehydrate_history(with_history.as_bytes()));
 }
 
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn agentic_budget_rejects_numeric_expansion_before_classification() {
+    let filter = make_filter("on_invalid: reject");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 24000").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let numbers = vec!["1e15"; 500].join(",");
+    let raw = format!(
+        r#"{{"model":"test","input":[{{"type":"tool_search_output","tools":[{{"type":"function","name":"pick","parameters":{{"type":"number","enum":[{numbers}]}}}}]}}]}}"#
+    );
+    assert!(raw.len() < 3_000, "raw bytes alone fit the old eightfold allowance");
+    let mut body = Some(Bytes::from(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("numeric normalization must be rejected before JSON parsing");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(ctx.get_metadata("openai_responses_format.format").is_none());
+}
+
+#[test]
+#[cfg(feature = "openai-responses")]
+fn agentic_budget_projection_allows_large_text_with_few_json_nodes() {
+    let raw = serde_json::json!({"model": "test", "input": "x".repeat(64 * 1024)}).to_string();
+    assert!(initial_json_parse_peak_bytes(raw.as_bytes()).is_some_and(|bytes| bytes < 1_048_576));
+}
+
 // -----------------------------------------------------------------------------
 // Body Parsing Edge Cases
 // -----------------------------------------------------------------------------

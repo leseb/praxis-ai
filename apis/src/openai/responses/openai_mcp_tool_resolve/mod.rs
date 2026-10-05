@@ -72,7 +72,8 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
-    AgenticBudgetPolicy, bound_body_outcome, budget_error,
+    agentic_loop::AgenticBudgetPolicy,
+    bound_body_outcome, budget_error,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -86,16 +87,23 @@ use crate::{
 
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
-pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
+pub(super) const MAX_FUNCTION_NAME_LEN: usize = 64;
 
 /// Raw control page, decoded listing, converted JSON, function tools, public
 /// listing, and one owner for transformation overlap.
 const DEFERRED_LISTING_OWNER_RESERVATION: usize = 6;
 
-/// Eager resolution retains the decoded task result, per-entry filtered and
-/// converted tools, dispatch map, rewritten body, public listing, private
-/// cache listing, and serialization overlap alongside the raw control body.
-const EAGER_LISTING_OWNER_RESERVATION: usize = 12;
+/// Fixed generated function, dispatch, and discovery fields per listed tool.
+const EAGER_TOOL_OVERHEAD_RESERVATION_BYTES: usize = 512;
+
+/// Shared budget headroom and independently owned request staging at eager discovery.
+#[derive(Clone, Copy)]
+struct EagerListingBudget {
+    /// Request-wide ceiling.
+    limit: usize,
+    /// Existing state, buffered wire body, and local parsed request owners.
+    baseline: usize,
+}
 
 // -----------------------------------------------------------------------------
 // McpToolResolveFilter
@@ -346,24 +354,22 @@ impl McpToolResolveFilter {
         mut parsed: serde_json::Value,
         listener_budget: Option<&ResponsesState>,
     ) -> Result<FilterAction, ResolveError> {
+        if let Some(limit) = ctx
+            .extensions
+            .get::<AgenticBudgetPolicy>()
+            .map(|policy| policy.max_retained_bytes())
+        {
+            let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+                return Err(ResolveError::RetainedBudget);
+            };
+            state.apply_retained_payload_limit(limit);
+        }
         let mut mcp_entries = extract_mcp_entries(&mut parsed);
         if mcp_entries.is_empty() {
             return Ok(FilterAction::Continue);
         }
 
         resolve_connector_ids(&self.connectors, &mut mcp_entries.values)?;
-        let local_staging = match ctx.extensions.get::<ResponsesState>().or(listener_budget) {
-            Some(state) if state.retained_payload_limit().is_some() => retained_json_bytes(&parsed)
-                .and_then(|bytes| bytes.checked_add(retained_json_bytes(&mcp_entries.values)?.checked_mul(2)?))
-                .filter(|bytes| state.can_retain_payload(*bytes)),
-            _ => Some(0),
-        };
-        let Some(local_staging) = local_staging else {
-            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-                state.discard_payload_for_budget_error();
-            }
-            return Err(ResolveError::RetainedBudget);
-        };
         let has_configured_connector = mcp_entries
             .values
             .iter()
@@ -380,6 +386,15 @@ impl McpToolResolveFilter {
         };
         require_tool_search_for_deferred(ctx, &mcp_entries.values)?;
         self.validate_entries(&mcp_entries.values)?;
+        let eager_budget = if mcp_entries
+            .values
+            .iter()
+            .any(|entry| resolvable_server_url(entry).is_some())
+        {
+            eager_listing_budget(ctx, body, &parsed, &mcp_entries.values)?
+        } else {
+            None
+        };
 
         // Capture the parent transport + downstream attributes for the outbound
         // callout before the resolution work borrows `ctx` mutably; fails closed
@@ -391,21 +406,13 @@ impl McpToolResolveFilter {
             self.max_tools,
             self.max_rewritten_body_bytes,
         );
-        let local_staging = if local_staging == 0 {
-            0
-        } else {
-            local_staging
-                .checked_add(pending_deferred_bytes(&deferred_mcp).ok_or(ResolveError::RetainedBudget)?)
-                .ok_or(ResolveError::RetainedBudget)?
-        };
         let resolution = self
             .resolve_request_entries(
                 ctx,
                 &mcp_entries.values,
                 &callout,
                 connector_identity.as_ref(),
-                local_staging,
-                listener_budget,
+                eager_budget,
             )
             .await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
@@ -436,7 +443,7 @@ impl McpToolResolveFilter {
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "rewrite needs the parsed body and both resolved maps"
+        reason = "rewrite and admission need the parsed body and both resolved maps"
     )]
     fn commit_resolved_tools(
         &self,
@@ -456,20 +463,19 @@ impl McpToolResolveFilter {
             listings,
             ..
         } = resolution;
-        let rewrite_budget = if let Some(state) = ctx
+        let rewrite_budget = ctx
             .extensions
             .get::<ResponsesState>()
             .or(listener_budget)
             .filter(|state| state.retained_payload_limit().is_some())
-        {
-            Some(EagerRewriteBudget {
-                state,
-                fixed_bytes: eager_commit_fixed_bytes(&tool_map, &deferred_mcp, &listings, &connector_context_policy)
-                    .ok_or(ResolveError::RetainedBudget)?,
+            .map(|state| {
+                Ok(EagerRewriteBudget {
+                    state,
+                    fixed_bytes: eager_commit_fixed_bytes(&tool_map, &listings, &deferred_mcp, body)
+                        .ok_or(ResolveError::RetainedBudget)?,
+                })
             })
-        } else {
-            None
-        };
+            .transpose()?;
         let Some(serialized) = rewrite_request_body(
             &mut parsed,
             mcp_entries,
@@ -477,46 +483,40 @@ impl McpToolResolveFilter {
             &tool_map,
             &resolved_labels,
             rewrite_budget.as_ref(),
+            self.max_rewritten_body_bytes,
         )?
         else {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
-        let commit_fits = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .or(listener_budget)
-            .is_none_or(|state| {
-                eager_commit_fits(
-                    state,
-                    &parsed,
-                    &tool_map,
-                    &deferred_mcp,
-                    &listings,
-                    &connector_context_policy,
-                    serialized.len(),
-                )
-            });
-        if !commit_fits {
+        if !eager_commit_fits(
+            ctx,
+            &parsed,
+            &tool_map,
+            &listings,
+            &deferred_mcp,
+            serialized.len(),
+            body,
+        ) {
             return Err(ResolveError::RetainedBudget);
         }
+        serialized.commit(body, self.name(), "tools");
         write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy);
         commit_discovery_items(ctx, listings);
         if ctx
             .extensions
             .get::<ResponsesState>()
-            .is_some_and(|state| !state.can_retain_payload(0))
+            .is_some_and(|state| state.retained_payload_limit().is_some() && !state.can_retain_payload(0))
         {
             return Err(ResolveError::RetainedBudget);
         }
-        serialized.commit(body, self.name(), "tools");
         Ok(FilterAction::Continue)
     }
 
     /// Resolve request entries using the effective trusted-header view.
     #[expect(
         clippy::too_many_arguments,
-        reason = "resolution needs the request-local budget staging"
+        reason = "resolution threads callout identity and shared budget"
     )]
     async fn resolve_request_entries(
         &self,
@@ -524,8 +524,7 @@ impl McpToolResolveFilter {
         entries: &[serde_json::Value],
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
-        local_staging: usize,
-        listener_budget: Option<&ResponsesState>,
+        budget: Option<EagerListingBudget>,
     ) -> Result<Resolution, ResolveError> {
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
         let owner_fingerprint = ctx
@@ -541,8 +540,7 @@ impl McpToolResolveFilter {
             &forwarded_headers,
             callout,
             connector_identity,
-            ctx.extensions.get::<ResponsesState>().or(listener_budget),
-            local_staging,
+            budget,
         )
         .await
     }
@@ -562,16 +560,15 @@ impl McpToolResolveFilter {
     /// Resolve all MCP entries, building both the global dispatch
     /// map and pre-built function tools for body rewriting.
     ///
-    /// Server resolutions run concurrently in batches admitted by the
-    /// aggregate payload budget via [`futures::future::try_join_all`].
-    /// Non-credentialed entries
+    /// Server resolutions run concurrently in batches admitted by the shared
+    /// retained-payload budget. Non-credentialed entries
     /// sharing the same `(server_label, server_url)` are
     /// deduplicated to a single resolution task; credentialed
     /// entries always resolve independently.
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "concurrent resolution threads cache, trusted headers, executor, and scoped identity"
+        reason = "budgeted batch resolution threads cache, trusted headers, executor, and scoped identity"
     )]
     async fn resolve_all_entries(
         &self,
@@ -581,143 +578,59 @@ impl McpToolResolveFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
-        state: Option<&ResponsesState>,
-        local_staging: usize,
+        budget: Option<EagerListingBudget>,
     ) -> Result<Resolution, ResolveError> {
         let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries)?;
-        let consumers = task_consumer_counts(&entry_to_task, task_entries.len());
-        let budgeted_state = state.filter(|state| state.retained_payload_limit().is_some());
         let mut task_results = Vec::with_capacity(task_entries.len());
-        let mut prepared_charge = 0_usize;
-
-        while task_results.len() < task_entries.len() {
-            let start = task_results.len();
-            let mut end = start;
-            let mut batch_charge = 0_usize;
-            while end < task_entries.len() {
-                let ((entry, allowed_names), consumers) = task_entries
-                    .get(end)
-                    .zip(task_allowed_names.get(end))
-                    .zip(consumers.get(end))
-                    .ok_or(ResolveError::RetainedBudget)?;
-                let charge = if let Some(state) = budgeted_state {
-                    self.eager_task_reservation(
+        let mut start = 0;
+        while start < task_entries.len() {
+            let end = match budget {
+                Some(budget) => {
+                    let reserved = eager_prepared_bytes(&task_results).ok_or(ResolveError::RetainedBudget)?;
+                    let available = budget
+                        .limit
+                        .checked_sub(budget.baseline)
+                        .and_then(|bytes| bytes.checked_sub(reserved))
+                        .ok_or(ResolveError::RetainedBudget)?;
+                    let per_call = mcp_client::MAX_LISTING_RESPONSE_BYTES
+                        .checked_mul(DEFERRED_LISTING_OWNER_RESERVATION)
+                        .ok_or(ResolveError::RetainedBudget)?;
+                    let count = (available / per_call).min(task_entries.len() - start);
+                    if count == 0 {
+                        return Err(ResolveError::RetainedBudget);
+                    }
+                    start + count
+                },
+                None => task_entries.len(),
+            };
+            let batch_entries = task_entries.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+            let batch_allowed = task_allowed_names.get(start..end).ok_or(ResolveError::RetainedBudget)?;
+            let futures = batch_entries.iter().zip(batch_allowed).map(|(entry, allowed)| async {
+                let result = self
+                    .resolve_entry(
                         entry,
-                        allowed_names.as_deref(),
-                        &state.previous_tools,
+                        previous_tools,
                         owner_fingerprint,
-                        *consumers,
-                    )?
-                } else {
-                    0
-                };
-                let Some(next_charge) = batch_charge.checked_add(charge) else {
-                    return Err(ResolveError::RetainedBudget);
-                };
-                let Some(staging) = local_staging
-                    .checked_add(prepared_charge)
-                    .and_then(|bytes| bytes.checked_add(next_charge))
-                else {
-                    return Err(ResolveError::RetainedBudget);
-                };
-                if budgeted_state.is_some_and(|state| !state.can_retain_payload(staging)) {
-                    break;
-                }
-                batch_charge = next_charge;
-                end += 1;
-            }
-            if end == start {
+                        allowed.as_deref(),
+                        forwarded_headers,
+                        callout,
+                        connector_identity,
+                    )
+                    .await;
+                redact_connector_client_error(result, entry)
+            });
+            task_results.extend(futures::future::try_join_all(futures).await?);
+            if budget.is_some_and(|budget| {
+                eager_prepared_bytes(&task_results)
+                    .and_then(|bytes| budget.baseline.checked_add(bytes))
+                    .is_none_or(|bytes| bytes > budget.limit)
+            }) {
                 return Err(ResolveError::RetainedBudget);
             }
-
-            let entries_batch = task_entries.get(start..end).ok_or(ResolveError::RetainedBudget)?;
-            let allowed_batch = task_allowed_names.get(start..end).ok_or(ResolveError::RetainedBudget)?;
-            let futures: Vec<_> = entries_batch
-                .iter()
-                .zip(allowed_batch)
-                .map(|(entry, allowed)| async {
-                    let result = self
-                        .resolve_entry(
-                            entry,
-                            previous_tools,
-                            owner_fingerprint,
-                            allowed.as_deref(),
-                            forwarded_headers,
-                            callout,
-                            connector_identity,
-                        )
-                        .await;
-                    redact_connector_client_error(result, entry)
-                })
-                .collect();
-            let batch_results = futures::future::try_join_all(futures).await?;
-            if budgeted_state.is_some() {
-                for (offset, result) in batch_results.iter().enumerate() {
-                    if let Some(tools) = result {
-                        let task_idx = start + offset;
-                        let entry = task_entries.get(task_idx).ok_or(ResolveError::RetainedBudget)?;
-                        let consumers = *consumers.get(task_idx).ok_or(ResolveError::RetainedBudget)?;
-                        let charge = eager_listing_charge(
-                            entry,
-                            retained_json_bytes(tools).ok_or(ResolveError::RetainedBudget)?,
-                            tools.len(),
-                            consumers,
-                        )?;
-                        prepared_charge = prepared_charge
-                            .checked_add(charge)
-                            .ok_or(ResolveError::RetainedBudget)?;
-                    }
-                }
-                let staging = local_staging
-                    .checked_add(prepared_charge)
-                    .ok_or(ResolveError::RetainedBudget)?;
-                if budgeted_state.is_some_and(|state| !state.can_retain_payload(staging)) {
-                    return Err(ResolveError::RetainedBudget);
-                }
-            }
-            task_results.extend(batch_results);
+            start = end;
         }
 
-        collect_resolutions(entries, &entry_to_task, task_results)
-    }
-
-    /// Charge an eager task before it clones a cache entry or dials a server.
-    /// A fresh task may consume the complete independent MCP listing cap.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "cache identity and one task's owner count are separate inputs"
-    )]
-    fn eager_task_reservation(
-        &self,
-        entry: &serde_json::Value,
-        allowed_names: Option<&[String]>,
-        previous_tools: &[serde_json::Value],
-        owner_fingerprint: Option<&str>,
-        consumers: usize,
-    ) -> Result<usize, ResolveError> {
-        let server_url = resolvable_server_url(entry).ok_or(ResolveError::RetainedBudget)?;
-        let cached = can_reuse_cached_listing(entry, entry.get("connector_id").is_some())
-            .then(|| {
-                find_cached_listing_borrowed(
-                    Some(previous_tools),
-                    server_label(entry),
-                    server_url,
-                    owner_fingerprint,
-                    allowed_names,
-                )
-            })
-            .flatten();
-        let listed_bytes = cached.map_or_else(|| Some(mcp_client::MAX_LISTING_RESPONSE_BYTES), retained_json_bytes);
-        let tool_count = cached.map_or_else(
-            || self.max_tools.min(mcp_client::MAX_LISTING_RESPONSE_BYTES),
-            <[serde_json::Value]>::len,
-        );
-        eager_listing_charge(
-            entry,
-            listed_bytes.ok_or(ResolveError::RetainedBudget)?,
-            tool_count,
-            consumers,
-        )
+        collect_resolutions_with_budget(entries, &entry_to_task, task_results, budget)
     }
 
     /// Resolve tools for a single MCP entry independently.
@@ -916,14 +829,18 @@ impl HttpFilter for McpToolResolveFilter {
         let Some(bytes) = body.as_ref().cloned() else {
             return Ok(FilterAction::Continue);
         };
-        let mut listener_budget = match resolver_listener_budget(ctx, &bytes) {
-            Ok(budget) => budget,
-            Err(rejection) => return Ok(rejection),
-        };
-        let parsed = match parse_budgeted_mcp_request(ctx, &bytes, listener_budget.as_mut()) {
-            Ok(Some(parsed)) => parsed,
-            Ok(None) => return Ok(FilterAction::Continue),
-            Err(rejection) => return Ok(rejection),
+        // The buffered wire body remains live while parsing creates another
+        // owned JSON tree. Admit its normalized size before allocating it.
+        let parse_fits = ctx.extensions.get::<ResponsesState>().is_none_or(|state| {
+            state.retained_payload_limit().is_none()
+                || super::buffered_parsed_json_bytes_upper_bound(&bytes)
+                    .is_some_and(|parsed_bytes| state.can_retain_payload(parsed_bytes))
+        });
+        if !parse_fits {
+            return Ok(reject_retained_budget(ctx));
+        }
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(FilterAction::Continue);
         };
 
         let streaming = is_streaming(ctx);
@@ -933,7 +850,6 @@ impl HttpFilter for McpToolResolveFilter {
         // captures the size-bounded request options from it) is cheap.
         match Box::pin(self.resolve_mcp_tools(ctx, body, parsed, listener_budget.as_ref())).await {
             Ok(action) => Ok(action),
-            Err(ResolveError::RetainedBudget) => Ok(reject_retained_budget(ctx)),
             Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
     }
@@ -948,8 +864,7 @@ impl HttpFilter for McpToolResolveFilter {
     }
 }
 
-/// Mark an aggregate-budget failure terminal before constructing its response.
-/// No successful response may later be persisted for this request body.
+/// Reject an armed shared-budget overflow in the actual request phase.
 fn reject_retained_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
     budget_error::reject_request(ctx, &ResolveError::RetainedBudget.to_string())
 }
@@ -1139,114 +1054,187 @@ fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize)
     Ok(())
 }
 
-/// Admit the eager rewrite while the old request state, rewritten JSON, wire
-/// bytes, dispatch map, and discovery listings are all independently owned.
-/// The final state check after commit is a guard against a future output-shape
-/// change outgrowing this projection; the request body is committed last.
+/// Reserve the parsed request copies and raw buffered body before any eager
+/// `tools/list` callout. An absent request-wide limit preserves standalone
+/// resolver behavior.
+fn eager_listing_budget(
+    ctx: &HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    parsed: &serde_json::Value,
+    entries: &[serde_json::Value],
+) -> Result<Option<EagerListingBudget>, ResolveError> {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Ok(None);
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return Ok(None);
+    };
+    let staged = retained_json_bytes(parsed)
+        .and_then(|bytes| bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(retained_json_bytes(entries)?.checked_mul(3)?))
+        .and_then(|bytes| bytes.checked_add(body.as_ref().map_or(0, Bytes::len)))
+        .ok_or(ResolveError::RetainedBudget)?;
+    let baseline = state
+        .retained_payload_bytes_bounded(limit)
+        .and_then(|bytes| bytes.checked_add(staged))
+        .filter(|&bytes| bytes <= limit)
+        .ok_or(ResolveError::RetainedBudget)?;
+    Ok(Some(EagerListingBudget { limit, baseline }))
+}
+
+/// Keep enough room for the decoded results and their later function, dispatch,
+/// public-listing, and private-cache owners while resolving more servers.
+fn eager_prepared_bytes(results: &[Option<Vec<serde_json::Value>>]) -> Option<usize> {
+    let (bytes, tools) = results
+        .iter()
+        .flatten()
+        .try_fold((0_usize, 0_usize), |(bytes, tools), result| {
+            Some((
+                bytes.checked_add(retained_json_bytes(result)?)?,
+                tools.checked_add(result.len())?,
+            ))
+        })?;
+    bytes
+        .checked_mul(DEFERRED_LISTING_OWNER_RESERVATION)?
+        .checked_add(tools.checked_mul(EAGER_TOOL_OVERHEAD_RESERVATION_BYTES)?)
+}
+
+/// Reserve entry metadata copied into every dispatch-map tool before building
+/// any of those maps. The fixed per-tool reserve above covers generated fields,
+/// but credentials and other entry values can be much larger than that floor.
+fn eager_dispatch_fanout_bytes(
+    entries: &[serde_json::Value],
+    entry_to_task: &[Option<usize>],
+    results: &[Option<Vec<serde_json::Value>>],
+) -> Result<usize, ResolveError> {
+    entries
+        .iter()
+        .zip(entry_to_task)
+        .try_fold(0_usize, |used, (entry, task)| {
+            let Some(tools) = task.and_then(|index| results.get(index)).and_then(Option::as_ref) else {
+                return Ok(used);
+            };
+            let allowed = extract_allowed_tools(entry)?;
+            let count = tools
+                .iter()
+                .filter(|tool| allowed.matches(tool) && tool.get("name").and_then(serde_json::Value::as_str).is_some())
+                .count();
+            if count == 0 {
+                return Ok(used);
+            }
+            let metadata = eager_entry_dispatch_metadata_bytes(entry).ok_or(ResolveError::RetainedBudget)?;
+            used.checked_add(metadata.checked_mul(count).ok_or(ResolveError::RetainedBudget)?)
+                .ok_or(ResolveError::RetainedBudget)
+        })
+}
+
+/// Dynamic strings and JSON values copied by `insert_tools` for each tool.
+fn eager_entry_dispatch_metadata_bytes(entry: &serde_json::Value) -> Option<usize> {
+    let label = server_label(entry).len();
+    let server_url = entry
+        .get("server_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .len();
+    ["headers", "authorization", "require_approval", "connector_id"]
+        .iter()
+        .try_fold(label.checked_mul(2)?.checked_add(server_url)?, |used, &field| {
+            used.checked_add(entry.get(field).map_or(Some(0), retained_json_bytes)?)
+        })
+}
+
+/// Keep the raw listings and prior request owners live in the same projection
+/// as dispatch metadata before `collect_resolutions` starts cloning entries.
+fn collect_resolutions_with_budget(
+    entries: &[serde_json::Value],
+    entry_to_task: &[Option<usize>],
+    task_results: Vec<Option<Vec<serde_json::Value>>>,
+    budget: Option<EagerListingBudget>,
+) -> Result<Resolution, ResolveError> {
+    if let Some(budget) = budget {
+        let prepared = eager_prepared_bytes(&task_results).ok_or(ResolveError::RetainedBudget)?;
+        let fanout = eager_dispatch_fanout_bytes(entries, entry_to_task, &task_results)?;
+        let peak = budget
+            .baseline
+            .checked_add(prepared)
+            .and_then(|bytes| bytes.checked_add(fanout));
+        if peak.is_none_or(|bytes| bytes > budget.limit) {
+            return Err(ResolveError::RetainedBudget);
+        }
+    }
+    collect_resolutions(entries, entry_to_task, task_results)
+}
+
+/// Admit the independently owned rewritten body, dispatch map, discovery
+/// listings, and state copies before committing any of them.
 #[expect(
     clippy::too_many_arguments,
-    reason = "every independent commit owner is projected explicitly"
+    reason = "projection counts each simultaneously owned request and listing value"
 )]
 fn eager_commit_fits(
-    state: &ResponsesState,
+    ctx: &HttpFilterContext<'_>,
     parsed: &serde_json::Value,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-    deferred_mcp: &[DeferredMcpConnector],
     listings: &[McpListing],
-    connector_context_policy: &McpConnectorContextPolicy,
+    deferred_mcp: &[DeferredMcpConnector],
     serialized_bytes: usize,
+    body: &Option<Bytes>,
 ) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
     if state.retained_payload_limit().is_none() {
         return true;
     }
-    let projected = eager_commit_fixed_bytes(tool_map, deferred_mcp, listings, connector_context_policy)
-        .and_then(|bytes| bytes.checked_add(retained_json_bytes(parsed)?))
-        .and_then(|bytes| bytes.checked_add(serialized_bytes))
-        // write_state clones these two fields from the rewritten request.
-        .and_then(|bytes| bytes.checked_add(optional_json_bytes(parsed.get("tools"))?))
-        .and_then(|bytes| bytes.checked_add(optional_json_bytes(parsed.get("tool_choice"))?));
-    projected.is_some_and(|bytes| state.can_retain_payload(bytes))
+    let fixed = eager_commit_fixed_bytes(tool_map, listings, deferred_mcp, body);
+    let staging = retained_json_bytes(parsed)
+        .and_then(|bytes| bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(serialized_bytes.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(fixed?));
+    staging.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
 
-/// Owners independent of the expanded JSON tree and serialized wire body.
+/// Owners independent of the rewritten request tree and serialized wire body.
 fn eager_commit_fixed_bytes(
     tool_map: &HashMap<(String, String), serde_json::Value>,
-    deferred_mcp: &[DeferredMcpConnector],
     listings: &[McpListing],
-    connector_context_policy: &McpConnectorContextPolicy,
+    deferred_mcp: &[DeferredMcpConnector],
+    body: &Option<Bytes>,
 ) -> Option<usize> {
-    let map = tool_map.iter().try_fold(0_usize, |used, ((server, tool), entry)| {
+    let map_bytes = tool_map.iter().try_fold(0_usize, |used, ((server, tool), entry)| {
         used.checked_add(server.len())?
             .checked_add(tool.len())?
             .checked_add(retained_json_bytes(entry)?)
     })?;
-    let deferred = deferred_mcp.iter().try_fold(map, |used, connector| {
-        used.checked_add(deferred_connector_bytes(connector)?)
-    })?;
-    let listings = listings.iter().try_fold(deferred, |used, listing| {
-        let owner = retained_json_bytes(&listing.tools)?
-            .checked_add(listing.server_label.len())?
+    let listing_bytes = listings.iter().try_fold(0_usize, |used, listing| {
+        used.checked_add(listing.server_label.len())?
             .checked_add(listing.server_url.as_ref().map_or(0, String::len))?
-            .checked_add(64)?;
-        used.checked_add(owner.checked_mul(4)?)
+            .checked_add(retained_json_bytes(&listing.tools)?)
     })?;
-    listings.checked_add(connector_context_policy.retained_payload_bytes()?)
+    map_bytes
+        .checked_mul(2)?
+        .checked_add(listing_bytes.checked_mul(4)?)?
+        .checked_add(pending_deferred_bytes(deferred_mcp)?.checked_mul(2)?)?
+        .checked_add(body.as_ref().map_or(0, Bytes::len))
 }
 
-/// Project the complete commit while `tool_choice` still holds its compact
-/// selectors. Both the expanded tree and wire body remain live at the peak.
+/// Admit selector expansion while the compact request and prepared tools live.
 struct EagerRewriteBudget<'a> {
-    /// Request-wide meter that owns the existing canonical state.
+    /// Shared request budget owner.
     state: &'a ResponsesState,
-    /// Dispatch and discovery owners independent of the rewritten request.
+    /// Dispatch, listing, deferred connector, and original wire owners.
     fixed_bytes: usize,
 }
 
 impl EagerRewriteBudget<'_> {
-    /// Admit both request owners plus the cloned tools and choice projections.
+    /// Project the request tree and wire before allocating expanded selectors.
     fn admits(&self, obj: &serde_json::Map<String, serde_json::Value>, expansion_bytes: usize) -> bool {
         let projected = retained_json_bytes(obj)
             .and_then(|bytes| bytes.checked_add(expansion_bytes))
-            .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(|bytes| bytes.checked_add(optional_json_bytes(obj.get("tools"))?))
-            .and_then(|bytes| bytes.checked_add(optional_json_bytes(obj.get("tool_choice"))?))
-            .and_then(|bytes| bytes.checked_add(expansion_bytes))
+            .and_then(|bytes| bytes.checked_mul(5))
             .and_then(|bytes| bytes.checked_add(self.fixed_bytes));
         projected.is_some_and(|bytes| self.state.can_retain_payload(bytes))
     }
-}
-
-/// Measured retained size of an optional request field.
-fn optional_json_bytes(value: Option<&serde_json::Value>) -> Option<usize> {
-    value.map_or(Some(0), retained_json_bytes)
-}
-
-/// Conservative peak for a decoded eager listing and each entry consuming it.
-/// The function name is capped, but the label remains in private and public
-/// listing owners once per tool. Dispatch clones the entry's target, headers,
-/// authorization, approval policy, and connector ID into every tool map entry.
-/// Charge those repeated fields twice to cover map construction overlap.
-/// All arithmetic fails closed.
-fn eager_listing_charge(
-    entry: &serde_json::Value,
-    listed_bytes: usize,
-    tool_count: usize,
-    consumers: usize,
-) -> Result<usize, ResolveError> {
-    let repeated_metadata = server_label(entry)
-        .len()
-        .checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(resolvable_server_url(entry)?.len()))
-        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("headers"))?))
-        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("authorization"))?))
-        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("require_approval"))?))
-        .and_then(|bytes| bytes.checked_add(optional_json_bytes(entry.get("connector_id"))?))
-        .ok_or(ResolveError::RetainedBudget)?;
-    listed_bytes
-        .checked_mul(EAGER_LISTING_OWNER_RESERVATION)
-        .and_then(|bytes| bytes.checked_add(repeated_metadata.checked_mul(tool_count)?.checked_mul(2)?))
-        .and_then(|bytes| bytes.checked_mul(consumers))
-        .ok_or(ResolveError::RetainedBudget)
 }
 
 /// Collect per-entry resolutions from task results.
@@ -1921,9 +1909,9 @@ fn build_list_tools_failure_response(
     // `pending` (not `ctx`) and the `model` metadata borrow of `ctx` both ended
     // with the final `discovery_response` call above, so the snapshot is moved
     // into state here without a clone.
-    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-    state.response_object = response;
-    state.mark_current_output_changed();
+    ctx.extensions
+        .get_or_insert_with(ResponsesState::default)
+        .replace_response_object(response);
 
     // Emit as a header-phase `TerminalResponse`, not a `Reject`. A terminal
     // response preserves downstream keepalive (this is a successful 200 transport
@@ -2335,7 +2323,11 @@ fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) 
 /// Connector-backed deferred entries are sanitized so the
 /// pipeline-local `connector_id`, configured URL, and credentials
 /// never reach the inference backend.
-#[expect(clippy::too_many_arguments, reason = "rewrite needs the independent request budget")]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "request rewrite checks both budget limits before selector and wire allocation"
+)]
 fn rewrite_request_body(
     parsed: &mut serde_json::Value,
     mcp_entries: ExtractedMcpEntries,
@@ -2343,6 +2335,7 @@ fn rewrite_request_body(
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
     budget: Option<&EagerRewriteBudget<'_>>,
+    max_rewritten_body_bytes: usize,
 ) -> Result<Option<SerializedJson>, ResolveError> {
     let Some(obj) = parsed.as_object_mut() else {
         return Ok(None);
@@ -2361,21 +2354,30 @@ fn rewrite_request_body(
 
     let rewritten_count = rewritten.len();
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
-    if let Some(budget) = budget {
-        let expansion = projected_tool_choice_expansion_bytes(obj.get("tool_choice"), tool_map)
-            .ok_or(ResolveError::RetainedBudget)?;
-        if !budget.admits(obj, expansion) {
-            return Err(ResolveError::RetainedBudget);
-        }
+    let original_choice = obj.get("tool_choice");
+    let projection =
+        projected_tool_choice_bytes(original_choice, tool_map, resolved_labels).ok_or(ResolveError::RetainedBudget)?;
+    let original_choice_bytes = original_choice
+        .map_or(Some(0), retained_json_bytes)
+        .ok_or(ResolveError::RetainedBudget)?;
+    let projected_bytes = retained_json_bytes(obj)
+        .and_then(|bytes| bytes.checked_sub(original_choice_bytes))
+        .and_then(|bytes| bytes.checked_add(projection.final_choice_bytes))
+        .ok_or(ResolveError::RetainedBudget)?;
+    if projected_bytes > max_rewritten_body_bytes {
+        return Err(ResolveError::BodyTooLarge {
+            actual: projected_bytes,
+            limit: max_rewritten_body_bytes,
+        });
+    }
+    if budget.is_some_and(|budget| !budget.admits(obj, projection.peak_expansion_bytes)) {
+        return Err(ResolveError::RetainedBudget);
     }
     rewrite_tool_choice(obj, tool_map, resolved_labels)?;
 
-    // Guard the wire allocation with the measured rewritten tree as well. The
-    // earlier projection must admit the selector growth before its JSON objects
-    // exist; this check covers any later rewrite shape added to this function.
-    if let Some(budget) = budget
-        && !budget.admits(obj, 0)
-    {
+    // The projection above admitted selector fanout before construction; the
+    // exact rewritten tree still needs room before serialization adds wire.
+    if budget.is_some_and(|budget| !budget.admits(obj, 0)) {
         return Err(ResolveError::RetainedBudget);
     }
 
@@ -2387,68 +2389,149 @@ fn rewrite_request_body(
     Ok(Some(serialized))
 }
 
-/// Upper bound for function references produced by MCP `tool_choice` selectors.
-/// Each generated name is sanitized to ASCII and capped at 64 bytes, so its
-/// compact JSON size can be computed from source names without allocating refs.
+/// The transient selector owners and the final compact wire size have
+/// different bounds: the former overlaps the original selector, while the
+/// latter replaces it. Keep both projections before allocating function refs.
+struct ToolChoiceProjection {
+    /// Additional reference bytes retained while the original choice is live.
+    peak_expansion_bytes: usize,
+    /// Compact JSON bytes in the final `tool_choice` value.
+    final_choice_bytes: usize,
+}
+
+/// Project MCP selector fanout without building any expanded JSON objects.
 #[expect(
     clippy::too_many_lines,
-    reason = "both named and server-level selector projections share one label index"
+    reason = "named and server-wide selector projections share one borrowed index"
 )]
-fn projected_tool_choice_expansion_bytes(
+fn projected_tool_choice_bytes(
     choice: Option<&serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-) -> Option<usize> {
-    let Some(choice) = choice.and_then(serde_json::Value::as_object) else {
-        return Some(0);
+    resolved_labels: &HashSet<String>,
+) -> Option<ToolChoiceProjection> {
+    let Some(choice) = choice else {
+        return Some(ToolChoiceProjection {
+            peak_expansion_bytes: 0,
+            final_choice_bytes: 0,
+        });
     };
-    let mut by_label = HashMap::<&str, usize>::new();
+    let original_bytes = retained_json_bytes(choice)?;
+    let Some(choice_obj) = choice.as_object() else {
+        return Some(ToolChoiceProjection {
+            peak_expansion_bytes: 0,
+            final_choice_bytes: original_bytes,
+        });
+    };
+    let mut by_label = HashMap::<&str, (usize, usize)>::new();
     let mut by_name = HashMap::<(&str, &str), usize>::new();
     for (server, tool) in tool_map.keys() {
         let bytes = projected_function_ref_bytes(server, tool)?;
-        let total = by_label.get(server.as_str()).copied().unwrap_or(0).checked_add(bytes)?;
-        by_label.insert(server.as_str(), total);
+        let (prior_bytes, prior_count) = by_label.get(server.as_str()).copied().unwrap_or((0, 0));
+        by_label.insert(
+            server.as_str(),
+            (prior_bytes.checked_add(bytes)?, prior_count.checked_add(1)?),
+        );
         by_name.insert((server.as_str(), tool.as_str()), bytes);
     }
-    let selector_bytes = |label: &str, name: Option<&str>| -> Option<usize> {
-        if let Some(name) = name {
-            return Some(by_name.get(&(label, name)).copied().unwrap_or(0));
-        }
-        Some(by_label.get(label).copied().unwrap_or(0))
+    let selector_refs = |label: &str, name: Option<&str>| -> (usize, usize) {
+        name.map_or_else(
+            || by_label.get(label).copied().unwrap_or((0, 0)),
+            |name| by_name.get(&(label, name)).map_or((0, 0), |bytes| (*bytes, 1)),
+        )
     };
-    match choice.get("type").and_then(serde_json::Value::as_str) {
+    match choice_obj.get("type").and_then(serde_json::Value::as_str) {
         Some("mcp") => {
-            let label = choice
+            let label = choice_obj
                 .get("server_label")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            let name = choice.get("name").and_then(serde_json::Value::as_str);
-            let bytes = selector_bytes(label, name)?;
-            // Server-level selectors add `mode` and a `tools` wrapper.
-            bytes.checked_add(64)
+            let name = choice_obj.get("name").and_then(serde_json::Value::as_str);
+            let (reference_bytes, reference_count) = selector_refs(label, name);
+            let peak_expansion_bytes = reference_bytes.checked_add(reference_count)?.checked_add(64)?;
+            let final_choice_bytes = if reference_count == 0 {
+                original_bytes
+            } else if name.is_some() {
+                reference_bytes
+            } else {
+                br#"{"type":"allowed_tools","mode":"required","tools":[]}"#
+                    .len()
+                    .checked_add(reference_bytes)?
+                    .checked_add(reference_count.checked_sub(1)?)?
+            };
+            Some(ToolChoiceProjection {
+                peak_expansion_bytes,
+                final_choice_bytes,
+            })
         },
         Some("allowed_tools") => {
-            choice
-                .get("tools")
-                .and_then(serde_json::Value::as_array)
-                .map_or(Some(0), |selectors| {
-                    selectors.iter().try_fold(0_usize, |total, selector| {
-                        if selector.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
-                            return Some(total);
-                        }
-                        let label = selector
-                            .get("server_label")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
-                        let name = selector.get("name").and_then(serde_json::Value::as_str);
-                        total.checked_add(selector_bytes(label, name)?)
-                    })
-                })
+            let Some(selectors) = choice_obj.get("tools").and_then(serde_json::Value::as_array) else {
+                return Some(ToolChoiceProjection {
+                    peak_expansion_bytes: 0,
+                    final_choice_bytes: original_bytes,
+                });
+            };
+            let mut peak_expansion_bytes = 0_usize;
+            let mut final_elements_bytes = 0_usize;
+            let mut final_elements = 0_usize;
+            let mut changed = false;
+            for selector in selectors {
+                if selector.get("type").and_then(serde_json::Value::as_str) == Some("mcp") {
+                    let label = selector
+                        .get("server_label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let name = selector.get("name").and_then(serde_json::Value::as_str);
+                    let (reference_bytes, reference_count) = selector_refs(label, name);
+                    peak_expansion_bytes = peak_expansion_bytes
+                        .checked_add(reference_bytes)?
+                        .checked_add(reference_count)?;
+                    if reference_count > 0 {
+                        changed = true;
+                        final_elements_bytes = final_elements_bytes.checked_add(reference_bytes)?;
+                        final_elements = final_elements.checked_add(reference_count)?;
+                        continue;
+                    }
+                    if selector
+                        .get("server_label")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|label| resolved_labels.contains(label))
+                    {
+                        changed = true;
+                        continue;
+                    }
+                }
+                final_elements_bytes = final_elements_bytes.checked_add(retained_json_bytes(selector)?)?;
+                final_elements = final_elements.checked_add(1)?;
+            }
+            let final_choice_bytes = if !changed
+                || (final_elements == 0
+                    && choice_obj.get("mode").and_then(serde_json::Value::as_str) == Some("required"))
+            {
+                original_bytes
+            } else if final_elements == 0 {
+                br#""none""#.len()
+            } else {
+                let original_tools_bytes = retained_json_bytes(choice_obj.get("tools")?)?;
+                let final_tools_bytes = 2_usize
+                    .checked_add(final_elements_bytes)?
+                    .checked_add(final_elements.checked_sub(1)?)?;
+                original_bytes
+                    .checked_sub(original_tools_bytes)?
+                    .checked_add(final_tools_bytes)?
+            };
+            Some(ToolChoiceProjection {
+                peak_expansion_bytes,
+                final_choice_bytes,
+            })
         },
-        _ => Some(0),
+        _ => Some(ToolChoiceProjection {
+            peak_expansion_bytes: 0,
+            final_choice_bytes: original_bytes,
+        }),
     }
 }
 
-/// Include an array separator for each possible generated reference.
+/// Exact compact JSON bytes for one generated function reference.
 fn projected_function_ref_bytes(server: &str, tool: &str) -> Option<usize> {
     let name_bytes = server
         .chars()
@@ -2456,7 +2539,7 @@ fn projected_function_ref_bytes(server: &str, tool: &str) -> Option<usize> {
         .checked_add(2)?
         .checked_add(tool.chars().count())?
         .min(MAX_FUNCTION_NAME_LEN);
-    br#"{"type":"function","name":""}"#.len().checked_add(name_bytes)?.checked_add(1)
+    br#"{"type":"function","name":""}"#.len().checked_add(name_bytes)
 }
 
 /// Rewrite a tools array, replacing resolved MCP entries with
@@ -3025,7 +3108,7 @@ async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), 
 /// pending so the round can return to the caller.
 #[expect(
     clippy::too_many_lines,
-    reason = "transactional deferred discovery keeps preparation, preflight, and commit together"
+    reason = "deferred discovery reserves and commits one bounded connector batch"
 )]
 pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     state: &mut ResponsesState,
@@ -3820,6 +3903,19 @@ impl AllowedTools {
     fn as_names(&self) -> Option<&[String]> {
         self.names.as_deref()
     }
+
+    /// Apply the same name and read-only checks before and during filtering.
+    fn matches(&self, tool: &serde_json::Value) -> bool {
+        if let Some(names) = self.as_names()
+            && !tool
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| names.iter().any(|allowed| allowed == name))
+        {
+            return false;
+        }
+        self.read_only.is_none_or(|wanted| tool_read_only_hint(tool) == wanted)
+    }
 }
 
 /// Check `previous_tools` for a cached listing matching
@@ -3840,25 +3936,6 @@ fn find_cached_listing(
     owner_fingerprint: Option<&str>,
     allowed_tools: Option<&[String]>,
 ) -> Option<Vec<serde_json::Value>> {
-    find_cached_listing_borrowed(
-        previous_tools.map(Vec::as_slice),
-        label,
-        server_url,
-        owner_fingerprint,
-        allowed_tools,
-    )
-    .map(<[serde_json::Value]>::to_vec)
-}
-
-/// Inspect a cache candidate without cloning its tool definitions. Aggregate
-/// admission uses this before the eager resolver may materialize the listing.
-fn find_cached_listing_borrowed<'a>(
-    previous_tools: Option<&'a [serde_json::Value]>,
-    label: &str,
-    server_url: &str,
-    owner_fingerprint: Option<&str>,
-    allowed_tools: Option<&[String]>,
-) -> Option<&'a [serde_json::Value]> {
     let previous = previous_tools?;
     let allowed = allowed_tools?;
 
@@ -3881,36 +3958,15 @@ fn find_cached_listing_borrowed<'a>(
         return None;
     }
 
-    Some(cached_tools)
+    Some(cached_tools.clone())
 }
 
 /// Filter tools by name list and/or read-only annotation.
 fn apply_allowed_tools_filter(tools: Vec<serde_json::Value>, allowed: &AllowedTools) -> Vec<serde_json::Value> {
-    let names = allowed.as_names();
-    let read_only = allowed.read_only;
-
-    if names.is_none() && read_only.is_none() {
+    if allowed.names.is_none() && allowed.read_only.is_none() {
         return tools;
     }
-
-    tools
-        .into_iter()
-        .filter(|t| {
-            if let Some(list) = names {
-                let matches_name = t
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|n| list.iter().any(|a| a == n));
-                if !matches_name {
-                    return false;
-                }
-            }
-            if let Some(want_read_only) = read_only {
-                return tool_read_only_hint(t) == want_read_only;
-            }
-            true
-        })
-        .collect()
+    tools.into_iter().filter(|tool| allowed.matches(tool)).collect()
 }
 
 /// Return whether an MCP tool has `annotations.readOnlyHint`

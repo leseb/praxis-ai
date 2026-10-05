@@ -18,7 +18,7 @@ use crate::{
     CalloutCredentials,
     openai::{
         api_client::{ApiClient, ApiClientConfig},
-        responses::state::ResponsesState,
+        responses::{buffered_parsed_json_bytes_upper_bound, state::ResponsesState},
     },
 };
 
@@ -34,16 +34,13 @@ fn aggregate_file_parse_admission_respects_existing_state() {
     state.apply_retained_payload_limit(baseline + 96);
     ctx.extensions.insert(state);
 
+    assert!(file_parse_fits_budget(&ctx, 96), "exact remaining allowance should fit");
     assert!(
-        ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(96),
-        "exact remaining allowance should fit"
-    );
-    assert!(
-        !ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(97),
+        !file_parse_fits_budget(&ctx, 97),
         "one byte over the allowance should fail"
     );
-    assert_eq!(aggregate_resolution_headroom(&ctx, 0), Some(96));
-    assert_eq!(aggregate_resolution_headroom(&ctx, 24), Some(0));
+    assert_eq!(aggregate_resolution_headroom(&ctx, 32, 32), Ok(Some(32)));
+    assert_eq!(aggregate_resolution_headroom(&ctx, 64, 64), Err(()));
 }
 
 #[test]
@@ -819,12 +816,30 @@ async fn continuation_file_budget_overflow_remains_server_error() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the URL stub must also stop when admission rejects before dialing"
+)]
 async fn aggregate_url_prefix_overflow_uses_budget_cleanup() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let url = format!("{origin}/a");
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = loop {
+            if !matches!(stop_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+                return;
+            }
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::park_timeout(Duration::from_millis(10));
+                },
+                Err(error) => panic!("URL stub accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
         let mut request = [0_u8; 4096];
         let _read = stream.read(&mut request).unwrap();
         write!(
@@ -854,6 +869,7 @@ async fn aggregate_url_prefix_overflow_uses_budget_cleanup() {
     );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    drop(stop_tx);
     server.join().unwrap();
 }
 

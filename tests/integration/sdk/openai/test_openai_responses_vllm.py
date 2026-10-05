@@ -5779,7 +5779,7 @@ filter_chains:
               - filter: openai_stream_events
               - filter: openai_agentic_loop
                 max_infer_iters: 1
-                max_retained_bytes: 4096
+                max_retained_bytes: 65536
               - filter: openai_responses_proxy
               - filter: router
                 routes:
@@ -5803,7 +5803,6 @@ insecure_options:
             "              - filter: responses_to_chat_completions\n",
             1,
         )
-        config = config.replace("max_retained_bytes: 4096", "max_retained_bytes: 65536")
     if scenario.endswith("header_suppressed"):
         first = config.index("          - name: first\n")
         transition = config.index("            on_result:\n", first)

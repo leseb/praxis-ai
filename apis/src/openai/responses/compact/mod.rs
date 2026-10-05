@@ -86,7 +86,9 @@ const TOKENIZER_STAGING_MULTIPLIER: usize = 160;
 
 /// Budget exhaustion must bypass the configured ordinary callout fail-open policy.
 enum ReactiveCompactionError {
+    /// The aggregate retained-payload admission failed.
     RetainedBudget,
+    /// The ordinary callout policy returned a filter action.
     Rejection(FilterAction),
 }
 
@@ -339,6 +341,8 @@ impl CompactFilter {
         )
         .await;
         if state.retained_payload_limit().is_some() {
+            // The transport already bounds an unsuccessful response body. It
+            // is never parsed, so preserve the configured callout policy.
             match &result {
                 Ok(resp) if (200..300).contains(&(resp.status as usize)) => {
                     let parsed = buffered_parsed_json_bytes_upper_bound(&resp.body)
@@ -362,8 +366,24 @@ impl CompactFilter {
                 _ => {},
             }
         }
+        Ok(self
+            .handle_reactive_subrequest_result(result, state.retained_payload_limit().map(|_| response_limit))?
+            .map(|s| s.content))
+    }
+
+    /// Admit the raw, parsed, and extracted response owners before JSON parsing.
+    fn handle_reactive_subrequest_result(
+        &self,
+        result: Result<subrequest::SubResponse, subrequest::SubRequestError>,
+        response_limit: Option<usize>,
+    ) -> Result<Option<Summarization>, ReactiveCompactionError> {
+        if let (Some(limit), Ok(resp)) = (response_limit, &result)
+            && (200..300).contains(&(resp.status as usize))
+            && !reactive_summarization_response_fits(&resp.body, limit)
+        {
+            return Err(ReactiveCompactionError::RetainedBudget);
+        }
         self.handle_subrequest_result(result)
-            .map(|summary| summary.map(|item| item.content))
             .map_err(ReactiveCompactionError::Rejection)
     }
 
@@ -524,10 +544,6 @@ impl CompactFilter {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "reactive budget cleanup belongs in the same request-body lifecycle"
-)]
 #[async_trait]
 impl HttpFilter for CompactFilter {
     fn name(&self) -> &'static str {
@@ -552,6 +568,10 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential reactive compaction admission and dispatch"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -613,10 +633,9 @@ impl HttpFilter for CompactFilter {
                 )));
             },
         };
-        let response_limit = match reactive_compaction_response_limit(state, &conversation_text, &params, &self.config)
-        {
-            Ok(limit) => limit,
-            Err(()) => return Ok(reject_compaction_budget(ctx)),
+        let Ok(response_limit) = reactive_compaction_response_limit(state, &conversation_text, &params, &self.config)
+        else {
+            return Ok(reject_compaction_budget(ctx));
         };
         let summary = match self
             .execute_compaction(state, &params, &conversation_text, response_limit)
@@ -679,6 +698,7 @@ fn reactive_compaction_text_fits(state: &ResponsesState) -> bool {
 /// Reserve escaped JSON request copies and buffered transport owners before
 /// dispatching the summarizer. Successful bodies are separately admitted for
 /// parsed-tree staging before they are decoded.
+#[expect(clippy::too_many_lines, reason = "checked reservation accounts for each live owner")]
 fn reactive_compaction_response_limit(
     state: &ResponsesState,
     conversation_text: &str,
@@ -718,6 +738,19 @@ fn reactive_compaction_response_limit(
     Ok(Some(response_limit))
 }
 
+/// The reactive response allowance reserves four raw-body lengths. A parsed
+/// JSON tree can expand numeric tokens, while summary text and usage are copied
+/// out of that tree before it is dropped. Their individual compact sizes are
+/// each bounded by the normalized size of the whole tree.
+fn reactive_summarization_response_fits(body: &[u8], response_limit: usize) -> bool {
+    buffered_parsed_json_bytes_upper_bound(body)
+        .and_then(|normalized| normalized.checked_mul(3))
+        .and_then(|owners| owners.checked_add(body.len()))
+        .zip(response_limit.checked_mul(4))
+        .is_some_and(|(peak, reserved)| peak <= reserved)
+}
+
+/// Use the shared request-phase rejection for a compaction admission failure.
 fn reject_compaction_budget(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
     super::budget_error::reject_request(
         ctx,

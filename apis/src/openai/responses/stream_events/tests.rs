@@ -522,12 +522,12 @@ fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
 #[test]
 fn eos_remeasures_history_appended_after_first_stream_chunk() {
     let (filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
     let baseline = responses.retained_payload_bytes().unwrap();
     responses.apply_retained_payload_limit(baseline + 2_000);
     ctx.extensions.insert(responses);
-    assert!(super::shared_retained_budget(&ctx, &stream).unwrap().1.is_some());
+    assert!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1.is_some());
     ctx.insert_filter_state(stream);
 
     let item = json!({"type": "reasoning", "id": "rs_eos", "summary": "x".repeat(3_000)});
@@ -882,19 +882,107 @@ fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
 }
 
 #[test]
+fn deferred_terminal_reserves_restored_payload_and_wire_together() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let tools = vec![json!({"type": "custom", "name": "custom", "description": "x".repeat(10_000)})];
+    let mut state = ResponsesState {
+        request_body: json!({"tools": tools, "stream": true}),
+        tools: tools.clone(),
+        client_tool_echo: Some(ClientToolEcho {
+            tools,
+            tool_choice: json!("auto"),
+        }),
+        response_object: json!({"id": "resp_1", "object": "response", "status": "completed", "output": []}),
+        client_tool_lowering: [(
+            "custom".to_owned(),
+            LoweredClientTool {
+                original_name: "custom".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        )]
+        .into(),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": state.response_object}),
+    };
+    // The parser's published retained charge still contains the deferred
+    // terminal until finalize replaces it, as it does on the live path.
+    state.retained_stream_parser_bytes = terminal.retained_payload_bytes().unwrap();
+    let limit = 131_072;
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.set_retained_external_payload_bytes(limit - baseline - 25_000);
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    let mut wire = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut wire).is_err());
+    assert!(
+        wire.is_empty(),
+        "an unadmitted successful terminal must not reach the client"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn deferred_terminal_rejects_echo_before_restoring_canonical_response() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState::from_request_body(json!({"stream": true}));
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type":"custom", "name":"custom", "description":"x".repeat(20_000)})],
+        tool_choice: json!("auto"),
+    });
+    state.replace_response_object(json!({"id":"r", "status":"completed", "output":[], "tools":[]}));
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type":"response.completed", "response":{"id":"r", "output":[], "tools":[]}}),
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let terminal_bytes = terminal.retained_payload_bytes().unwrap();
+    let echo_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    assert!(echo_staging > 40_000, "both restored response owners must be projected");
+    state.apply_retained_payload_limit(baseline + terminal_bytes + 1_024);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(terminal.payload["response"]["tools"], json!([]));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
 fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     let (filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState {
         request_body: json!({"input": "p".repeat(32_768)}),
         input: vec![json!({"text": "history"})],
+        accumulated_output: vec![json!({"type": "mcp_call", "result": "o".repeat(1_048_576)})],
         response_object: json!({"output": []}),
         ..ResponsesState::default()
     };
-    responses.apply_retained_payload_limit(1_000_000);
+    responses.apply_retained_payload_limit(2_000_000);
     ctx.extensions.insert(responses);
-    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
-    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+    let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
+    let cached = stream.shared_stable_bytes.get().copied().unwrap();
+    let prior = stream.shared_prior_output_bytes.get().copied().flatten().unwrap();
+    assert!(
+        prior.bytes > 1_048_576,
+        "the large prior-round output must be in the per-round cache"
+    );
     assert_eq!(
         initial,
         ctx.extensions
@@ -903,14 +991,8 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .retained_payload_bytes()
             .unwrap()
     );
-    ctx.insert_filter_state(stream);
-    let mut body = Some(make_sse_chunk(
-        "response.output_item.added",
-        &json!({"output_index": 0, "item": {"text": "new"}}),
-    ));
-    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
-    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object = json!({"output": [{"text": "new"}]});
+    let next = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     assert_eq!(
         next,
         ctx.extensions
@@ -919,7 +1001,155 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .retained_payload_bytes()
             .unwrap()
     );
-    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+    for _ in 0..100 {
+        assert_eq!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1, Some(next));
+        assert_eq!(stream.shared_stable_bytes.get().copied(), Some(cached));
+        assert_eq!(
+            stream.shared_prior_output_bytes.get().copied().flatten().unwrap().bytes,
+            prior.bytes
+        );
+    }
+    // The owner may append output at EOS; the next round must charge it again.
+    stream.clear_shared_budget_cache();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .accumulated_output
+        .push(json!({"type": "message", "content": "next round"}));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .tool_calls
+        .push(json!({"type": "function_call", "arguments": "next round"}));
+    let after_eos = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
+    assert_eq!(
+        after_eos,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert!(stream.shared_prior_output_bytes.get().copied().flatten().unwrap().bytes > prior.bytes);
+    ctx.insert_filter_state(stream);
+    filter.arm(&mut ctx);
+    let mut rearmed = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        rearmed.tool_calls_bytes.is_none(),
+        "a resumed round must remeasure completed calls"
+    );
+    assert_eq!(
+        super::shared_retained_budget(&ctx, &mut rearmed).unwrap().1,
+        ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_bytes()
+    );
+}
+
+#[test]
+fn streaming_budget_cache_counts_tool_snapshots_once_per_round() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState {
+        client_tool_echo: Some(ClientToolEcho {
+            tools: vec![
+                json!({"type": "function", "name": "tool", "parameters": {"description": "x".repeat(1_048_576)}}),
+            ],
+            tool_choice: json!("auto"),
+        }),
+        mcp_tool_map: [(
+            ("server".to_owned(), "tool".to_owned()),
+            json!({"schema": "y".repeat(1_048_576)}),
+        )]
+        .into(),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(3_000_000);
+    ctx.extensions.insert(responses);
+
+    let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
+    let stable = stream.shared_stable_bytes.get().copied().unwrap();
+    assert!(
+        stable > 2_097_152,
+        "echo and resolved MCP schema must be cached for the round"
+    );
+    assert_eq!(
+        initial,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    for _ in 0..100 {
+        assert_eq!(
+            super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+            Some(initial)
+        );
+    }
+
+    // A newly armed round remeasures the stable owners after prior state was
+    // discarded; the old echo charge must not remain in its cache.
+    stream.clear_shared_budget_cache();
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().client_tool_echo = None;
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().mcp_tool_map.clear();
+    let next = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
+    assert_eq!(
+        next,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert!(
+        next < initial,
+        "clearing tool snapshots must release their retained charge"
+    );
+}
+
+#[test]
+fn numeric_sse_event_is_rejected_before_expanded_value_allocation() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let numbers = std::iter::repeat_n("1e15", 10_000).collect::<Vec<_>>().join(",");
+    let wire = Bytes::from(format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r1\",\"output\":[],\"metadata\":{{\"values\":[{numbers}]}}}}}}\n\n"
+    ));
+    let mut responses = ResponsesState::default();
+    let limit = responses.retained_payload_bytes().unwrap() + wire.len() * 4;
+    responses.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(responses);
+
+    let result = super::parse_and_accumulate(&mut stream, &mut ctx, &wire, std::time::Instant::now()).unwrap();
+    assert!(
+        result.is_none(),
+        "numeric expansion must fail before event construction"
+    );
+    assert_eq!(
+        stream.event_count, 0,
+        "no event may be parsed after the preflight fails"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn ordinary_delta_skips_already_flushed_local_output_bound() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    ctx.extensions.insert(ResponsesState {
+        accumulated_output: vec![json!({"id": "mcp_1", "type": "mcp_call", "output": "x".repeat(1_048_576)})],
+        locally_executed_output_items: ["mcp_1".to_owned()].into(),
+        ..ResponsesState::default()
+    });
+    let chunk = make_sse_chunk("response.output_text.delta", &json!({"delta": "x"}));
+    let mut parser = SseFrameParser::new(65_536);
+    let frames = parser.parse_chunk(&chunk).unwrap();
+    let event = crate::openai::sse::responses::ResponsesEvent::from_frame(&frames[0]).unwrap();
+    let pending = super::logical_output_upper_bound(&ctx, &stream, std::slice::from_ref(&event)).unwrap();
+    assert!(pending > 1_048_576, "the first content event must reserve local output");
+
+    stream.local_items_flushed = true;
+    let flushed = super::logical_output_upper_bound(&ctx, &stream, &[event]).unwrap();
+    assert!(flushed < 1_024, "later deltas only reserve their own wire payload");
 }
 
 #[test]
@@ -947,15 +1177,14 @@ fn streaming_budget_caches_client_tool_echo_captured_after_arm() {
         started.elapsed()
     );
 
-    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     assert!(stream.shared_stable_bytes.get().copied().unwrap() > 1_048_576);
-    assert_eq!(super::shared_retained_budget(&ctx, stream).unwrap().1, Some(expected));
-    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(
-        responses
-            .stream_changing_payload_bytes_bounded_for_parser(1_024)
-            .is_some()
+    assert_eq!(
+        super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+        Some(expected)
     );
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(responses.stream_changing_payload_bytes_bounded(1_024).is_some());
     assert!(!responses.retained_payload_failed);
 }
 
@@ -1073,7 +1302,7 @@ fn unbounded_stream_skips_echo_projection_without_snapshots() {
 #[test]
 fn streaming_budget_cache_refreshes_prior_output_after_revision_change() {
     let (_filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState {
         accumulated_output: vec![json!({"text": "a".repeat(128 * 1024)})],
         ..ResponsesState::default()
@@ -1081,7 +1310,7 @@ fn streaming_budget_cache_refreshes_prior_output_after_revision_change() {
     responses.apply_retained_payload_limit(1_000_000);
     ctx.extensions.insert(responses);
 
-    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     let cache = stream.shared_prior_output_bytes.get().unwrap().unwrap();
     assert!(cache.bytes > 128 * 1024);
     assert_eq!(
@@ -1092,12 +1321,15 @@ fn streaming_budget_cache_refreshes_prior_output_after_revision_change() {
             .retained_payload_bytes()
             .unwrap()
     );
-    assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(initial));
+    assert_eq!(
+        super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+        Some(initial)
+    );
 
     let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
     responses.accumulated_output[0]["text"] = json!("b".repeat(256 * 1024));
     responses.mark_replay_stable_payload_changed();
-    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    let next = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     assert_eq!(
         next,
         ctx.extensions
@@ -1112,12 +1344,12 @@ fn streaming_budget_cache_refreshes_prior_output_after_revision_change() {
 #[test]
 fn eos_remeasures_history_appended_after_the_first_stream_chunk() {
     let (filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
     let baseline = responses.retained_payload_bytes().unwrap();
     responses.apply_retained_payload_limit(baseline + 2_000);
     ctx.extensions.insert(responses);
-    assert!(super::shared_retained_budget(&ctx, &stream).unwrap().1.is_some());
+    assert!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1.is_some());
     ctx.insert_filter_state(stream);
 
     // Agentic collection runs before the stream-events EOS callback and copies
@@ -1151,12 +1383,15 @@ fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
         output_index: 0,
         item_id: Some("call_done".to_owned()),
     });
+    // A completed output item leaves an allocated size-cache slot after the
+    // round's cache invalidation; finalization must release that capacity too.
+    stream.output_item_bytes = vec![Some(32); 16];
     let parser_bytes = stream.retained_payload_bytes().unwrap();
     let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
     let baseline = responses.retained_payload_bytes().unwrap();
-    responses.apply_retained_payload_limit(baseline + parser_bytes + 128);
+    responses.apply_retained_payload_limit(baseline + parser_bytes * 2 + 128);
     ctx.extensions.insert(responses);
-    assert!(super::publish_stream_payload(&mut ctx, &stream));
+    assert!(super::publish_stream_payload(&mut ctx, &mut stream));
     ctx.insert_filter_state(stream);
     ctx.filter_results
         .entry("openai_agentic_loop")
@@ -1173,6 +1408,7 @@ fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
     );
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(responses.retained_stream_parser_bytes, 0);
+    assert!(!responses.retained_payload_failed);
     assert!(
         responses.can_retain_payload(parser_bytes + 128),
         "the next IRR step must have room for payload that the old parser released"
@@ -1911,6 +2147,172 @@ fn make_sse_chunk(event_type: &str, data: &serde_json::Value) -> Bytes {
         .or_insert_with(|| serde_json::Value::String(event_type.to_owned()));
     let data_str = serde_json::to_string(&obj).unwrap();
     Bytes::from(format!("event: {event_type}\ndata: {data_str}\n\n"))
+}
+
+fn assert_cached_response_charge_matches_uncached(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    let cached = parser
+        .response_object_bytes(&responses.response_object, usize::MAX)
+        .unwrap();
+    let cached_tool_calls = parser.completed_tool_calls_bytes(&responses.tool_calls).unwrap();
+    assert_eq!(cached, super::retained_json_bytes(&responses.response_object).unwrap());
+    assert_eq!(
+        responses
+            .stream_changing_payload_bytes_bounded_with_response_object_size(
+                usize::MAX,
+                cached,
+                Some(cached_tool_calls)
+            )
+            .unwrap(),
+        responses.stream_changing_payload_bytes_bounded(usize::MAX).unwrap(),
+        "cached response charge must preserve all other independent owners, including tool_calls"
+    );
+    ctx.insert_filter_state(parser);
+}
+
+#[test]
+fn stream_response_object_cache_tracks_item_and_top_level_mutations() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true, "input": "hello"}));
+    responses.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(responses);
+
+    for (event, payload) in [
+        (
+            "response.output_item.added",
+            json!({"output_index":0,"item":{"id":"call_1","type":"function_call","name":"f","arguments":""}}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            json!({"output_index":0,"item_id":"call_1","arguments":"abc"}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            json!({"output_index":0,"item_id":"call_1","arguments":"abcde"}),
+        ),
+        (
+            "response.output_item.done",
+            json!({"output_index":0,"item":{"id":"call_1","type":"function_call","name":"f","arguments":"abcde","status":"completed"}}),
+        ),
+        (
+            "response.completed",
+            json!({"response":{"id":"resp_1","status":"completed","output":[{"id":"call_1","type":"function_call","name":"f","arguments":"abcdef","status":"completed"}],"usage":{"input_tokens":1}}}),
+        ),
+    ] {
+        let prior_tool_call_bytes =
+            super::retained_json_values_bytes(&ctx.extensions.get::<ResponsesState>().unwrap().tool_calls).unwrap();
+        let mut chunk = Some(make_sse_chunk(event, &payload));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(
+            !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "{event} unexpectedly failed admission"
+        );
+        if event == "response.function_call_arguments.done" && prior_tool_call_bytes > 0 {
+            let calls = &ctx.extensions.get::<ResponsesState>().unwrap().tool_calls;
+            assert_eq!(calls.len(), 1, "arguments.done replaces the call at the same index");
+            assert!(super::retained_json_values_bytes(calls).unwrap() > prior_tool_call_bytes);
+        }
+        if event == "response.completed" {
+            let calls = &ctx.extensions.get::<ResponsesState>().unwrap().tool_calls;
+            assert_eq!(
+                calls.len(),
+                1,
+                "terminal replaces the call without changing vector length"
+            );
+            assert!(super::retained_json_values_bytes(calls).unwrap() > prior_tool_call_bytes);
+        }
+        assert_cached_response_charge_matches_uncached(&mut ctx);
+    }
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object["status"] =
+        json!("completed-with-longer-status");
+    assert_cached_response_charge_matches_uncached(&mut ctx);
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    // The shared view excludes this filter's separately published parser
+    // charge, so tighten the limit against that view itself.
+    let exact = super::shared_retained_budget(&ctx, &mut parser).unwrap().1.unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(exact - 1);
+    assert!(
+        super::shared_retained_budget(&ctx, &mut parser).unwrap().1.is_none(),
+        "cached call sizes must still honor a smaller shared limit"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the timed regression reports a before/after comparison when run with --nocapture"
+)]
+fn completed_stream_item_is_charged_across_later_small_deltas() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true, "input": "hello"}));
+    responses.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(responses);
+    let item = json!({"output_index":0,"item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[],"encrypted_content":"x".repeat(1_048_576)}});
+    for event in ["response.output_item.added", "response.output_item.done"] {
+        let mut chunk = Some(make_sse_chunk(event, &item));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some());
+    }
+    let frame = make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"item_id":"msg_1","output_index":1,"content_index":0,"delta":"hi"}),
+    );
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let mut chunk = Some(frame.clone());
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some());
+    }
+    eprintln!("completed-item 100-delta budget scan: {:?}", start.elapsed());
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_cached_response_charge_matches_uncached(&mut ctx);
+}
+
+#[test]
+#[expect(clippy::print_stderr, reason = "matched before/after budget-meter timing probe")]
+fn completed_tool_call_budget_checks_reuse_exact_charge() {
+    fn timed_checks(retain_call: bool) -> std::time::Duration {
+        let (_filter, mut ctx) = make_armed_context();
+        let mut responses = ResponsesState::from_request_body(json!({"input":"hi", "stream":true}));
+        let call = json!({
+            "type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"tool",
+            "arguments":"x".repeat(262_144), "status":"completed"
+        });
+        responses.replace_response_object(json!({"output":[call.clone()]}));
+        if retain_call {
+            responses.tool_calls.push(call);
+        }
+        responses.apply_retained_payload_limit(64 * 1024 * 1024);
+        ctx.extensions.insert(responses);
+        let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+        let expected = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        assert_eq!(
+            super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+            Some(expected)
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(super::shared_retained_budget(&ctx, &mut stream));
+        }
+        assert_eq!(
+            super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+            Some(expected)
+        );
+        start.elapsed()
+    }
+
+    let output_only = timed_checks(false);
+    let completed_call = timed_checks(true);
+    eprintln!("200 unchanged budget checks: output_only={output_only:?}; with_completed_tool_call={completed_call:?}");
 }
 
 #[tokio::test]
@@ -3321,7 +3723,8 @@ async fn logical_output_is_admitted_before_allocation() {
     let mut parser = SseFrameParser::new(65_536);
     let frames = parser.parse_chunk(&chunk).unwrap();
     let event = crate::openai::sse::responses::ResponsesEvent::from_frame(&frames[0]).unwrap();
-    let output_upper_bound = super::logical_output_upper_bound(&ctx, false, &[event]).unwrap();
+    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, stream, &[event]).unwrap();
     ctx.extensions
         .get_mut::<ResponsesState>()
         .unwrap()
@@ -3369,7 +3772,8 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
     let frame_bytes = super::retained_frame_payload_bytes(&frames).unwrap();
     let event_bytes = super::retained_event_payload_bytes(&events[0]).unwrap();
     let projected_state_bytes = super::projected_responses_state_clone_bytes(&ctx, &events);
-    let output_upper_bound = super::logical_output_upper_bound(&ctx, false, &events).unwrap();
+    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, stream, &events).unwrap();
     let current = ctx
         .extensions
         .get::<ResponsesState>()
@@ -3387,6 +3791,207 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
 
     assert!(body.is_none(), "the commit must reject all simultaneous owners");
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn lifecycle_echo_snapshots_are_rejected_before_plan_allocation() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut state = ResponsesState::from_request_body(json!({"stream":true}));
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type":"custom", "name":"custom", "description":"x".repeat(20_000)})],
+        tool_choice: json!("auto"),
+    });
+    ctx.extensions.insert(state);
+    filter.arm(&mut ctx);
+    let payload = json!({"type":"response.in_progress", "response":{"id":"r", "output":[], "tools":[]}});
+    let mut chunk = Vec::new();
+    for _ in 0..32 {
+        chunk.extend_from_slice(&make_sse_chunk("response.in_progress", &payload));
+    }
+    let mut frame_parser = SseFrameParser::new(65_536);
+    let frames = frame_parser.parse_chunk(&chunk).unwrap();
+    let events = frames
+        .iter()
+        .map(crate::openai::sse::responses::ResponsesEvent::from_frame)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let echo_projection = {
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        super::client_tools::lifecycle_restore_staging_bytes(
+            &state.client_tool_lowering,
+            state.client_tool_echo.as_ref(),
+            &[],
+            &events,
+        )
+        .unwrap()
+    };
+    assert!(echo_projection > 640_000);
+    let baseline = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let construction = super::retained_frame_payload_bytes(&frames).unwrap()
+        + events
+            .iter()
+            .map(|event| super::retained_event_payload_bytes(event).unwrap())
+            .sum::<usize>();
+    let clones = super::projected_responses_state_clone_bytes(&ctx, &events).unwrap();
+    let output =
+        super::logical_output_upper_bound(&ctx, ctx.get_filter_state::<StreamEventsState>().unwrap(), &events).unwrap();
+    let limit = baseline + construction + clones + output * 2 + 4_096;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(limit);
+
+    let mut body = Some(Bytes::from(chunk));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_none(), "unadmitted echoed lifecycle must not be emitted");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn compacted_namespace_item_names_are_rejected_before_restore_plan_allocation() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let original_name = "n".repeat(1_048_576);
+    let private_name = "agentic_ns___0123456789abcdef";
+    let mut state = ResponsesState::from_request_body(json!({"stream": true}));
+    state.client_tool_lowering.insert(
+        private_name.to_owned(),
+        LoweredClientTool {
+            original_name: original_name.clone(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({
+            "type": "namespace", "name": "ns", "description": "tools",
+            "tools": [{"type": "function", "name": original_name}]
+        })],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(64 * 1_048_576);
+    ctx.extensions.insert(state);
+    filter.arm(&mut ctx);
+
+    let mut chunk = Vec::new();
+    let mut events = Vec::new();
+    for index in 0..80 {
+        let payload = json!({
+            "type": "response.output_item.added", "output_index": index,
+            "item": {"type": "function_call", "name": private_name,
+                     "id": format!("fc_{index}"), "call_id": format!("call_{index}")}
+        });
+        chunk.extend_from_slice(&make_sse_chunk("response.output_item.added", &payload));
+        events.push(crate::openai::sse::responses::ResponsesEvent::OutputItemAdded(payload));
+    }
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let projected = super::client_tools::lifecycle_restore_staging_bytes(
+        &state.client_tool_lowering,
+        state.client_tool_echo.as_ref(),
+        &[],
+        &events,
+    )
+    .unwrap();
+    assert!(
+        projected > 64 * 1_048_576,
+        "the repeated public name must be reserved before planning"
+    );
+    assert!(
+        state.retained_payload_bytes().unwrap() + chunk.len() * 8 < 64 * 1_048_576,
+        "the compact provider frames alone must fit the request budget"
+    );
+
+    let mut body = Some(Bytes::from(chunk));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        body.is_none(),
+        "the item-level restoration peak must fail before emission"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn lowered_completion_reserves_both_full_item_snapshots() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    let item = json!({
+        "type": "function_call", "name": "private", "id": "fc_1",
+        "call_id": "c".repeat(262_144), "arguments": ""
+    });
+    let item_bytes = crate::openai::responses::state::retained_json_bytes(&item).unwrap();
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.output_items_mut().push(item);
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(state);
+    let done = crate::openai::sse::responses::ResponsesEvent::FunctionCallArgumentsDone(json!({
+        "type": "response.function_call_arguments.done", "item_id": "fc_1",
+        "output_index": 0, "arguments": "{\"input\":\"x\"}"
+    }));
+    let projected = super::projected_responses_state_clone_bytes(&ctx, &[done]).unwrap();
+    assert!(
+        projected >= item_bytes * 2,
+        "tool_calls and ClientToolCompletion each clone the full preexisting item"
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_echo_snapshot_with_headroom_is_emitted() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut state = ResponsesState::from_request_body(json!({"stream":true}));
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type":"custom", "name":"custom"})],
+        tool_choice: json!("auto"),
+    });
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 65_536);
+    ctx.extensions.insert(state);
+    filter.arm(&mut ctx);
+
+    let payload = json!({"type":"response.in_progress", "response":{"id":"r", "output":[], "tools":[]}});
+    let mut body = Some(make_sse_chunk("response.in_progress", &payload));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let emitted = String::from_utf8(body.expect("admitted lifecycle").to_vec()).unwrap();
+    assert!(emitted.contains("\"name\":\"custom\""), "{emitted}");
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[test]
@@ -5941,7 +6546,8 @@ fn parse_error_sets_metadata() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         shared_prior_output_bytes: std::sync::OnceLock::new(),
-        shared_current_output_bytes: std::sync::atomic::AtomicUsize::new(0),
+        output_item_bytes: Vec::new(),
+        tool_calls_bytes: None,
     });
 
     let large_chunk =
@@ -5997,7 +6603,8 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         shared_prior_output_bytes: std::sync::OnceLock::new(),
-        shared_current_output_bytes: std::sync::atomic::AtomicUsize::new(0),
+        output_item_bytes: Vec::new(),
+        tool_calls_bytes: None,
     });
 
     validate_stream_end(&mut ctx);
@@ -8357,4 +8964,274 @@ fn make_armed_context_with_filter(
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
     (filter, ctx)
+}
+
+#[test]
+fn budget_rejects_lossy_expansion_of_prior_partial_event_line() {
+    let filter = make_filter();
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true}));
+    responses.apply_retained_payload_limit(4_096);
+    ctx.extensions.insert(responses);
+    filter.arm(&mut ctx);
+
+    let mut partial = b"event: ".to_vec();
+    partial.extend(std::iter::repeat_n(0xFF, 3_000));
+    for fragment in partial.chunks(100) {
+        let mut body = Some(Bytes::copy_from_slice(fragment));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "an unfinished line remains within the budget"
+        );
+    }
+    let mut terminator = Some(Bytes::from_static(b"\n"));
+    filter.on_response_body(&mut ctx, &mut terminator, false).unwrap();
+    assert!(
+        ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+        "the old line's lossy UTF-8 expansion must be rejected before parsing"
+    );
+    assert!(terminator.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budget_rejects_same_chunk_function_call_clone_fanout() {
+    let filter = make_filter();
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut responses = ResponsesState::from_request_body(json!({"stream": true}));
+    responses.apply_retained_payload_limit(102_232);
+    ctx.extensions.insert(responses);
+    filter.arm(&mut ctx);
+
+    let mut wire = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "x".repeat(10_000), "arguments": ""}
+        }),
+    )
+    .to_vec();
+    let done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "arguments": "{}"}),
+    );
+    for _ in 0..32 {
+        wire.extend_from_slice(&done);
+    }
+    let mut body = Some(Bytes::from(wire));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        responses.retained_payload_failed,
+        "fanout must fail before any item clone is committed"
+    );
+    assert!(responses.tool_calls.is_empty(), "no tool-call copies may be retained");
+    assert!(body.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budget_rejects_done_fallback_arguments_before_cloning() {
+    use crate::openai::sse::responses::ResponsesEvent;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    responses.replace_response_object(json!({
+        "output": [{
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "tool", "arguments": "", "status": "in_progress"
+        }]
+    }));
+    responses.apply_retained_payload_limit(250_000);
+    ctx.extensions.insert(responses);
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    stream
+        .tool_call_args
+        .insert("item:fc_1".to_owned(), "x".repeat(200_000));
+    let done_payload = json!({"item_id": "fc_1", "output_index": 0});
+    let done = ResponsesEvent::FunctionCallArgumentsDone(done_payload.clone());
+    let fallback_projection = super::projected_argument_fallback_clone_bytes(&stream, &[done]).unwrap();
+    assert_eq!(fallback_projection, 400_004, "both JSON string copies must be reserved");
+    let explicit = ResponsesEvent::FunctionCallArgumentsDone(json!({
+        "item_id": "fc_1", "output_index": 0, "arguments": "{}"
+    }));
+    assert_eq!(
+        super::projected_argument_fallback_clone_bytes(&stream, &[explicit]),
+        Some(0),
+        "explicit final arguments replace, rather than copy, the buffered fallback"
+    );
+    let budget = super::shared_retained_budget(&ctx, &mut stream);
+    assert!(budget.unwrap().1.is_some(), "the buffered source itself fits");
+    assert!(
+        !super::stream_payload_fits_with_budget(&stream, fallback_projection, budget),
+        "preflight must reject the destination copies before commitment"
+    );
+    ctx.insert_filter_state(stream);
+
+    let mut body = Some(make_sse_chunk("response.function_call_arguments.done", &done_payload));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(responses.retained_payload_failed, "the logical stream must fail closed");
+    assert!(responses.tool_calls.is_empty(), "no fallback copy may be committed");
+    assert!(body.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budget_rejects_escaped_done_fallback_before_cloning() {
+    use crate::openai::sse::responses::ResponsesEvent;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    responses.replace_response_object(json!({"output": [{
+        "type": "function_call", "id": "fc_1", "call_id": "call_1",
+        "name": "tool", "arguments": "", "status": "in_progress"
+    }]}));
+    responses.apply_retained_payload_limit(350_000);
+    ctx.extensions.insert(responses);
+    let arguments = serde_json::to_string(&json!({"s": "\\".repeat(50_000)})).unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_ok());
+    for delta in arguments.as_bytes().chunks(1_024) {
+        let mut body = Some(make_sse_chunk(
+            "response.function_call_arguments.delta",
+            &json!({
+                "item_id": "fc_1", "output_index": 0,
+                "delta": std::str::from_utf8(delta).unwrap()
+            }),
+        ));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            !ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "the buffered argument source fits before completion"
+        );
+    }
+
+    let done_payload = json!({"item_id": "fc_1", "output_index": 0});
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert_eq!(stream.tool_call_args.get("item:fc_1"), Some(&arguments));
+    let done = ResponsesEvent::FunctionCallArgumentsDone(done_payload.clone());
+    let projection = super::projected_argument_fallback_clone_bytes(&stream, &[done]).unwrap();
+    assert_eq!(
+        projection,
+        serde_json::to_string(&arguments).unwrap().len() * 2,
+        "reserve the exact JSON-escaped form of both destination strings"
+    );
+    assert!(
+        projection > arguments.len() * 2,
+        "backslashes must expand the reservation"
+    );
+    let budget = super::shared_retained_budget(&ctx, &mut stream);
+    assert!(budget.unwrap().1.is_some(), "the buffered source itself fits");
+    assert!(
+        !super::stream_payload_fits_with_budget(&stream, projection, budget),
+        "preflight must reject escaped destination copies before commitment"
+    );
+    ctx.insert_filter_state(stream);
+
+    let mut body = Some(make_sse_chunk("response.function_call_arguments.done", &done_payload));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        responses.retained_payload_failed,
+        "escaped fallback clones exceed the budget"
+    );
+    assert!(
+        responses.tool_calls.is_empty(),
+        "no escaped fallback copy may be committed"
+    );
+    assert!(body.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budget_rejects_lowered_done_fallback_before_restore_plan() {
+    use crate::openai::sse::responses::ResponsesEvent;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    responses.client_tool_lowering.insert(
+        "custom".to_owned(),
+        LoweredClientTool {
+            original_name: "custom".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(responses);
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "custom", "arguments": "", "status": "in_progress"
+            }
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    stream.tool_call_args.insert(
+        "item:fc_1".to_owned(),
+        serde_json::to_string(&json!({"input": "x".repeat(200_000)})).unwrap(),
+    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(700_000);
+    let done_payload = json!({"item_id": "fc_1", "output_index": 0});
+    let done = ResponsesEvent::FunctionCallArgumentsDone(done_payload.clone());
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    let restore = super::client_tools::lifecycle_fallback_staging_bytes(
+        &responses.client_tool_lowering,
+        &stream.client_tool_items,
+        &stream.tool_call_args,
+        &[done],
+    )
+    .unwrap();
+    assert!(
+        restore > 800_000,
+        "the completion artifact and restored input need separate reservations"
+    );
+    stream.tool_call_args.insert("item:native".to_owned(), "{}".to_owned());
+    let native_done = ResponsesEvent::FunctionCallArgumentsDone(json!({"item_id": "native"}));
+    assert_eq!(
+        super::client_tools::lifecycle_fallback_staging_bytes(
+            &responses.client_tool_lowering,
+            &stream.client_tool_items,
+            &stream.tool_call_args,
+            &[native_done],
+        ),
+        Some(0),
+        "an unrelated native function must not reserve lowered restoration owners"
+    );
+    stream.tool_call_args.remove("item:native");
+    let budget = super::shared_retained_budget(&ctx, &mut stream);
+    assert!(budget.unwrap().1.is_some(), "the buffered source itself fits");
+    assert!(
+        !super::stream_payload_fits_with_budget(&stream, restore, budget),
+        "precommit admission must reject the restore plan before it allocates"
+    );
+    ctx.insert_filter_state(stream);
+
+    let mut body = Some(make_sse_chunk("response.function_call_arguments.done", &done_payload));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        responses.retained_payload_failed,
+        "the lowered fallback exceeds the budget"
+    );
+    assert!(
+        responses.tool_calls.is_empty(),
+        "no completed tool copy may be retained"
+    );
+    assert!(body.is_none(), "the rejected chunk must not be forwarded");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }

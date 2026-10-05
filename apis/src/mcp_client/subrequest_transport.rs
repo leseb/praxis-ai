@@ -63,10 +63,6 @@ use crate::{StateOwner, callout_target::AddressPolicy};
 /// `mod.rs` derives its cumulative `tools/list` budget from this value.
 pub(crate) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
 
-/// Keep ordinary MCP handshakes usable even when the admitted tool result is
-/// small. The dispatcher separately reserves this floor for every new session.
-pub(crate) const MIN_TOOL_INITIALIZE_BYTES: usize = 1_024;
-
 /// JSON-RPC envelope allowance added on top of the configured `tools/call`
 /// result cap, covering the surrounding result object beyond the raw payload.
 const MAX_TOOL_RESULT_ENVELOPE_BYTES: usize = 65_536;
@@ -86,6 +82,82 @@ fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
     max_result_bytes
         .saturating_mul(MAX_JSON_STRING_EXPANSION)
         .saturating_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)
+}
+
+/// Bound the raw response, decoded strings/numbers, and JSON tree nodes before
+/// rmcp deserializes an untrusted tool result. The node allowance covers `Value`
+/// storage and container growth even for dense arrays of one-byte values.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one lexical pass counts numeric expansion and JSON nodes"
+)]
+pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
+    let mut normalized = raw.len();
+    let mut nodes = 1_usize;
+    let mut index = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    while let Some(&byte) = raw.get(index) {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'[' | b'{' | b':' | b',' => nodes = nodes.checked_add(1)?,
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                let mut exponent = false;
+                while let Some(&digit) = raw.get(index) {
+                    if !matches!(digit, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+                        break;
+                    }
+                    exponent |= matches!(digit, b'e' | b'E');
+                    index += 1;
+                }
+                let token = raw.get(start..index)?;
+                if exponent || token.len() >= 20 || token == b"-0" {
+                    normalized = normalized.checked_add(24_usize.saturating_sub(token.len()))?;
+                }
+                continue;
+            },
+            _ => {},
+        }
+        index += 1;
+    }
+    // Two wire-like owners may coexist: the transport body and SSE `data` or
+    // serde's string allocation. One structural node needs at most 128 bytes
+    // including container slack and map entry links.
+    raw.len()
+        .checked_mul(2)?
+        .checked_add(normalized)?
+        .checked_add(nodes.checked_mul(128)?)
+}
+
+/// True when the raw message and its worst-case parsed owners fit the optional cap.
+pub(super) fn json_preparse_fits(raw: &[u8], limit: Option<usize>) -> bool {
+    limit.is_none_or(|limit| json_preparse_peak_bytes(raw).is_some_and(|bytes| bytes <= limit))
+}
+
+/// Record a typed size error before rmcp can allocate a parsed JSON-RPC message.
+fn admit_json_preparse(
+    raw: &[u8],
+    limit: Option<usize>,
+    signal: &Arc<OnceLock<TransportSignal>>,
+) -> Result<(), StreamableHttpError<McpTransportError>> {
+    if json_preparse_fits(raw, limit) {
+        return Ok(());
+    }
+    let cap = limit.unwrap_or(0);
+    signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+    Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
 }
 
 /// Loose executor backstop for a streaming callout (spec §4.5, F3).
@@ -396,8 +468,8 @@ pub(crate) fn build_bare_outbound_pipeline(allow_private: bool) -> Result<Arc<Fi
 /// of these per request via [`from_context`](Self::from_context) and thread it
 /// down to
 /// [`list_tools_with_forwarded_headers`](super::list_tools_with_forwarded_headers)/
-/// [`call_tool_with_forwarded_headers_bounded_initialize`](super::call_tool_with_forwarded_headers_bounded_initialize),
-/// which build an [`McpSubrequestClient`] from it.
+/// [`call_tool_with_forwarded_headers_with_budget`](super::call_tool_with_forwarded_headers_with_budget), which build
+/// an [`McpSubrequestClient`] from it.
 ///
 /// It deliberately does *not* fabricate a fresh connector or a default runtime:
 /// the callout must share the server's connection pool and carry the originating
@@ -550,12 +622,15 @@ pub(crate) struct McpSubrequestClient {
     callout: McpCallout,
     /// Wire byte ceiling applied to a `tools/call` response on this client.
     ///
-    /// `tools/call` uses this configured, JSON-expansion-adjusted ceiling.
-    /// Tool-session `initialize` uses the separate admitted payload cap.
+    /// `tools/call` responses use this configured, JSON-expansion-adjusted
+    /// ceiling (see [`Self::response_limit`]).
     tool_result_bytes: usize,
-    /// Initialization can be retained as rmcp peer information for the session
-    /// lifetime. Tool sessions bound it to their admitted result payload.
-    initialize_bytes: usize,
+    /// Optional request-wide allowance for a `tools/call` raw wire plus rmcp's
+    /// parsed JSON. Control exchanges have their own admission reservation.
+    preparse_peak_limit: Option<usize>,
+    /// Per-exchange cap for initialize and other control responses. Budgeted
+    /// tool calls lower this before dialing a fresh session.
+    control_response_bytes: usize,
     /// Cumulative wire-byte ceiling for a server-initiated GET SSE stream.
     ///
     /// An intentionally coarse raw-wire `DoS` backstop, not decoded parity: for a
@@ -594,34 +669,39 @@ impl McpSubrequestClient {
             MAX_CONTROL_RESPONSE_BYTES,
             MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            None,
             owner,
         )
     }
 
     /// Build a client for
-    /// [`call_tool_with_forwarded_headers_bounded_initialize`](super::call_tool_with_forwarded_headers_bounded_initialize):
-    /// With an aggregate budget, `initialize` uses the supplied decoded cap
-    /// (with a 1 KiB floor). Otherwise it keeps the 1 MiB control ceiling.
-    /// `tools/call` expands its result cap for worst-case JSON string escaping.
+    /// [`call_tool_with_forwarded_headers_with_budget`](super::call_tool_with_forwarded_headers_with_budget):
+    /// `initialize` uses the supplied control ceiling and the `tools/call`
+    /// response uses `max_result_bytes`, expanded for JSON string escaping.
     ///
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
     /// posture decides whether loopback destinations are permitted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "tool transport has independent wire and parse caps"
+    )]
     pub(crate) fn for_tool(
         callout: McpCallout,
         step_timeout: Duration,
         max_result_bytes: usize,
-        initialize_limit: usize,
+        max_control_response_bytes: usize,
+        preparse_peak_limit: Option<usize>,
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
-        let initialize_bytes = initialize_limit.clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES);
         Self::with_wire_cap(
             callout,
             step_timeout,
             wire,
-            initialize_bytes,
-            wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            max_control_response_bytes,
+            wire.saturating_add(max_control_response_bytes),
+            preparse_peak_limit,
             owner,
         )
     }
@@ -630,20 +710,22 @@ impl McpSubrequestClient {
     /// ceiling.
     #[expect(
         clippy::too_many_arguments,
-        reason = "independent result and initialize ceilings share one transport"
+        reason = "tool and control wire caps are independent transport bounds"
     )]
     fn with_wire_cap(
         callout: McpCallout,
         step_timeout: Duration,
         tool_result_bytes: usize,
-        initialize_bytes: usize,
+        control_response_bytes: usize,
         stream_cumulative_cap: usize,
+        preparse_peak_limit: Option<usize>,
         owner: Option<StateOwner>,
     ) -> Self {
         Self {
             callout,
             tool_result_bytes,
-            initialize_bytes,
+            preparse_peak_limit,
+            control_response_bytes,
             step_timeout,
             stream_cumulative_cap,
             owner,
@@ -681,21 +763,37 @@ impl McpSubrequestClient {
 
     /// Select the wire byte ceiling for one outbound message.
     ///
-    /// `tools/call` uses the configured result ceiling. Tool-session
-    /// `initialize` is separately bounded because rmcp retains its metadata;
-    /// other exchanges use the control ceiling.
+    /// `tools/call` responses use the configured tool-result ceiling; every other
+    /// exchange (`initialize`, `tools/list`, notifications, ...) is bounded to the
+    /// control ceiling so an untrusted server cannot exhaust proxy memory on the
+    /// control plane.
     fn response_limit(&self, message: &ClientJsonRpcMessage) -> usize {
-        match message {
-            ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)) => {
-                self.tool_result_bytes
-            },
-            ClientJsonRpcMessage::Request(request)
-                if matches!(request.request, ClientRequest::InitializeRequest(_)) =>
-            {
-                self.initialize_bytes
-            },
-            _ => MAX_CONTROL_RESPONSE_BYTES,
+        if Self::is_tool_call(message) {
+            self.tool_result_bytes
+        } else {
+            self.control_response_bytes
         }
+    }
+
+    /// Tool replies use the result reservation; control exchanges use their
+    /// separately admitted raw and parsed response allowance.
+    fn preparse_limit(&self, message: &ClientJsonRpcMessage) -> Option<usize> {
+        if Self::is_tool_call(message) {
+            self.preparse_peak_limit
+        } else {
+            self.control_preparse_limit()
+        }
+    }
+
+    /// Parsed control owners share the same multiplier reserved by dispatch.
+    fn control_preparse_limit(&self) -> Option<usize> {
+        self.preparse_peak_limit
+            .map(|_| self.control_response_bytes * super::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
+    }
+
+    /// Match the request whose reply uses the configured tool-result ceiling.
+    fn is_tool_call(message: &ClientJsonRpcMessage) -> bool {
+        matches!(message, ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)))
     }
 
     /// Prepare and validate the dial for `uri` — SSRF/DNS validation, upstream
@@ -936,6 +1034,7 @@ impl McpSubrequestClient {
             // can never clamp the authoritative per-event bound below `wire_cap()`.
             max_sse_event_size.max(self.wire_cap()),
             signal,
+            self.control_preparse_limit(),
         ))
     }
 
@@ -999,6 +1098,7 @@ impl McpSubrequestClient {
         session_was_attached: bool,
         per_event_cap: usize,
         max_sse_event_size: usize,
+        preparse_peak_limit: Option<usize>,
         signal: Arc<OnceLock<TransportSignal>>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
         let status = StatusCode::from_u16(response.status)
@@ -1047,8 +1147,10 @@ impl McpSubrequestClient {
             // spurious 413 (see collect_capped). Exactly one of the two branches
             // cancels the body.
             if content_type.as_deref().is_some_and(is_json_content_type) {
-                if let Some(bytes) = collect_capped(&mut body, MAX_CONTROL_RESPONSE_BYTES).await
-                    && let Some(message) = parse_json_rpc_error(&String::from_utf8_lossy(&bytes))
+                if let Some(bytes) = collect_capped(&mut body, self.control_response_bytes).await
+                    && json_preparse_fits(&bytes, preparse_peak_limit)
+                    && let Ok(text) = std::str::from_utf8(&bytes)
+                    && let Some(message) = parse_json_rpc_error(text)
                 {
                     return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
                 }
@@ -1070,6 +1172,7 @@ impl McpSubrequestClient {
                     // the per-message cap so it never clamps the per-event bound below it.
                     max_sse_event_size.max(per_event_cap),
                     Arc::clone(&signal).into(),
+                    preparse_peak_limit,
                 );
                 Ok(StreamableHttpPostResponse::Sse(sse, session_id_out))
             },
@@ -1080,6 +1183,7 @@ impl McpSubrequestClient {
                 // unparseable body is a typed UnexpectedServerResponse, never an
                 // Accepted ack (which is reserved for one-way messages).
                 let buffered = collect_body(&mut body, per_event_cap, &signal).await?;
+                admit_json_preparse(&buffered, preparse_peak_limit, &signal)?;
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&buffered) {
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                     Err(_error) => Err(StreamableHttpError::UnexpectedServerResponse(
@@ -1109,6 +1213,7 @@ impl StreamableHttpClient for McpSubrequestClient {
         let session_was_attached = session_id.is_some();
         let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
         let max_response_bytes = self.response_limit(&message);
+        let preparse_peak_limit = self.preparse_limit(&message);
         let signal = self.signal_handle();
         let body =
             serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
@@ -1121,7 +1226,7 @@ impl StreamableHttpClient for McpSubrequestClient {
             &signal,
         ))
         .await?;
-        classify_buffered_post_response(response, &message, session_was_attached)
+        classify_buffered_post_response(response, &message, session_was_attached, preparse_peak_limit, &signal)
     }
 
     async fn delete_session(
@@ -1244,6 +1349,7 @@ impl StreamableHttpClient for McpSubrequestClient {
         let session_was_attached = session_id.is_some();
         let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
         let max_response_bytes = self.response_limit(&message);
+        let preparse_peak_limit = self.preparse_limit(&message);
         let signal = self.signal_handle();
         let body =
             serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
@@ -1265,6 +1371,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                 &message,
                 session_was_attached,
                 max_response_bytes,
+                preparse_peak_limit,
                 &signal,
             ),
             Some(streaming_body) => {
@@ -1274,6 +1381,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                     session_was_attached,
                     max_response_bytes,
                     max_sse_event_size,
+                    preparse_peak_limit,
                     signal,
                 )
                 .await
@@ -1286,26 +1394,33 @@ impl StreamableHttpClient for McpSubrequestClient {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// The streaming executor's 2× backstop can return a buffered fallback larger
-/// than the per-message cap. Check the cap before rmcp parses the response.
+/// The streaming executor can return a buffered fallback under its 2×
+/// backstop. Enforce the actual per-message cap before rmcp parses it.
 fn classify_bounded_buffered_post_response(
     response: SubResponse,
     message: &ClientJsonRpcMessage,
     session_was_attached: bool,
     cap: usize,
+    preparse_peak_limit: Option<usize>,
     signal: &Arc<OnceLock<TransportSignal>>,
 ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
     if response.body.len() > cap {
         let status = StatusCode::from_u16(response.status)
             .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
         // These outcomes do not parse the body. In particular, a reused
-        // session's 404 must reach rmcp as SessionExpired so it can reinitialize.
+        // session's 404 must remain SessionExpired so rmcp can reinitialize.
         if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT)
             || (status == StatusCode::NOT_FOUND && session_was_attached)
             || (matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
                 && www_authenticate(&response.headers).is_some())
         {
-            return classify_buffered_post_response(response, message, session_was_attached);
+            return classify_buffered_post_response(
+                response,
+                message,
+                session_was_attached,
+                preparse_peak_limit,
+                signal,
+            );
         }
         if !status.is_success() {
             return Err(StreamableHttpError::UnexpectedServerResponse(
@@ -1315,7 +1430,7 @@ fn classify_bounded_buffered_post_response(
         signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
         return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
     }
-    classify_buffered_post_response(response, message, session_was_attached)
+    classify_buffered_post_response(response, message, session_was_attached, preparse_peak_limit, signal)
 }
 
 /// Classify a fully buffered POST response into an rmcp post response.
@@ -1332,6 +1447,8 @@ fn classify_buffered_post_response(
     response: SubResponse,
     message: &ClientJsonRpcMessage,
     session_was_attached: bool,
+    preparse_peak_limit: Option<usize>,
+    signal: &Arc<OnceLock<TransportSignal>>,
 ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
     let status = StatusCode::from_u16(response.status)
         .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
@@ -1378,11 +1495,12 @@ fn classify_buffered_post_response(
     }
 
     if !status.is_success() {
-        if content_type.as_deref().is_some_and(is_json_content_type) {
-            let body = String::from_utf8_lossy(&response.body);
-            if let Some(message) = parse_json_rpc_error(&body) {
-                return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
-            }
+        if content_type.as_deref().is_some_and(is_json_content_type)
+            && json_preparse_fits(&response.body, preparse_peak_limit)
+            && let Ok(text) = std::str::from_utf8(&response.body)
+            && let Some(message) = parse_json_rpc_error(text)
+        {
+            return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
         }
         return Err(StreamableHttpError::UnexpectedServerResponse(
             format!("HTTP {status}").into(),
@@ -1391,7 +1509,7 @@ fn classify_buffered_post_response(
 
     match content_type.as_deref() {
         Some(content_type) if is_event_stream_content_type(content_type) => {
-            match parse_buffered_sse_terminal(&response.body) {
+            match parse_buffered_sse_terminal(&response.body, preparse_peak_limit, signal)? {
                 Some(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                 None => Err(StreamableHttpError::UnexpectedServerResponse(
                     "buffered SSE stream contained no JSON-RPC message".into(),
@@ -1399,6 +1517,7 @@ fn classify_buffered_post_response(
             }
         },
         Some(content_type) if is_json_content_type(content_type) => {
+            admit_json_preparse(&response.body, preparse_peak_limit, signal)?;
             match serde_json::from_slice::<ServerJsonRpcMessage>(&response.body) {
                 Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                 // A Request always needs a reply; an unparseable body is a typed
@@ -1422,7 +1541,7 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
 /// Collect a streaming body into a single `Bytes` buffer, failing closed.
 ///
 /// Accumulates chunks into one bounded [`bytes::BytesMut`] and enforces a local
-/// byte `cap`. Before an overflowing chunk is copied, the size signal is recorded into
+/// byte `cap`. On overflow (`buf.len() > cap`) the size signal is recorded into
 /// `signal` (first wins) so the typed 413 survives rmcp's opaque error mapping,
 /// the body is cancelled, and a typed [`McpTransportError::ResponseTooLarge`] is
 /// returned — never the truncated buffer.
@@ -1744,19 +1863,26 @@ fn sse_data_events(text: &str) -> Vec<String> {
 ///
 /// Returns the first `Response`/`Error` message (the terminal answer for a
 /// request/response exchange), falling back to the last parseable message.
-fn parse_buffered_sse_terminal(body: &[u8]) -> Option<ServerJsonRpcMessage> {
-    let text = std::str::from_utf8(body).ok()?;
+fn parse_buffered_sse_terminal(
+    body: &[u8],
+    preparse_peak_limit: Option<usize>,
+    signal: &Arc<OnceLock<TransportSignal>>,
+) -> Result<Option<ServerJsonRpcMessage>, StreamableHttpError<McpTransportError>> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Ok(None);
+    };
     let mut last = None;
     for data in sse_data_events(text) {
+        admit_json_preparse(data.as_bytes(), preparse_peak_limit, signal)?;
         let Ok(message) = serde_json::from_str::<ServerJsonRpcMessage>(&data) else {
             continue;
         };
         if matches!(message, JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) {
-            return Some(message);
+            return Ok(Some(message));
         }
         last = Some(message);
     }
-    last
+    Ok(last)
 }
 
 // -----------------------------------------------------------------------------
@@ -1884,21 +2010,33 @@ mod tests {
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
             "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
         );
-        let message = parse_buffered_sse_terminal(body.as_bytes()).expect("terminal response");
+        let message = parse_buffered_sse_terminal(body.as_bytes(), None, &test_signal())
+            .unwrap()
+            .expect("terminal response");
         assert!(matches!(message, JsonRpcMessage::Response(_)));
     }
 
     #[test]
     fn parse_buffered_sse_terminal_returns_error_message_as_terminal() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"boom\"}}\n\n";
-        let message = parse_buffered_sse_terminal(body.as_bytes()).expect("terminal error");
+        let message = parse_buffered_sse_terminal(body.as_bytes(), None, &test_signal())
+            .unwrap()
+            .expect("terminal error");
         assert!(matches!(message, JsonRpcMessage::Error(_)));
     }
 
     #[test]
     fn parse_buffered_sse_terminal_without_json_is_none() {
-        assert!(parse_buffered_sse_terminal(b"data: not-json\n\n").is_none());
-        assert!(parse_buffered_sse_terminal(b"").is_none());
+        assert!(
+            parse_buffered_sse_terminal(b"data: not-json\n\n", None, &test_signal())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_buffered_sse_terminal(b"", None, &test_signal())
+                .unwrap()
+                .is_none()
+        );
     }
 
     // -- Content-type classification -------------------------------------------
@@ -1926,18 +2064,84 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "regression checks the wire, parse, and signal boundaries"
+    )]
+    fn budgeted_tool_json_rejects_numeric_expansion_before_rmcp_parse() {
+        let numbers = vec!["1e15"; 300_000].join(",");
+        let wire = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[],\"structuredContent\":{{\"values\":[{numbers}]}}}}}}"
+        );
+        let parse_cap = 2 * 1_048_576;
+        assert!(
+            wire.len() < tool_result_wire_cap(262_144),
+            "the existing wire limit admits this response"
+        );
+        assert!(
+            !json_preparse_fits(wire.as_bytes(), Some(parse_cap)),
+            "dense exponent values must be rejected before rmcp allocates them"
+        );
+        let call: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .unwrap();
+        let signal = test_signal();
+        let mut response = sub_response(200, Some("application/json"), b"");
+        response.body = Bytes::from(wire);
+        let result = classify_buffered_post_response(response, &call, false, Some(parse_cap), &signal);
+        assert!(
+            matches!(
+                result,
+                Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+            ),
+            "the buffered transport must reject before deserialization"
+        );
+        assert!(matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit }) if *limit == parse_cap));
+        assert!(
+            json_preparse_fits(
+                br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
+                Some(parse_cap)
+            ),
+            "an ordinary tool result must still fit"
+        );
+    }
+
+    #[test]
+    fn oversized_json_rpc_error_keeps_http_status_without_parsing() {
+        let numbers = vec!["1e15"; 3_000].join(",");
+        let wire = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32000,\"message\":\"failure\",\"data\":[{numbers}]}}}}"
+        );
+        let call: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .unwrap();
+        let signal = test_signal();
+        let mut response = sub_response(500, Some("application/json"), b"");
+        response.body = Bytes::from(wire);
+        let result = classify_buffered_post_response(response, &call, false, Some(40_000), &signal);
+        assert!(
+            matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(message)) if message.contains("HTTP 500")),
+            "a budgeted error body must fall back to the real HTTP status"
+        );
+        assert!(signal.get().is_none(), "an HTTP error body must not record a false 413");
+    }
+
+    #[test]
     fn streaming_executor_backstop_doubles_and_saturates() {
         assert_eq!(streaming_executor_backstop(1000), 2000);
         assert_eq!(streaming_executor_backstop(usize::MAX), usize::MAX);
     }
 
     #[test]
-    fn tool_session_initialize_uses_admitted_payload_cap() {
+    fn response_limit_uses_tool_cap_only_for_tools_call() {
         let client = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
-            2048,
+            1_024,
+            Some(4_096),
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -1945,25 +2149,159 @@ mod tests {
         )
         .expect("deserialize tools/call");
         assert_eq!(client.response_limit(&call), tool_result_wire_cap(2048));
-
-        let initialize: ClientJsonRpcMessage = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
-        )
-        .expect("deserialize initialize");
-        assert_eq!(client.response_limit(&initialize), 2048);
-        let unbudgeted = McpSubrequestClient::for_tool(
-            McpCallout::fabricated(false).expect("fabricated callout"),
-            Duration::from_secs(5),
-            2048,
-            MAX_CONTROL_RESPONSE_BYTES,
-            None,
-        );
-        assert_eq!(unbudgeted.response_limit(&initialize), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(client.preparse_limit(&call), Some(4_096));
 
         let list: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
                 .expect("deserialize tools/list");
-        assert_eq!(client.response_limit(&list), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(client.response_limit(&list), 1_024);
+        assert_eq!(
+            client.preparse_limit(&list),
+            Some(1_024 * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
+        );
+    }
+
+    #[test]
+    fn minimum_tool_result_budget_admits_initialize_control_json() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            1_024,
+            1_024,
+            Some(2_048),
+            None,
+        );
+        let initialize: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        )
+        .expect("deserialize initialize request");
+        let wire = br#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1.0"}}}"#;
+        assert!(json_preparse_peak_bytes(wire).unwrap() > 2_048);
+        assert_eq!(client.response_limit(&initialize), 1_024);
+        assert_eq!(
+            client.preparse_limit(&initialize),
+            Some(1_024 * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
+        );
+        let response = sub_response(200, Some("application/json"), wire);
+        assert!(matches!(
+            classify_buffered_post_response(
+                response,
+                &initialize,
+                false,
+                client.preparse_limit(&initialize),
+                &test_signal()
+            ),
+            Ok(StreamableHttpPostResponse::Json(_, _))
+        ));
+    }
+
+    #[test]
+    fn minimum_tool_result_budget_still_rejects_numeric_result_expansion() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            1_024,
+            MAX_CONTROL_RESPONSE_BYTES,
+            Some(2_048),
+            None,
+        );
+        let call: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .expect("deserialize tools/call");
+        let numbers = vec!["1e15"; 200].join(",");
+        let wire = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[],\"structuredContent\":{{\"values\":[{numbers}]}}}}}}"
+        );
+        assert!(wire.len() < client.response_limit(&call));
+        let signal = test_signal();
+        let mut response = sub_response(200, Some("application/json"), b"");
+        response.body = Bytes::from(wire);
+        assert!(matches!(
+            classify_buffered_post_response(response, &call, false, client.preparse_limit(&call), &signal),
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one numeric control witness covers JSON and SSE admission"
+    )]
+    fn budgeted_numeric_control_json_and_sse_fit_the_control_reservation() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            1_024,
+            1_024,
+            Some(2_048),
+            None,
+        );
+        let initialize: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        )
+        .expect("deserialize initialize request");
+        let numbers = vec!["1e15"; 140].join(",");
+        let wire = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{{\"code\":-32000,\"message\":\"failure\",\"data\":[{numbers}]}}}}"
+        );
+        let cap = client.preparse_limit(&initialize).expect("budgeted control cap");
+        assert!(wire.len() <= client.response_limit(&initialize));
+        let peak = json_preparse_peak_bytes(wire.as_bytes()).unwrap();
+        assert!(peak > 2_048 && peak <= cap);
+
+        let sse = format!("data: {wire}\n\n");
+        let response = SubResponse {
+            body: Bytes::from(wire),
+            ..sub_response(200, Some("application/json"), b"")
+        };
+        assert!(matches!(
+            classify_buffered_post_response(response, &initialize, false, Some(cap), &test_signal()),
+            Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(_), _))
+        ));
+
+        assert!(sse.len() <= client.response_limit(&initialize));
+        assert!(matches!(
+            parse_buffered_sse_terminal(sse.as_bytes(), Some(cap), &test_signal()),
+            Ok(Some(JsonRpcMessage::Error(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn budgeted_control_streaming_error_preserves_http_status_when_over_wire_cap() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            1_024,
+            1_024,
+            Some(2_048),
+            None,
+        );
+        let (body, _cancelled) = fake_body([Bytes::from(vec![b'x'; 1_025])]);
+        let signal = test_signal();
+        let result = client
+            .classify_streaming_post_response(
+                sub_response(500, Some("application/json"), b""),
+                body,
+                false,
+                1_024,
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+                client.control_preparse_limit(),
+                Arc::clone(&signal),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::UnexpectedServerResponse(message)) if message.contains("HTTP 500")
+        ));
+        assert!(
+            signal.get().is_none(),
+            "bounded error bodies must not set a false size signal"
+        );
     }
 
     #[test]
@@ -2252,6 +2590,7 @@ mod tests {
             max_result_bytes,
             MAX_CONTROL_RESPONSE_BYTES,
             None,
+            None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
         assert_eq!(client.wire_cap(), expected_wire);
@@ -2282,6 +2621,7 @@ mod tests {
             1024,
             MAX_CONTROL_RESPONSE_BYTES,
             None,
+            None,
         )
     }
 
@@ -2296,7 +2636,7 @@ mod tests {
         ));
         let response = sub_response(200, Some("text/event-stream"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await
             .unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Sse(_, _)));
@@ -2313,7 +2653,7 @@ mod tests {
         ));
         let response = sub_response(202, None, b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await
             .unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Accepted));
@@ -2336,7 +2676,7 @@ mod tests {
             Arc::clone(&cancelled),
         ));
         let err = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await
             .unwrap_err();
         assert!(matches!(err, StreamableHttpError::AuthRequired(_)));
@@ -2352,7 +2692,7 @@ mod tests {
         ));
         let response = sub_response(200, Some("application/json"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await
             .unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
@@ -2360,40 +2700,6 @@ mod tests {
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "collect_body must cancel after buffering"
         );
-    }
-
-    #[test]
-    fn buffered_initialize_fallback_rechecks_the_message_cap_before_parsing() {
-        let initialize: ClientJsonRpcMessage = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
-        )
-        .unwrap();
-        let mut response = sub_response(200, Some("application/json"), b"");
-        response.body = Bytes::from(vec![b'x'; 3_072]);
-        let signal = test_signal();
-        let result = classify_bounded_buffered_post_response(response, &initialize, false, 2_048, &signal);
-        assert!(matches!(
-            result,
-            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
-        ));
-        assert!(matches!(
-            signal.get(),
-            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
-        ));
-    }
-
-    #[test]
-    fn oversized_buffered_session_expiry_still_triggers_reinitialization() {
-        let call: ClientJsonRpcMessage = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
-        )
-        .unwrap();
-        let mut response = sub_response(404, Some("application/json"), b"");
-        response.body = Bytes::from(vec![b'x'; 3_072]);
-        let signal = test_signal();
-        let result = classify_bounded_buffered_post_response(response, &call, true, 2_048, &signal);
-        assert!(matches!(result, Err(StreamableHttpError::SessionExpired)));
-        assert!(signal.get().is_none(), "404 is a session signal, not a size error");
     }
 
     #[test]
@@ -2407,8 +2713,37 @@ mod tests {
             Some("application/json"),
             br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
         );
-        let out = classify_buffered_post_response(response, &message, false).unwrap();
+        let out = classify_buffered_post_response(response, &message, false, None, &test_signal()).unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+    }
+
+    #[test]
+    fn buffered_stream_fallback_enforces_message_cap_without_hiding_session_expiry() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let signal = test_signal();
+        let oversized = sub_response(
+            200,
+            Some("application/json"),
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        );
+        let error = classify_bounded_buffered_post_response(oversized, &message, false, 8, None, &signal)
+            .expect_err("fallback body must respect the per-message cap");
+        assert!(matches!(
+            error,
+            StreamableHttpError::Client(McpTransportError::ResponseTooLarge)
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 8 })
+        ));
+
+        let expired = sub_response(404, Some("application/json"), b"oversized expiry body");
+        let error = classify_bounded_buffered_post_response(expired, &message, true, 8, None, &test_signal())
+            .expect_err("rmcp must see the expired-session status");
+        assert!(matches!(error, StreamableHttpError::SessionExpired));
     }
 
     // -- collect_body fail-closed (F4) --
@@ -2497,7 +2832,7 @@ mod tests {
         let (body, _cancelled) = fake_body([Bytes::from_static(b"{not json")]);
         let response = sub_response(200, Some("application/json"), b"");
         let result = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await;
         assert!(
             matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))),
@@ -2516,7 +2851,7 @@ mod tests {
         }))
         .unwrap();
         let response = sub_response(200, Some("application/json"), b"{not json");
-        let result = classify_buffered_post_response(response, &message, false);
+        let result = classify_buffered_post_response(response, &message, false, None, &test_signal());
         assert!(
             matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))),
             "an unparseable buffered JSON Request response must be a typed error (was Accepted)"
@@ -2533,7 +2868,7 @@ mod tests {
                 .expect("deserialize notification");
         assert!(matches!(notification, ClientJsonRpcMessage::Notification(_)));
         let response = sub_response(200, None, b"");
-        let out = classify_buffered_post_response(response, &notification, false).unwrap();
+        let out = classify_buffered_post_response(response, &notification, false, None, &test_signal()).unwrap();
         assert!(
             matches!(out, StreamableHttpPostResponse::Accepted),
             "an empty-200 notification ack must stay Accepted (R4)"
@@ -2547,7 +2882,7 @@ mod tests {
         }))
         .unwrap();
         let response = sub_response(202, None, b"");
-        let out = classify_buffered_post_response(response, &message, false).unwrap();
+        let out = classify_buffered_post_response(response, &message, false, None, &test_signal()).unwrap();
         assert!(
             matches!(out, StreamableHttpPostResponse::Accepted),
             "a 202 ack must stay Accepted (R4)"
@@ -2602,7 +2937,7 @@ mod tests {
         )]);
         let response = sub_response(500, Some("application/json"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await
             .expect("a JSON-RPC error is a valid reply, surfaced as Json");
         assert!(matches!(
@@ -2617,7 +2952,7 @@ mod tests {
         let response = sub_response(500, Some("application/json"), b"");
         let client = client();
         let result = client
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await;
         let Err(StreamableHttpError::UnexpectedServerResponse(msg)) = result else {
             panic!("expected UnexpectedServerResponse for a non-JSON-RPC 500 body");
@@ -2634,7 +2969,7 @@ mod tests {
         let (body, cancelled) = fake_body([Bytes::from_static(b"boom")]);
         let response = sub_response(503, Some("text/plain"), b"");
         let result = client()
-            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, None, test_signal())
             .await;
         assert!(matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))));
         assert!(
@@ -2703,7 +3038,7 @@ mod tests {
         ));
         let response = sub_response(200, Some("text/event-stream"), b"");
         let out = client()
-            .classify_streaming_post_response(response, body, false, 1024, 8, test_signal())
+            .classify_streaming_post_response(response, body, false, 1024, 8, None, test_signal())
             .await
             .unwrap();
         let StreamableHttpPostResponse::Sse(mut stream, _) = out else {
@@ -2714,48 +3049,6 @@ mod tests {
             first.data.as_deref(),
             Some("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}")
         );
-    }
-
-    #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exercise the complete initialize SSE cap and signal path"
-    )]
-    async fn streaming_initialize_sse_obeys_admitted_control_cap() {
-        let client = McpSubrequestClient::for_tool(
-            McpCallout::fabricated(false).expect("fabricated callout"),
-            Duration::from_secs(5),
-            2_048,
-            2_048,
-            None,
-        );
-        let initialize: ClientJsonRpcMessage = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
-        )
-        .unwrap();
-        let cap = client.response_limit(&initialize);
-        let event = format!(
-            "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"instructions\":\"{}\"}}}}\n\n",
-            "x".repeat(3_072)
-        );
-        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
-            [Bytes::from(event)],
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        ));
-        let signal = test_signal();
-        let response = sub_response(200, Some("text/event-stream"), b"");
-        let out = client
-            .classify_streaming_post_response(response, body, false, cap, 16 * 1024 * 1024, Arc::clone(&signal))
-            .await
-            .unwrap();
-        let StreamableHttpPostResponse::Sse(mut stream, _) = out else {
-            panic!("expected an SSE post response");
-        };
-        assert!(matches!(futures::StreamExt::next(&mut stream).await, Some(Err(_))));
-        assert!(matches!(
-            signal.get(),
-            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
-        ));
     }
 
     #[tokio::test]
