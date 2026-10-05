@@ -1925,12 +1925,6 @@ impl ResponsesState {
         self.tool_calls_revision = self.tool_calls_revision.and_then(|revision| revision.checked_add(1));
     }
 
-    /// Borrow the response object for mutation and invalidate response-filter byte caches.
-    pub(crate) fn response_object_mut(&mut self) -> &mut serde_json::Value {
-        self.mark_response_object_changed();
-        &mut self.response_object
-    }
-
     /// Replace the response object and invalidate response-filter byte caches.
     pub(crate) fn replace_response_object(&mut self, response: serde_json::Value) {
         self.response_object = response;
