@@ -2037,6 +2037,9 @@ fn commit_chunk_events(
 }
 
 
+/// Completion snapshots and their aggregate charge until restoration ends.
+type ChargedClientToolCompletions = (Vec<client_tools::ClientToolCompletion>, usize);
+
 /// Parsed owners stay live for a chunk while its shared-state estimate grows.
 struct CompletionAdmission {
     /// Parsed SSE frames and event values still owned during accumulation.
