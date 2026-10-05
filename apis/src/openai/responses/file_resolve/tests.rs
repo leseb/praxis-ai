@@ -985,16 +985,24 @@ async fn aggregate_content_limit_tied_with_independent_cap_rejects_under_continu
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
     let mut state = ResponsesState::from_request_body(original);
     let baseline = state.retained_payload_bytes().unwrap();
-    // Four parsed-body owners and the eight-copy resolution reserve leave
-    // exactly 512 bytes after charging the cache key for "file-a".
+    // The live state plus raw body and parsed tree leave exactly 512 bytes
+    // after transport staging and the cache key for "file-a" are charged.
     let raw_bytes = body.as_ref().unwrap().len();
+    let parsed_bytes = retained_json_bytes(&state.request_body).unwrap();
     state.apply_retained_payload_limit(
-        baseline + 4 * raw_bytes + crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + (512 + "file-a".len()) * 8,
+        baseline
+            + raw_bytes
+            + parsed_bytes
+            + crate::subrequest::MAX_TRANSPORT_STAGING_BYTES
+            + (512 + "file-a".len()) * 8,
     );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(response) if response.status == 413));
+    assert!(
+        matches!(&action, FilterAction::Reject(response) if response.status == 413),
+        "action: {action:?}"
+    );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
     server.join().unwrap();

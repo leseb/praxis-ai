@@ -651,7 +651,7 @@ impl McpDispatchFilter {
             && !ctx
                 .extensions
                 .get::<ResponsesState>()
-                .is_some_and(|state| approval_decisions_fit(state, &resolved))
+                .is_some_and(|state| approval_decisions_fit(state, &resolved, self.max_total_result_bytes))
         {
             record_approval_budget_failure(ctx);
             return Ok(());
@@ -704,7 +704,11 @@ impl McpDispatchFilter {
 }
 
 /// Preflight the independently owned values created by approval resumptions.
-fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]) -> bool {
+fn approval_decisions_fit(
+    state: &ResponsesState,
+    decisions: &[ResolvedApproval],
+    max_total_result_bytes: usize,
+) -> bool {
     let removed = state
         .messages
         .iter()
@@ -2259,6 +2263,10 @@ fn aggregate_transport_ceiling_lowered(
 
 /// Distinguish a request-wide size failure from a configured per-tool limit.
 /// The latter stays a bounded tool error so an executed call is not retried.
+#[expect(
+    clippy::too_many_lines,
+    reason = "classify all transport and decoded size ceilings at the call boundary"
+)]
 fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
     if matches!(options.aggregate_result_policy, McpAggregateResultPolicy::Unbudgeted) {
         return false;

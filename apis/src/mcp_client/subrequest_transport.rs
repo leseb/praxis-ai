@@ -66,6 +66,9 @@ use crate::{StateOwner, callout_target::AddressPolicy};
 /// `mod.rs` derives its cumulative `tools/list` budget from this value.
 pub(crate) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
 
+/// Smallest initialize response cap that still admits a normal MCP handshake.
+pub(crate) const MIN_TOOL_INITIALIZE_BYTES: usize = 1_024;
+
 /// JSON-RPC envelope allowance added on top of the configured `tools/call`
 /// result cap, covering the surrounding result object beyond the raw payload.
 const MAX_TOOL_RESULT_ENVELOPE_BYTES: usize = 65_536;
@@ -798,6 +801,10 @@ impl McpSubrequestClient {
     #[cfg(test)]
     /// Compatibility constructor for transport fixtures that exercise the
     /// operation ceilings without a separate dispatch admission.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fixture exposes the MCP response ceilings independently"
+    )]
     fn for_tool(
         callout: McpCallout,
         step_timeout: Duration,
@@ -2346,7 +2353,7 @@ mod tests {
         let list: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
                 .expect("deserialize tools/list");
-        assert_eq!(client.response_limit(&list), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(client.response_limit(&list), 2048);
         assert_eq!(
             McpSubrequestClient::response_limit_kind(&list),
             McpResponseLimitKind::Control
@@ -2959,7 +2966,7 @@ mod tests {
         let mut response = sub_response(200, Some("application/json"), b"");
         response.body = Bytes::from(vec![b'x'; 3_072]);
         let signal = test_signal();
-        let result = classify_bounded_buffered_post_response(response, &initialize, false, 2_048, &signal);
+        let result = classify_bounded_buffered_post_response(response, &initialize, false, 2_048, None, &signal);
         assert!(matches!(
             result,
             Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
@@ -2979,7 +2986,7 @@ mod tests {
         let mut response = sub_response(404, Some("application/json"), b"");
         response.body = Bytes::from(vec![b'x'; 3_072]);
         let signal = test_signal();
-        let result = classify_bounded_buffered_post_response(response, &call, true, 2_048, &signal);
+        let result = classify_bounded_buffered_post_response(response, &call, true, 2_048, None, &signal);
         assert!(matches!(result, Err(StreamableHttpError::SessionExpired)));
         assert!(signal.get().is_none(), "404 is a session signal, not a size error");
     }
