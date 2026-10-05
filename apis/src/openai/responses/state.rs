@@ -1157,7 +1157,7 @@ impl ResponsesState {
             .retained_stream_parser_bytes
             .checked_add(self.retained_rehydrate_stream_bytes)?;
         let remaining = max_bytes.checked_sub(stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false, None, None)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, false, false, false, None, None, None)?
             .checked_add(stream_bytes)
     }
 
@@ -1233,8 +1233,32 @@ impl ResponsesState {
     #[cfg(test)]
     pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let remaining = max_bytes.checked_sub(self.retained_rehydrate_stream_bytes)?;
-        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, None, None)?
+        self.retained_payload_bytes_bounded_inner(remaining, true, true, true, true, None, None, None)?
             .checked_add(self.retained_rehydrate_stream_bytes)
+    }
+
+    /// Reuse the Chat converter's revision-keyed response, local template,
+    /// and completed-call charge while checking changing sibling owners.
+    pub(crate) fn chat_stream_changing_payload_bytes_bounded_with_current_output(
+        &self,
+        max_bytes: usize,
+        current_output_bytes: usize,
+    ) -> Option<usize> {
+        let stream_bytes = self
+            .retained_stream_parser_bytes
+            .checked_add(self.retained_rehydrate_stream_bytes)?;
+        let remaining = max_bytes.checked_sub(stream_bytes)?;
+        self.retained_payload_bytes_bounded_inner(
+            remaining,
+            true,
+            true,
+            true,
+            true,
+            None,
+            None,
+            Some(current_output_bytes),
+        )?
+        .checked_add(stream_bytes)
     }
 
     /// Use the stream parser's exact charges for unchanged output items and
@@ -1255,13 +1279,16 @@ impl ResponsesState {
             true,
             Some(response_object_bytes),
             tool_calls_bytes,
+            None,
         )?
         .checked_add(self.retained_rehydrate_stream_bytes)
     }
 
     /// Count changing owners while a response filter caches request, history,
     /// fixed tool snapshots, and prior output. Include the stream parsers'
-    /// published charges.
+    /// published charges. Retained for meter parity tests; production callers
+    /// use their revision-keyed response and completed-call charges.
+    #[cfg(test)]
     pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
         self.stream_changing_payload_bytes_bounded_with_cached_output_and_response_object_size(max_bytes, None, None)
     }
@@ -1286,6 +1313,7 @@ impl ResponsesState {
             true,
             response_object_bytes,
             tool_calls_bytes,
+            None,
         )?
         .checked_add(stream_bytes)
     }
@@ -1311,6 +1339,7 @@ impl ResponsesState {
             true,
             response_object_bytes,
             tool_calls_bytes,
+            None,
         )?
         .checked_add(stream_bytes)
     }
@@ -1323,7 +1352,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, None, None)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, None, None, None)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1343,6 +1372,7 @@ impl ResponsesState {
         skip_stream_fixed_tools: bool,
         response_object_bytes: Option<usize>,
         tool_calls_bytes: Option<usize>,
+        current_output_bytes: Option<usize>,
     ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
@@ -1365,21 +1395,26 @@ impl ResponsesState {
                 meter.raw(id.len())?;
             }
         }
-        if let Some(bytes) = response_object_bytes {
+        if let Some(bytes) = current_output_bytes {
             meter.raw(bytes)?;
         } else {
-            meter.json(&self.response_object)?;
+            if let Some(bytes) = response_object_bytes {
+                meter.raw(bytes)?;
+            } else {
+                meter.json(&self.response_object)?;
+            }
+            meter.json(&self.local_completion_response_template)?;
+            if let Some(bytes) = tool_calls_bytes {
+                meter.raw(bytes)?;
+            } else {
+                meter.json_values(&self.tool_calls)?;
+            }
         }
-        for value in [&self.local_completion_response_template, &self.tool_choice, &self.usage] {
+        for value in [&self.tool_choice, &self.usage] {
             meter.json(value)?;
         }
         if !skip_accumulated_output {
             meter.json_values(&self.accumulated_output)?;
-        }
-        if let Some(bytes) = tool_calls_bytes {
-            meter.raw(bytes)?;
-        } else {
-            meter.json_values(&self.tool_calls)?;
         }
         for values in [&self.tool_search_calls, &self.web_search_calls] {
             meter.json_values(values)?;
@@ -2159,12 +2194,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    fn current_output_bytes(state: &ResponsesState) -> usize {
-        retained_json_bytes(&state.response_object).unwrap()
-            + retained_json_bytes(&state.local_completion_response_template).unwrap()
-            + retained_json_values_bytes(&state.tool_calls).unwrap()
-    }
 
     #[test]
     fn retained_payload_admits_below_and_at_limit_but_rejects_above() {

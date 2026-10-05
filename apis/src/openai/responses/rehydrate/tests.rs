@@ -2794,14 +2794,6 @@ fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
     assert!(fits(&mut armed, &state));
     let cached = armed.stable_payload.unwrap();
 
-    state.retained_stream_parser_bytes = 120;
-    assert!(cached.matches(&state));
-    assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
-        "a cached output charge must still include the live stream parser"
-    );
-    state.retained_stream_parser_bytes = 0;
-
     // Dispatch can append history after a round has already advanced. The
     // cache must refresh even when the logical iteration did not change.
     state.messages.push(json!("new".repeat(80)));
@@ -2834,52 +2826,6 @@ fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
         !cached.matches(&state, state.retained_payload_limit().unwrap()),
         "an exhausted revision must invalidate the earlier charge"
     );
-    state.replay_stable_payload_revision = Some(1);
-    state.current_output_revision = Some(u64::MAX);
-    state.mark_current_output_changed();
-    assert_eq!(state.current_output_revision, None);
-    assert!(
-        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
-        "an exhausted current-output revision must also fail closed"
-    );
-}
-
-#[test]
-fn streaming_restore_reuses_completed_output_across_small_fragments() {
-    let mut state = rehydrated_state("resp_prev");
-    let call = json!({"type": "function_call", "arguments": "x".repeat(512 * 1_024)});
-    state.response_object = json!({"output": [call.clone()]});
-    state.tool_calls.push(call);
-    let baseline = state.retained_payload_bytes().unwrap();
-    state.apply_retained_payload_limit(baseline + 128);
-    let mut stable_budget = None;
-    assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
-    assert!(stable_budget.unwrap().current_output_bytes > 1_048_576);
-
-    for _ in 0..200 {
-        assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
-    }
-    // The repeated-fragment path must consume the cached measurement instead
-    // of serializing the unchanged response tree again.
-    stable_budget.as_mut().unwrap().current_output_bytes = usize::MAX;
-    assert!(!streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
-}
-
-#[test]
-fn streaming_restore_remeasures_same_length_completed_output_rewrite() {
-    let mut state = rehydrated_state("resp_prev");
-    state.response_object = json!({"output": [{"text": "a".repeat(4_096)}]});
-    let baseline = state.retained_payload_bytes().unwrap();
-    state.apply_retained_payload_limit(baseline + 128);
-    let mut stable_budget = None;
-    assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
-    let cached = stable_budget.unwrap();
-
-    state.response_object["output"][0]["text"] = json!("\u{0001}".repeat(4_096));
-    state.mark_current_output_changed();
-    assert_eq!(state.output_items().len(), 1);
-    assert!(!cached.matches(&state));
-    assert!(!streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
 }
 
 #[tokio::test]

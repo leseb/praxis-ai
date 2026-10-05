@@ -5844,14 +5844,15 @@ fn eager_dispatch_rejects_credential_fanout_before_map_construction() {
 }
 
 #[tokio::test]
-async fn eager_listing_with_policy_rejects_missing_shared_state() {
+async fn eager_listing_with_policy_rejects_oversized_initial_body() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
-    let body_json = mcp_body("https://mcp.example/mcp");
+    let mut body_json = mcp_body("https://mcp.example/mcp");
+    body_json["instructions"] = serde_json::json!("x".repeat(4096));
     let original = serde_json::to_vec(&body_json).unwrap();
     let mut body = Some(Bytes::from(original.clone()));
 
@@ -5861,6 +5862,24 @@ async fn eager_listing_with_policy_rejects_missing_shared_state() {
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[test]
+fn eager_listing_listener_budget_admits_normal_initial_body() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 67108864").unwrap()).unwrap(),
+    );
+    let raw = serde_json::to_vec(&mcp_body("https://mcp.example/mcp")).unwrap();
+    let mut budget = resolver_listener_budget(&mut ctx, &raw)
+        .expect("ordinary request is admitted")
+        .expect("a missing state receives a provisional budget");
+    let parsed = parse_budgeted_mcp_request(&mut ctx, &Bytes::from(raw), Some(&mut budget))
+        .expect("normal request parses")
+        .expect("MCP request is JSON");
+    assert_eq!(parsed["model"], "gpt-4o");
+    assert!(budget.can_retain_payload(0));
 }
 
 /// `commit_discovery_items` appends one item per server in request order.

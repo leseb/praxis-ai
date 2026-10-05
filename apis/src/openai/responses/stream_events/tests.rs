@@ -1191,7 +1191,7 @@ fn streaming_budget_caches_client_tool_echo_captured_after_arm() {
 #[test]
 fn streaming_budget_reuses_unchanged_current_output_charge() {
     let (_filter, mut ctx) = make_armed_context();
-    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let call = json!({
         "type": "function_call",
         "id": "fc_completed",
@@ -1205,15 +1205,28 @@ fn streaming_budget_reuses_unchanged_current_output_charge() {
         ..ResponsesState::default()
     };
     let expected = responses.retained_payload_bytes().unwrap();
-    responses.apply_retained_payload_limit(expected + 1);
+    responses.apply_retained_payload_limit(expected + 1_024);
     ctx.extensions.insert(responses);
+
+    assert_eq!(
+        super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+        Some(expected)
+    );
+    let local = stream.retained_payload_bytes().unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(expected + local + 1);
 
     let started = std::time::Instant::now();
     for _ in 0..200 {
-        assert_eq!(super::shared_retained_budget(&ctx, &stream).unwrap().1, Some(expected));
+        assert_eq!(
+            super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+            Some(expected)
+        );
     }
-    assert!(super::stream_payload_fits(&ctx, &stream, 1));
-    assert!(!super::stream_payload_fits(&ctx, &stream, 2));
+    assert!(super::stream_payload_fits(&ctx, &mut stream, 1));
+    assert!(!super::stream_payload_fits(&ctx, &mut stream, 2));
     assert!(
         started.elapsed() < std::time::Duration::from_secs(1),
         "unchanged completed output must not be reserialized on every SSE admission: {:?}",
@@ -1244,7 +1257,7 @@ fn flushed_local_item_does_not_reproject_on_heartbeat_chunks() {
     assert!(
         super::local_terminal_output_upper_bound(ctx.extensions.get::<ResponsesState>().unwrap()).unwrap() > 1_048_576
     );
-    assert_eq!(super::logical_output_upper_bound(&ctx, true, &[]), Some(0));
+    assert_eq!(super::logical_output_upper_bound(&ctx, &parser, &[]), Some(0));
     ctx.insert_filter_state(parser);
 
     let started = std::time::Instant::now();
@@ -6851,8 +6864,9 @@ fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
     };
     responses.apply_retained_payload_limit(16 * 1_048_576);
     ctx.extensions.insert(responses);
-    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
-    assert!(super::shared_retained_budget(&ctx, stream).unwrap().1.is_some());
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1.is_some());
+    ctx.insert_filter_state(stream);
     let added = json!({
         "output_index": 0,
         "item": {"type": "message", "id": "item_A", "content": [{"type": "output_text", "text": "aaaa"}]}
@@ -6885,6 +6899,7 @@ fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
     });
     let mut body = Some(make_sse_chunk("response.output_item.done", &done));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(responses.output_items().len(), 1);
     assert_eq!(
@@ -6893,7 +6908,6 @@ fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
     );
     assert!(crate::openai::responses::state::retained_json_bytes(&responses.response_object).unwrap() > before_bytes);
     assert_eq!(responses.replay_stable_payload_revision, stable_revision);
-    let stream = ctx.get_filter_state::<StreamEventsState>().unwrap();
     assert!(
         stream
             .shared_prior_output_bytes
@@ -6903,7 +6917,7 @@ fn completed_output_revision_changes_on_same_length_done_but_not_text_delta() {
             .matches(responses)
     );
     for _ in 0..200 {
-        assert!(super::shared_retained_budget(&ctx, stream).unwrap().1.is_some());
+        assert!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1.is_some());
     }
 }
 

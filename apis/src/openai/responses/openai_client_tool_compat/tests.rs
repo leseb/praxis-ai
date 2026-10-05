@@ -1265,8 +1265,8 @@ fn buffered_restoration_charges_repeated_namespace_metadata() {
     assert_eq!(reject_parts(&rejected.err().unwrap()).0, 502);
 }
 
-#[test]
-fn buffered_restoration_uses_listener_budget_and_discards_failed_state() {
+#[tokio::test]
+async fn buffered_restoration_uses_listener_budget_and_discards_failed_state() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.extensions.insert(state_with_custom_lowered());
@@ -1274,14 +1274,24 @@ fn buffered_restoration_uses_listener_budget_and_discards_failed_state() {
         AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap())
             .expect("valid listener policy"),
     );
-    let mut body = Some(Bytes::from(
-        json!({"object": "response", "output": [], "payload": "x".repeat(16 * 1024)}).to_string(),
-    ));
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("16384"));
+    ctx.response_header = Some(response);
     let action = filter()
-        .on_response_body(&mut ctx, &mut body, true)
+        .on_response(&mut ctx)
+        .await
         .expect("budget rejection is a filter action");
     assert_eq!(reject_parts(&action).0, 502, "provider output growth is a server error");
-    assert!(body.is_none(), "the oversized buffered provider body is released");
+    assert!(
+        matches!(ctx.response_body_mode, BodyMode::Stream),
+        "reject before buffering"
+    );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     let state = ctx.extensions.get::<ResponsesState>().expect("state remains present");
     assert!(
@@ -1316,7 +1326,7 @@ async fn request_lowering_rejects_before_expanding_tool_state_past_aggregate_bud
         .collect();
     let parsed = json!({"model": "m", "input": "hi", "tools": tools, "store": false});
     let raw = serde_json::to_vec(&parsed).expect("request serializes");
-    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 24576").unwrap();
     let mut tight = crate::test_utils::make_filter_context_without_subrequest_client(&request);
     tight
         .extensions
@@ -1349,7 +1359,7 @@ async fn request_lowering_rejects_before_expanding_tool_state_past_aggregate_bud
     let discarded = tight.extensions.get::<ResponsesState>().unwrap();
     assert!(discarded.retained_payload_failed, "successful persistence is disabled");
     assert!(
-        discarded.retained_payload_bytes().unwrap() <= 4096,
+        discarded.retained_payload_bytes().unwrap() <= 24576,
         "large lowered owners are never committed over the aggregate cap"
     );
 

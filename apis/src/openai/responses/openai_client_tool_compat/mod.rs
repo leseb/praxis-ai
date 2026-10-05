@@ -157,9 +157,9 @@ use tracing::debug;
 
 use self::config::{ClientToolCompatConfig, build_config};
 use super::{
-    agentic_loop::AgenticBudgetPolicy,
+    agentic_loop::{AgenticBudgetPolicy, buffered_parsed_json_bytes_upper_bound},
     body_limits::reject_rewritten_body_too_large,
-    budget_error::{reject_retained_payload_budget, reject_retained_payload_response_budget},
+    budget_error::{reject_retained_payload_budget, response_rejection},
     error::responses_error_rejection,
     state::{
         ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call,
@@ -998,10 +998,7 @@ impl HttpFilter for ClientToolCompatFilter {
             return Ok(FilterAction::Continue);
         }
         let Some(admission) = self.budgeted_restore_admission(ctx) else {
-            return Ok(FilterAction::Reject(super::budget_error::response_rejection(
-                ctx,
-                RESTORE_BUDGET_MESSAGE,
-            )));
+            return Ok(FilterAction::Reject(response_rejection(ctx, RESTORE_BUDGET_MESSAGE)));
         };
         // A prior filter's larger cap is declined above. The core ratchet can
         // now select the admitted cap without overriding another filter's need.
@@ -1036,11 +1033,14 @@ impl HttpFilter for ClientToolCompatFilter {
             .get::<AgenticBudgetPolicy>()
             .copied()
             .map(AgenticBudgetPolicy::max_retained_bytes);
+        let admitted = ctx.get_filter_state::<ClientToolRestoreAdmission>().copied();
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if let Some(limit) = listener_limit {
+            state.apply_retained_payload_limit(limit);
+        }
         if state.retained_payload_limit().is_some() && state.client_tool_echo.is_some() {
-            let admitted = ctx.get_filter_state::<ClientToolRestoreAdmission>().copied();
             let fits = admitted.is_some_and(|admission| {
                 admission
                     .exact_wire_bytes
@@ -1063,7 +1063,7 @@ impl HttpFilter for ClientToolCompatFilter {
             Ok(None) => Ok(FilterAction::Continue),
             Err(error) if error.budget => {
                 *body = None;
-                Ok(reject_retained_payload_response_budget(ctx, RESTORATION_BUDGET_ERROR))
+                Ok(FilterAction::Reject(response_rejection(ctx, RESTORATION_BUDGET_ERROR)))
             },
             Err(error) => Ok(error.action),
         }

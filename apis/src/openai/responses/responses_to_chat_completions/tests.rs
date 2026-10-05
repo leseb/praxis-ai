@@ -68,6 +68,27 @@ fn chat_stream_meter_includes_fixed_tool_snapshots_once() {
 }
 
 #[test]
+fn chat_stream_current_output_cache_reuses_and_invalidates() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hello", "stream": true}));
+    state.response_object = json!({"output": [{"text": "x".repeat(1_048_576)}]});
+    let mut converter = StreamConverter::new("resp_cached".to_owned(), 1, wide_stream_limits());
+    let limit = 4 * 1_048_576;
+    let initial = converter.current_output_bytes(&state, limit).unwrap();
+    for _ in 0..100 {
+        assert_eq!(converter.current_output_bytes(&state, limit), Some(initial));
+    }
+    assert_eq!(converter.current_output_measurements(), 1);
+
+    state.response_object["output"][0]["text"] = json!("\u{0001}".repeat(1_048_576));
+    state.mark_response_object_changed();
+    assert!(
+        converter.current_output_bytes(&state, limit).is_none(),
+        "escaped rewrite exceeds this budget"
+    );
+    assert_eq!(converter.current_output_measurements(), 2);
+}
+
+#[test]
 fn first_stream_callback_reserves_both_request_echo_lifecycle_frames() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
