@@ -723,7 +723,7 @@ async fn aggregate_budget_rejects_file_before_content_callout() {
     let original = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-a"}]}]});
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
     let mut state = ResponsesState::from_request_body(original);
-    state.apply_retained_payload_limit(4096);
+    state.apply_retained_payload_limit(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 4096);
     assert!(state.can_retain_payload(body.as_ref().unwrap().len()));
     ctx.extensions.insert(state);
 
@@ -755,7 +755,7 @@ async fn aggregate_budget_allows_small_resolved_file() {
         json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-history"}]}]});
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
     let mut state = ResponsesState::from_request_body(original);
-    state.apply_retained_payload_limit(4096);
+    state.apply_retained_payload_limit(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 4096);
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -858,7 +858,7 @@ async fn aggregate_url_prefix_overflow_uses_budget_cleanup() {
     let original = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_url":url},{"type":"input_text","text":"x".repeat(220)}]}]});
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
     let mut state = ResponsesState::from_request_body(original);
-    state.apply_retained_payload_limit(4096);
+    state.apply_retained_payload_limit(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 4096);
     assert!(body.as_ref().unwrap().len() <= 4096 / super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER);
     ctx.extensions.insert(state);
 
@@ -950,7 +950,7 @@ async fn aggregate_metadata_read_limit_is_not_swallowed_by_missing_file_policy()
     let original = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-a"}]}]});
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
     let mut state = ResponsesState::from_request_body(original);
-    state.apply_retained_payload_limit(4096);
+    state.apply_retained_payload_limit(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 4096);
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -985,14 +985,31 @@ async fn aggregate_content_limit_tied_with_independent_cap_rejects_under_continu
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
     let mut state = ResponsesState::from_request_body(original);
     let baseline = state.retained_payload_bytes().unwrap();
-    // Four parsed-body owners and the eight-copy resolution reserve leave
-    // exactly 512 bytes after charging the cache key for "file-a".
+    // The live state plus raw body and parsed tree leave exactly 512 bytes
+    // after transport staging and the cache key for "file-a" are charged.
     let raw_bytes = body.as_ref().unwrap().len();
-    state.apply_retained_payload_limit(baseline + 4 * raw_bytes + (512 + "file-a".len()) * 8);
+    let parsed_bytes = retained_json_bytes(&state.request_body).unwrap();
+    state.apply_retained_payload_limit(
+        baseline
+            + raw_bytes
+            + parsed_bytes
+            + crate::subrequest::MAX_TRANSPORT_STAGING_BYTES
+            + (512 + "file-a".len()) * 8,
+    );
     ctx.extensions.insert(state);
+    assert_eq!(
+        aggregate_resolution_headroom(&ctx, raw_bytes, parsed_bytes),
+        Ok(Some(
+            crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + (512 + "file-a".len()) * 8
+        )),
+        "the fixture must exercise the exact aggregate transport and inline cap"
+    );
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(response) if response.status == 413));
+    assert!(
+        matches!(&action, FilterAction::Reject(response) if response.status == 413),
+        "action: {action:?}"
+    );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
     server.join().unwrap();
@@ -1047,7 +1064,7 @@ async fn aggregate_budget_bounds_escaped_metadata_across_file_fanout() {
     let original = json!({"model":"m","input":[{"role":"user","content":content}]});
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
     let mut state = ResponsesState::from_request_body(original);
-    state.apply_retained_payload_limit(16 * 1024);
+    state.apply_retained_payload_limit(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 16 * 1024);
     assert!(state.can_retain_payload(body.as_ref().unwrap().len()));
     ctx.extensions.insert(state);
 
