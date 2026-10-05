@@ -126,6 +126,61 @@ fn terminal_restoration_preflights_public_namespace_for_each_call() {
     );
 }
 
+#[test]
+fn terminal_restoration_counts_existing_wire_capacity_before_copying_namespaces() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        accumulated_output: (0..32)
+            .map(|index| {
+                json!({
+                    "type": "function_call",
+                    "name": "private",
+                    "call_id": format!("call_{index}"),
+                    "arguments": "{}"
+                })
+            })
+            .collect(),
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("n".repeat(8_192)),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": null}),
+    };
+    let mut output = Vec::with_capacity(128 * 1024);
+    output.resize(70 * 1024, b'x');
+    let metadata_bytes = terminal.retained_payload_bytes().unwrap();
+    let parser_bytes = parser_state.retained_payload_bytes().unwrap();
+    let length_staging = super::canonicalization_staging_bytes(&state, output.len()).unwrap() + metadata_bytes;
+    let capacity_staging = super::canonicalization_staging_bytes(&state, output.capacity()).unwrap() + metadata_bytes;
+    assert!(capacity_staging > length_staging + 1_024);
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + parser_bytes + length_staging + 1_024);
+    assert!(state.can_replace_retained_payload(0, parser_bytes, length_staging));
+    assert!(!state.can_replace_retained_payload(0, parser_bytes, capacity_staging));
+    ctx.extensions.insert(state);
+
+    let allocations = allocation_counter::measure(|| {
+        assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    });
+    assert!(output.is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(
+        allocations.bytes_max < 65_536,
+        "capacity must reject before restoring every namespace: {}",
+        allocations.bytes_max
+    );
+}
+
 /// A terminal payload moves into shared state before the restoration plan.
 fn assert_terminal_does_not_pay_moved_staging(lowered: bool) {
     let (filter, mut ctx) = make_armed_context();
@@ -1184,7 +1239,8 @@ fn deferred_terminal_reserves_restored_payload_and_wire_together() {
     state.retained_stream_parser_bytes = terminal.retained_payload_bytes().unwrap();
     let limit = 131_072;
     let baseline = state.retained_payload_bytes().unwrap();
-    state.set_retained_external_payload_bytes(limit - baseline - 25_000);
+    // One restored echo fits, but it must coexist with the outgoing frame.
+    state.set_retained_external_payload_bytes(limit - baseline - 15_000);
     state.apply_retained_payload_limit(limit);
     ctx.extensions.insert(state);
     let mut wire = Vec::new();
@@ -1222,7 +1278,7 @@ fn deferred_terminal_rejects_echo_before_restoring_canonical_response() {
     let baseline = state.retained_payload_bytes().unwrap();
     let terminal_bytes = terminal.retained_payload_bytes().unwrap();
     let echo_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
-    assert!(echo_staging > 40_000, "both restored response owners must be projected");
+    assert!(echo_staging > 20_000, "the restored echo owner must be projected");
     state.apply_retained_payload_limit(baseline + terminal_bytes + 1_024);
     ctx.extensions.insert(state);
     let mut output = Vec::new();
@@ -4462,6 +4518,30 @@ fn commit_projection_charges_bare_terminal_usage_clones() {
     assert!(
         projection >= response_bytes + usage_bytes * 2,
         "the bare fallback clones the response and usage merging retains two more owners"
+    );
+}
+
+#[test]
+fn terminal_usage_projection_reserves_merge_and_reinsertion_peak() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.extensions.insert(ResponsesState::default());
+    let response = json!({
+        "id": "resp_usage_peak",
+        "object": "response",
+        "status": "completed",
+        "output": [],
+        "usage": {"detail": "x".repeat(65_536)}
+    });
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let terminal = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+        "type": "response.completed",
+        "response": response
+    }));
+    let projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
+    assert!(
+        projection >= response_bytes * 3,
+        "event, cloned response, merged usage, and replacement usage clone must fit together"
     );
 }
 

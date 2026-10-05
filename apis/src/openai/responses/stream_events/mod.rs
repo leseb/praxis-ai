@@ -1329,9 +1329,9 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
                 if payload.get("response").is_some() {
                     usage_peak
                 } else {
-                    // Preserve the old bare-response fallback, which clones
-                    // the whole payload so its envelope can still be emitted.
-                    usage_peak.checked_add(response_bytes)?
+                    // The bare-response fallback still clones the whole
+                    // payload. Retain Stage7's three-copy peak for that path.
+                    response_bytes.checked_mul(3)?.checked_add(previous_usage_bytes)?
                 }
             },
             ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
@@ -1708,7 +1708,7 @@ fn logical_output_upper_bound(
     clippy::too_many_lines,
     reason = "one terminal projection covers several independent owners"
 )]
-fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes: usize) -> Option<usize> {
+fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_capacity: usize) -> Option<usize> {
     let output = if state.accumulated_output.is_empty() {
         state.output_items()
     } else {
@@ -1747,7 +1747,7 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
         .checked_add(usage_bytes)?
         .checked_add(client_tool_bytes)?
         .checked_add(echo_bytes)?
-        .checked_add(existing_output_bytes)
+        .checked_add(existing_output_capacity)
 }
 
 /// Abort an offending chunk after aggregate admission fails. The caller drops
@@ -2061,9 +2061,6 @@ fn release_client_tool_charge(ctx: &mut HttpFilterContext<'_>, bytes: usize) {
         responses.release_external_payload_bytes(bytes);
     }
 }
-
-/// Completion snapshots and the aggregate charge held until restoration ends.
-type ChargedClientToolCompletions = (Vec<client_tools::ClientToolCompletion>, usize);
 
 /// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`
 /// and capture lowered client-tool completion artifacts for phase 2b (#1159).
@@ -3428,7 +3425,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
         state.replace_response_object(response);
     }
     state.mark_current_output_changed();
-    if !canonicalization_staging_bytes(state, output.len())
+    if !canonicalization_staging_bytes(state, output.capacity())
         .is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging))
     {
         drop(output);
@@ -3836,7 +3833,7 @@ fn emit_deferred_terminal(
     // Match the wire-rewrite decision so the persisted store source cannot disagree
     // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
-    let preflight = canonicalization_staging_bytes(state, output.len())
+    let preflight = canonicalization_staging_bytes(state, output.capacity())
         .and_then(|staging| terminal.retained_payload_bytes()?.checked_add(staging));
     // The parser owner is already published in ResponsesState for cross-filter
     // admission. Replace that published charge with the current local size;

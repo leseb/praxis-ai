@@ -97,7 +97,7 @@ async fn request_parse_charges_wire_and_parsed_tree_with_live_history() {
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     let original = json!({"model":"m","input":"hello","metadata":{"padding":"y".repeat(1024)}});
     let raw = serde_json::to_vec(&original).unwrap();
-    let parsed_bytes = super::super::state::retained_json_bytes(&original).unwrap();
+    let parsed_bytes = retained_json_bytes(&original).unwrap();
     let mut state = ResponsesState::from_request_body(original);
     state.iteration = 1;
     state
