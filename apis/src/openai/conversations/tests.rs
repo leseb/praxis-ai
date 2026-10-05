@@ -3618,6 +3618,12 @@ fn mark_buffered_agentic_done(ctx: &mut HttpFilterContext<'_>) {
         .unwrap();
 }
 
+fn finalize_buffered_agentic_state(state: &mut ResponsesState) {
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    assert!(body.is_some(), "the canonical response must have a wire body");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_not_armed_without_conversation_metadata() {
     let (filter, store) = harness();
@@ -4448,6 +4454,7 @@ async fn reversed_response_filter_order_persists_before_budgeted_conversation_ap
         ..ResponsesState::default()
     };
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    finalize_buffered_agentic_state(&mut state);
     ctx.extensions.insert(state);
     mark_buffered_agentic_done(&mut ctx);
     let mut response = make_response();
@@ -4547,6 +4554,7 @@ async fn reversed_response_filter_order_rolls_back_after_append_budget_rejection
         ..ResponsesState::default()
     };
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4096);
+    finalize_buffered_agentic_state(&mut state);
     ctx.extensions.insert(state);
     let mut response = make_response();
     response
@@ -4635,16 +4643,17 @@ async fn response_conditions_excluding_store_do_not_suppress_conversation_append
         ..ResponsesState::default()
     };
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    let wire_bytes = serde_json::to_vec(&state.response_object).unwrap().len();
     ctx.extensions.insert(state);
     let mut response = make_response();
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
     // Core-private IterationState is unavailable in this synthetic context;
-    // a bounded provider header keeps this test focused on round participation.
+    // the exact provider length keeps this test focused on round participation.
     response
         .headers
-        .insert(http::header::CONTENT_LENGTH, "512".parse().unwrap());
+        .insert(http::header::CONTENT_LENGTH, wire_bytes.to_string().parse().unwrap());
     ctx.response_header = Some(&mut response);
 
     // An intermediate IRR response did run Store. Its participation marker
@@ -5338,21 +5347,8 @@ async fn budgeted_store_then_append_failure_removes_response_row() {
 
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
     ctx.current_filter_id = Some(1);
-    assert!(matches!(
-        response_store.on_response_body(&mut ctx, &mut body, true).unwrap(),
-        FilterAction::Continue
-    ));
-    assert!(
-        ctx.extensions
-            .get::<crate::openai::responses::store::PersistedResponseForConversation>()
-            .is_some(),
-        "Store must mark this exchange's durable insert"
-    );
-    assert!(store.get_response(&owner, response_id).await.unwrap().is_some());
-
-    ctx.current_filter_id = Some(0);
-    let FilterAction::Reject(rejection) = conversations.on_response_body(&mut ctx, &mut body, true).unwrap() else {
-        panic!("bounded Conversation append must reject the completed response");
+    let FilterAction::Reject(rejection) = response_store.on_response_body(&mut ctx, &mut body, true).unwrap() else {
+        panic!("Store must propagate the bounded Conversation append failure");
     };
     assert_eq!(rejection.status, 502);
     assert!(
@@ -5442,14 +5438,20 @@ async fn budgeted_conversation_and_store_share_finite_wire_cap() {
             conversations.on_response(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ));
-        assert!(matches!(
-            ctx.response_body_mode,
-            BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap == wire_bytes
-        ));
+        if !finalized {
+            assert!(matches!(
+                ctx.response_body_mode,
+                BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap == wire_bytes
+            ));
+        }
         ctx.current_filter_id = Some(0);
         assert!(matches!(
             response_store.on_response(&mut ctx).await.unwrap(),
             FilterAction::Continue
+        ));
+        assert!(matches!(
+            ctx.response_body_mode,
+            BodyMode::StreamBuffer { max_bytes: Some(cap) } if cap == wire_bytes
         ));
     }
 }
@@ -7165,16 +7167,17 @@ async fn review_final_gate_must_not_revive_a_conversation_hook_skipped_this_roun
         ..ResponsesState::default()
     };
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 1_048_576);
+    let wire_bytes = serde_json::to_vec(&state.response_object).unwrap().len();
     ctx.extensions.insert(state);
     let mut response = make_response();
     response
         .headers
         .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
     // Core-private IterationState is unavailable in this synthetic context;
-    // a bounded provider header keeps this test focused on round participation.
+    // the exact provider length keeps this test focused on round participation.
     response
         .headers
-        .insert(http::header::CONTENT_LENGTH, "512".parse().unwrap());
+        .insert(http::header::CONTENT_LENGTH, wire_bytes.to_string().parse().unwrap());
     ctx.response_header = Some(&mut response);
 
     // An intermediate IRR response did run Store. Its participation marker

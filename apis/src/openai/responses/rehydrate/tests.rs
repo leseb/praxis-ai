@@ -2111,23 +2111,22 @@ async fn finite_restore_reserves_numeric_normalization_before_parsing() {
         "{{\"id\":\"resp_new\",\"object\":\"response\",\"previous_response_id\":null,\"output\":[{numeric_values}]}}"
     );
     let baseline = state.retained_payload_bytes().unwrap();
-    let raw_only_reservation = body_bytes.len() * 5 + "resp_prev".len() * 12 + 128;
+    // Five raw-body owners plus the two possible framework wire buffers fit.
+    let raw_only_reservation = body_bytes.len() * 7 + "resp_prev".len() * 12 + 128;
     state.apply_retained_payload_limit(baseline + raw_only_reservation);
     state.buffered_canonical_finalized = true;
     ctx.extensions.insert(state);
+    response.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&body_bytes.len().to_string()).unwrap(),
+    );
     ctx.response_header = Some(&mut response);
-    assert!(matches!(
-        filter.on_response(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-
-    let mut body = Some(Bytes::from(body_bytes.clone()));
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    match action {
-        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 502),
-        other => panic!("expected normalization budget rejection, got {other:?}"),
-    }
-    assert_eq!(body.as_deref(), Some(body_bytes.as_bytes()));
+    // The trusted wire length is small enough for a raw-only reservation, but
+    // numeric normalization needs more space. Reject before client headers.
+    let FilterAction::Reject(rejection) = filter.on_response(&mut ctx).await.unwrap() else {
+        panic!("expected preheader normalization budget rejection");
+    };
+    assert_eq!(rejection.status, 502);
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
