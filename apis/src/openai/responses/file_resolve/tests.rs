@@ -1024,6 +1024,13 @@ async fn aggregate_content_limit_tied_with_independent_cap_rejects_under_continu
             + (512 + "file-a".len()) * 8,
     );
     ctx.extensions.insert(state);
+    assert_eq!(
+        aggregate_resolution_headroom(&ctx, raw_bytes, parsed_bytes),
+        Ok(Some(
+            crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + (512 + "file-a".len()) * 8
+        )),
+        "the fixture must exercise the exact aggregate transport and inline cap"
+    );
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(

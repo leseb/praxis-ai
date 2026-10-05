@@ -1373,11 +1373,7 @@ pub(crate) fn discard_retained_request_payload(ctx: &mut HttpFilterContext<'_>) 
     }
 }
 
-/// Reserve the zstd replay peak: one worker-owned copy of every payload plus
-/// compressed frames alongside the still-live captured rows. Zstd's
-/// `compressBound(n)` is at most `n + n / 256 + 64` per event. The store codec
-/// is hidden behind the backend trait, so this also conservatively applies to
-/// stores that borrow uncompressed replay payloads.
+/// Reserve replay payload copies and compressed frames while captured rows remain live.
 fn replay_payload_staging_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     let Some(capture) = ctx.extensions.get::<ResponseStoreRequestState>() else {
         return Some(0);
@@ -1386,14 +1382,15 @@ fn replay_payload_staging_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
         return Some(0);
     }
     let payload_bytes = usize::try_from(capture.event_bytes).ok()?;
+    // Zstd's compressBound(n) is at most n + n / 256 + 64 per event.
     payload_bytes
         .checked_mul(2)?
         .checked_add(payload_bytes >> 8)?
         .checked_add(capture.events.len().checked_mul(64)?)
 }
 
-/// Bound a buffered response's normalized JSON size before parsing its store record.
-fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> bool {
+/// Admit the normalized parsed response while its buffered wire remains live.
+fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, wire: &[u8]) -> bool {
     let projected = if ctx
         .extensions
         .get::<ResponsesState>()
@@ -1402,11 +1399,11 @@ fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, bytes: &[
     {
         // serde_json can expand exponent-form numbers while constructing the
         // record; use the same no-allocation upper bound as agentic admission.
-        buffered_parsed_json_bytes_upper_bound(bytes)
+        buffered_parsed_json_bytes_upper_bound(wire)
     } else {
-        Some(bytes.len())
+        Some(wire.len())
     };
-    projected.is_some_and(|response_bytes| persistence_construction_fits_with_wire(ctx, response_bytes, bytes.len()))
+    projected.is_some_and(|response_bytes| persistence_construction_fits_with_wire(ctx, response_bytes, wire.len()))
 }
 
 /// The response, messages, and input columns may each be zstd-compressed and
@@ -2417,6 +2414,9 @@ impl HttpFilter for ResponseStoreFilter {
                     Ok(parts) => parts,
                     Err(action) => return Ok(action),
                 };
+                // The request snapshot is consumed. If the backend reports an
+                // ambiguous write error, fail-open must not retry on the body hook.
+                ctx.extensions.insert(BufferedResponsePersistenceAttempted);
                 let Some(record) = build_streaming_record(ctx, persist.owner, persist.request_input) else {
                     return Ok(FilterAction::Reject(reject_store_error()));
                 };
@@ -2434,7 +2434,6 @@ impl HttpFilter for ResponseStoreFilter {
                 if !inserted {
                     return Ok(persistence_budget_failure(ctx, false, &mut None));
                 }
-                ctx.extensions.insert(BufferedResponsePersistenceAttempted);
                 #[cfg(feature = "openai-conversations")]
                 ctx.extensions.insert(StoreResponseHeaderRan(response_round(ctx)));
                 #[cfg(feature = "openai-conversations")]
@@ -3537,10 +3536,9 @@ mod encode_replay_event_tests {
         assert!(persistence_construction_fits(&ctx, short_response_bytes));
     }
 
-    /// Captured replay events remain live while the backend copies and
-    /// compresses their payloads. Admit that peak before persistence begins.
+    /// Captured rows remain live while zstd copies and compresses their payloads.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks the replay compression staging boundary")]
+    #[expect(clippy::too_many_lines, reason = "checks replay compression staging admission")]
     fn replay_persistence_preflights_compression_payload_copies() {
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);

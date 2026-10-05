@@ -1188,6 +1188,27 @@ impl crate::store::ResponseStore for RecordingResponseStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        _approvals: &[crate::store::PendingApprovalRecord],
+    ) -> Result<bool, crate::store::StoreError> {
+        self.upserts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            return Err(crate::store::StoreError::Unavailable(
+                "recording store: forced failure".to_owned(),
+            ));
+        }
+        let mut records = self.records.lock().expect("records mutex should not be poisoned");
+        match records.entry(record.id.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(record.clone());
+                Ok(true)
+            },
+        }
+    }
+
     async fn get_response(
         &self,
         owner: &crate::StateOwner,
@@ -1562,6 +1583,56 @@ async fn streaming_terminal_fail_open_error_is_not_retried_at_eos() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "header error and body callback share one request context"
+)]
+async fn buffered_header_persist_error_is_not_retried_on_body() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(true));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_recording_store(&mut ctx, store_dyn);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let response = json!({
+        "id": "resp_header_retry",
+        "created_at": 1_719_900_100_i64,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": []
+    });
+    let mut state = ResponsesState {
+        response_object: response,
+        buffered_canonical_finalized: true,
+        buffered_canonical_wire_bytes: Some(256),
+        buffered_canonical_parsed_bound_bytes: Some(256),
+        buffered_canonical_body_digest: Some([0; 32]),
+        ..Default::default()
+    };
+    state.apply_retained_payload_limit(67_108_864);
+    ctx.extensions.insert(state);
+    let mut headers = crate::test_utils::make_response();
+    headers
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut headers);
+
+    assert!(filter.on_response(&mut ctx).await.is_err());
+    assert_eq!(store.upsert_count(), 1);
+    let mut body = Some(Bytes::from_static(b"{}"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(store.upsert_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_propagates_persist_rejection() {
     // #937 (latest-main integration): `persist_from_streaming_state` returns
     // `Ok(FilterAction::Reject(_))` when the immutable owner/request state was
@@ -1658,49 +1729,6 @@ event: response.completed\n\
 data: {\"type\":\"response.completed\",\"sequence_number\":2}\n\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn streaming_events_persist_at_terminal_seam() {
-    let filter = make_filter();
-    let store = Arc::new(RecordingResponseStore::new(false));
-    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
-
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam", true).await;
-
-    // The deferred terminal frame arrives with the captured events; the seam
-    // persists the record and then flushes the whole log before release.
-    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
-    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
-    assert!(
-        matches!(action, FilterAction::Release),
-        "the terminal chunk is released after the record and log persist"
-    );
-    assert_eq!(store.upsert_count(), 1, "the JSON record persists exactly once");
-    assert_eq!(
-        store.event_count("resp_seam"),
-        3,
-        "all captured events flush together at the terminal seam"
-    );
-
-    let events = store
-        .list_events_after(&crate::test_utils::test_owner("default"), "resp_seam", None, 10)
-        .await
-        .unwrap();
-    assert_eq!(
-        events.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
-        vec![0, 1, 2],
-        "events persist in ascending sequence order"
-    );
-    assert!(
-        events.last().unwrap().terminal,
-        "the terminal event must be marked terminal so the log is replayable"
-    );
-    assert!(
-        events.iter().take(2).all(|e| !e.terminal),
-        "non-terminal events must not be flagged terminal"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[expect(
     clippy::too_many_lines,
     reason = "exercises exact-budget zstd persistence and replay"
@@ -1787,6 +1815,49 @@ async fn compressed_stream_replay_persists_at_exact_aggregate_staging_bound() {
         })
         .to_string()
         .as_bytes()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_events_persist_at_terminal_seam() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam", true).await;
+
+    // The deferred terminal frame arrives with the captured events; the seam
+    // persists the record and then flushes the whole log before release.
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "the terminal chunk is released after the record and log persist"
+    );
+    assert_eq!(store.upsert_count(), 1, "the JSON record persists exactly once");
+    assert_eq!(
+        store.event_count("resp_seam"),
+        3,
+        "all captured events flush together at the terminal seam"
+    );
+
+    let events = store
+        .list_events_after(&crate::test_utils::test_owner("default"), "resp_seam", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "events persist in ascending sequence order"
+    );
+    assert!(
+        events.last().unwrap().terminal,
+        "the terminal event must be marked terminal so the log is replayable"
+    );
+    assert!(
+        events.iter().take(2).all(|e| !e.terminal),
+        "non-terminal events must not be flagged terminal"
     );
 }
 
