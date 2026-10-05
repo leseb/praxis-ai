@@ -37,20 +37,24 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
-    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
+    SelectedUpstreamBodyOutcome, SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde::{Deserialize, ser::SerializeMap as _};
 use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
 use super::{
+    ObservedResponsesSse,
     body_limits::reject_rewritten_body_too_large,
     enforce_agentic_stream_guard,
     error::responses_error_rejection,
     state::{ResponsesState, normalize_input_owned, retained_json_bytes, retained_json_values_bytes},
 };
 use crate::json_body::SerializedJson;
+
+/// Per-step header evidence paired with streaming body delivery below.
+const PROXY_SSE_HEADER_KEY: &str = "responses.proxy_sse_header";
 
 // -----------------------------------------------------------------------------
 // ResponsesProxyFilter
@@ -702,6 +706,47 @@ impl HttpFilter for ResponsesProxyFilter {
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming
+            && ctx.extensions.get::<IterationState>().is_some()
+            && ctx.response_header.as_ref().is_some_and(|response| {
+                response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.as_bytes().get(..b"text/event-stream".len()))
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/event-stream"))
+            })
+        {
+            ctx.set_metadata(PROXY_SSE_HEADER_KEY, "true");
+        }
+        Ok(FilterAction::Continue)
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        // IRR retains extensions across steps but replaces `previous_response`
+        // after each one. Remember that SSE body delivery started, including
+        // an empty stream whose headers were already committed, so a later
+        // request-phase failure cannot append a JSON rejection.
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming
+            && ctx.extensions.get::<IterationState>().is_some()
+            && ctx.extensions.get::<ObservedResponsesSse>().is_none()
+            && (end_of_stream || body.as_ref().is_some_and(|bytes| !bytes.is_empty()))
+            && ctx.get_metadata(PROXY_SSE_HEADER_KEY) == Some("true")
+        {
+            ctx.extensions.insert(ObservedResponsesSse);
+        }
+        Ok(FilterAction::Continue)
     }
 
     fn may_select_streaming_subrequest_response(&self) -> bool {

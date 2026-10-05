@@ -440,9 +440,9 @@ impl FileUrlResolver {
 
         // Compute max raw bytes after reserving data URI prefix
         let max_content_bytes = max_content_bytes_for_data_url(max_resolved_bytes, &content_type).ok_or_else(|| {
-            ResolveError::FileUrlFailed {
-                label: label.clone(),
-                detail: "content type prefix exceeds budget".to_owned(),
+            ResolveError::TooLarge {
+                reference: label.clone(),
+                limit: max_resolved_bytes,
             }
         })?;
 

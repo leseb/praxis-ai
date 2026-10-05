@@ -30,6 +30,422 @@ use crate::{
 };
 
 #[test]
+fn lowered_snapshot_echo_fails_before_planning_many_owned_copies() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter());
+    let mut state = ResponsesState::default();
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "public", "description": "x".repeat(16_000)})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(65_536);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let frame = make_sse_chunk(
+        "response.in_progress",
+        &json!({"response": {"id": "resp_probe", "output": []}}),
+    );
+    let mut body = Some(Bytes::from(frame.repeat(20)));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none(), "the whole co-batched chunk must be suppressed");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        allocations.bytes_max < 65_536 * 2,
+        "restoration must reject before retaining many echo copies: {}",
+        allocations.bytes_max
+    );
+}
+
+#[test]
+fn multiline_data_rejects_before_reallocating_prior_frame_buffer() {
+    let (filter, mut ctx) = make_armed_context();
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model", "input": "hello", "stream": true
+    })));
+
+    let mut first_line = Some(Bytes::from(format!("data: {}\n", "x".repeat(30_000))));
+    filter.on_response_body(&mut ctx, &mut first_line, false).unwrap();
+    let response = ctx.extensions.get::<ResponsesState>().unwrap();
+    let shared = response.retained_payload_bytes().unwrap() - response.retained_stream_parser_bytes;
+    let local = ctx
+        .get_filter_state::<StreamEventsState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let second_line = Bytes::from_static(b"data: x\n");
+    let limit = shared + local + second_line.len() * 4 + 30_000 - 1;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(limit);
+
+    let mut body = Some(second_line);
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        body.is_none(),
+        "reallocating the existing data buffer must be preflighted"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn crlf_does_not_hide_carried_data_buffer_copy() {
+    for split_crlf in [false, true] {
+        let (filter, mut ctx) = make_armed_context();
+        ctx.extensions.insert(ResponsesState::from_request_body(json!({
+            "model": "test-model", "input": "hello", "stream": true
+        })));
+
+        let mut first_line = Some(Bytes::from(format!("data: {}\n", "x".repeat(30_000))));
+        filter.on_response_body(&mut ctx, &mut first_line, false).unwrap();
+        if split_crlf {
+            let mut event_line = Some(Bytes::from_static(b"event: ping\r"));
+            filter.on_response_body(&mut ctx, &mut event_line, false).unwrap();
+        }
+
+        let suffix = if split_crlf {
+            Bytes::from_static(b"\ndata: x\n")
+        } else {
+            Bytes::from_static(b"event: ping\r\ndata: x\n")
+        };
+        let response = ctx.extensions.get::<ResponsesState>().unwrap();
+        let shared = response.retained_payload_bytes().unwrap() - response.retained_stream_parser_bytes;
+        let local = ctx
+            .get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        let limit = shared + local + suffix.len() * 4 + 30_000 - 1;
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(limit);
+
+        let mut body = Some(suffix);
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "carried data must stay live across CRLF, split={split_crlf}"
+        );
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+}
+
+#[test]
+fn lowered_heartbeat_does_not_reserve_unused_tool_echo_copies() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter());
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    responses.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "public", "description": "x".repeat(256_000)})],
+        tool_choice: json!("auto"),
+    });
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + 8_192);
+    ctx.extensions.insert(responses);
+
+    for _ in 0..8 {
+        let mut body = Some(Bytes::from_static(b": ping\n\n"));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(ctx.get_metadata("responses.stream_error_message").is_none());
+    }
+    assert!(!ctx.get_filter_state::<StreamEventsState>().unwrap().stream_failed);
+}
+
+#[test]
+fn native_terminal_avoids_duplicate_restoration_staging() {
+    assert_terminal_avoids_duplicate_staging(false);
+}
+
+#[test]
+fn lowered_terminal_avoids_duplicate_restoration_staging() {
+    assert_terminal_avoids_duplicate_staging(true);
+}
+
+#[test]
+fn lowered_completion_snapshots_count_toward_both_budgets() {
+    for aggregate_limit in [None, Some(65_536)] {
+        let stream_limit = if aggregate_limit.is_some() { 1_048_576 } else { 65_536 };
+        let (filter, mut ctx) =
+            make_armed_context_with_filter(make_filter_from(&format!("max_accumulated_bytes: {stream_limit}")));
+        let mut responses = ResponsesState::default();
+        responses.client_tool_lowering.insert(
+            "agentic_ns__fs__read".to_owned(),
+            LoweredClientTool {
+                original_name: "read".to_owned(),
+                namespace: Some("fs".to_owned()),
+                restore: ClientToolRestore::Namespace,
+            },
+        );
+        ctx.extensions.insert(responses);
+
+        let mut added = Some(make_sse_chunk(
+            "response.output_item.added",
+            &json!({
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "name": "agentic_ns__fs__read",
+                    "call_id": "c1",
+                    "id": "fc_1",
+                    "arguments": "",
+                    "status": "in_progress",
+                    "padding": "x".repeat(8_192)
+                }
+            }),
+        ));
+        filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+        assert!(added.is_some(), "the large item itself must fit");
+        if let Some(limit) = aggregate_limit {
+            ctx.extensions
+                .get_mut::<ResponsesState>()
+                .unwrap()
+                .apply_retained_payload_limit(limit);
+        }
+
+        // Small done frames each clone the large completed item into the
+        // restoration plan. Their snapshots coexist until planning finishes.
+        let mut frames = Vec::new();
+        for _ in 0..50 {
+            frames.extend_from_slice(&make_sse_chunk(
+                "response.function_call_arguments.done",
+                &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
+            ));
+        }
+        let mut body = Some(Bytes::from(frames));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(body.is_none(), "the snapshot copies must trip the byte ceiling");
+        if aggregate_limit.is_some() {
+            let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+            assert!(responses.retained_payload_failed);
+            assert_eq!(responses.retained_external_payload_bytes, 0);
+        } else {
+            assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
+        }
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+}
+
+#[test]
+fn lowered_completion_uses_post_accumulation_staging_near_cap() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    responses.apply_retained_payload_limit(65_536);
+    ctx.extensions.insert(responses);
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "name": "private",
+                "id": "fc_1",
+                "call_id": "c1",
+                "arguments": "",
+                "status": "in_progress",
+                "padding": "x".repeat(8_192)
+            }
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    assert!(added.is_some());
+
+    let arguments = format!("{{\"text\":\"{}\"}}", "y".repeat(4_096));
+    let mut done = Some(make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "item_id": "fc_1", "arguments": arguments}),
+    ));
+    filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+    assert!(done.is_some(), "the live owners fit within the 64 KiB request budget");
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn co_batched_completions_do_not_reserialize_unrelated_large_output() {
+    assert_completion_batch_does_not_reserialize_unrelated_output(false);
+}
+
+#[test]
+fn interleaved_item_done_does_not_reserialize_unrelated_large_output() {
+    assert_completion_batch_does_not_reserialize_unrelated_output(true);
+}
+
+fn assert_completion_batch_does_not_reserialize_unrelated_output(interleave_done: bool) {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    responses.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(responses);
+    let mut added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "x".repeat(1_048_576)}]}}),
+    )
+    .to_vec();
+    let mut done = Vec::new();
+    for index in 0..300 {
+        added.extend_from_slice(&make_sse_chunk(
+            "response.output_item.added",
+            &json!({"output_index": index + 1, "item": {"type": "function_call", "name": "private", "id": format!("fc_{index}"), "call_id": format!("c{index}"), "arguments": "", "status": "in_progress"}}),
+        ));
+        done.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": index + 1, "item_id": format!("fc_{index}"), "arguments": "{}"}),
+        ));
+        if interleave_done {
+            done.extend_from_slice(&make_sse_chunk(
+                "response.output_item.done",
+                &json!({"output_index": index + 1, "item": {"type": "function_call", "name": "private", "id": format!("fc_{index}"), "call_id": format!("c{index}"), "arguments": "{}", "status": "completed"}}),
+            ));
+        }
+    }
+    let mut body = Some(Bytes::from(added));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_some());
+    body = Some(Bytes::from(done));
+    let started = std::time::Instant::now();
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_some(), "the completion batch must fit its 64 MiB budget");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "300 small completions (interleaved={interleave_done}) must not rescan a 1 MiB output per event: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn co_batched_completion_snapshots_reject_before_next_large_clone() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    ctx.extensions.insert(responses);
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "function_call", "name": "private", "id": "fc_1", "call_id": "c1", "arguments": "", "status": "in_progress", "padding": "x".repeat(16_384)}}),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    let baseline = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(65_536);
+    let frame = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
+    );
+    let mut body = Some(Bytes::from([frame.as_ref(), frame.as_ref()].concat()));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none());
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+    assert!(
+        allocations.bytes_max < u64::try_from(65_536 - baseline).unwrap(),
+        "reject before the next clone exceeds remaining headroom: {allocations:?}"
+    );
+}
+
+/// A terminal response is retained in shared state before restoration planning.
+fn assert_terminal_avoids_duplicate_staging(lowered: bool) {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
+    if lowered {
+        responses.client_tool_lowering.insert(
+            "private".to_owned(),
+            LoweredClientTool {
+                original_name: "public".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
+        responses.client_tool_echo = Some(ClientToolEcho {
+            tools: vec![json!({"type": "custom", "name": "public"})],
+            tool_choice: json!("auto"),
+        });
+    }
+    responses.apply_retained_payload_limit(30_000);
+    ctx.extensions.insert(responses);
+    let metadata: serde_json::Map<String, serde_json::Value> =
+        (0..8).map(|i| (format!("key{i}"), json!("x".repeat(512)))).collect();
+    let terminal = make_sse_chunk(
+        "response.completed",
+        &json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_budget",
+                "object": "response",
+                "status": "completed",
+                "output": [],
+                "metadata": metadata,
+            }
+        }),
+    );
+    for slice in terminal.chunks(256) {
+        let mut body = Some(Bytes::copy_from_slice(slice));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            ctx.get_metadata("responses.stream_error_code").is_none(),
+            "{:?}",
+            ctx.get_metadata("responses.stream_error_message")
+        );
+    }
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let body = std::str::from_utf8(eos.as_ref().unwrap()).unwrap();
+    assert!(body.contains("event: response.completed"), "{body}");
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+}
+
+#[test]
 fn done_after_terminal_at_max_events_is_allowed() {
     let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
     let completed =
@@ -83,37 +499,6 @@ fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
     OpenaiStreamEventsFilter::build(&yaml).unwrap()
 }
 
-#[tokio::test]
-async fn parser_payload_is_visible_to_a_different_agentic_filter_id() {
-    let (stream_filter, mut ctx) = make_armed_context();
-    let mut responses = ResponsesState {
-        request_body: json!({"model": "m", "input": "hello", "stream": true}),
-        ..ResponsesState::default()
-    };
-    responses.apply_retained_payload_limit(64 * 1024);
-    ctx.extensions.insert(responses);
-    let mut partial = Some(Bytes::from(format!("data: {}", "x".repeat(5_000))));
-    stream_filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
-    let parser_bytes = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .unwrap()
-        .retained_stream_parser_bytes;
-    assert!(parser_bytes >= 5_000, "unfinished frame must be published");
-
-    ctx.current_filter_id = Some(1);
-    assert!(ctx.get_filter_state::<StreamEventsState>().is_none());
-    let agentic = crate::openai::responses::agentic_loop::AgenticLoopFilter::from_config(
-        &serde_yaml::from_str("max_retained_bytes: 4096").unwrap(),
-    )
-    .unwrap();
-    assert!(matches!(
-        agentic.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
-}
-
 #[test]
 fn eos_remeasures_history_appended_after_first_stream_chunk() {
     let (filter, mut ctx) = make_armed_context();
@@ -151,6 +536,37 @@ fn eos_remeasures_history_appended_after_first_stream_chunk() {
 /// `IterationState` is covered by the functional integration tests.
 fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     make_armed_context_with_filter(make_filter())
+}
+
+#[tokio::test]
+async fn parser_payload_is_visible_to_a_different_agentic_filter_id() {
+    let (stream_filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState {
+        request_body: json!({"model": "m", "input": "hello", "stream": true}),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(64 * 1024);
+    ctx.extensions.insert(responses);
+    let mut partial = Some(Bytes::from(format!("data: {}", "x".repeat(5_000))));
+    stream_filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
+    let parser_bytes = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_stream_parser_bytes;
+    assert!(parser_bytes >= 5_000, "unfinished frame must be published");
+
+    // Praxis's filter state is keyed by current_filter_id. The loop callback
+    // cannot read the parser's slot, but its shared budget must still reject it.
+    ctx.current_filter_id = Some(1);
+    assert!(ctx.get_filter_state::<StreamEventsState>().is_none());
+    let agentic = crate::openai::responses::agentic_loop::AgenticLoopFilter::from_config(
+        &serde_yaml::from_str("max_retained_bytes: 4096").unwrap(),
+    )
+    .unwrap();
+    let action = agentic.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(_)));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[test]
@@ -342,6 +758,40 @@ fn local_completion_preflights_synthesized_sse_output() {
 }
 
 #[test]
+fn deferred_terminal_replaces_published_parser_charge_once() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    parser_state
+        .tool_call_args
+        .insert("item:large".to_owned(), "x".repeat(5_000));
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({
+            "type": "response.completed",
+            "response": {"id": "resp_budget", "object": "response", "status": "completed", "output": []}
+        }),
+    };
+    let mut state = ResponsesState {
+        response_object: json!({"id": "resp_budget", "object": "response", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let local_bytes = parser_state.retained_payload_bytes().unwrap();
+    state.retained_stream_parser_bytes = local_bytes + terminal.retained_payload_bytes().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    let canonical_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    state.apply_retained_payload_limit(
+        baseline + canonical_staging + terminal.retained_payload_bytes().unwrap() + 2_000,
+    );
+    ctx.extensions.insert(state);
+
+    let mut output = Vec::new();
+    super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output)
+        .expect("the published parser owner must only be charged once");
+    assert!(String::from_utf8_lossy(&output).contains("event: response.completed"));
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
 fn deferred_terminal_preflights_canonical_output_owners() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -508,8 +958,9 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     ctx.extensions.insert(responses);
     let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
     let cached = stream.shared_stable_bytes.get().copied().unwrap();
+    let prior = stream.shared_prior_output_bytes.get().copied().flatten().unwrap();
     assert!(
-        cached > 1_048_576,
+        prior.bytes > 1_048_576,
         "the large prior-round output must be in the per-round cache"
     );
     assert_eq!(
@@ -533,6 +984,10 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
     for _ in 0..100 {
         assert_eq!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1, Some(next));
         assert_eq!(stream.shared_stable_bytes.get().copied(), Some(cached));
+        assert_eq!(
+            stream.shared_prior_output_bytes.get().copied().flatten().unwrap().bytes,
+            prior.bytes
+        );
     }
     // The owner may append output at EOS; the next round must charge it again.
     stream.clear_shared_budget_cache();
@@ -555,7 +1010,7 @@ fn streaming_budget_cache_counts_stable_owners_once_per_round() {
             .retained_payload_bytes()
             .unwrap()
     );
-    assert!(stream.shared_stable_bytes.get().copied().unwrap() > cached);
+    assert!(stream.shared_prior_output_bytes.get().copied().flatten().unwrap().bytes > prior.bytes);
     ctx.insert_filter_state(stream);
     filter.arm(&mut ctx);
     let mut rearmed = ctx.remove_filter_state::<StreamEventsState>().unwrap();
@@ -675,6 +1130,248 @@ fn ordinary_delta_skips_already_flushed_local_output_bound() {
     stream.local_items_flushed = true;
     let flushed = super::logical_output_upper_bound(&ctx, &stream, &[event]).unwrap();
     assert!(flushed < 1_024, "later deltas only reserve their own wire payload");
+}
+
+#[test]
+fn streaming_budget_caches_client_tool_echo_captured_after_arm() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    // Client-tool lowering captures this snapshot after stream-events arms at
+    // request time, before the first upstream response chunk is checked.
+    responses.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "function", "name": "large", "description": "x".repeat(1_048_576)})],
+        tool_choice: json!("auto"),
+    });
+    responses.apply_retained_payload_limit(1_200_000);
+    let expected = responses.retained_payload_bytes().unwrap();
+    ctx.extensions.insert(responses);
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let mut body = Some(Bytes::from_static(b": ping\n\n"));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the stable echo must not be serialized on every tiny SSE chunk: {:?}",
+        started.elapsed()
+    );
+
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 1_048_576);
+    assert_eq!(
+        super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+        Some(expected)
+    );
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(responses.stream_changing_payload_bytes_bounded(1_024).is_some());
+    assert!(!responses.retained_payload_failed);
+}
+
+#[test]
+fn unbounded_stream_skips_echo_projection_without_snapshots() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "function", "name": "large", "description": "x".repeat(1_048_576)})],
+        tool_choice: json!("auto"),
+    });
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(responses);
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let mut body = Some(Bytes::from_static(b": ping\n\n"));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "heartbeat chunks must not serialize a 1 MiB echo without snapshots: {:?}",
+        started.elapsed()
+    );
+    assert!(ctx.get_metadata("responses.stream_error_message").is_none());
+}
+
+#[test]
+fn streaming_budget_cache_refreshes_prior_output_after_revision_change() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState {
+        accumulated_output: vec![json!({"text": "a".repeat(128 * 1024)})],
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(1_000_000);
+    ctx.extensions.insert(responses);
+
+    let initial = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
+    let cache = stream.shared_prior_output_bytes.get().unwrap().unwrap();
+    assert!(cache.bytes > 128 * 1024);
+    assert_eq!(
+        initial,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert_eq!(
+        super::shared_retained_budget(&ctx, &mut stream).unwrap().1,
+        Some(initial)
+    );
+
+    let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    responses.accumulated_output[0]["text"] = json!("b".repeat(256 * 1024));
+    responses.mark_replay_stable_payload_changed();
+    let next = super::shared_retained_budget(&ctx, &mut stream).unwrap().1.unwrap();
+    assert_eq!(
+        next,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert_eq!(next - initial, 128 * 1024);
+}
+
+#[test]
+fn eos_remeasures_history_appended_after_the_first_stream_chunk() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + 2_000);
+    ctx.extensions.insert(responses);
+    assert!(super::shared_retained_budget(&ctx, &mut stream).unwrap().1.is_some());
+    ctx.insert_filter_state(stream);
+
+    // Agentic collection runs before the stream-events EOS callback and copies
+    // the round's reasoning/tool item into both history owners.
+    let item = json!({"type": "reasoning", "id": "rs_eos", "summary": "x".repeat(3_000)});
+    let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    responses.messages.push(item.clone());
+    responses.persisted_messages.push(item);
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+}
+
+#[test]
+fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
+    use super::client_tools::{ClientToolPhase, ClientToolStreamItem};
+    use crate::openai::responses::state::ClientToolRestore;
+
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    stream.client_tool_items.push(ClientToolStreamItem {
+        key: "item:call_done".to_owned(),
+        private_name: "private_tool".repeat(100),
+        restore: ClientToolRestore::Custom,
+        phase: ClientToolPhase::Done,
+        output_index: 0,
+        item_id: Some("call_done".to_owned()),
+    });
+    // A completed output item leaves an allocated size-cache slot after the
+    // round's cache invalidation; finalization must release that capacity too.
+    stream.output_item_bytes = vec![Some(32); 16];
+    let parser_bytes = stream.retained_payload_bytes().unwrap();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + parser_bytes * 2 + 128);
+    ctx.extensions.insert(responses);
+    assert!(super::publish_stream_payload(&mut ctx, &mut stream));
+    ctx.insert_filter_state(stream);
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "loop");
+
+    let mut output = None;
+    super::finalize_logical_stream(&mut ctx, &mut output);
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .retained_payload_bytes(),
+        Some(0)
+    );
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(responses.retained_stream_parser_bytes, 0);
+    assert!(!responses.retained_payload_failed);
+    assert!(
+        responses.can_retain_payload(parser_bytes + 128),
+        "the next IRR step must have room for payload that the old parser released"
+    );
+}
+
+#[test]
+fn shared_eos_wire_rejects_before_copying_a_second_large_buffer() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    let wire = Bytes::from(vec![b'x'; 32 * 1024]);
+    // A downstream handle keeps the normalized EOS chunk shared while this
+    // filter finalizes it. The old and new buffers coexist during a copy.
+    let _other_owner = wire.clone();
+    responses.apply_retained_payload_limit(baseline + wire.len() * 2 - 1);
+    ctx.extensions.insert(responses);
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "loop");
+
+    let mut body = Some(wire);
+    let allocations = allocation_counter::measure(|| {
+        super::finalize_logical_stream(&mut ctx, &mut body);
+    });
+    let output = String::from_utf8(body.expect("bounded error frame").to_vec()).unwrap();
+    assert_eq!(output.matches("event: error").count(), 1);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(
+        allocations.bytes_max < 32 * 1024,
+        "the oversized second wire buffer must never be allocated: {allocations:?}"
+    );
+}
+
+#[test]
+fn numeric_sse_payload_rejects_before_parsed_value_expands() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    responses.apply_retained_payload_limit(45 * 1024);
+    ctx.extensions.insert(responses);
+
+    // serde_json normalizes each four-byte `1e15` into an eighteen-byte
+    // decimal. The raw frame fits the parser preflight, but its parsed JSON
+    // and the retained frame cannot coexist under this limit.
+    let data = format!(
+        "{{\"type\":\"vendor.extension\",\"numbers\":[{}]}}",
+        vec!["1e15"; 2_000].join(",")
+    );
+    let mut body = Some(Bytes::from(format!("event: vendor.extension\ndata: {data}\n\n")));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none(), "the overflowing frame must not be forwarded");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+    assert!(
+        allocations.bytes_max < 40 * 1024,
+        "reject before allocating the expanded JSON tree: {allocations:?}"
+    );
 }
 
 #[test]
@@ -5690,6 +6387,7 @@ fn parse_error_sets_metadata() {
         client_tool_items: Vec::new(),
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        shared_prior_output_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
         output_array_bytes: None,
         output_revision: None,
@@ -5748,6 +6446,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         }],
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
+        shared_prior_output_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
         output_array_bytes: None,
         output_revision: None,

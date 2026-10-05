@@ -4,6 +4,7 @@
 //! Unit tests for the `openai_response_store` filter.
 
 use std::{
+    fmt::Write as _,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     sync::Arc,
@@ -28,8 +29,8 @@ use crate::{
     },
     service::responses::{ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items},
     store::{
-        DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
-        SqliteResponseStore,
+        CompressionAlgorithm, DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _,
+        ResponseStoreRegistry, SqliteResponseStore, StoreCompressionConfig,
     },
 };
 
@@ -494,6 +495,115 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
         ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
         "a persisted Responses create must arm persistence for this exchange"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_before_state_creator_transfers_snapshot_into_shared_budget() {
+    use crate::openai::responses::{AgenticBudgetPolicy, OpenaiResponsesRequestFilter, OpenaiResponsesValidateFilter};
+
+    let policy: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    for creator in [
+        OpenaiResponsesValidateFilter::from_config(&serde_yaml::Value::Null).unwrap(),
+        OpenaiResponsesRequestFilter::from_config(&serde_yaml::Value::Null).unwrap(),
+    ] {
+        let store = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        install_store(&mut ctx).await;
+        ctx.extensions
+            .insert(AgenticBudgetPolicy::from_config(&policy).unwrap());
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
+
+        assert!(matches!(
+            store.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(ctx.extensions.get::<ResponsesState>().is_none());
+        let snapshot_bytes = super::filter::retained_request_payload_bytes(&ctx).unwrap();
+        assert!(snapshot_bytes > 0);
+
+        let action = creator.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(!matches!(action, FilterAction::Reject(_)));
+        let responses = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .expect("later filter created state");
+        assert_eq!(responses.retained_external_payload_bytes, snapshot_bytes);
+        assert!(
+            responses.store_persist_armed,
+            "late state must inherit store approval arming"
+        );
+        assert!(responses.can_retain_payload(0));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_before_state_creator_rejects_oversized_snapshot_before_parse() {
+    use crate::openai::responses::AgenticBudgetPolicy;
+
+    let store = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "x".repeat(600)})).unwrap(),
+    ));
+
+    let action = store.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(super::filter::retained_request_payload_bytes(&ctx), Some(0));
+    assert!(!super::filter::request_persistence_armed(&ctx));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipeline_store_before_request_creator_preserves_budget_and_approval_arming() {
+    use crate::openai::responses::AgenticBudgetPolicy;
+
+    let (db_url, db_path) = temp_sqlite_url("pipeline_store_before_request_creator");
+    let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
+        r#"
+- filter: openai_responses_format
+- filter: openai_response_store
+  backend: sqlite
+  database_url: "{db_url}"
+  responses_table: test_responses
+  conversations_table: test_conversations
+- filter: openai_responses_request
+"#
+    ))
+    .unwrap();
+    let mut registry = crate::test_utils::make_ai_registry();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_responses_request" => crate::openai::responses::OpenaiResponsesRequestFilter::from_config
+    );
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(file_store_registry(&db_url).await);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
+
+    let action = pipeline
+        .execute_http_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(!matches!(action, FilterAction::Reject(_)));
+    let snapshot_bytes = super::filter::retained_request_payload_bytes(&ctx).unwrap();
+    let responses = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("request filter created state");
+    assert_eq!(responses.retained_external_payload_bytes, snapshot_bytes);
+    assert!(responses.store_persist_armed);
+    drop(ctx);
+    drop(std::fs::remove_file(db_path));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1541,6 +1651,86 @@ event: response.output_text.delta\n\
 data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1}\n\n\
 event: response.completed\n\
 data: {\"type\":\"response.completed\",\"sequence_number\":2}\n\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercises exact-budget zstd persistence and replay"
+)]
+async fn compressed_stream_replay_persists_at_exact_aggregate_staging_bound() {
+    let filter = make_filter();
+    let codec = StoreCompressionConfig {
+        algorithm: CompressionAlgorithm::Zstd,
+        level: None,
+    };
+    let store = Arc::new(
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_zstd_replay_responses",
+            "test_zstd_replay_conversations",
+            None,
+            None,
+            Some(&codec),
+        )
+        .await
+        .unwrap(),
+    );
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<SqliteResponseStore>::clone(&store);
+    let response_id = "resp_zstd_replay";
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, response_id, false).await;
+
+    let mut wire = String::new();
+    let mut payload_bytes = 0_usize;
+    for sequence_number in 0..16 {
+        let payload = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": sequence_number,
+            "delta": "x".repeat(4_096),
+        })
+        .to_string();
+        payload_bytes += payload.len();
+        write!(wire, "event: response.output_text.delta\ndata: {payload}\n\n").unwrap();
+    }
+    let terminal = json!({"type": "response.completed", "sequence_number": 16}).to_string();
+    payload_bytes += terminal.len();
+    write!(wire, "event: response.completed\ndata: {terminal}\n\n").unwrap();
+    let mut chunk = Some(Bytes::from(wire));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap(),
+        FilterAction::Release
+    ));
+
+    let replay_count = 17_usize;
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&state.response_object).unwrap();
+    let history_bytes = crate::openai::responses::state::retained_json_values_bytes(&state.persisted_messages).unwrap();
+    let captured_bytes = super::filter::retained_request_payload_bytes(&ctx).unwrap();
+    let staging = response_bytes * 6
+        + history_bytes * 3
+        + super::filter::encoded_column_headroom(response_bytes, history_bytes, 0).unwrap()
+        + captured_bytes
+        + response_id.len() * replay_count
+        + payload_bytes * 2
+        + (payload_bytes >> 8)
+        + replay_count * 64;
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.apply_retained_payload_limit(baseline + staging);
+    state.logical_stream_terminal_emitted = true;
+    let mut eos = None;
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut eos, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(eos.is_none(), "exactly admitted persistence emits no budget error");
+
+    let owner = crate::test_utils::test_owner("default");
+    assert!(store.get_response(&owner, response_id).await.unwrap().is_some());
+    let replay = store.list_events_after(&owner, response_id, None, 32).await.unwrap();
+    assert_eq!(replay.len(), replay_count);
+    assert!(replay.last().unwrap().terminal);
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_events_persist_at_terminal_seam() {

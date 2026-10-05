@@ -102,11 +102,14 @@ pub(super) struct AgenticLoopConfig {
     /// bytes for owned strings and streaming buffers. When several loop filters
     /// touch one request, the smallest configured value wins. Valid from 4 `KiB`
     /// through the non-disableable 256 `MiB` ceiling; defaults to 64 `MiB`.
-    /// Initial Responses create bodies are capped at one eighth of the smallest
-    /// reachable budget; the default therefore allows 8 `MiB`, which may reject
-    /// larger bodies accepted previously. To admit bodies up to `B` bytes, set
-    /// the effective budget to at least `8 × B` and
-    /// `body_limits.max_request_bytes` to at least `B`.
+    /// Initial Responses create bodies are admitted only when their raw and
+    /// projected parsed JSON sizes each fit within one eighth of the smallest
+    /// reachable budget. The default raw ceiling is 8 `MiB`; exponent-form
+    /// numbers may reduce the effective raw allowance. To admit a body, set
+    /// the effective budget to at least eight times its projected parsed size
+    /// and `body_limits.max_request_bytes` to at least its raw size. Input-token
+    /// and compact requests with history selectors use the same pre-parse guard;
+    /// requests without a history selector keep their usual body limit.
     #[serde(default = "default_max_retained_bytes")]
     pub max_retained_bytes: RetainedBytes,
 }
