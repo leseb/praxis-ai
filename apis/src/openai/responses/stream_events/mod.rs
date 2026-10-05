@@ -1063,6 +1063,7 @@ fn parse_and_accumulate(
         let lifecycle = client_tools::lifecycle_restore_staging_bytes(
             &responses.client_tool_lowering,
             responses.client_tool_echo.as_ref(),
+            &state.client_tool_items,
             &events,
         )?;
         let fallback = client_tools::lifecycle_fallback_staging_bytes(
@@ -1071,7 +1072,12 @@ fn parse_and_accumulate(
             &state.tool_call_args,
             &events,
         )?;
-        lifecycle.checked_add(fallback)
+        let plan = client_tools::restoration_plan_staging_bytes(
+            &responses.client_tool_lowering,
+            &state.client_tool_items,
+            &events,
+        )?;
+        lifecycle.checked_add(fallback)?.checked_add(plan)
     });
     if !construction_bytes
         .and_then(|staging| staging.checked_add(projected_item_scratch_bytes?))
@@ -1282,12 +1288,21 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
                     || state.and_then(|state| find_output_item(state.output_items(), payload)),
                     |items| find_projected_output_item(items, payload),
                 );
+                let item_bytes = matched_item.map_or(Some(0), retained_json_bytes)?;
+                let completion_snapshot = matched_item.is_some_and(|item| {
+                    item.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| state.is_some_and(|state| state.client_tool_lowering.contains_key(name)))
+                });
                 // Completion may own an extracted argument string, grow the
                 // canonical item, and clone that completed item into
-                // `tool_calls` before the event is consumed.
+                // `tool_calls` before the event is consumed. A lowered client
+                // tool also clones the full item into ClientToolCompletion for
+                // the restore plan while the tool_calls clone remains live.
                 event_bytes
                     .checked_mul(3)?
-                    .checked_add(matched_item.map_or(Some(0), retained_json_bytes)?)?
+                    .checked_add(item_bytes)?
+                    .checked_add(if completion_snapshot { item_bytes } else { 0 })?
             },
             // Other events can still acquire logical-stream bookkeeping keys
             // or grow their normalized payload before serialization.

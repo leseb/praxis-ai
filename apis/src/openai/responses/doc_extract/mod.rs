@@ -271,8 +271,9 @@ fn document_parse_fits_budget(ctx: &mut HttpFilterContext<'_>, raw: &Bytes) -> b
         return true;
     }
     // This filter may precede the Responses request classifier. Apply its
-    // allocation-free structural admission before constructing a JSON Value;
-    // compact arrays can own far more nodes than their wire length suggests.
+    // allocation-free structural and normalized-byte admission before
+    // constructing a JSON Value; compact arrays can own far more nodes than
+    // their wire length suggests.
     if super::initial_budget_rejection(ctx, raw).is_some()
         || !super::initial_json_parse_peak_bytes(raw).is_some_and(|bytes| extraction_fits_budget(ctx, bytes))
     {

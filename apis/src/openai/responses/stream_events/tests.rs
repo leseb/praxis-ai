@@ -3341,6 +3341,7 @@ async fn lifecycle_echo_snapshots_are_rejected_before_plan_allocation() {
         super::client_tools::lifecycle_restore_staging_bytes(
             &state.client_tool_lowering,
             state.client_tool_echo.as_ref(),
+            &[],
             &events,
         )
         .unwrap()
@@ -3370,6 +3371,103 @@ async fn lifecycle_echo_snapshots_are_rejected_before_plan_allocation() {
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
     assert!(body.is_none(), "unadmitted echoed lifecycle must not be emitted");
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn compacted_namespace_item_names_are_rejected_before_restore_plan_allocation() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let original_name = "n".repeat(1_048_576);
+    let private_name = "agentic_ns___0123456789abcdef";
+    let mut state = ResponsesState::from_request_body(json!({"stream": true}));
+    state.client_tool_lowering.insert(
+        private_name.to_owned(),
+        LoweredClientTool {
+            original_name: original_name.clone(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({
+            "type": "namespace", "name": "ns", "description": "tools",
+            "tools": [{"type": "function", "name": original_name}]
+        })],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(64 * 1_048_576);
+    ctx.extensions.insert(state);
+    filter.arm(&mut ctx);
+
+    let mut chunk = Vec::new();
+    let mut events = Vec::new();
+    for index in 0..80 {
+        let payload = json!({
+            "type": "response.output_item.added", "output_index": index,
+            "item": {"type": "function_call", "name": private_name,
+                     "id": format!("fc_{index}"), "call_id": format!("call_{index}")}
+        });
+        chunk.extend_from_slice(&make_sse_chunk("response.output_item.added", &payload));
+        events.push(crate::openai::sse::responses::ResponsesEvent::OutputItemAdded(payload));
+    }
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let projected = super::client_tools::lifecycle_restore_staging_bytes(
+        &state.client_tool_lowering,
+        state.client_tool_echo.as_ref(),
+        &[],
+        &events,
+    )
+    .unwrap();
+    assert!(
+        projected > 64 * 1_048_576,
+        "the repeated public name must be reserved before planning"
+    );
+    assert!(
+        state.retained_payload_bytes().unwrap() + chunk.len() * 8 < 64 * 1_048_576,
+        "the compact provider frames alone must fit the request budget"
+    );
+
+    let mut body = Some(Bytes::from(chunk));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        body.is_none(),
+        "the item-level restoration peak must fail before emission"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn lowered_completion_reserves_both_full_item_snapshots() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    let item = json!({
+        "type": "function_call", "name": "private", "id": "fc_1",
+        "call_id": "c".repeat(262_144), "arguments": ""
+    });
+    let item_bytes = crate::openai::responses::state::retained_json_bytes(&item).unwrap();
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.output_items_mut().push(item);
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(state);
+    let done = crate::openai::sse::responses::ResponsesEvent::FunctionCallArgumentsDone(json!({
+        "type": "response.function_call_arguments.done", "item_id": "fc_1",
+        "output_index": 0, "arguments": "{\"input\":\"x\"}"
+    }));
+    let projected = super::projected_responses_state_clone_bytes(&ctx, &[done]).unwrap();
+    assert!(
+        projected >= item_bytes * 2,
+        "tool_calls and ClientToolCompletion each clone the full preexisting item"
+    );
 }
 
 #[tokio::test]
