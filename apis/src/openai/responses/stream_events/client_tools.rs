@@ -418,6 +418,7 @@ fn restored_item_event_growth_bytes(lowered: &LoweredClientTool, payload: &Value
 /// plan is returned. Generic Shell/ToolSearch JSON may expand compact numeric
 /// tokens into a larger Value; Custom unwraps one string envelope. Reserve the
 /// plan value, emitted event, and wire while the original argument stays live.
+/// The generic bound also covers serde's heap cost for dense arrays and objects.
 fn explicit_arguments_restore_growth_bytes(lowered: &LoweredClientTool, arguments: Option<&str>) -> Option<usize> {
     let Some(arguments) = arguments else {
         return Some(0);
@@ -428,9 +429,7 @@ fn explicit_arguments_restore_growth_bytes(lowered: &LoweredClientTool, argument
             retained_json_bytes(arguments)?.checked_mul(3)?.checked_add(512)
         },
         ClientToolRestore::Shell | ClientToolRestore::ToolSearch => {
-            super::super::agentic_loop::buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())?
-                .checked_mul(4)?
-                .checked_add(512)
+            super::super::initial_json_parse_peak_bytes(arguments.as_bytes())?.checked_add(512)
         },
     }
 }
@@ -502,6 +501,10 @@ fn projected_vec_slots(count: usize) -> Option<usize> {
 /// frame uses arguments retained from prior deltas. The ordinary done frame is
 /// tiny, so its event payload cannot bound the captured item, parsed input,
 /// synthesized event values, and outgoing SSE wire made from that fallback.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflight each client-tool completion owner before the restore plan allocates"
+)]
 pub(super) fn lifecycle_fallback_staging_bytes(
     reverse: &HashMap<String, LoweredClientTool>,
     committed: &[ClientToolStreamItem],
@@ -521,26 +524,106 @@ pub(super) fn lifecycle_fallback_staging_bytes(
         let Some(key) = client_tool_event_key(payload) else {
             return Some(used);
         };
-        let Some(arguments) = buffered_arguments.get(&key) else {
+        let Some(prior_events) = events.get(..index) else {
             return Some(used);
         };
         let Some(restore) = fallback_restore_kind(reverse, committed, events, index, &key) else {
             return Some(used);
         };
+        let pieces =
+            buffered_arguments
+                .get(&key)
+                .map(String::as_str)
+                .into_iter()
+                .chain(prior_events.iter().filter_map(|prior| {
+                    let ResponsesEvent::FunctionCallArgumentsDelta(delta) = prior else {
+                        return None;
+                    };
+                    same_event_item(payload, delta)
+                        .then(|| delta.get("delta")?.as_str())
+                        .flatten()
+                }));
+        let (completion_bytes, parsed_peak, saw_piece) = joined_fallback_argument_peak_bytes(pieces)?;
+        if !saw_piece {
+            return Some(used);
+        }
         // `capture_client_tool_completion` retains a third completed-item copy
         // beyond the output item and tool_calls charged by the common projection.
-        let completion_bytes = retained_json_bytes(arguments)?;
-        let restoration_bytes = if restore == ClientToolRestore::Namespace {
-            0
-        } else {
-            // Custom/typed restoration parses the envelope, retains the plan
-            // input, constructs a synthetic event value, and writes up to two
-            // SSE frames while that plan remains live.
-            let parsed = super::super::agentic_loop::buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())?;
-            parsed.checked_mul(4)?.checked_add(512)?
+        let restoration_bytes = match restore {
+            ClientToolRestore::Namespace => 0,
+            // Custom only parses one string envelope; reserve the plan string
+            // and the two emitted input frames alongside the completion copy.
+            ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
+                completion_bytes.checked_mul(3)?.checked_add(512)?
+            },
+            // Shell/ToolSearch parse a generic Value. The joined structural
+            // bound includes tiny-node heap and numeric normalization.
+            ClientToolRestore::Shell | ClientToolRestore::ToolSearch => parsed_peak.checked_add(512)?,
         };
         used.checked_add(completion_bytes)?.checked_add(restoration_bytes)
     })
+}
+
+/// Count a JSON argument stream across prior chunks and earlier deltas in this
+/// chunk without concatenating it. Carry lexical state across slice boundaries:
+/// scanning each delta independently can miss nodes after a split string closes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "allocation-free lexical scan across fragmented JSON arguments"
+)]
+fn joined_fallback_argument_peak_bytes<S: AsRef<str>>(pieces: impl Iterator<Item = S>) -> Option<(usize, usize, bool)> {
+    let (mut raw, mut escaped, mut objects, mut arrays, mut strings, mut scalars) =
+        (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_usize);
+    let (mut in_string, mut escaped_char, mut in_number, mut saw_piece) = (false, false, false, false);
+    for piece in pieces {
+        let piece = piece.as_ref();
+        saw_piece = true;
+        raw = raw.checked_add(piece.len())?;
+        escaped = escaped.checked_add(retained_json_bytes(piece)?)?;
+        for byte in piece.bytes() {
+            if in_string {
+                if escaped_char {
+                    escaped_char = false;
+                } else if byte == b'\\' {
+                    escaped_char = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => {
+                    strings = strings.checked_add(1)?;
+                    in_string = true;
+                    in_number = false;
+                },
+                b'{' => {
+                    objects = objects.checked_add(1)?;
+                    in_number = false;
+                },
+                b'[' => {
+                    arrays = arrays.checked_add(1)?;
+                    in_number = false;
+                },
+                b'-' | b'0'..=b'9' if !in_number => {
+                    scalars = scalars.checked_add(1)?;
+                    in_number = true;
+                },
+                b'-' | b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' if in_number => {},
+                b't' | b'f' | b'n' => {
+                    scalars = scalars.checked_add(1)?;
+                    in_number = false;
+                },
+                _ => in_number = false,
+            }
+        }
+    }
+    let nodes = objects
+        .checked_add(arrays)?
+        .checked_add(strings)?
+        .checked_add(scalars)?;
+    let parsed_peak = raw.checked_mul(8)?.checked_add(nodes.checked_mul(256)?)?;
+    Some((escaped, parsed_peak, saw_piece))
 }
 
 /// Find a lowered call already tracked or opened earlier in this same chunk.
@@ -1794,6 +1877,51 @@ mod tests {
         assert!(
             lifecycle_restore_staging_bytes(&reverse, None, &committed, &[item_done]).unwrap() >= parsed * 4,
             "typed output_item.done must also reserve the parsed argument Value"
+        );
+    }
+
+    #[test]
+    fn same_chunk_fallback_deltas_reserve_typed_parse_before_commit() {
+        let reverse = reverse_tool_search();
+        let committed = [ClientToolStreamItem {
+            key: "item:fc_1".to_owned(),
+            private_name: "tool_search".to_owned(),
+            restore: ClientToolRestore::ToolSearch,
+            phase: ClientToolPhase::Opened,
+            output_index: 0,
+            item_id: Some("fc_1".to_owned()),
+        }];
+        let arguments = format!("{{\"values\":[{}]}}", vec!["1e15"; 2_000].join(","));
+        let (first, second) = arguments.split_at(arguments.len() / 2);
+        let delta = |part: &str| {
+            ResponsesEvent::FunctionCallArgumentsDelta(serde_json::json!({
+                "type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                "output_index": 0, "delta": part
+            }))
+        };
+        let done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "item_id": "fc_1", "output_index": 0
+        }));
+        let projected = lifecycle_fallback_staging_bytes(
+            &reverse,
+            &committed,
+            &HashMap::new(),
+            &[delta(first), delta(second), done],
+        )
+        .unwrap();
+        assert!(
+            projected > arguments.len() * 10,
+            "prior deltas in the same chunk must reserve dense numeric parse before accumulation"
+        );
+
+        let pieces = ["{\"x\":\"abc", "\",\"values\":[1e15]}"];
+        let joined = pieces.concat();
+        let (_, parsed_peak, saw_piece) = joined_fallback_argument_peak_bytes(pieces.into_iter()).unwrap();
+        assert!(saw_piece);
+        assert_eq!(
+            parsed_peak,
+            super::super::super::initial_json_parse_peak_bytes(joined.as_bytes()).unwrap(),
+            "a string closing at a delta boundary must not hide later JSON nodes"
         );
     }
 
