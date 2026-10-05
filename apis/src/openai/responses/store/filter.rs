@@ -2087,7 +2087,7 @@ fn flush_event_log_blocking(
 fn is_terminal_event_type(event_type: &str) -> bool {
     matches!(
         event_type,
-        "response.completed" | "response.incomplete" | "response.failed" | "error"
+        "response.completed" | "response.incomplete" | "response.failed" | "response.cancelled" | "error"
     )
 }
 
@@ -3937,6 +3937,8 @@ mod encode_replay_event_tests {
             b"data: {\"type\":\"response.completed\",\"sequence_number\":0}\n\n".as_slice(),
             b"event: response.completed\ndata: {}\n\n".as_slice(),
             b"data: {\"type\":\"response.completed\"}\n\n".as_slice(),
+            b"event: response.cancelled\ndata: {\"type\":\"response.cancelled\",\"sequence_number\":0}\n\n".as_slice(),
+            b"data: {\"type\":\"response.cancelled\",\"sequence_number\":0}\n\n".as_slice(),
         ] {
             let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
             let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
