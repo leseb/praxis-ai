@@ -23,7 +23,7 @@ use crate::callout_target::{AddressPolicy, validate_http_target, validate_resolv
 /// A bounded callout can still stage a full 64 KiB Pingora H1 read or H2
 /// flow-window chunk and its copy before enforcing the requested body limit.
 /// Reserve both owners before dispatch under a request-wide payload budget.
-#[cfg(feature = "openai-responses")]
+#[cfg(feature = "openai-file-resolve-filter")]
 pub(crate) const MAX_TRANSPORT_STAGING_BYTES: usize = 2 * 65_536;
 
 /// Build an isolated client after installing the process-wide crypto provider.
