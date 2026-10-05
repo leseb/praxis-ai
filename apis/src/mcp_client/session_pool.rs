@@ -118,6 +118,8 @@ pub(crate) struct PooledSession {
     initialize_limit: usize,
     /// Immutable JSON parse ceiling baked into this session's transport.
     preparse_peak_limit: Option<usize>,
+    /// Request payload retained by rmcp's config and its live GET/close clones.
+    transport_config_bytes: Option<usize>,
     /// Bound for the standalone GET parser while rmcp keeps polling this
     /// session after a successful tool call.
     stream_retained_reserve: Option<NonZeroUsize>,
@@ -130,12 +132,17 @@ pub(crate) struct PooledSession {
 impl PooledSession {
     /// Bind a freshly initialized service to its transport state and immutable
     /// response limit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the service and immutable wire, control, parse, and config charges are one pooled-session boundary"
+    )]
     pub(crate) fn new(
         service: RunningService<RoleClient, ()>,
         signal_state: Arc<TransportSignalState>,
         payload_limit: usize,
         initialize_limit: usize,
         preparse_peak_limit: Option<usize>,
+        transport_config_bytes: Option<usize>,
     ) -> Self {
         Self {
             service,
@@ -143,6 +150,7 @@ impl PooledSession {
             payload_limit,
             initialize_limit,
             preparse_peak_limit,
+            transport_config_bytes,
             stream_retained_reserve: super::subrequest_transport::tool_stream_retained_reserve(
                 payload_limit,
                 initialize_limit,
@@ -164,6 +172,7 @@ impl PooledSession {
     fn retained_payload_bytes(&self) -> Option<usize> {
         let info = self.service.peer_info()?;
         retained_json_bytes(info.as_ref())?
+            .checked_add(self.transport_config_bytes?)?
             .checked_add(self.stream_retained_reserve?.get())?
             .checked_add(super::subrequest_transport::tool_delete_retained_reserve(
                 self.initialize_limit,
@@ -626,7 +635,14 @@ mod tests {
             },
             Some(rmcp::model::ServerConfig::default().into()),
         );
-        let session = PooledSession::new(service, Arc::new(TransportSignalState::new(None)), 1_024, 1_024, None);
+        let session = PooledSession::new(
+            service,
+            Arc::new(TransportSignalState::new(None)),
+            1_024,
+            1_024,
+            None,
+            Some(0),
+        );
         let pool = McpSessionPool::new();
         pool.close_sessions_in_background(vec![session]);
         assert!(

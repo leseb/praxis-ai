@@ -311,7 +311,7 @@ pub(super) fn sse_stream_from_body(
                 && !super::subrequest_transport::json_preparse_fits(data.as_bytes(), preparse_peak_limit)
             {
                 let limit = preparse_peak_limit.unwrap_or(0);
-                parse_signal.record(TransportSignal::ResponseTooLarge {
+                parse_signal.record(TransportSignal::JsonPreparseTooLarge {
                     limit,
                     // GET uses the control parse reservation, even though
                     // its raw per-event wire cap is the tool result cap.
@@ -476,7 +476,7 @@ mod tests {
         );
         assert!(matches!(
             signal.get(),
-            Some(TransportSignal::ResponseTooLarge {
+            Some(TransportSignal::JsonPreparseTooLarge {
                 limit: 40_000,
                 kind: McpResponseLimitKind::GetStream
             })

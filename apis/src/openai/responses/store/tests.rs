@@ -1729,49 +1729,6 @@ event: response.completed\n\
 data: {\"type\":\"response.completed\",\"sequence_number\":2}\n\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn streaming_events_persist_at_terminal_seam() {
-    let filter = make_filter();
-    let store = Arc::new(RecordingResponseStore::new(false));
-    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
-
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam", true).await;
-
-    // The deferred terminal frame arrives with the captured events; the seam
-    // persists the record and then flushes the whole log before release.
-    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
-    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
-    assert!(
-        matches!(action, FilterAction::Release),
-        "the terminal chunk is released after the record and log persist"
-    );
-    assert_eq!(store.upsert_count(), 1, "the JSON record persists exactly once");
-    assert_eq!(
-        store.event_count("resp_seam"),
-        3,
-        "all captured events flush together at the terminal seam"
-    );
-
-    let events = store
-        .list_events_after(&crate::test_utils::test_owner("default"), "resp_seam", None, 10)
-        .await
-        .unwrap();
-    assert_eq!(
-        events.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
-        vec![0, 1, 2],
-        "events persist in ascending sequence order"
-    );
-    assert!(
-        events.last().unwrap().terminal,
-        "the terminal event must be marked terminal so the log is replayable"
-    );
-    assert!(
-        events.iter().take(2).all(|e| !e.terminal),
-        "non-terminal events must not be flagged terminal"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[expect(
     clippy::too_many_lines,
     reason = "exercises exact-budget zstd persistence and replay"
@@ -1858,6 +1815,49 @@ async fn compressed_stream_replay_persists_at_exact_aggregate_staging_bound() {
         })
         .to_string()
         .as_bytes()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_events_persist_at_terminal_seam() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam", true).await;
+
+    // The deferred terminal frame arrives with the captured events; the seam
+    // persists the record and then flushes the whole log before release.
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "the terminal chunk is released after the record and log persist"
+    );
+    assert_eq!(store.upsert_count(), 1, "the JSON record persists exactly once");
+    assert_eq!(
+        store.event_count("resp_seam"),
+        3,
+        "all captured events flush together at the terminal seam"
+    );
+
+    let events = store
+        .list_events_after(&crate::test_utils::test_owner("default"), "resp_seam", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "events persist in ascending sequence order"
+    );
+    assert!(
+        events.last().unwrap().terminal,
+        "the terminal event must be marked terminal so the log is replayable"
+    );
+    assert!(
+        events.iter().take(2).all(|e| !e.terminal),
+        "non-terminal events must not be flagged terminal"
     );
 }
 

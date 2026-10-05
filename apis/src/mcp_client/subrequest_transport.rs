@@ -163,7 +163,7 @@ fn admit_json_preparse(
         return Ok(());
     }
     let cap = limit.unwrap_or(0);
-    signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap, kind });
+    signal.get_or_init(|| TransportSignal::JsonPreparseTooLarge { limit: cap, kind });
     Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
 }
 
@@ -311,6 +311,14 @@ pub(crate) enum TransportSignal {
         /// The effective response-size limit that was exceeded.
         limit: usize,
         /// Exchange whose wire ceiling produced the limit.
+        kind: McpResponseLimitKind,
+    },
+    /// The raw response fit its wire cap, but its parsed JSON owners did not
+    /// fit the separately admitted request-wide preparse reservation.
+    JsonPreparseTooLarge {
+        /// The admitted parsed-owner ceiling.
+        limit: usize,
+        /// Exchange whose JSON response was being parsed.
         kind: McpResponseLimitKind,
     },
     /// The MCP target resolved to an address the SSRF policy rejected.
@@ -1898,6 +1906,11 @@ pub(crate) fn transport_signal_error(
 ) -> Option<McpClientError> {
     match signal.get()? {
         TransportSignal::ResponseTooLarge { limit, kind } => Some(McpClientError::ResponseTooLarge {
+            url: url.clone(),
+            limit: *limit,
+            kind: *kind,
+        }),
+        TransportSignal::JsonPreparseTooLarge { limit, kind } => Some(McpClientError::JsonPreparseTooLarge {
             url: url.clone(),
             limit: *limit,
             kind: *kind,
@@ -3708,7 +3721,9 @@ mod tests {
             ),
             "the buffered transport must reject before deserialization"
         );
-        assert!(matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit, .. }) if *limit == parse_cap));
+        assert!(
+            matches!(signal.get(), Some(TransportSignal::JsonPreparseTooLarge { limit, .. }) if *limit == parse_cap)
+        );
         assert!(
             json_preparse_fits(
                 br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
@@ -3832,7 +3847,7 @@ mod tests {
         ));
         assert!(matches!(
             signal.get(),
-            Some(TransportSignal::ResponseTooLarge { limit: 2_048, .. })
+            Some(TransportSignal::JsonPreparseTooLarge { limit: 2_048, .. })
         ));
     }
 

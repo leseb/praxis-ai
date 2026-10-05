@@ -336,8 +336,8 @@ impl ResolutionBudget {
     /// Each representation still has its own independent resolver limit.
     pub(crate) fn apply_aggregate_headroom(&mut self, headroom: usize) {
         // Metadata, content, and URL reads are sequential, so one fixed
-        // transport reserve covers the currently active callout. The core
-        // client can stage a full chunk and copy it before checking the cap.
+        // reserve covers the full transport chunk and its copy before the
+        // currently active callout enforces its body cap.
         let limit = headroom.saturating_sub(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES)
             / AGGREGATE_RESOLUTION_OWNER_RESERVATION;
         self.aggregate_remaining_bytes = Some(limit);
