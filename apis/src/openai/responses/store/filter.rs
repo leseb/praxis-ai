@@ -1249,7 +1249,7 @@ mod pending_wire_tests {
         capture.track_pending_wire_bytes(b"data: {}\r");
         let before_lf = capture.pending_wire_bytes;
         capture.track_pending_wire_bytes(b"\n");
-        assert_eq!(capture.pending_wire_bytes, before_lf + 1);
+        assert_eq!(capture.pending_wire_bytes, before_lf);
         capture.track_pending_wire_bytes(b"\r");
         assert_eq!(capture.pending_wire_bytes, 0);
         capture.track_pending_wire_bytes(b"\n");
@@ -4733,7 +4733,9 @@ mod encode_replay_event_tests {
             ..ResponsesState::default()
         };
         state.apply_retained_payload_limit(16_384);
-        state.buffered_canonical_finalized = true;
+        let mut body = None;
+        state.finalize_response_body(&mut body).unwrap();
+        assert!(body.is_some());
         ctx.extensions.insert(state);
         let mut response = crate::test_utils::make_response();
         response

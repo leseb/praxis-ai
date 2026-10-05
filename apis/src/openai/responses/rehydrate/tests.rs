@@ -2253,8 +2253,10 @@ async fn canonical_incomplete_restore_keeps_existing_header_path() {
     ctx.current_filter_id = Some(0);
     let mut state = rehydrated_state("resp_prev");
     state.apply_retained_payload_limit(32_768);
-    state.buffered_canonical_finalized = true;
     state.response_object = json!({"id":"resp_new","object":"response","status":"incomplete"});
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    assert!(body.is_some());
     ctx.extensions.insert(state);
     ctx.response_header = Some(&mut response);
 
