@@ -1206,46 +1206,6 @@ fn retained_frame_payload_bytes(frames: &[SseFrame]) -> Option<usize> {
     })
 }
 
-/// Bound compact JSON growth when `serde_json` normalizes exponent notation.
-///
-/// This build does not enable `serde_json`'s arbitrary-precision feature, so a
-/// parsed number is an i64/u64/f64; 32 extra bytes per lexical number cover
-/// its longest compact output. Strings and escaped quotes are skipped, and the
-/// source length is already charged separately by the caller. Invalid JSON
-/// may overcount but is rejected by the parser without committing any event.
-fn json_number_normalization_bound(data: &[u8]) -> Option<usize> {
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut in_number = false;
-    let mut numbers = 0_usize;
-    for &byte in data {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if byte == b'"' {
-            in_string = true;
-            in_number = false;
-            continue;
-        }
-        if in_number && matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
-            continue;
-        }
-        in_number = false;
-        if matches!(byte, b'0'..=b'9' | b'-') {
-            numbers = numbers.checked_add(1)?;
-            in_number = true;
-        }
-    }
-    numbers.checked_mul(32)
-}
-
 /// Count one parsed event's independently owned payloads.
 fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
     let payload_bytes = retained_json_bytes(event.payload())?;
@@ -3921,12 +3881,25 @@ fn emit_deferred_terminal(
             }
         });
     // The deferred metadata remains independently owned while the borrowed
-    // response is serialized into the wire buffer. The wire and metadata
-    // therefore coexist even though the response tree itself is only borrowed.
-    let staging = terminal_frame_bytes
-        .and_then(|bytes| output.len().checked_add(bytes))
-        .and_then(|bytes| terminal.retained_payload_bytes()?.checked_add(bytes));
-    if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
+    // response is serialized into the wire buffer. Reserve for the old Vec
+    // allocation during growth, then check the actual capacity before writing.
+    let metadata_bytes = terminal.retained_payload_bytes();
+    let wire_peak = terminal_frame_bytes
+        .and_then(|frame_bytes| output.len().checked_add(frame_bytes))
+        .and_then(|final_len| {
+            if final_len > output.capacity() {
+                final_len.checked_add(output.capacity())
+            } else {
+                Some(output.capacity())
+            }
+        });
+    let staging = wire_peak.and_then(|bytes| metadata_bytes?.checked_add(bytes));
+    if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes))
+        || terminal_frame_bytes.is_none_or(|bytes| output.try_reserve_exact(bytes).is_err())
+        || !metadata_bytes
+            .and_then(|bytes| bytes.checked_add(output.capacity()))
+            .is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes))
+    {
         // The failed terminal never reached the client. Reuse its sequence
         // number for the single error event emitted by the finalizer.
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
