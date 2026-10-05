@@ -1205,6 +1205,16 @@ impl ResponsesState {
             meter.json(value)?;
         }
         self.meter_deferred_mcp(&mut meter)?;
+        for value in [
+            self.context_management.as_ref(),
+            self.conversation.as_ref(),
+            self.previous_usage.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.json(value)?;
+        }
         Some(meter.used())
     }
 
@@ -1387,20 +1397,20 @@ impl ResponsesState {
             for id in &self.provider_compaction_ids {
                 meter.raw(id.len())?;
             }
-            if let Some(echo) = &self.client_tool_echo {
-                meter.json_values(&echo.tools)?;
-                meter.json(&echo.tool_choice)?;
-            }
             meter.json(&self.tool_choice)?;
             if let Some(original_tool_choice) = &self.original_tool_choice {
                 meter.json(original_tool_choice)?;
             }
-            for ((server, tool), value) in &self.mcp_tool_map {
-                meter.raw(server.len())?;
-                meter.raw(tool.len())?;
+            for value in [
+                self.context_management.as_ref(),
+                self.conversation.as_ref(),
+                self.previous_usage.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 meter.json(value)?;
             }
-            self.meter_deferred_mcp_payload(&mut meter)?;
         }
         if let Some(bytes) = response_object_bytes {
             meter.raw(bytes)?;
@@ -1420,16 +1430,6 @@ impl ResponsesState {
         }
         for values in [&self.tool_search_calls, &self.web_search_calls] {
             meter.json_values(values)?;
-        }
-        for value in [
-            self.context_management.as_ref(),
-            self.conversation.as_ref(),
-            self.previous_usage.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            meter.json(value)?;
         }
         if !skip_stream_fixed_tools {
             for ((server, tool), value) in &self.mcp_tool_map {
