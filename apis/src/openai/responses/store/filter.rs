@@ -220,10 +220,6 @@ impl ResponseStoreFilter {
         clippy::too_many_lines,
         reason = "checks aggregate admission before constructing the store record"
     )]
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "distinguishes absent state from an unmeasurable response before persistence"
-    )]
     fn persist_from_streaming_state(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
@@ -342,7 +338,7 @@ impl ResponseStoreFilter {
                     && bytes.len() <= admission.response_upper_bytes
                     && expected_digest == Some(crate::hash::Sha256::digest(bytes))
             });
-        if !header_admitted && !persistence_construction_fits(ctx, bytes.len()) {
+        if !header_admitted && !buffered_persistence_construction_fits(ctx, bytes) {
             return Ok(persistence_budget_failure(ctx, false, body));
         }
 
@@ -1136,7 +1132,42 @@ pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, respons
     persistence_construction_fits_with_wire(ctx, response_bytes, 0)
 }
 
+/// Admit the normalized parsed response while its buffered wire remains live.
+fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, wire: &[u8]) -> bool {
+    let projected = if ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+        .is_some()
+    {
+        buffered_parsed_json_bytes_upper_bound(wire)
+    } else {
+        Some(wire.len())
+    };
+    projected.is_some_and(|bytes| persistence_construction_fits_with_wire(ctx, bytes, wire.len()))
+}
+
+/// Reserve two compressed column copies beside the original JSON columns.
+/// Zstd's bound for each column is at most `n + n / 256 + 64`.
+pub(super) fn encoded_column_headroom(
+    response_bytes: usize,
+    history_bytes: usize,
+    input_bytes: usize,
+) -> Option<usize> {
+    response_bytes
+        .checked_mul(2)?
+        .checked_add(history_bytes)?
+        .checked_add(input_bytes)?
+        .checked_shr(8)?
+        .checked_add(3 * 64)?
+        .checked_mul(2)
+}
+
 /// Include a separately owned wire body when a direct response is buffered.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the checked reserve enumerates independently owned persistence buffers"
+)]
 fn persistence_construction_fits_with_wire(
     ctx: &HttpFilterContext<'_>,
     response_bytes: usize,
@@ -1183,6 +1214,7 @@ fn persistence_construction_fits_with_wire(
         .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(replay_id_bytes?))
         .and_then(|bytes| bytes.checked_add(replay_payload_bytes?))
+        .and_then(|bytes| bytes.checked_add(compression_headroom?))
         .and_then(|bytes| bytes.checked_add(wire_bytes));
     additional.is_some_and(|bytes| state.can_retain_payload(bytes))
 }
@@ -2712,8 +2744,9 @@ mod encode_replay_event_tests {
 
     use super::{
         AgenticBudgetPolicy, CapturedEvent, DirectFiniteRestoreFraming, ResponseEventRecord, ResponseStoreFilter,
-        StateOwner, admit_request_input_snapshot, buffered_header_persistence_length, capture_request_input,
-        encode_replay_event, persistence_budget_failure, persistence_construction_fits,
+        StateOwner, admit_request_input_snapshot, buffered_header_persistence_length,
+        buffered_parsed_json_bytes_upper_bound, buffered_persistence_construction_fits, capture_request_input,
+        encode_replay_event, encoded_column_headroom, persistence_budget_failure, persistence_construction_fits,
     };
     use crate::openai::responses::state::ResponsesState;
 

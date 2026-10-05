@@ -651,7 +651,7 @@ impl McpDispatchFilter {
             && !ctx
                 .extensions
                 .get::<ResponsesState>()
-                .is_some_and(|state| approval_decisions_fit(state, &resolved, self.max_total_result_bytes))
+                .is_some_and(|state| approval_decisions_fit(state, &resolved))
         {
             record_approval_budget_failure(ctx);
             return Ok(());
@@ -704,11 +704,7 @@ impl McpDispatchFilter {
 }
 
 /// Preflight the independently owned values created by approval resumptions.
-fn approval_decisions_fit(
-    state: &ResponsesState,
-    decisions: &[ResolvedApproval],
-    max_total_result_bytes: usize,
-) -> bool {
+fn approval_decisions_fit(state: &ResponsesState, decisions: &[ResolvedApproval]) -> bool {
     let removed = state
         .messages
         .iter()
