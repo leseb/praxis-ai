@@ -160,6 +160,12 @@ pub(super) struct StreamEventsState {
     /// Exact compact-JSON sizes of unchanged current-round output items.
     /// A `None` slot is recomputed after the corresponding item changes.
     output_item_bytes: Vec<Option<usize>>,
+    /// Exact compact-JSON size of the whole current-round output array. Most
+    /// SSE deltas leave it unchanged, so a budget check can charge it in O(1).
+    output_array_bytes: Option<usize>,
+    /// Revision whose output slots and aggregate are cached. An unrelated
+    /// filter can replace an item without a streaming lifecycle event.
+    output_revision: Option<u64>,
     /// Exact total for completed tool calls. They stay unchanged across text
     /// deltas; arguments.done and authoritative terminal events invalidate it.
     tool_calls_bytes: Option<usize>,
@@ -193,6 +199,8 @@ impl StreamEventsState {
         self.shared_stable_bytes = OnceLock::new();
         self.shared_prior_output_bytes = OnceLock::new();
         self.output_item_bytes.clear();
+        self.output_array_bytes = None;
+        self.output_revision = None;
         self.tool_calls_bytes = None;
     }
 
@@ -224,20 +232,34 @@ impl StreamEventsState {
     /// Measure the response object's changing top-level fields on each check,
     /// while reusing sizes for output items untouched by the latest SSE event.
     /// This is the exact compact-JSON size used by `ResponsesState`'s meter.
-    fn response_object_bytes(&mut self, response: &Value, limit: usize) -> Option<usize> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "revision validation and exact JSON field metering share one pass"
+    )]
+    fn response_object_bytes(&mut self, response: &Value, revision: Option<u64>, limit: usize) -> Option<usize> {
+        if revision.is_none() || self.output_revision != revision {
+            self.output_item_bytes.clear();
+            self.output_array_bytes = None;
+            self.output_revision = revision;
+        }
         let Some(object) = response.as_object() else {
             self.output_item_bytes.clear();
+            self.output_array_bytes = None;
             let mut meter = PayloadMeter::new(limit);
             meter.json(response)?;
             return Some(meter.used());
         };
         let Some(output) = object.get("output").and_then(Value::as_array) else {
             self.output_item_bytes.clear();
+            self.output_array_bytes = None;
             let mut meter = PayloadMeter::new(limit);
             meter.json(response)?;
             return Some(meter.used());
         };
-        self.output_item_bytes.resize(output.len(), None);
+        if self.output_item_bytes.len() != output.len() {
+            self.output_array_bytes = None;
+            self.output_item_bytes.resize(output.len(), None);
+        }
         let mut meter = PayloadMeter::new(limit);
         meter.raw(2)?; // Outer braces.
         for (index, (key, value)) in object.iter().enumerate() {
@@ -257,6 +279,10 @@ impl StreamEventsState {
 
     /// Charge array punctuation and cached item sizes without copying output.
     fn charge_output_array(&mut self, output: &[Value], limit: usize, meter: &mut PayloadMeter) -> Option<()> {
+        if let Some(bytes) = self.output_array_bytes {
+            return meter.raw(bytes);
+        }
+        let before = meter.used();
         meter.raw(2)?; // Array brackets.
         for (index, item) in output.iter().enumerate() {
             if index != 0 {
@@ -274,27 +300,49 @@ impl StreamEventsState {
             };
             meter.raw(bytes)?;
         }
+        self.output_array_bytes = Some(meter.used().checked_sub(before)?);
         Some(())
     }
 
     /// Match the accumulator's output-item mutations. An unchanged completed
     /// item can remain cached while unrelated text deltas arrive.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "all SSE output mutation variants invalidate the matching cache owners"
+    )]
     fn invalidate_output_item_for_event(&mut self, responses: &ResponsesState, event: &ResponsesEvent) {
         let index = match event {
             ResponsesEvent::ResponseCompleted(_)
             | ResponsesEvent::ResponseIncomplete(_)
             | ResponsesEvent::ResponseFailed(_) => {
                 self.output_item_bytes.clear();
+                self.output_array_bytes = None;
+                self.output_revision = responses.response_object_revision;
                 return;
             },
+            ResponsesEvent::OutputItemAdded(_) => None,
             ResponsesEvent::OutputItemDone(payload) => output_item_done_index(responses, payload),
             ResponsesEvent::FunctionCallArgumentsDone(payload) => function_call_done_index(responses, payload),
             _ => return,
         };
-        if let Some(index) = index
-            && let Some(slot) = self.output_item_bytes.get_mut(index)
+        // One accumulator mutation advances the revision once. If another
+        // filter also edited the response, every old slot may be stale.
+        if responses.response_object_revision.is_none()
+            || self.output_revision.and_then(|revision| revision.checked_add(1)) != responses.response_object_revision
         {
-            *slot = None;
+            self.output_item_bytes.clear();
+        }
+        self.output_revision = responses.response_object_revision;
+        self.output_array_bytes = None;
+        if matches!(event, ResponsesEvent::OutputItemAdded(_)) {
+            return;
+        }
+        if let Some(index) = index {
+            if let Some(slot) = self.output_item_bytes.get_mut(index) {
+                *slot = None;
+            }
+        } else {
+            self.output_item_bytes.clear();
         }
     }
 
@@ -483,6 +531,8 @@ impl OpenaiStreamEventsFilter {
             shared_stable_bytes: OnceLock::new(),
             shared_prior_output_bytes: OnceLock::new(),
             output_item_bytes: Vec::new(),
+            output_array_bytes: None,
+            output_revision: None,
             tool_calls_bytes: None,
         }
     }
@@ -1453,7 +1503,11 @@ fn shared_retained_budget(
         .checked_sub(stable)
         .and_then(|remaining| remaining.checked_sub(prior_bytes?))
         .and_then(|remaining| {
-            let response_bytes = stream.response_object_bytes(&responses.response_object, remaining)?;
+            let response_bytes = stream.response_object_bytes(
+                &responses.response_object,
+                responses.response_object_revision,
+                remaining,
+            )?;
             let tool_calls_bytes = stream.completed_tool_calls_bytes(&responses.tool_calls)?;
             responses.stream_changing_payload_bytes_bounded_with_response_object_size(
                 remaining,
