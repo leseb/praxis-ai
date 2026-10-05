@@ -705,27 +705,13 @@ impl McpDispatchFilter {
         // must leave request-scoped state unchanged.
         if aggregate_budget_armed && resolved.iter().any(|decision| decision.approve) {
             let executable_fits = ctx.extensions.get_mut::<ResponsesState>().is_some_and(|state| {
-                let original_calls = state.tool_calls.len();
-                let original_messages = state.messages.len();
-                let original_persisted = state.persisted_messages.len();
-                for decision in &resolved {
-                    apply_decision(state, decision);
-                }
-                let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-                let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
-                let fits = aggregate_mcp_result_limit(
+                approval_execution_fits(
                     state,
-                    &mcp_calls,
+                    &resolved,
                     self.max_total_result_bytes,
                     forwarded_headers,
                     connector_identity,
                 )
-                .is_some();
-                state.tool_calls.truncate(original_calls);
-                state.mark_tool_calls_changed();
-                state.messages.truncate(original_messages);
-                state.persisted_messages.truncate(original_persisted);
-                fits
             });
             if !executable_fits {
                 record_approval_budget_failure(ctx);
@@ -750,6 +736,45 @@ impl McpDispatchFilter {
         }
         Ok(())
     }
+}
+
+/// Stage approved calls only while measuring their dispatch peak, then restore
+/// every provisional owner before the durable approval claim can fail.
+#[expect(
+    clippy::too_many_lines,
+    reason = "all provisional approval owners roll back together"
+)]
+fn approval_execution_fits(
+    state: &mut ResponsesState,
+    decisions: &[ResolvedApproval],
+    max_total_result_bytes: usize,
+    forwarded_headers: &http::HeaderMap,
+    connector_identity: Option<&McpCalloutIdentity>,
+) -> bool {
+    let original_calls = state.tool_calls.len();
+    let original_approved_calls = state.approved_tool_calls.len();
+    let original_messages = state.messages.len();
+    let original_persisted = state.persisted_messages.len();
+    for decision in decisions {
+        apply_decision(state, decision);
+    }
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let selected_calls = state.selected_tool_calls();
+    let mcp_calls = extract_mcp_tool_calls(&selected_calls, &tool_index);
+    let fits = aggregate_mcp_result_limit(
+        state,
+        &mcp_calls,
+        max_total_result_bytes,
+        forwarded_headers,
+        connector_identity,
+    )
+    .is_some();
+    state.tool_calls.truncate(original_calls);
+    state.approved_tool_calls.truncate(original_approved_calls);
+    state.mark_tool_calls_changed();
+    state.messages.truncate(original_messages);
+    state.persisted_messages.truncate(original_persisted);
+    fits
 }
 
 /// Preflight the independently owned values created by approval resumptions.
@@ -803,7 +828,8 @@ fn minimum_approval_dispatch_reserve(
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let mut calls = 0_usize;
     let mut staging = 0_usize;
-    for call in extract_mcp_tool_calls(&state.tool_calls, &tool_index) {
+    let selected_calls = state.selected_tool_calls();
+    for call in extract_mcp_tool_calls(&selected_calls, &tool_index) {
         calls = calls.checked_add(1)?;
         let arguments = mcp_argument_staging_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?;
         staging = staging.checked_add(mcp_call_dispatch_staging(

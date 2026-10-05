@@ -16,12 +16,12 @@ use serde_json::json;
 
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
-    approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result, build_success_result,
-    content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls,
-    execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
-    is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits,
-    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
-    process_call_result, resolve_tool_entry, result_payload_limit,
+    approval_execution_fits, approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result,
+    build_success_result, content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors,
+    execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls,
+    find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new,
+    mcp_result_commit_fits, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
+    prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -86,6 +86,53 @@ async fn approval_remains_claimable_when_minimum_dispatch_cannot_fit() {
         .await
         .unwrap();
     assert_eq!(consumed, None, "unexecuted approval must remain retryable");
+}
+
+#[test]
+fn approved_call_budget_probe_restores_temporary_selection() {
+    let decision = ResolvedApproval {
+        approval_id: "call_1".to_owned(),
+        approve: true,
+        reason: None,
+        server_label: "weather".to_owned(),
+        tool_name: "get_weather".to_owned(),
+        encoded_name: "weather__get_weather".to_owned(),
+        arguments: "{}".to_owned(),
+    };
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(64 * 1_048_576);
+    let original = state.retained_payload_bytes().unwrap();
+    let headers = http::HeaderMap::new();
+    assert!(approval_execution_fits(
+        &mut state,
+        &[decision.clone()],
+        8_192,
+        &headers,
+        None
+    ));
+    assert!(
+        state.approved_tool_calls.is_empty(),
+        "admitted probe must not commit an approval"
+    );
+    assert!(
+        state.selected_tool_calls().is_empty(),
+        "probe must not leave an executable call"
+    );
+    assert_eq!(state.retained_payload_bytes(), Some(original));
+
+    state.apply_retained_payload_limit(original + 1);
+    assert!(!approval_execution_fits(&mut state, &[decision], 8_192, &headers, None));
+    assert!(
+        state.approved_tool_calls.is_empty(),
+        "rejected probe must not commit an approval"
+    );
+    assert!(
+        state.selected_tool_calls().is_empty(),
+        "rejected probe must not leave an executable call"
+    );
 }
 
 #[tokio::test]
