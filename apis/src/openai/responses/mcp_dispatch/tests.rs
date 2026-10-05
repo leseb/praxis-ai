@@ -682,9 +682,10 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
         panic!("weather tool must resolve")
     };
+    let config = super::mcp_transport_config_staging(entry, &http::HeaderMap::new(), None).unwrap();
     let entry = retained_json_bytes(entry).unwrap();
-    let available = headroom - arguments - entry;
-    let admission = aggregate_mcp_result_limit(&state, &calls, 8_192).unwrap();
+    let available = headroom - arguments - entry - config;
+    let admission = aggregate_mcp_result_limit(&state, &calls, 8_192, &http::HeaderMap::new(), None).unwrap();
     assert!(
         admission.aggregate_constrained,
         "the wire envelope must lower the configured allowance"
@@ -695,6 +696,146 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
         admission.result_limit == 8_192
             || super::mcp_callout_peak_bytes(admission.result_limit + 1, calls.len()).unwrap() + control_peak
                 > available
+    );
+}
+
+#[test]
+fn aggregate_mcp_limit_preflights_forwarded_connector_headers_before_callout() {
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}})],
+        ..ResponsesState::default()
+    };
+    state
+        .mcp_tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap()["connector_id"] = json!("configured");
+    let empty = http::HeaderMap::new();
+    let (config, call) = {
+        let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+        let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
+            panic!("weather tool must resolve")
+        };
+        let config = super::mcp_transport_config_staging(entry, &empty, None).unwrap();
+        let call = super::mcp_call_dispatch_staging(
+            "call_1",
+            super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap(),
+            "weather__get_weather",
+            &tool_index,
+        )
+        .unwrap();
+        (config, call)
+    };
+    let minimum_peak = super::mcp_callout_peak_bytes(super::MIN_RETAINED_RESULT_BYTES, 1).unwrap();
+    let control_min =
+        crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER * 4;
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + call + config + minimum_peak + control_min + 1_024);
+    let calls = call_refs(&state.tool_calls);
+    assert!(
+        aggregate_mcp_result_limit(&state, &calls, 8_192, &empty, None).is_some(),
+        "ordinary connector headers must leave a usable result allowance"
+    );
+
+    let mut forwarded = http::HeaderMap::new();
+    forwarded.insert(
+        "x-forwarded-credential",
+        http::HeaderValue::from_str(&"a".repeat(4_096)).unwrap(),
+    );
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
+        panic!("weather tool must resolve")
+    };
+    assert!(
+        super::mcp_transport_config_staging(entry, &forwarded, None).unwrap() > config + 4_096,
+        "the independent forwarded value needs its own pre-copy reservation"
+    );
+    assert!(
+        aggregate_mcp_result_limit(&state, &calls, 8_192, &forwarded, None).is_none(),
+        "oversized forwarded config must reject before constructing or dialing the transport"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_trusted_header_copy_is_admitted_before_cloning() {
+    let filter = McpDispatchFilter {
+        pool_namespace: super::mcp_client::McpPoolNamespace::new(),
+        user_credential_slot: None,
+        authorization_assertion_slot: None,
+        outbound_pipeline: super::mcp_client::build_bare_outbound_pipeline(false).unwrap(),
+        forward_headers: vec!["x-tenant".parse().unwrap()],
+        timeout: std::time::Duration::from_secs(1),
+        max_calls_per_round: 1,
+        max_parallel_calls: 1,
+        max_result_bytes: TEST_MAX_RESULT_BYTES,
+        max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+    };
+    let mut request = make_request(http::Method::POST, "/v1/responses");
+    request.headers.insert("x-tenant", "untrusted".parse().unwrap());
+    request
+        .headers
+        .insert("x-unrelated", http::HeaderValue::from_str(&"z".repeat(4_096)).unwrap());
+    let mut ctx = make_owned_filter_context(&request);
+    let selected = super::forwarded_header_copy_staging(&ctx, &filter.forward_headers).unwrap();
+    assert_eq!(selected, "x-tenant".len() + "untrusted".len());
+    let mut state = ResponsesState::default();
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + selected);
+    ctx.extensions.insert(state);
+    assert_eq!(
+        filter.forwarded_headers(&ctx).unwrap().get("x-tenant").unwrap(),
+        "untrusted"
+    );
+
+    ctx.pre_read_mutations.push(praxis_filter::TrustedHeaderMutation::Set(
+        "x-tenant".parse().unwrap(),
+        http::HeaderValue::from_str(&"trusted".repeat(1_024)).unwrap(),
+    ));
+    let projected = super::forwarded_header_copy_staging(&ctx, &filter.forward_headers).unwrap();
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(baseline + projected);
+    ctx.extensions.insert(state);
+    assert_eq!(
+        filter
+            .forwarded_headers(&ctx)
+            .unwrap()
+            .get("x-tenant")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "trusted".repeat(1_024)
+    );
+
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(baseline + projected - 1);
+    assert!(
+        filter.forwarded_headers(&ctx).is_none(),
+        "the trusted-mutation map and selected copy must be reserved first"
+    );
+
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    state
+        .mcp_tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap()["connector_id"] = json!("configured");
+    state.apply_retained_payload_limit(1_000_000);
+    ctx.extensions.insert(state);
+    assert!(matches!(
+        filter.dispatch(&mut ctx, &None, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_external_payload_bytes,
+        0,
+        "the selected header owner must be released on an early return"
     );
 }
 
@@ -724,7 +865,14 @@ fn aggregate_mcp_limit_rejects_when_tool_wire_envelope_exceeds_headroom() {
     state.apply_retained_payload_limit(current + 20_000);
 
     assert!(
-        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        aggregate_mcp_result_limit(
+            &state,
+            &call_refs(&state.tool_calls),
+            8_192,
+            &http::HeaderMap::new(),
+            None
+        )
+        .is_none(),
         "the tools/call wire envelope alone can exceed 20 KiB of request headroom"
     );
 }
@@ -742,7 +890,14 @@ fn aggregate_mcp_limit_reserves_parked_get_parser_before_execution() {
     // headroom, although a session-ID server could park a live GET parser.
     state.apply_retained_payload_limit(current + 200_000);
     assert!(
-        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        aggregate_mcp_result_limit(
+            &state,
+            &call_refs(&state.tool_calls),
+            8_192,
+            &http::HeaderMap::new(),
+            None
+        )
+        .is_none(),
         "the standalone GET parser must be reserved before an external tool call"
     );
 }
@@ -770,7 +925,10 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
     state.apply_retained_payload_limit(current + "call_1".len() + argument_staging + entry_staging - 1);
     let calls = call_refs(&state.tool_calls);
 
-    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+    assert_eq!(
+        aggregate_mcp_result_limit(&state, &calls, 8_192, &http::HeaderMap::new(), None),
+        None
+    );
 }
 
 #[tokio::test]
@@ -831,7 +989,14 @@ fn aggregate_mcp_limit_rejects_expanding_numeric_arguments_before_execution() {
         current + "call_1".len() + raw * 3 + tool_bytes + 3 * super::MIN_RETAINED_RESULT_BYTES,
     );
     assert!(
-        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        aggregate_mcp_result_limit(
+            &state,
+            &call_refs(&state.tool_calls),
+            8_192,
+            &http::HeaderMap::new(),
+            None
+        )
+        .is_none(),
         "expanding numeric arguments must be rejected before the MCP call"
     );
 }
@@ -849,7 +1014,10 @@ fn exponent_arguments_reject_before_dispatch_normalization() {
     let live_peak = state.retained_payload_bytes().unwrap() + retained_json_bytes(&parsed).unwrap() + copied_text.len();
     state.apply_retained_payload_limit(live_peak - 1);
     let calls = call_refs(&state.tool_calls);
-    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+    assert_eq!(
+        aggregate_mcp_result_limit(&state, &calls, 8_192, &http::HeaderMap::new(), None),
+        None
+    );
 }
 
 #[test]
@@ -1506,7 +1674,7 @@ fn budgeted_control_json_parse_overflow_uses_the_transport_cap() {
         (control_parse_cap, crate::mcp_client::McpResponseLimitKind::Control),
         (get_parse_cap, crate::mcp_client::McpResponseLimitKind::GetStream),
     ] {
-        let error = crate::mcp_client::McpClientError::ResponseTooLarge {
+        let error = crate::mcp_client::McpClientError::JsonPreparseTooLarge {
             url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
             limit,
             kind,
@@ -1517,6 +1685,54 @@ fn budgeted_control_json_parse_overflow_uses_the_transport_cap() {
             "{kind:?} parse cap must be terminal"
         );
     }
+}
+
+#[test]
+fn equal_tool_wire_and_parse_caps_keep_their_distinct_failure_origins() {
+    let mut options = execution_options(false, std::time::Duration::from_secs(1));
+    options.max_result_bytes = 131_072;
+    options.configured_max_result_bytes = 131_072;
+    options.aggregate_result_policy = super::McpAggregateResultPolicy::Budgeted;
+    let payload = result_payload_limit(options.max_result_bytes);
+    let tied_cap = crate::mcp_client::tool_result_wire_cap(payload);
+    assert_eq!(tied_cap, options.max_result_bytes * 2);
+    let url = crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap());
+
+    let wire = process_call_result(
+        Err(crate::mcp_client::McpClientError::ResponseTooLarge {
+            url: url.clone(),
+            limit: tied_cap,
+            kind: crate::mcp_client::McpResponseLimitKind::Tool,
+        }),
+        "c1",
+        "srv",
+        "tool",
+        "{}",
+        None,
+        payload,
+    );
+    assert!(
+        !super::aggregate_result_limit_exceeded(&wire, &options),
+        "the unchanged configured wire limit remains a recoverable tool error"
+    );
+
+    let parse = process_call_result(
+        Err(crate::mcp_client::McpClientError::JsonPreparseTooLarge {
+            url,
+            limit: tied_cap,
+            kind: crate::mcp_client::McpResponseLimitKind::Tool,
+        }),
+        "c1",
+        "srv",
+        "tool",
+        "{}",
+        None,
+        payload,
+    );
+    assert!(
+        super::aggregate_result_limit_exceeded(&parse, &options),
+        "the separately reserved JSON parse peak is terminal"
+    );
 }
 
 #[test]
@@ -4504,7 +4720,10 @@ async fn execution_budget_failure_keeps_approval_available_for_retry() {
     state.apply_retained_payload_limit(baseline + 2000);
     ctx.extensions.insert(state);
 
-    filter.resume_approvals(&mut ctx).await.unwrap();
+    filter
+        .resume_approvals(&mut ctx, &http::HeaderMap::new(), None)
+        .await
+        .unwrap();
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(state.retained_payload_failed, "result admission fails before a callout");
     assert!(

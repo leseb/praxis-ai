@@ -62,6 +62,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
     HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
+use secrecy::ExposeSecret as _;
 use tracing::{debug, warn};
 
 use self::{
@@ -320,7 +321,18 @@ impl McpDispatchFilter {
     }
 
     /// Select only configured headers from the effective body-phase request.
-    fn forwarded_headers(&self, ctx: &HttpFilterContext<'_>) -> http::HeaderMap {
+    /// Reserve the effective map copy and selected values before either exists.
+    fn forwarded_headers(&self, ctx: &HttpFilterContext<'_>) -> Option<http::HeaderMap> {
+        if self.forward_headers.is_empty() {
+            return Some(http::HeaderMap::new());
+        }
+        if let Some(state) = ctx.extensions.get::<ResponsesState>()
+            && state.retained_payload_limit().is_some()
+            && !forwarded_header_copy_staging(ctx, &self.forward_headers)
+                .is_some_and(|bytes| state.can_retain_payload(bytes))
+        {
+            return None;
+        }
         let effective = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
         let mut forwarded = http::HeaderMap::with_capacity(self.forward_headers.len());
         for name in &self.forward_headers {
@@ -328,7 +340,7 @@ impl McpDispatchFilter {
                 forwarded.insert(name.clone(), value.clone());
             }
         }
-        forwarded
+        Some(forwarded)
     }
 
     /// Bind connector approvals to the ambient headers this request will send.
@@ -471,7 +483,12 @@ impl McpDispatchFilter {
         clippy::large_stack_frames,
         reason = "five borrow-scoped phases: parse, load, resolve, consume, apply"
     )]
-    async fn resume_approvals(&self, ctx: &mut HttpFilterContext<'_>) -> Result<(), Rejection> {
+    async fn resume_approvals(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        forwarded_headers: &http::HeaderMap,
+        connector_identity: Option<&McpCalloutIdentity>,
+    ) -> Result<(), Rejection> {
         // Phase 0: parse the client-supplied approval responses and capture the
         // response that issued them. Only the correlation id, verdict, and
         // reason are trusted from the client; the pending call itself is looked
@@ -671,7 +688,14 @@ impl McpDispatchFilter {
                 }
                 let tool_index = McpToolIndex::new(&state.mcp_tool_map);
                 let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
-                let fits = aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes).is_some();
+                let fits = aggregate_mcp_result_limit(
+                    state,
+                    &mcp_calls,
+                    self.max_total_result_bytes,
+                    forwarded_headers,
+                    connector_identity,
+                )
+                .is_some();
                 state.tool_calls.truncate(original_calls);
                 state.mark_tool_calls_changed();
                 state.messages.truncate(original_messages);
@@ -802,6 +826,124 @@ fn mcp_call_dispatch_staging(
         _ => 0,
     };
     id.len().checked_add(arguments_staging_bytes)?.checked_add(tool_bytes)
+}
+
+/// Reserve the transport configuration before rmcp constructs independent
+/// URL/header/credential owners. The full tool entry bounds its source fields;
+/// forwarded values and trusted connector secrets are separate inputs. Count
+/// three header owners for the worker, parked GET, and reserved close POST.
+#[expect(
+    clippy::too_many_lines,
+    reason = "borrowed transport config fields are measured together before constructing any owned copy"
+)]
+fn mcp_transport_config_staging(
+    entry: &serde_json::Value,
+    forwarded_headers: &http::HeaderMap,
+    connector_identity: Option<&McpCalloutIdentity>,
+) -> Option<usize> {
+    let source = entry
+        .get("server_url")
+        .and_then(serde_json::Value::as_str)
+        .map_or(0, str::len)
+        .checked_add(entry.get("headers").map_or(Some(0), retained_json_bytes)?)?
+        .checked_add(
+            entry
+                .get("authorization")
+                .and_then(serde_json::Value::as_str)
+                .map_or(0, str::len),
+        )?;
+    let connector_entry = is_connector_tool_entry(entry);
+    let forwarded = if connector_entry {
+        forwarded_headers.iter().try_fold(0_usize, |used, (name, value)| {
+            used.checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())
+        })?
+    } else {
+        0
+    };
+    let connector = if connector_entry {
+        connector_identity.map_or(Some(0), |identity| {
+            identity
+                .user_credential()
+                .map_or(0, |secret| secret.expose_secret().len())
+                .checked_add(
+                    identity
+                        .authorization()
+                        .map_or(0, |secret| secret.expose_secret().len()),
+                )
+        })?
+    } else {
+        0
+    };
+    source
+        .checked_add(forwarded)?
+        .checked_add(connector)?
+        .checked_add(64)? // injected authorization/assertion header names and Bearer prefix
+        .checked_mul(3)
+}
+
+/// Bound a possible copy of the whole request map caused by trusted mutations
+/// plus the independently owned selected map. This runs while every source is
+/// still borrowed, before `effective_body_callout_headers` can clone a value.
+#[expect(
+    clippy::too_many_lines,
+    reason = "all ordered request-header mutation sources must be included in the before-copy bound"
+)]
+fn forwarded_header_copy_staging(ctx: &HttpFilterContext<'_>, forwarded_names: &[http::HeaderName]) -> Option<usize> {
+    let source = header_map_payload_bytes(&ctx.request.headers)?;
+    let mutations = ctx
+        .prior_pre_read_mutations
+        .iter()
+        .chain(&ctx.pre_read_mutations)
+        .try_fold(0_usize, |used, mutation| match mutation {
+            praxis_filter::TrustedHeaderMutation::Remove(_) => Some(used),
+            praxis_filter::TrustedHeaderMutation::Set(name, value) => used
+                .checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len()),
+            praxis_filter::TrustedHeaderMutation::Add(name, value) => {
+                used.checked_add(name.as_str().len())?.checked_add(value.len())
+            },
+        })?
+        .checked_add(
+            ctx.request_headers_to_set
+                .iter()
+                .try_fold(0_usize, |used, (name, value)| {
+                    used.checked_add(name.as_str().len())?
+                        .checked_add(value.as_bytes().len())
+                })?,
+        )?
+        .checked_add(
+            ctx.extra_request_headers
+                .iter()
+                .try_fold(0_usize, |used, (name, value)| {
+                    used.checked_add(name.len())?.checked_add(value.len())
+                })?,
+        )?;
+    let effective_bound = source.checked_add(mutations)?;
+    let has_mutations = !ctx.prior_pre_read_mutations.is_empty()
+        || !ctx.pre_read_mutations.is_empty()
+        || !ctx.request_headers_to_remove.is_empty()
+        || !ctx.request_headers_to_set.is_empty()
+        || !ctx.extra_request_headers.is_empty();
+    if has_mutations {
+        effective_bound.checked_mul(2)
+    } else {
+        forwarded_names.iter().try_fold(0_usize, |used, name| {
+            let Some(value) = ctx.request.headers.get(name) else {
+                return Some(used);
+            };
+            used.checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())
+        })
+    }
+}
+
+/// Payload copied into the selected forwarded-header owner.
+fn header_map_payload_bytes(headers: &http::HeaderMap) -> Option<usize> {
+    headers.iter().try_fold(0_usize, |used, (name, value)| {
+        used.checked_add(name.as_str().len())?
+            .checked_add(value.as_bytes().len())
+    })
 }
 
 /// Bound each live argument owner without parsing the whole argument tree.
@@ -1321,7 +1463,6 @@ impl McpDispatchFilter {
     /// Execute discovery, approval resume, and bounded MCP calls for this round.
     #[expect(
         clippy::too_many_lines,
-        clippy::large_stack_frames,
         reason = "the existing MCP dispatch lifecycle now includes aggregate admission"
     )]
     async fn dispatch(
@@ -1334,16 +1475,59 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
-        let forwarded_headers = self.forwarded_headers(ctx);
+        let has_connector_state = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            !state.deferred_mcp.is_empty() || state.mcp_tool_map.values().any(is_connector_tool_entry)
+        });
+        let forwarded_headers = if has_connector_state {
+            let Some(headers) = self.forwarded_headers(ctx) else {
+                return Ok(Self::aggregate_budget_action(ctx));
+            };
+            headers
+        } else {
+            http::HeaderMap::new()
+        };
+        let held_headers = if let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+            && state.retained_payload_limit().is_some()
+        {
+            let Some(bytes) = header_map_payload_bytes(&forwarded_headers) else {
+                return Ok(Self::aggregate_budget_action(ctx));
+            };
+            if !state.can_retain_payload(bytes) || !state.retain_external_payload_bytes(bytes) {
+                return Ok(Self::aggregate_budget_action(ctx));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let action = self
+            .dispatch_with_forwarded_headers(ctx, body, &forwarded_headers, has_connector_state)
+            .await;
+        if let Some(bytes) = held_headers
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            state.release_external_payload_bytes(bytes);
+        }
+        action
+    }
 
+    /// Run the MCP lifecycle while the forwarded-header owner is charged.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::large_stack_frames,
+        reason = "the existing MCP dispatch lifecycle includes aggregate admission"
+    )]
+    async fn dispatch_with_forwarded_headers(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+        forwarded_headers: &http::HeaderMap,
+        has_connector_state: bool,
+    ) -> Result<FilterAction, FilterError> {
         // Approval resume runs before the approved call is injected into
         // `tool_calls`, so stage connector identity from the resolved tool map
         // itself. This binds pending approvals to the effective per-user bearer
         // without retaining the raw credential. Direct URL-only requests never
         // stage or bind ambient connector context.
-        let has_connector_state = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
-            !state.deferred_mcp.is_empty() || state.mcp_tool_map.values().any(is_connector_tool_entry)
-        });
         let dispatch_context_policy = McpConnectorContextPolicy::new(
             self.user_credential_slot.as_deref(),
             self.authorization_assertion_slot.as_deref(),
@@ -1384,7 +1568,7 @@ impl McpDispatchFilter {
         } else {
             None
         };
-        if !self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref()) {
+        if !self.bind_request_forwarded_header_context(ctx, forwarded_headers, connector_identity.as_ref()) {
             return Ok(Self::aggregate_budget_action(ctx));
         }
 
@@ -1405,7 +1589,10 @@ impl McpDispatchFilter {
         // On approval this injects a function-call-shaped tool call that the
         // dispatch machinery below runs; on denial it appends a
         // `function_call_output` so inference resumes without a tool call.
-        if let Err(rejection) = self.resume_approvals(ctx).await {
+        if let Err(rejection) = self
+            .resume_approvals(ctx, forwarded_headers, connector_identity.as_ref())
+            .await
+        {
             return Ok(FilterAction::Reject(rejection));
         }
         if ctx
@@ -1462,7 +1649,7 @@ impl McpDispatchFilter {
                 ctx,
                 bytes,
                 &self.forward_headers,
-                &forwarded_headers,
+                forwarded_headers,
                 &callout,
                 connector_identity.as_ref(),
             )
@@ -1494,7 +1681,13 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(admission) = aggregate_mcp_result_limit(state, &mcp_calls, self.max_total_result_bytes) else {
+        let Some(admission) = aggregate_mcp_result_limit(
+            state,
+            &mcp_calls,
+            self.max_total_result_bytes,
+            forwarded_headers,
+            connector_identity.as_ref(),
+        ) else {
             return Ok(Self::aggregate_budget_action(ctx));
         };
 
@@ -1503,7 +1696,7 @@ impl McpDispatchFilter {
                 state,
                 &mcp_calls,
                 &tool_index,
-                &forwarded_headers,
+                forwarded_headers,
                 &callout,
                 connector_identity.as_ref(),
                 &session_pool,
@@ -2057,6 +2250,10 @@ enum McpSizeLimitFailure {
     /// Decoded content exceeded the admitted result allowance; retain its
     /// measured size so the configured cap can still own a recoverable error.
     Decoded(usize),
+    /// JSON parse staging exceeded the request-wide reservation before rmcp
+    /// could allocate it. This source is distinct from a raw wire ceiling even
+    /// when their numeric limits happen to be equal.
+    Preparse,
     /// An MCP exchange exceeded this wire ceiling and records its origin.
     Transport {
         /// The exceeded byte ceiling.
@@ -2102,6 +2299,8 @@ fn aggregate_mcp_result_limit(
     state: &ResponsesState,
     mcp_calls: &[&serde_json::Value],
     configured_limit: usize,
+    forwarded_headers: &http::HeaderMap,
+    connector_identity: Option<&McpCalloutIdentity>,
 ) -> Option<McpResultAdmission> {
     if mcp_calls.is_empty() || state.retained_payload_limit().is_none() {
         return Some(McpResultAdmission {
@@ -2116,7 +2315,7 @@ fn aggregate_mcp_result_limit(
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let staging = mcp_calls.iter().try_fold(0_usize, |used, call| {
         let arguments = mcp_argument_staging_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?;
-        used.checked_add(mcp_call_dispatch_staging(
+        let call_staging = mcp_call_dispatch_staging(
             call.get("call_id")
                 .or_else(|| call.get("id"))
                 .and_then(serde_json::Value::as_str)
@@ -2124,7 +2323,14 @@ fn aggregate_mcp_result_limit(
             arguments,
             call.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
             &tool_index,
-        )?)
+        )?;
+        let config_staging = match tool_index.get(call.get("name").and_then(serde_json::Value::as_str).unwrap_or("")) {
+            Some(McpToolMatch::Unique { entry, .. }) => {
+                mcp_transport_config_staging(entry, forwarded_headers, connector_identity)?
+            },
+            _ => 0,
+        };
+        used.checked_add(call_staging)?.checked_add(config_staging)
     })?;
     let available = limit.checked_sub(current)?.checked_sub(staging)?;
     let count = mcp_calls.len();
@@ -2255,10 +2461,6 @@ fn aggregate_transport_ceiling_lowered(
 
 /// Distinguish a request-wide size failure from a configured per-tool limit.
 /// The latter stays a bounded tool error so an executed call is not retried.
-#[expect(
-    clippy::too_many_lines,
-    reason = "classify all transport and decoded size ceilings at the call boundary"
-)]
 fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
     if matches!(options.aggregate_result_policy, McpAggregateResultPolicy::Unbudgeted) {
         return false;
@@ -2266,27 +2468,9 @@ fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutio
     let admitted_payload = result_payload_limit(options.max_result_bytes);
     let configured_payload = result_payload_limit(options.configured_max_result_bytes);
     let admitted_control = mcp_client::tool_control_response_cap(admitted_payload, options.max_control_response_bytes);
-    if let Some(McpSizeLimitFailure::Transport { limit, kind }) = result.size_limit_exceeded {
-        // These are request-wide parse reservations even when the configured
-        // result cap itself did not shrink.
-        let parse_cap = match kind {
-            mcp_client::McpResponseLimitKind::Tool => options.max_result_bytes.saturating_mul(2),
-            mcp_client::McpResponseLimitKind::Initialize | mcp_client::McpResponseLimitKind::Control => {
-                admitted_control.saturating_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
-            },
-            mcp_client::McpResponseLimitKind::GetStream => {
-                let wire = mcp_client::tool_stream_cumulative_cap(
-                    mcp_client::tool_result_wire_cap(admitted_payload),
-                    admitted_control,
-                );
-                admitted_control
-                    .saturating_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
-                    .min(wire.saturating_mul(12))
-            },
-        };
-        if limit == parse_cap {
-            return true;
-        }
+    if matches!(result.size_limit_exceeded, Some(McpSizeLimitFailure::Preparse)) {
+        // Tool-session preparse limits are only armed with a shared budget.
+        return true;
     }
     let result_constrained = matches!(
         options.aggregate_result_policy,
@@ -2297,6 +2481,7 @@ fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutio
     }
     let exceeded_aggregate_cap = match result.size_limit_exceeded {
         Some(McpSizeLimitFailure::Decoded(actual)) => result_constrained && actual <= configured_payload,
+        Some(McpSizeLimitFailure::Preparse) => true,
         Some(McpSizeLimitFailure::Transport { limit, kind }) => {
             aggregate_transport_ceiling_lowered(limit, kind, admitted_payload, configured_payload, admitted_control)
         },
@@ -2602,6 +2787,7 @@ fn process_call_result(
                         kind: *kind,
                     })
                 },
+                mcp_client::McpClientError::JsonPreparseTooLarge { .. } => Some(McpSizeLimitFailure::Preparse),
                 _ => None,
             };
             let mut result = build_error_result(
