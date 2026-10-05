@@ -919,8 +919,9 @@ fn buffered_response_headroom(ctx: &HttpFilterContext<'_>) -> Option<usize> {
 
 /// Choose the finite transport cap before Store runs. The loop's finalizer
 /// publishes an exact wire length and digest; a direct response may instead
-/// use one trusted identity-coded Content-Length. Preserve any prior narrower
-/// buffer when no exact length is known because core only ratchets caps upward.
+/// use one trusted identity-coded Content-Length. An internal IRR response can
+/// use remaining headroom because its headers are not yet client-visible.
+/// A direct response with unknown length must fail before committing headers.
 fn finite_conversation_buffer_cap(ctx: &HttpFilterContext<'_>, headroom: usize) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>()?;
     let exact = if state.buffered_canonical_finalized {
@@ -933,7 +934,7 @@ fn finite_conversation_buffer_cap(ctx: &HttpFilterContext<'_>, headroom: usize) 
     } else {
         None
     };
-    let cap = exact.unwrap_or(headroom);
+    let cap = exact.or_else(|| ctx.extensions.get::<praxis_filter::IterationState>().map(|_| headroom))?;
     if cap == 0 || cap > headroom {
         return None;
     }
