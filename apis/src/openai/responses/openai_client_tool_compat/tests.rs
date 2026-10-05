@@ -9,7 +9,7 @@ use praxis_filter::body::MAX_JSON_BODY_BYTES;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::test_utils::{make_filter_context, make_request, make_response};
 
 // -----------------------------------------------------------------------------
 // Test helpers
@@ -315,6 +315,60 @@ fn streaming_guard_ignores_requests_without_rich_client_tools() {
 // -----------------------------------------------------------------------------
 // Namespace tool lowering
 // -----------------------------------------------------------------------------
+
+#[test]
+fn namespace_description_fanout_is_rejected_before_lowering_allocates_copies() {
+    let members = (0..32)
+        .map(|index| json!({"type": "function", "name": format!("member_{index}"), "parameters": {"type": "object"}}))
+        .collect::<Vec<_>>();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "namespace", "name": "large", "description": "x".repeat(4096), "tools": members}],
+    }));
+    state.apply_retained_payload_limit(64 * 1024);
+    assert!(state.can_retain_payload(0), "the original request fits");
+
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("the repeated description exceeds the shared budget");
+    assert_eq!(reject_parts(&action).0, 413);
+    assert_eq!(state.request_body["tools"][0]["type"], "namespace");
+    assert!(state.client_tool_lowering.is_empty(), "no lowered state was committed");
+}
+
+#[test]
+fn namespace_description_escape_fanout_is_rejected_before_serialization() {
+    let members = (0..48)
+        .map(|index| json!({"type": "function", "name": format!("member_{index}"), "parameters": {"type": "object"}}))
+        .collect::<Vec<_>>();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "namespace", "name": "escaped", "description": "\0".repeat(4096), "tools": members}],
+    }));
+    state.apply_retained_payload_limit(1024 * 1024);
+    assert!(state.can_retain_payload(0), "the compact original request fits");
+
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("JSON escaping the repeated description exceeds the shared budget");
+    assert_eq!(reject_parts(&action).0, 413);
+    assert_eq!(state.request_body["tools"][0]["type"], "namespace");
+}
+
+#[test]
+fn discovered_namespace_description_fanout_is_preflighted() {
+    let members = (0..32)
+        .map(|index| json!({"type": "function", "name": format!("member_{index}"), "parameters": {"type": "object"}}))
+        .collect::<Vec<_>>();
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi"}));
+    state.apply_retained_payload_limit(64 * 1024);
+    let discovered = [json!({"type": "namespace", "name": "large", "description": "x".repeat(4096), "tools": members})];
+    let action = preflight_namespace_expansion(&state, &discovered)
+        .expect_err("discovered descriptions are repeated during lowering too");
+    assert_eq!(reject_parts(&action).0, 413);
+}
 
 #[test]
 fn lowers_namespace_members_to_flat_functions() {
@@ -5584,10 +5638,8 @@ fn discovered_namespace_custom_member_reject_worthy_format_twin_fails_closed_reg
 
 #[tokio::test]
 async fn lowering_arms_response_buffer_and_strips_accept_encoding() {
-    // A request that lowers rich client tools must buffer the upstream response and
-    // strip `Accept-Encoding`: a chunked response would let early chunks reach the
-    // client with lowered private function names un-restored, and a compressed body
-    // would fail JSON parsing and pass through un-restored.
+    // The request strips compression before dispatch, then the response header
+    // selects a buffer when the restoration echo is known.
     let filter = filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -5612,17 +5664,246 @@ async fn lowering_arms_response_buffer_and_strips_accept_encoding() {
             .is_some(),
         "lowering rich client tools records a restoration echo",
     );
+    assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+    assert!(
+        ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
+        "Accept-Encoding is stripped so a compliant backend returns plaintext JSON",
+    );
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
     assert_eq!(
         ctx.response_body_mode,
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES)
         },
-        "the response is buffered so restoration sees the whole body",
+        "unbudgeted restoration keeps the configured finite cap",
     );
-    assert!(
-        ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
-        "Accept-Encoding is stripped so a compliant backend returns plaintext JSON",
+}
+
+#[tokio::test]
+async fn budgeted_restore_caps_buffer_to_trusted_length_and_restores_echo() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
+    }));
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut None, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+
+    let wire = json!({"object": "response", "output": [], "tools": [], "tool_choice": "auto"}).to_string();
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&wire.len().to_string()).unwrap(),
     );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(wire.len())
+        },
+        "the admitted wire length bounds core before any body buffering",
+    );
+
+    let mut body = Some(Bytes::from(wire));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(restored["tools"][0]["type"], "custom");
+    assert_eq!(restored["tools"][0]["name"], "run_python");
+}
+
+#[tokio::test]
+async fn budgeted_restore_accepts_unframed_body_under_bounded_cap() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
+    }));
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut None, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    ctx.response_header = Some(response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let BodyMode::StreamBuffer { max_bytes: Some(cap) } = ctx.response_body_mode else {
+        panic!("an unframed provider body needs a finite core cap");
+    };
+    assert!(cap > 0 && cap < 16_384, "the cap reserves restoration copies");
+    let wire = json!({"object": "response", "output": [], "tools": [], "tool_choice": "auto"}).to_string();
+    assert!(wire.len() < cap);
+    let mut body = Some(Bytes::from(wire));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(restored["tools"][0]["name"], "run_python");
+}
+
+#[tokio::test]
+async fn budgeted_restore_aborts_late_body_expansion_without_forwarding() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "run_python"})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(65_536);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(Box::leak(Box::new(make_response())));
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let BodyMode::StreamBuffer { max_bytes: Some(cap) } = ctx.response_body_mode else {
+        panic!("unframed restoration must be capped");
+    };
+    // Core enforces this cap on raw bytes. A preceding translator can replace
+    // that raw body with a larger value before this callback, so check again.
+    let mut body = Some(Bytes::from(vec![b'x'; cap + 1]));
+    assert!(filter.on_response_body(&mut ctx, &mut body, true).is_err());
+    assert!(body.is_none(), "late failure cannot forward private lowered data");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn budgeted_restore_accepts_finalized_canonical_body_without_length() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let wire = json!({"object": "response", "output": [], "tools": [], "tool_choice": "auto"}).to_string();
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "run_python"})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    state.buffered_canonical_finalized = true;
+    state.buffered_canonical_wire_bytes = Some(wire.len());
+    state.buffered_canonical_parsed_bound_bytes = Some(wire.len());
+    state.buffered_canonical_body_digest = Some(crate::hash::Sha256::digest(wire.as_bytes()));
+    ctx.extensions.insert(state);
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(wire.len())
+        }
+    );
+    let mut body = Some(Bytes::from(wire));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let restored: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(restored["tools"][0]["name"], "run_python");
+}
+
+#[tokio::test]
+async fn budgeted_restore_preserves_provider_error_without_buffering() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "run_python"})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let response = Box::leak(Box::new(make_response()));
+    response.status = http::StatusCode::BAD_GATEWAY;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+    let error = Bytes::from_static(b"{\"error\":\"backend unavailable\"}");
+    let mut body = Some(error.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(body, Some(error));
+}
+
+#[tokio::test]
+async fn budgeted_restore_rejects_other_filters_larger_buffer_cap() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "run_python"})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("64"));
+    ctx.response_header = Some(response);
+    ctx.response_body_mode = BodyMode::StreamBuffer {
+        max_bytes: Some(MAX_JSON_BODY_BYTES),
+    };
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert_eq!(reject_parts(&action).0, 502);
 }
 
 #[tokio::test]
@@ -5662,6 +5943,54 @@ async fn passthrough_request_does_not_arm_buffering_or_strip_encoding() {
         ctx.request_headers_to_remove.is_empty(),
         "Accept-Encoding is left intact when nothing will be restored",
     );
+}
+
+#[tokio::test]
+async fn budgeted_streaming_rich_tool_response_stays_unbuffered() {
+    let filter = filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("responses.client_tool_stream_restoration", "true".to_owned());
+    let mut state = ResponsesState::from_request_body(json!({
+        "stream": true,
+        "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
+    }));
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    ctx.extensions.insert(state);
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut None, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .client_tool_echo
+            .is_some()
+    );
+
+    let response = Box::leak(Box::new(make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    ctx.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+
+    let chunk = Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
+    let mut body = Some(chunk.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(body, Some(chunk), "SSE bytes belong to the stream restoration owner");
 }
 
 #[tokio::test]

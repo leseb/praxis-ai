@@ -147,6 +147,23 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Atomically insert this owner's response and approvals without replacing
+    /// an existing response with the same ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when owner validation or the backend write fails.
+    pub async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        self.store
+            .persist_response_with_pending_approvals_if_absent(record, pending_approvals)
+            .await
+    }
+
     /// Retrieve pending approvals issued to this owner.
     ///
     /// # Errors
@@ -410,6 +427,25 @@ impl OwnerScopedStore {
         }
         self.store
             .create_items_and_sync_messages(&self.owner, conversation_id, items)
+            .await
+    }
+
+    /// Append and rebuild only if the transaction's retained payload fits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an owner mismatch, budget overflow, or backend error.
+    pub async fn create_items_and_sync_messages_bounded(
+        &self,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store
+            .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_rebuild_bytes)
             .await
     }
 

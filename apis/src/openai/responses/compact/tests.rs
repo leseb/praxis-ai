@@ -1149,6 +1149,49 @@ async fn reactive_compaction_independent_response_ceiling_remains_fail_open() {
 }
 
 #[test]
+fn reactive_compaction_rejects_numeric_expansion_before_parsing() {
+    let filter = make_filter("open");
+    let mut state = ResponsesState::from_request_body(json!({"model":"gpt-4o", "input":"hello"}));
+    state.apply_retained_payload_limit(2_097_152);
+    let params = CompactionParams {
+        compact_threshold: 1_000,
+        compaction_model: None,
+    };
+    let cap = reactive_compaction_response_limit(&state, "hello", &params, &filter.config)
+        .unwrap()
+        .unwrap();
+    let raw = format!(
+        r#"{{"choices":[{{"message":{{"content":"summary"}}}}],"usage":{{"values":[{}]}}}}"#,
+        vec!["1e15"; 85_000].join(",")
+    );
+    assert!(raw.len() < cap, "the transport body cap admits this valid response");
+    assert!(parse_summarization_response(raw.as_bytes()).is_ok());
+    let response = subrequest::SubResponse {
+        status: 200,
+        headers: http::HeaderMap::new(),
+        body: Bytes::from(raw),
+    };
+    assert!(matches!(
+        filter.handle_reactive_subrequest_result(Ok(response), Some(cap)),
+        Err(ReactiveCompactionError::RetainedBudget)
+    ));
+}
+
+#[test]
+fn reactive_compaction_accepts_ordinary_summary_within_response_allowance() {
+    let filter = make_filter("open");
+    let response = subrequest::SubResponse {
+        status: 200,
+        headers: http::HeaderMap::new(),
+        body: Bytes::from_static(br#"{"choices":[{"message":{"content":"summary"}}],"usage":{"total_tokens":10}}"#),
+    };
+    assert!(matches!(
+        filter.handle_reactive_subrequest_result(Ok(response), Some(256)),
+        Ok(Some(summary)) if summary.content == "summary"
+    ));
+}
+
+#[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");
     let result = filter.on_callout_error("something went wrong");
