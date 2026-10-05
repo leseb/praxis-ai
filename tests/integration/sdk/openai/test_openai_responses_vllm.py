@@ -5588,7 +5588,9 @@ filter_chains:
               - filter: openai_stream_events
               - filter: openai_agentic_loop
                 max_infer_iters: 1
-                max_retained_bytes: 65536
+                # Leave room for the Files API transport's 128 KiB staging
+                # while keeping the declared 48 KiB file over the shared cap.
+                max_retained_bytes: 262144
               - filter: openai_responses_proxy
               - filter: router
                 routes:
