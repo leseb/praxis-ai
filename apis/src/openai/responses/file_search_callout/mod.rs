@@ -41,7 +41,8 @@ use tracing::warn;
 use self::{
     client::{
         CalloutTransport, FileSearchClient, FileSearchClientConfig, FileSearchError, MAX_QUERY_BYTES,
-        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec, request_error,
+        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec,
+        outbound_request_peak_bytes, request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client, require_inline_outbound_chain},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
@@ -83,6 +84,10 @@ const MAX_QUERIES_PER_CALL: usize = 64;
 /// metadata is added. Synthetic bridge messages are used only for the next
 /// inference round and are not persisted into rehydration history.
 const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
+
+/// Fixed bridge fields, call identifiers, and bounded template bookkeeping
+/// retained while a joined query is formatted.
+const QUERY_FORMATTING_FIXED_BYTES: usize = 1_024;
 
 /// Dispatches the loop owner's pending file-search assignments against a vector
 /// store API compatible backend.
@@ -402,11 +407,13 @@ impl FileSearchCalloutFilter {
     /// Execute the bounded fan-out for a completed plan.
     #[expect(
         clippy::too_many_lines,
+        clippy::too_many_arguments,
         reason = "separates global, per-call, and transport planning failures"
     )]
     async fn execute_plan(
         &self,
         plan: &SearchPlan,
+        specs: &[SearchSpec<'_>],
         request_headers: &HeaderMap,
         transport: &CalloutTransport<'_>,
         max_decoded_bytes: usize,
@@ -435,12 +442,11 @@ impl FileSearchCalloutFilter {
                 })
             })
             .collect::<Vec<_>>();
-        let specs = build_search_specs(plan);
         let mut batch = if specs.is_empty() {
             SearchBatch::new(plan.calls.len())
         } else {
             self.client
-                .search_with_retained_limit(&specs, plan.calls.len(), request_headers, transport, max_decoded_bytes)
+                .search_with_retained_limit(specs, plan.calls.len(), request_headers, transport, max_decoded_bytes)
                 .await
         };
         batch.failures.extend(planning_failures);
@@ -568,6 +574,22 @@ impl FileSearchCalloutFilter {
             }
             return Ok(FilterAction::Continue);
         };
+        let specs = build_search_specs(&plan);
+        // A search body is serialized into an owned Vec before the callout,
+        // and up to eight such bodies may coexist. Reserve their peak while
+        // the plan and decoded responses are also live.
+        let execution_bytes = if state.retained_payload_limit().is_some() && plan.planning_error.is_none() {
+            outbound_request_peak_bytes(&specs).and_then(|peak| plan_bytes.checked_add(peak))
+        } else {
+            Some(plan_bytes)
+        };
+        let Some(execution_bytes) = execution_bytes else {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            return Ok(FilterAction::Continue);
+        };
         let hdrs = callout_request_headers(ctx);
         // Keep the existing filtered callout transport and request identity.
         let downstream = SubrequestRuntime::new(
@@ -581,14 +603,16 @@ impl FileSearchCalloutFilter {
             downstream,
             identity: &identity,
         };
-        let Some(max_decoded_bytes) = retained_payload_available(state, plan_bytes) else {
+        let Some(max_decoded_bytes) = retained_payload_available(state, execution_bytes) else {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
                 state.dispatch_failure = Some(file_search_budget_failure());
             }
             return Ok(FilterAction::Continue);
         };
-        let batch = self.execute_plan(&plan, &hdrs, &transport, max_decoded_bytes).await;
+        let batch = self
+            .execute_plan(&plan, &specs, &hdrs, &transport, max_decoded_bytes)
+            .await;
         if batch.retained_payload_overflow() {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
@@ -1188,7 +1212,9 @@ fn file_search_state_accounting_failure() -> DispatchFailure {
 /// staged/final owners, with room for the canonical result wrapper. Model
 /// bridges have three simultaneous owners while formatting (the rendered
 /// string, the bridge value, and its staged/final state owner), so the model
-/// budget is capped to one third of the remaining aggregate allowance.
+/// budget is capped to one third of the remaining aggregate allowance. The
+/// joined query and its JSON argument copies need a separate reservation:
+/// JSON escaping can expand each query byte to six bytes.
 #[expect(
     clippy::too_many_lines,
     reason = "preflight accounts each transient owner before formatting"
@@ -1222,6 +1248,28 @@ fn reserve_file_search_formatting(
     let non_model_bytes = batch_bytes
         .checked_add(public_bytes)
         .and_then(|bytes| bytes.checked_add(plan_bytes))
+        .ok_or_else(file_search_state_accounting_failure)?;
+
+    // The plan already owns each original query. Formatting also owns the
+    // joined query, a temporary serde_json query value, and its serialized
+    // argument (at most six escaped bytes per input byte). The empty bridge
+    // drops before the final bridge is built, and only one call is formatted
+    // at a time, so reserve the largest joined query rather than their sum.
+    // Do this before join_queries_bounded or either bridge allocates.
+    let query_formatting_bytes = if plan.calls.is_empty() {
+        0
+    } else {
+        plan.calls
+            .iter()
+            .map(|call| joined_query_size(&call.queries).0)
+            .max()
+            .unwrap_or_default()
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(QUERY_FORMATTING_FIXED_BYTES))
+            .ok_or_else(file_search_state_accounting_failure)?
+    };
+    let non_model_bytes = non_model_bytes
+        .checked_add(query_formatting_bytes)
         .ok_or_else(file_search_state_accounting_failure)?;
 
     let model_bytes = match state.retained_payload_limit() {
@@ -1302,16 +1350,18 @@ impl BridgeBudget<'_> {
     /// Reserve exact structural and metadata bytes, then render chunks once.
     #[expect(clippy::too_many_lines, reason = "one ordered format and exact-budget transaction")]
     fn format(self, results: &[client::SearchResult], include_public_results: bool) -> BudgetedSearchResults {
-        let empty_model_messages = model_context_messages(
-            self.source_id,
-            self.output_index,
-            self.response_identity_hash,
-            self.query,
-            "",
-        );
-        let structural_bytes = bounded_json_size(&empty_model_messages, self.remaining_model_bytes)
-            .ok()
-            .flatten();
+        let structural_bytes = {
+            let empty_model_messages = model_context_messages(
+                self.source_id,
+                self.output_index,
+                self.response_identity_hash,
+                self.query,
+                "",
+            );
+            bounded_json_size(&empty_model_messages, self.remaining_model_bytes)
+                .ok()
+                .flatten()
+        };
         let max_context_bytes = structural_bytes
             .and_then(|bytes| self.remaining_model_bytes.checked_sub(bytes))
             .unwrap_or_default();
@@ -1580,7 +1630,9 @@ fn bounded_string_copy(value: &str, max_bytes: usize) -> String {
 /// Join model-facing query metadata without duplicating more than one query's
 /// maximum outbound byte allowance.
 fn join_queries_bounded(queries: &[String]) -> (String, bool) {
-    let mut joined = String::new();
+    let (joined_size, truncated) = joined_query_size(queries);
+    // A known exact capacity avoids a transient old-plus-grown String owner.
+    let mut joined = String::with_capacity(joined_size);
     for query in queries {
         let separator_bytes = usize::from(!joined.is_empty());
         let Some(next_len) = joined
@@ -1588,17 +1640,36 @@ fn join_queries_bounded(queries: &[String]) -> (String, bool) {
             .checked_add(separator_bytes)
             .and_then(|length| length.checked_add(query.len()))
         else {
-            return (joined, true);
+            break;
         };
-        if next_len > MAX_QUERY_BYTES {
-            return (joined, true);
+        if next_len > joined_size {
+            break;
         }
         if separator_bytes != 0 {
             joined.push('\n');
         }
         joined.push_str(query);
     }
-    (joined, false)
+    (joined, truncated)
+}
+
+/// Project the same bounded join without allocating its second query owner.
+fn joined_query_size(queries: &[String]) -> (usize, bool) {
+    let mut joined_size = 0_usize;
+    for query in queries {
+        let separator_bytes = usize::from(joined_size != 0);
+        let Some(next_size) = joined_size
+            .checked_add(separator_bytes)
+            .and_then(|size| size.checked_add(query.len()))
+        else {
+            return (joined_size, true);
+        };
+        if next_size > MAX_QUERY_BYTES {
+            return (joined_size, true);
+        }
+        joined_size = next_size;
+    }
+    (joined_size, false)
 }
 
 /// Return whether one output item still requires local file-search execution.

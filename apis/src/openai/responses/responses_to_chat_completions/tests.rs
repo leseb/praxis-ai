@@ -11,10 +11,11 @@ use serde_json::json;
 
 use super::{
     ARMED_KEY, CREATED_AT_KEY, RESPONSE_STATUS_KEY, RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM,
-    ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
+    ResponsesToChatCompletionsFilter, error::normalize_provider_error, finite_translation_fits, outbound_source_fits,
+    reject_incompatible_reasoning, stream::StreamConverter,
 };
 use crate::openai::{
-    responses::state::ResponsesState,
+    responses::state::{ClientToolEcho, ResponsesState},
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
 
@@ -31,6 +32,141 @@ fn wide_stream_limits() -> super::stream::StreamLimits {
     }
 }
 
+#[tokio::test]
+async fn budget_failure_after_completed_terminal_suppresses_later_provider_chunks() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_complete_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.as_ref().is_some_and(|chunk| {
+        chunk
+            .windows(b"event: response.completed".len())
+            .any(|window| window == b"event: response.completed")
+    }));
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(filter.on_response_body(&mut context, &mut body, false).is_err());
+    assert!(body.is_none());
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+
+    // A fail-open response pipeline may call this filter again after the error.
+    body = Some(Bytes::from_static(b"data: {\"provider_private\":true}\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none(), "raw Chat bytes must never resume after budget failure");
+    body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none());
+}
+
+#[test]
+fn chat_stream_meter_includes_fixed_tool_snapshots_once() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hello"}));
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "tool".to_owned()),
+        json!({"schema": "x".repeat(4_096)}),
+    );
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"name": "client-tool", "description": "y".repeat(4_096)})],
+        tool_choice: json!("auto"),
+    });
+    let mut converter = StreamConverter::new("resp_tools".to_owned(), 1, wide_stream_limits());
+    let stable = converter.shared_stable_bytes(&state, usize::MAX).unwrap();
+    let changing = state
+        .stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+        .unwrap();
+    assert_eq!(stable + changing, state.retained_payload_bytes().unwrap());
+
+    state.mcp_tool_map.clear();
+    state.client_tool_echo = None;
+    let mut next_stream = StreamConverter::new("resp_next".to_owned(), 2, wide_stream_limits());
+    let next_stable = next_stream.shared_stable_bytes(&state, usize::MAX).unwrap();
+    assert!(
+        next_stable < stable,
+        "the next stream remeasures discarded tool snapshots"
+    );
+    assert_eq!(
+        next_stable
+            + state
+                .stream_changing_payload_bytes_bounded_with_cached_output(usize::MAX)
+                .unwrap(),
+        state.retained_payload_bytes().unwrap()
+    );
+}
+
+#[test]
+fn chat_stream_current_output_cache_reuses_and_invalidates() {
+    let mut state = ResponsesState::from_request_body(json!({"input": "hello", "stream": true}));
+    state.response_object = json!({"output": [{"text": "x".repeat(1_048_576)}]});
+    let mut converter = StreamConverter::new("resp_cached".to_owned(), 1, wide_stream_limits());
+    let limit = 4 * 1_048_576;
+    let initial = converter.current_output_bytes(&state, limit).unwrap();
+    for _ in 0..100 {
+        assert_eq!(converter.current_output_bytes(&state, limit), Some(initial));
+    }
+    assert_eq!(converter.current_output_measurements(), 1);
+
+    state.response_object["output"][0]["text"] = json!("\u{0001}".repeat(1_048_576));
+    state.mark_response_object_changed();
+    assert!(
+        converter.current_output_bytes(&state, limit).is_none(),
+        "escaped rewrite exceeds this budget"
+    );
+    assert_eq!(converter.current_output_measurements(), 2);
+}
+
 #[test]
 fn first_stream_callback_reserves_both_request_echo_lifecycle_frames() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -39,7 +175,7 @@ fn first_stream_callback_reserves_both_request_echo_lifecycle_frames() {
         "model": "gpt-4.1", "stream": true, "input": "hi", "instructions": "x".repeat(100_000)
     }));
     state.apply_retained_payload_limit(600_000);
-    let mut converter = super::stream::StreamConverter::new("resp_echo".to_owned(), 1, wide_stream_limits());
+    let mut converter = StreamConverter::new("resp_echo".to_owned(), 1, wide_stream_limits());
     converter.set_echo_projection(&state.request_body, &state.tools, None);
     context.extensions.insert(state);
     assert!(
@@ -57,7 +193,7 @@ fn later_stream_round_reserves_original_tool_choice_echo() {
     }));
     state.original_tool_choice = Some(json!({"type": "function", "name": "x".repeat(100_000)}));
     state.apply_retained_payload_limit(600_000);
-    let mut converter = super::stream::StreamConverter::new("resp_echo".to_owned(), 1, wide_stream_limits());
+    let mut converter = StreamConverter::new("resp_echo".to_owned(), 1, wide_stream_limits());
     converter.set_echo_projection(&state.request_body, &state.tools, state.original_tool_choice.as_ref());
     context.extensions.insert(state);
     assert!(
@@ -72,7 +208,7 @@ fn batched_tool_deltas_stop_before_repeated_ids_fill_the_wire_buffer() {
     let mut context = crate::test_utils::make_filter_context(&request);
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
     state.apply_retained_payload_limit(8 * 1024 * 1024);
-    let mut converter = super::stream::StreamConverter::new("resp_batched".to_owned(), 1, wide_stream_limits());
+    let mut converter = StreamConverter::new("resp_batched".to_owned(), 1, wide_stream_limits());
     converter.set_echo_projection(&state.request_body, &state.tools, None);
     context.extensions.insert(state);
     let initial = format!(
@@ -129,6 +265,479 @@ fn batched_tool_deltas_stop_before_repeated_ids_fill_the_wire_buffer() {
     converter.push_into(batch.as_bytes(), &inputs, &mut out).unwrap();
     assert!(converter.callback_budget_failed());
     assert!(out.is_empty(), "the offending callback must not expose partial deltas");
+}
+
+#[tokio::test]
+async fn committed_chat_stream_without_finalizer_emits_budget_error_in_band() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        context.get_metadata(RESPONSE_TRANSFORM_KEY),
+        Some(RESPONSE_TRANSFORM_STREAM)
+    );
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_budget", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": null}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        body.as_ref().is_some_and(|bytes| bytes
+            .windows(b"event: response.created".len())
+            .any(|part| part == b"event: response.created")),
+        "the first translated SSE chunk must commit before the overflow: {body:?}"
+    );
+    let emitted_sequences = body
+        .as_ref()
+        .unwrap()
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"data: "))
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter_map(|event| event.get("sequence_number")?.as_u64())
+        .collect::<Vec<_>>();
+    assert!(!emitted_sequences.is_empty());
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_budget", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let error = body.expect("a committed stream without a finalizer must emit its own SSE error");
+    let error = std::str::from_utf8(&error).unwrap();
+    assert!(error.starts_with("event: error\n"), "{error}");
+    assert!(error.contains("server_error"), "{error}");
+    assert!(!error.contains("response.completed"), "{error}");
+    let error_data = error.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+    let error_event: serde_json::Value = serde_json::from_str(error_data).unwrap();
+    assert_eq!(
+        error_event["sequence_number"].as_u64(),
+        emitted_sequences.last().and_then(|sequence| sequence.checked_add(1)),
+        "the fallback terminal must continue the delivered SSE sequence"
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+
+    body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none(), "later provider frames cannot follow the terminal error");
+}
+
+#[tokio::test]
+async fn failed_chat_stream_drops_later_over_budget_provider_chunk() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(
+        &serde_yaml::from_str::<serde_yaml::Value>("max_stream_events: 2").unwrap(),
+    )
+    .unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_failed_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_failed", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": null}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let first = body.expect("event cap must emit a failed terminal");
+    assert!(
+        first
+            .windows(b"event: response.failed".len())
+            .any(|window| window == b"event: response.failed")
+    );
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_failed", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        body.is_none(),
+        "no second terminal may follow response.failed: {body:?}"
+    );
+
+    body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none());
+}
+
+#[tokio::test]
+async fn completed_chat_stream_rejects_later_over_budget_provider_chunk() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_chat_complete_budget");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true, "store": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+
+    let first_chunk = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })
+    );
+    let mut body = Some(Bytes::from(first_chunk));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        body.as_ref().is_some_and(|chunk| chunk
+            .windows(b"event: response.completed".len())
+            .any(|window| window == b"event: response.completed")),
+        "the successful terminal must already be on the wire"
+    );
+
+    let oversized_chunk = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_complete", "object": "chat.completion.chunk", "model": "m", "created": 1,
+            "choices": [{"index": 0, "delta": {"content": "x".repeat(16_384)}, "finish_reason": null}]
+        })
+    );
+    body = Some(Bytes::from(oversized_chunk));
+    assert!(
+        filter.on_response_body(&mut context, &mut body, false).is_err(),
+        "post-terminal provider data must fail the transport without a second SSE terminal"
+    );
+    assert!(body.is_none(), "the offending provider bytes must be discarded");
+}
+
+#[test]
+fn committed_chat_stream_with_finalizer_leaves_terminal_error_to_parser() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(super::super::STREAM_ERROR_FINALIZER_ARMED_KEY, "true");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": true
+    })));
+    let mut body = Some(Bytes::from_static(b"provider bytes"));
+
+    super::record_converter_budget_failure(&mut context, &mut body);
+
+    assert!(body.is_none(), "the armed logical parser emits the recorded error once");
+    assert_eq!(
+        context.get_metadata("responses.stream_error_code"),
+        Some("server_error")
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn chat_translation_admits_small_and_rejects_oversized_owners() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "stream": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    assert!(outbound_source_fits(&context));
+    assert!(finite_translation_fits(&context, br#"{"choices":[]}"#));
+    let many_small_strings = format!("[{}]", vec!["\"\""; 1_200].join(","));
+    assert!(
+        !finite_translation_fits(&context, many_small_strings.as_bytes()),
+        "small JSON strings still create many owned values"
+    );
+
+    let mut state = context.extensions.remove::<ResponsesState>().unwrap();
+    state.apply_retained_payload_limit(4_096);
+    context.extensions.insert(state);
+    assert!(!outbound_source_fits(&context));
+    assert!(!finite_translation_fits(&context, &vec![b'x'; 4_096]));
+}
+
+#[test]
+fn finite_chat_preflight_reserves_expanded_function_tool_echo() {
+    let tools: Vec<_> = (0..14_000)
+        .map(|index| json!({"type": "function", "name": format!("t{index}")}))
+        .collect();
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "x", "stream": false, "tools": tools
+    }));
+    state.apply_retained_payload_limit(4_000_000);
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.extensions.insert(state);
+
+    assert!(
+        !finite_translation_fits(&context, br#"{"choices":[]}"#),
+        "expanded response tool schemas and simultaneous wire copies exceed the budget"
+    );
+}
+
+#[test]
+fn finite_chat_preflight_reserves_duplicated_tool_call_id_and_wire_growth() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "x", "stream": false
+    }));
+    state.apply_retained_payload_limit(850_000);
+    context.extensions.insert(state);
+    let body = json!({
+        "id": "chatcmpl_test",
+        "object": "chat.completion",
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "x".repeat(100_000),
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+    .to_string();
+    assert!(body.len() < 101_000);
+    assert!(
+        !finite_translation_fits(&context, body.as_bytes()),
+        "the duplicated ID and old/new serialized Vec capacities exceed the budget"
+    );
+}
+
+#[tokio::test]
+async fn finite_chat_buffer_uses_remaining_aggregate_headroom() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": false
+    }));
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    context.response_body_mode = BodyMode::StreamBuffer {
+        max_bytes: Some(67_108_864),
+    };
+
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let BodyMode::StreamBuffer { max_bytes: Some(cap) } = context.response_body_mode else {
+        panic!("finite Chat must stay buffered");
+    };
+    assert!(
+        cap > 0 && cap < 8_192,
+        "the active budget must reduce the prior 64 MiB cap"
+    );
+}
+
+#[tokio::test]
+async fn finite_chat_client_tool_restore_accepts_unframed_composed_headers() {
+    let chat = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let compat = crate::openai::responses::openai_client_tool_compat::ClientToolCompatFilter::from_config(
+        &serde_yaml::Value::Null,
+    )
+    .unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": false
+    }));
+    state.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "custom", "name": "run_python"})],
+        tool_choice: json!("auto"),
+    });
+    state.apply_retained_payload_limit(4 * 1024 * 1024);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("512"));
+    context.response_header = Some(response);
+    assert!(matches!(
+        chat.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        !context
+            .response_header
+            .as_ref()
+            .unwrap()
+            .headers
+            .contains_key(http::header::CONTENT_LENGTH)
+    );
+    let chat_cap = match context.response_body_mode {
+        BodyMode::StreamBuffer { max_bytes: Some(cap) } => cap,
+        other => panic!("expected a bounded Chat buffer, got {other:?}"),
+    };
+    context.current_filter_id = Some(1);
+    assert!(matches!(
+        compat.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        context.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(chat_cap)
+        },
+        "compat preserves the adapter's already admitted raw buffer cap",
+    );
+}
+
+#[test]
+fn chat_stream_budget_failure_is_sticky_and_emits_no_success_terminal() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": true
+    }));
+    state.apply_retained_payload_limit(4_096);
+    context.extensions.insert(state);
+    let mut converter = StreamConverter::new(
+        "resp_budget".to_owned(),
+        1_700_000_000,
+        super::config::ResponsesToChatCompletionsConfig::default().stream_limits(),
+    );
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    converter.set_echo_projection(&state.request_body, &state.tools, state.original_tool_choice.as_ref());
+    context.insert_filter_state(converter);
+
+    let mut body = Some(Bytes::from(vec![b'x'; 256]));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let failed = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
+    assert!(failed.contains("event: error"));
+    assert!(!failed.contains("response.completed"));
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+
+    let mut later = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut later, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(later.is_none(), "later provider data cannot revive the failed stream");
 }
 
 #[test]
@@ -1828,6 +2437,415 @@ async fn malformed_success_aborts_after_headers_are_sent() {
 }
 
 #[tokio::test]
+async fn finite_success_rejects_near_limit_body_before_translation() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_budgeted");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": false, "store": true
+    }));
+    state.apply_retained_payload_limit(4096);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({
+            "id": "chatcmpl_large", "object": "chat.completion", "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "x".repeat(64 * 1024)},
+                "finish_reason": "stop"}]
+        })
+        .to_string(),
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 502),
+        other => panic!("expected response-side budget rejection, got {other:?}"),
+    }
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_success_reserves_expanded_content_parts_before_translation() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_many_parts");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": false, "store": false
+    }));
+    state.apply_retained_payload_limit(1024 * 1024);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({
+            "id": "chatcmpl_parts", "object": "chat.completion", "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": vec![json!({"text": "x"}); 8192]},
+                "finish_reason": "stop"}]
+        })
+        .to_string(),
+    );
+    assert!(original.len() < 128 * 1024, "the provider body fits well under the cap");
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "expanded content parts must be rejected before translation: {action:?}"
+    );
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_success_reserves_numeric_normalization_before_translation() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_numeric_logprobs");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini", "input": "hello", "stream": false, "store": false
+    }));
+    state.apply_retained_payload_limit(300 * 1024);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let numbers = vec!["1e15"; 8192].join(",");
+    let original = Bytes::from(format!(
+        r#"{{"id":"chatcmpl_numeric","object":"chat.completion","choices":[{{"message":{{"role":"assistant","content":"x"}},"logprobs":{{"content":[{numbers}]}},"finish_reason":"stop"}}]}}"#
+    ));
+    assert!(original.len() < 64 * 1024, "the exponent-form provider body is compact");
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "expanded logprobs must be rejected before translation: {action:?}"
+    );
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_success_reserves_duplicated_call_id_and_wire_capacity() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_call_id");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": false, "store": false,
+        "tools": [{"type": "function", "name": "f"}]
+    }));
+    state.apply_retained_payload_limit(750_000);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({
+            "id": "chatcmpl_call", "object": "chat.completion", "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [{
+                "id": "i".repeat(100_000), "type": "function",
+                "function": {"name": "f", "arguments": "{}"}
+            }]}, "finish_reason": "tool_calls"}]
+        })
+        .to_string(),
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "duplicated call IDs and wire capacity must be reserved: {action:?}"
+    );
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_success_reserves_fixed_resource_fields_near_limit() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_fixed");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": false, "store": false
+    }));
+    state.accumulated_output.push(json!({
+        "id": "msg_prior", "type": "message", "status": "completed", "role": "assistant",
+        "content": [{"type": "output_text", "text": "x".repeat(1200)}]
+    }));
+    state.apply_retained_payload_limit(4096);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]}).to_string(),
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "fixed Responses resource fields must be reserved: {action:?}"
+    );
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+async fn assert_finite_budget_rejection(request_body: serde_json::Value, limit: usize, original: Bytes) {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_echo");
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.apply_retained_payload_limit(limit);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "finite translation must reject before allocating: {action:?}"
+    );
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_success_reserves_normalized_function_tool_echo() {
+    let tools = (0..100)
+        .map(|index| json!({"type": "function", "name": format!("f{index}")}))
+        .collect::<Vec<_>>();
+    let request_body = json!({
+        "model": "m", "input": "hi", "stream": false, "store": false, "tools": tools
+    });
+    let provider_body = Bytes::from(
+        json!({"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]}).to_string(),
+    );
+
+    assert_finite_budget_rejection(request_body, 32_000, provider_body).await;
+}
+
+#[tokio::test]
+async fn finite_success_reserves_long_request_echo_wire_growth() {
+    let request_body = json!({
+        "model": "m", "input": "x".repeat(8192), "stream": false, "store": false
+    });
+    let provider_body = Bytes::from(
+        json!({"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]}).to_string(),
+    );
+
+    assert_finite_budget_rejection(request_body, 66_000, provider_body).await;
+}
+
+#[tokio::test]
+async fn finite_success_reserves_fixed_schema_at_wire_growth_boundary() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let response_id = "resp_12345678901234567890123456789012";
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", response_id);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "x".repeat(11), "stream": false, "store": false
+    }));
+    state.response_id = Some(response_id.to_owned());
+    state.apply_retained_payload_limit(4096);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(
+        json!({"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]}).to_string(),
+    );
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "fixed schema and wire growth must be reserved: {action:?}"
+    );
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn finite_provider_error_rejects_over_budget_body_before_normalization() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "stream": false, "store": false
+    }));
+    state.apply_retained_payload_limit(4096);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from(json!({"error": {"message": "x".repeat(64 * 1024)}}).to_string());
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "provider error normalization must check the aggregate budget before parsing: {action:?}"
+    );
+    assert_eq!(body, None, "rejected provider body must be discarded");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn committed_stream_finite_provider_error_without_finalizer_emits_in_band_budget_failure() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi", "stream":true, "store":false}));
+    state.iteration = 1;
+    state.apply_retained_payload_limit(65_536);
+    context.extensions.insert(state);
+    context.extensions.insert(super::ObservedResponsesSse);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut body = Some(Bytes::from(json!({"error":{"message":"x".repeat(8192)}}).to_string()));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let error = body.expect("without a finalizer, the committed stream must emit the error directly");
+    let error = std::str::from_utf8(&error).unwrap();
+    assert!(error.starts_with("event: error\n"), "{error}");
+    assert!(error.contains("server_error"), "{error}");
+    assert!(!error.contains("response.completed"), "{error}");
+    assert_eq!(
+        context.get_metadata("responses.stream_error_code"),
+        Some("server_error")
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        context.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "later iterative rounds must stop after the terminal error"
+    );
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+}
+
+#[tokio::test]
 async fn malformed_success_shape_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
@@ -2348,4 +3366,126 @@ async fn default_dialect_leaves_reasoning_content_unextracted() {
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "message");
     assert!(output.iter().all(|item| item["type"] != "reasoning"));
+}
+
+#[test]
+fn outbound_chat_translation_rejects_before_allocating_near_retained_limit() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi"}));
+    let message = json!({"role":"assistant", "content":"x".repeat(16_384)});
+    state.messages.push(message.clone());
+    state.persisted_messages.push(message);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    context.extensions.insert(state);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let result = filter.translated_request_bytes(&mut context).unwrap();
+    let Err(SelectedUpstreamBodyOutcome::Reject(rejection)) = result else {
+        panic!("expected initial outbound translation budget rejection");
+    };
+    assert_eq!(rejection.status, 413);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_request_error");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn outbound_chat_translation_overflow_on_continuation_remains_502() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi"}));
+    state.iteration = 1;
+    let message = json!({"role":"assistant", "content":"x".repeat(16_384)});
+    state.messages.push(message.clone());
+    state.persisted_messages.push(message);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    context.extensions.insert(state);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let result = filter.translated_request_bytes(&mut context).unwrap();
+    let Err(SelectedUpstreamBodyOutcome::Reject(rejection)) = result else {
+        panic!("expected continuation outbound translation budget rejection");
+    };
+    assert_eq!(rejection.status, 502);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(error["error"]["code"], "server_error");
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn committed_stream_outbound_budget_failure_emits_terminal_sse_error() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"hi", "stream":true}));
+    state.iteration = 1;
+    let message = json!({"role":"assistant", "content":"x".repeat(16_384)});
+    state.messages.push(message.clone());
+    state.persisted_messages.push(message);
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 100);
+    context.extensions.insert(state);
+    context.extensions.insert(super::ObservedResponsesSse);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let result = filter.translated_request_bytes(&mut context).unwrap();
+    let Err(SelectedUpstreamBodyOutcome::Reject(rejection)) = result else {
+        panic!("expected a terminal budget rejection after SSE commitment");
+    };
+    assert_eq!(rejection.status, 200, "committed SSE cannot switch to HTTP 502");
+    assert!(
+        rejection
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type") && value == "text/event-stream"),
+        "the terminal error keeps SSE framing: {:?}",
+        rejection.headers
+    );
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap());
+    assert!(body.contains("event: error\n"), "one terminal error is emitted: {body}");
+    assert!(
+        body.contains("server_error"),
+        "the budget failure is server side: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "no successful completion follows exhaustion: {body}"
+    );
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed,
+        "successful response persistence is disabled"
+    );
+}
+
+#[test]
+fn outbound_chat_translation_admits_large_prompt_with_sufficient_payload_headroom() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model":"m", "input":"x".repeat(512 * 1024)}));
+    let retained = state.retained_payload_bytes().unwrap();
+    // Room for the converted tree and serialization buffers, including one
+    // Vec growth boundary. The original request is already counted in state.
+    state.apply_retained_payload_limit(retained + 4_196_668);
+    context.extensions.insert(state);
+    let filter = ResponsesToChatCompletionsFilter {
+        config: super::config::ResponsesToChatCompletionsConfig::default(),
+    };
+
+    let translated = filter.translated_request_bytes(&mut context).unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&translated).unwrap();
+    assert_eq!(body["messages"][0]["content"].as_str().map(str::len), Some(512 * 1024));
+    assert_ne!(context.get_metadata("responses.skip_persist"), Some("true"));
 }

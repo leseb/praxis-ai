@@ -39,6 +39,10 @@ pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use responses::FileResolveFilter;
+#[cfg(feature = "store")]
+pub use responses::final_conversation_buffer_budget_rejection;
+#[cfg(feature = "store")]
+pub use responses::finish_unselected_store_conversation_append;
 #[cfg(feature = "openai-responses-openapi")]
 pub use responses::implementation_openapi_json as responses_openapi_json;
 #[cfg(feature = "openai-responses")]

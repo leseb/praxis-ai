@@ -30,6 +30,8 @@
 pub(crate) mod agentic_loop;
 #[cfg(feature = "openai-responses")]
 mod body_limits;
+#[cfg(feature = "openai-responses")]
+pub(crate) mod budget_error;
 #[cfg(feature = "openai-compact")]
 pub(crate) mod compact;
 mod config;
@@ -76,8 +78,19 @@ pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticBudgetPolicy;
+/// At least one nonempty Responses SSE chunk reached the client-facing stream.
+/// This survives IRR step transitions; parser arming and a `stream:true` request
+/// alone do not establish a committed response.
+#[cfg(feature = "openai-responses")]
+pub(crate) struct ObservedResponsesSse;
+/// Request-shared marker for a stream-events parser that can emit a recorded
+/// terminal error after a translated provider callback drops its body.
+#[cfg(feature = "openai-responses")]
+pub(crate) const STREAM_ERROR_FINALIZER_ARMED_KEY: &str = "responses.stream_error_finalizer_armed";
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "openai-responses")]
+pub(crate) use agentic_loop::buffered_parsed_json_bytes_upper_bound;
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
@@ -133,6 +146,99 @@ use crate::{
     },
     promotion::is_promotable_value,
 };
+
+/// Check the effective response buffer after every selected header filter has
+/// run. The server-injected store gate calls this from the last response hook.
+/// A noncanonical conversation response has no known wire size yet, so a
+/// framework buffer larger than remaining aggregate headroom must be rejected
+/// before its first chunk. Canonical completed turns were already serialized
+/// and admitted, including their separate wire/buffer owner.
+#[cfg(feature = "store")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the final response mode gate checks status, type, canonical state, and headroom"
+)]
+pub fn final_conversation_buffer_budget_rejection(ctx: &HttpFilterContext<'_>) -> Option<Rejection> {
+    if ctx.get_metadata("openai_responses_format.has_conversation") != Some("true") {
+        return None;
+    }
+    let response = ctx.response_header.as_ref()?;
+    let content_type = response.headers.get(http::header::CONTENT_TYPE)?.to_str().ok()?;
+    if !response.status.is_success()
+        || !content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+    {
+        return None;
+    }
+    let state = ctx.extensions.get::<state::ResponsesState>()?;
+    let limit = state.retained_payload_limit()?;
+    if buffered_canonical_completed(ctx) {
+        return None;
+    }
+    let remaining = state
+        .retained_payload_bytes_bounded(limit)
+        .and_then(|used| limit.checked_sub(used));
+    let fits = remaining.is_some_and(|remaining| match &ctx.response_body_mode {
+        BodyMode::StreamBuffer { max_bytes } => max_bytes.is_some_and(|cap| cap <= remaining),
+        _ => true,
+    });
+    (!fits).then(|| {
+        error::responses_error_rejection(
+            502,
+            "server_error",
+            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes before response buffering",
+        )
+    })
+}
+
+/// Complete a deferred conversation append when response conditions excluded
+/// the store after it had armed persistence during the request phase.
+///
+/// # Errors
+///
+/// Returns an error only if the delegated conversation hook cannot run.
+#[cfg(feature = "store")]
+#[cfg_attr(
+    not(feature = "openai-conversations"),
+    expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the conversation-enabled hook requires mutable context"
+    )
+)]
+pub async fn finish_unselected_store_conversation_append(
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<FilterAction, FilterError> {
+    #[cfg(feature = "openai-conversations")]
+    {
+        if ctx.get_metadata("responses.skip_persist") == Some("true") {
+            return Ok(FilterAction::Continue);
+        }
+        if !store::mark_store_response_header_skipped(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+        return super::conversations::append_after_store_response(ctx).await;
+    }
+    #[cfg(not(feature = "openai-conversations"))]
+    {
+        let _ = ctx;
+        Ok(FilterAction::Continue)
+    }
+}
+
+/// A buffered canonical response is usable by outer header hooks only after
+/// the agentic loop finalized this selected round. A completed-looking state
+/// from an earlier round or an unselected branch is not sufficient.
+#[cfg(feature = "store")]
+pub(crate) fn buffered_canonical_completed(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<state::ResponsesState>().is_some_and(|state| {
+        state.buffered_canonical_finalized
+            && state.response_object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+    })
+}
 
 /// Reduce an ordinary request-body action to the bound-upstream body's
 /// deliberately narrow continue-or-reject contract.
@@ -334,20 +440,246 @@ impl ResponsesFormatFilter {
     }
 }
 
-/// Conservative raw-body allowance before JSON parsing creates owned copies.
+/// Conservative body allowance before JSON parsing creates owned copies.
 #[cfg(feature = "openai-responses")]
 pub(crate) const INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER: usize = 8;
+
+/// Compare a JSON key with an ASCII selector, decoding escapes in place.
+/// Invalid escapes fail closed instead of allocating a decoded key.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "allocation-free JSON key decoding keeps escape handling local"
+)]
+fn selector_key_matches(raw: &[u8], target: &[u8]) -> Option<bool> {
+    fn hex_digit(byte: u8) -> Option<u16> {
+        match byte {
+            b'0'..=b'9' => Some(u16::from(byte - b'0')),
+            b'a'..=b'f' => Some(u16::from(byte - b'a' + 10)),
+            b'A'..=b'F' => Some(u16::from(byte - b'A' + 10)),
+            _ => None,
+        }
+    }
+
+    let mut index = 0;
+    let mut matched = 0;
+    while let Some(&byte) = raw.get(index) {
+        let (decoded, next) = if byte == b'\\' {
+            match *raw.get(index.checked_add(1)?)? {
+                b'u' => {
+                    let end = index.checked_add(6)?;
+                    let digits = raw.get(index + 2..end)?;
+                    let code = digits.iter().try_fold(0_u16, |code, digit| {
+                        code.checked_mul(16)?.checked_add(hex_digit(*digit)?)
+                    })?;
+                    let Ok(decoded) = u8::try_from(code) else {
+                        return Some(false);
+                    };
+                    (decoded, end)
+                },
+                b'"' => (b'"', index + 2),
+                b'\\' => (b'\\', index + 2),
+                b'/' => (b'/', index + 2),
+                b'b' => (8, index + 2),
+                b'f' => (12, index + 2),
+                b'n' => (b'\n', index + 2),
+                b'r' => (b'\r', index + 2),
+                b't' => (b'\t', index + 2),
+                _ => return None,
+            }
+        } else {
+            (byte, index + 1)
+        };
+        if target.get(matched) != Some(&decoded) {
+            return Some(false);
+        }
+        matched += 1;
+        index = next;
+    }
+    Some(matched == target.len())
+}
+
+/// Detect top-level, non-null history selectors without allocating payload.
+/// Malformed structure is conservatively admitted to the size preflight.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass structural scan must fail closed on malformed nesting"
+)]
+fn may_rehydrate_history(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'{') {
+        return true;
+    }
+    let mut stack = [0_u8; 128];
+    let mut depth = 0_usize;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'"' {
+            let start = index + 1;
+            index = start;
+            let mut escaped = false;
+            while let Some(&part) = bytes.get(index) {
+                if escaped {
+                    escaped = false;
+                } else if part == b'\\' {
+                    escaped = true;
+                } else if part == b'"' {
+                    break;
+                }
+                index += 1;
+            }
+            if bytes.get(index) != Some(&b'"') {
+                return true;
+            }
+            let Some(raw_key) = bytes.get(start..index) else {
+                return true;
+            };
+            index += 1;
+            if depth == 1 {
+                let mut tail = index;
+                while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                    tail += 1;
+                }
+                if bytes.get(tail) == Some(&b':') {
+                    let matched = selector_key_matches(raw_key, b"previous_response_id")
+                        .zip(selector_key_matches(raw_key, b"conversation"));
+                    let Some((previous, conversation)) = matched else {
+                        return true;
+                    };
+                    if previous || conversation {
+                        tail += 1;
+                        while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                            tail += 1;
+                        }
+                        if bytes.get(tail..tail.saturating_add(4)) != Some(b"null") {
+                            return true;
+                        }
+                        tail += 4;
+                        while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                            tail += 1;
+                        }
+                        if !matches!(bytes.get(tail), Some(b',' | b'}')) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        match byte {
+            b'{' | b'[' => {
+                if depth == stack.len() {
+                    return true;
+                }
+                let Some(slot) = stack.get_mut(depth) else {
+                    return true;
+                };
+                *slot = byte;
+                depth += 1;
+            },
+            b'}' | b']' => {
+                let Some(open) = depth.checked_sub(1).and_then(|slot| stack.get(slot)).copied() else {
+                    return true;
+                };
+                if !matches!((open, byte), (b'{', b'}') | (b'[', b']')) {
+                    return true;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return bytes
+                        .get(index + 1..)
+                        .is_none_or(|tail| tail.iter().any(|byte| !byte.is_ascii_whitespace()));
+                }
+            },
+            _ => {},
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Reserve JSON node headers and number normalization before the classifier
+/// parses a create request. The raw-byte multiplier covers copies of string
+/// contents; tiny values need separate space because their owned nodes can be
+/// much larger than their wire spelling. This scan allocates no payload.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass JSON token scan before parser allocation"
+)]
+fn initial_json_parse_peak_bytes(bytes: &[u8]) -> Option<usize> {
+    let (mut objects, mut arrays, mut strings, mut scalars) = (0_usize, 0_usize, 0_usize, 0_usize);
+    let (mut in_string, mut escaped, mut in_number) = (false, false, false);
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => {
+                strings = strings.checked_add(1)?;
+                in_string = true;
+                in_number = false;
+            },
+            b'{' => {
+                objects = objects.checked_add(1)?;
+                in_number = false;
+            },
+            b'[' => {
+                arrays = arrays.checked_add(1)?;
+                in_number = false;
+            },
+            b'-' | b'0'..=b'9' if !in_number => {
+                scalars = scalars.checked_add(1)?;
+                in_number = true;
+            },
+            b'-' | b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' if in_number => {},
+            b't' | b'f' | b'n' => {
+                scalars = scalars.checked_add(1)?;
+                in_number = false;
+            },
+            _ => in_number = false,
+        }
+    }
+    // Four canonical input projections can coexist with the parsed classifier
+    // value and the raw body. Per-node reserves include container capacity,
+    // scalar normalization (e.g. `1e15` expands when serialized), and clones.
+    let nodes = objects
+        .checked_add(arrays)?
+        .checked_add(strings)?
+        .checked_add(scalars)?;
+    bytes
+        .len()
+        .checked_mul(INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)?
+        .checked_add(nodes.checked_mul(256)?)
+}
 
 /// Reject a known oversized create body before classification parses JSON.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
-    if is_responses_create(&ctx.request.method, ctx.request.uri.path())
-        && let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>()
-    {
-        let raw_body_limit = policy.max_retained_bytes() / INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER;
-        if bytes.len() > raw_body_limit {
+    let policy = ctx.extensions.get::<AgenticBudgetPolicy>()?;
+    let path = ctx.request.uri.path().trim_end_matches('/');
+    let may_rehydrate = ctx.request.method == http::Method::POST
+        && matches!(path, "/v1/responses/input_tokens" | "/v1/responses/compact")
+        && may_rehydrate_history(bytes);
+    if is_responses_create(&ctx.request.method, ctx.request.uri.path()) || may_rehydrate {
+        let body_limit = policy.max_retained_bytes() / INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER;
+        // Exponent-form numbers can grow when serde_json materializes Values.
+        // Reserve that normalized size before the first owned JSON tree exists.
+        if bytes.len() > body_limit
+            || buffered_parsed_json_bytes_upper_bound(bytes).is_none_or(|parsed_bytes| parsed_bytes > body_limit)
+        {
             let message = format!(
-                "raw request body exceeds the {raw_body_limit}-byte limit derived from openai_agentic_loop.max_retained_bytes"
+                "request body exceeds the {body_limit}-byte admission limit derived from openai_agentic_loop.max_retained_bytes"
             );
             return Some(FilterAction::Reject(error::responses_error_rejection(
                 413,
@@ -355,8 +687,50 @@ pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]
                 &message,
             )));
         }
+        if initial_json_parse_peak_bytes(bytes).is_none_or(|peak| peak > policy.max_retained_bytes()) {
+            return Some(FilterAction::Reject(error::responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "request JSON structure exceeds openai_agentic_loop.max_retained_bytes before parsing",
+            )));
+        }
     }
     None
+}
+
+/// Create canonical request state and admit its independently retained owners.
+///
+/// Both Responses request filters use this boundary so store snapshots and the
+/// configured budget are applied before either can expose state to later filters.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn insert_budgeted_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+) -> Result<(), FilterAction> {
+    let mut state = state::ResponsesState::from_request_body(parsed);
+    state.response_id = Some(response_id.to_owned());
+    #[cfg(feature = "store")]
+    {
+        state.set_retained_external_payload_bytes(store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX));
+        state.store_persist_armed = store::request_persistence_armed(ctx);
+    }
+    if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+        state.apply_retained_payload_limit(policy.max_retained_bytes());
+        if !state.can_retain_payload(0) {
+            #[cfg(feature = "store")]
+            store::discard_retained_request_payload(ctx);
+            return Err(FilterAction::Reject(error::responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "initial request state exceeds openai_agentic_loop.max_retained_bytes",
+            )));
+        }
+    }
+    ctx.extensions.insert(state);
+    #[cfg(feature = "store")]
+    store::mark_retained_request_payload_charged(ctx);
+    Ok(())
 }
 
 #[async_trait]

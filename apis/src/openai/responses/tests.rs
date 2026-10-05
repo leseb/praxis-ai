@@ -7,6 +7,55 @@ use bytes::Bytes;
 
 use super::*;
 
+#[cfg(feature = "store")]
+#[test]
+fn final_conversation_buffer_guard_checks_effective_mode_after_wideners() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    let mut response = crate::test_utils::make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    let mut state = state::ResponsesState::default();
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 1024);
+    ctx.extensions.insert(state);
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: Some(1024) };
+    assert!(final_conversation_buffer_budget_rejection(&ctx).is_none());
+
+    // A later eligible response filter can ratchet the shared framework
+    // buffer to a larger cap after Store and Conversations selected 1024.
+    ctx.response_body_mode = BodyMode::StreamBuffer {
+        max_bytes: Some(MAX_JSON_BODY_BYTES),
+    };
+    let rejection = final_conversation_buffer_budget_rejection(&ctx).unwrap();
+    assert_eq!(rejection.status, 502);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(rejection.body.as_deref().unwrap()).unwrap()["error"]["type"],
+        "server_error"
+    );
+
+    // Canonical completed output has a known, separately admitted wire owner
+    // and may have been persisted before the final guard runs.
+    ctx.extensions
+        .get_mut::<state::ResponsesState>()
+        .unwrap()
+        .response_object = serde_json::json!({"status":"completed","output":[]});
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "done")
+        .unwrap();
+    ctx.extensions
+        .get_mut::<state::ResponsesState>()
+        .unwrap()
+        .buffered_canonical_finalized = true;
+    assert!(final_conversation_buffer_budget_rejection(&ctx).is_none());
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
@@ -263,12 +312,58 @@ async fn agentic_budget_rejects_raw_body_before_classification() {
     let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(
         error["error"]["message"],
-        "raw request body exceeds the 512-byte limit derived from openai_agentic_loop.max_retained_bytes"
+        "request body exceeds the 512-byte admission limit derived from openai_agentic_loop.max_retained_bytes"
     );
     assert!(
         ctx.get_metadata("openai_responses_format.format").is_none(),
         "classification must not parse or publish the oversized body"
     );
+}
+
+#[test]
+#[cfg(feature = "openai-responses")]
+fn history_selector_probe_handles_escaped_keys_without_allocating_payload() {
+    assert!(may_rehydrate_history(br#"{"prev\u0069ous_response_id":"resp_x"}"#));
+    assert!(may_rehydrate_history(br#"{"conversation":{"id":"conv_x"}}"#));
+    assert!(!may_rehydrate_history(br#"{"convers\u0061tion":null}"#));
+    assert!(!may_rehydrate_history(br#"{"input":{"conversation":"nested"}}"#));
+
+    let escaped_unknown_key = "\\u0061".repeat(20_000);
+    let without_history = format!(r#"{{"{escaped_unknown_key}":"x"}}"#);
+    assert!(!may_rehydrate_history(without_history.as_bytes()));
+    let with_history = format!(r#"{{"{escaped_unknown_key}":"x","previous_response_id":"resp_x"}}"#);
+    assert!(may_rehydrate_history(with_history.as_bytes()));
+}
+
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn agentic_budget_rejects_numeric_expansion_before_classification() {
+    let filter = make_filter("on_invalid: reject");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 24000").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let numbers = vec!["1e15"; 500].join(",");
+    let raw = format!(
+        r#"{{"model":"test","input":[{{"type":"tool_search_output","tools":[{{"type":"function","name":"pick","parameters":{{"type":"number","enum":[{numbers}]}}}}]}}]}}"#
+    );
+    assert!(raw.len() < 3_000, "raw bytes alone fit the old eightfold allowance");
+    let mut body = Some(Bytes::from(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("numeric normalization must be rejected before JSON parsing");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(ctx.get_metadata("openai_responses_format.format").is_none());
+}
+
+#[test]
+#[cfg(feature = "openai-responses")]
+fn agentic_budget_projection_allows_large_text_with_few_json_nodes() {
+    let raw = serde_json::json!({"model": "test", "input": "x".repeat(64 * 1024)}).to_string();
+    assert!(initial_json_parse_peak_bytes(raw.as_bytes()).is_some_and(|bytes| bytes < 1_048_576));
 }
 
 // -----------------------------------------------------------------------------
