@@ -2515,10 +2515,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks every streaming consumer of the stable context"
-    )]
     fn unchanged_context_fields_use_the_stream_stable_charge() {
         let mut state = ResponsesState::default();
         let stable_before = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
