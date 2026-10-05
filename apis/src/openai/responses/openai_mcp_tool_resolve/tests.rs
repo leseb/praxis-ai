@@ -3247,6 +3247,81 @@ async fn expanded_body_at_exact_limit_continues() {
     );
 }
 
+/// Replacing a named MCP selector shrinks it. The local wire cap applies to
+/// the rewritten body, not the original selector plus its replacement.
+#[tokio::test]
+async fn named_selector_rewrite_at_exact_body_limit_continues() {
+    let server_url = "http://8.8.8.8/mcp";
+    let mut body_json = mcp_body(server_url);
+    body_json["tool_choice"] = serde_json::json!({
+        "type": "mcp", "server_label": "weather", "name": "get_weather"
+    });
+    let cached = vec![serde_json::json!({"name": "get_weather"})];
+    let mut rewritten_len = None;
+
+    for cap in [1_048_576, 0] {
+        let filter = filter_with_max_rewritten_body_bytes(rewritten_len.unwrap_or(cap));
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+        let mut state = ResponsesState::from_request_body(body_json.clone());
+        state.previous_tools = vec![serde_json::json!({
+            "server_label": "weather", "server_url": server_url, "tools": cached,
+        })];
+        ctx.extensions.insert(state);
+        let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "named selector should fit its final wire cap"
+        );
+        let len = body.unwrap().len();
+        if let Some(exact) = rewritten_len {
+            assert_eq!(len, exact);
+        } else {
+            rewritten_len = Some(len);
+        }
+    }
+}
+
+/// Wire preflight must match the actual replacement across named, server-wide,
+/// repeated, unresolved, and resolved-empty selectors.
+#[test]
+fn tool_choice_wire_projection_matches_rewritten_choices() {
+    let tool_map = HashMap::from([
+        (("weather".to_owned(), "rain".to_owned()), serde_json::json!({})),
+        (("weather".to_owned(), "sun".to_owned()), serde_json::json!({})),
+    ]);
+    let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
+    let choices = [
+        serde_json::json!({"type":"mcp","server_label":"weather","name":"rain"}),
+        serde_json::json!({"type":"mcp","server_label":"weather"}),
+        serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[
+            {"type":"mcp","server_label":"weather"},
+            {"type":"mcp","server_label":"weather","name":"sun"},
+            {"type":"mcp","server_label":"unknown"},
+            {"type":"function","name":"plain"}
+        ]}),
+        serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[
+            {"type":"mcp","server_label":"empty"}
+        ]}),
+        serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[
+            {"type":"mcp","server_label":"unknown"}
+        ]}),
+        serde_json::json!("none"),
+    ];
+    for choice in choices {
+        let original = retained_json_bytes(&choice).unwrap();
+        let projection = projected_tool_choice_bytes(Some(&choice), &tool_map, &resolved_labels).unwrap();
+        let mut obj = serde_json::Map::new();
+        obj.insert("tool_choice".to_owned(), choice);
+        rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+        let actual = retained_json_bytes(&obj["tool_choice"]).unwrap();
+        assert_eq!(projection.final_choice_bytes, actual);
+        assert!(original + projection.peak_expansion_bytes >= actual);
+    }
+}
+
 /// `BodyTooLarge` maps to HTTP 413 with `invalid_request_error`.
 #[test]
 fn body_too_large_maps_to_413() {

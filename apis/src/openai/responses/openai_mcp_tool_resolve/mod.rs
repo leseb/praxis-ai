@@ -2226,10 +2226,15 @@ fn rewrite_request_body(
 
     let rewritten_count = rewritten.len();
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
-    let expansion =
-        projected_tool_choice_expansion_bytes(obj.get("tool_choice"), tool_map).ok_or(ResolveError::RetainedBudget)?;
+    let original_choice = obj.get("tool_choice");
+    let projection =
+        projected_tool_choice_bytes(original_choice, tool_map, resolved_labels).ok_or(ResolveError::RetainedBudget)?;
+    let original_choice_bytes = original_choice
+        .map_or(Some(0), retained_json_bytes)
+        .ok_or(ResolveError::RetainedBudget)?;
     let projected_bytes = retained_json_bytes(obj)
-        .and_then(|bytes| bytes.checked_add(expansion))
+        .and_then(|bytes| bytes.checked_sub(original_choice_bytes))
+        .and_then(|bytes| bytes.checked_add(projection.final_choice_bytes))
         .ok_or(ResolveError::RetainedBudget)?;
     if projected_bytes > max_rewritten_body_bytes {
         return Err(ResolveError::BodyTooLarge {
@@ -2237,7 +2242,7 @@ fn rewrite_request_body(
             limit: max_rewritten_body_bytes,
         });
     }
-    if budget.is_some_and(|budget| !budget.admits(obj, expansion)) {
+    if budget.is_some_and(|budget| !budget.admits(obj, projection.peak_expansion_bytes)) {
         return Err(ResolveError::RetainedBudget);
     }
     rewrite_tool_choice(obj, tool_map, resolved_labels)?;
@@ -2256,65 +2261,149 @@ fn rewrite_request_body(
     Ok(Some(serialized))
 }
 
-/// Upper bound for references emitted by MCP `tool_choice` selectors without
-/// building any of the expanded JSON objects.
+/// The transient selector owners and the final compact wire size have
+/// different bounds: the former overlaps the original selector, while the
+/// latter replaces it. Keep both projections before allocating function refs.
+struct ToolChoiceProjection {
+    /// Additional reference bytes retained while the original choice is live.
+    peak_expansion_bytes: usize,
+    /// Compact JSON bytes in the final `tool_choice` value.
+    final_choice_bytes: usize,
+}
+
+/// Project MCP selector fanout without building any expanded JSON objects.
 #[expect(
     clippy::too_many_lines,
     reason = "named and server-wide selector projections share one borrowed index"
 )]
-fn projected_tool_choice_expansion_bytes(
+fn projected_tool_choice_bytes(
     choice: Option<&serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-) -> Option<usize> {
-    let Some(choice) = choice.and_then(serde_json::Value::as_object) else {
-        return Some(0);
+    resolved_labels: &HashSet<String>,
+) -> Option<ToolChoiceProjection> {
+    let Some(choice) = choice else {
+        return Some(ToolChoiceProjection {
+            peak_expansion_bytes: 0,
+            final_choice_bytes: 0,
+        });
     };
-    let mut by_label = HashMap::<&str, usize>::new();
+    let original_bytes = retained_json_bytes(choice)?;
+    let Some(choice_obj) = choice.as_object() else {
+        return Some(ToolChoiceProjection {
+            peak_expansion_bytes: 0,
+            final_choice_bytes: original_bytes,
+        });
+    };
+    let mut by_label = HashMap::<&str, (usize, usize)>::new();
     let mut by_name = HashMap::<(&str, &str), usize>::new();
     for (server, tool) in tool_map.keys() {
         let bytes = projected_function_ref_bytes(server, tool)?;
-        let total = by_label.get(server.as_str()).copied().unwrap_or(0).checked_add(bytes)?;
-        by_label.insert(server.as_str(), total);
+        let (prior_bytes, prior_count) = by_label.get(server.as_str()).copied().unwrap_or((0, 0));
+        by_label.insert(
+            server.as_str(),
+            (prior_bytes.checked_add(bytes)?, prior_count.checked_add(1)?),
+        );
         by_name.insert((server.as_str(), tool.as_str()), bytes);
     }
-    let selector_bytes = |label: &str, name: Option<&str>| -> Option<usize> {
+    let selector_refs = |label: &str, name: Option<&str>| -> (usize, usize) {
         name.map_or_else(
-            || Some(by_label.get(label).copied().unwrap_or(0)),
-            |name| Some(by_name.get(&(label, name)).copied().unwrap_or(0)),
+            || by_label.get(label).copied().unwrap_or((0, 0)),
+            |name| by_name.get(&(label, name)).map_or((0, 0), |bytes| (*bytes, 1)),
         )
     };
-    match choice.get("type").and_then(serde_json::Value::as_str) {
+    match choice_obj.get("type").and_then(serde_json::Value::as_str) {
         Some("mcp") => {
-            let label = choice
+            let label = choice_obj
                 .get("server_label")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            let name = choice.get("name").and_then(serde_json::Value::as_str);
-            selector_bytes(label, name)?.checked_add(64)
+            let name = choice_obj.get("name").and_then(serde_json::Value::as_str);
+            let (reference_bytes, reference_count) = selector_refs(label, name);
+            let peak_expansion_bytes = reference_bytes.checked_add(reference_count)?.checked_add(64)?;
+            let final_choice_bytes = if reference_count == 0 {
+                original_bytes
+            } else if name.is_some() {
+                reference_bytes
+            } else {
+                br#"{"type":"allowed_tools","mode":"required","tools":[]}"#
+                    .len()
+                    .checked_add(reference_bytes)?
+                    .checked_add(reference_count.checked_sub(1)?)?
+            };
+            Some(ToolChoiceProjection {
+                peak_expansion_bytes,
+                final_choice_bytes,
+            })
         },
         Some("allowed_tools") => {
-            choice
-                .get("tools")
-                .and_then(serde_json::Value::as_array)
-                .map_or(Some(0), |selectors| {
-                    selectors.iter().try_fold(0_usize, |total, selector| {
-                        if selector.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
-                            return Some(total);
-                        }
-                        let label = selector
-                            .get("server_label")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown");
-                        let name = selector.get("name").and_then(serde_json::Value::as_str);
-                        total.checked_add(selector_bytes(label, name)?)
-                    })
-                })
+            let Some(selectors) = choice_obj.get("tools").and_then(serde_json::Value::as_array) else {
+                return Some(ToolChoiceProjection {
+                    peak_expansion_bytes: 0,
+                    final_choice_bytes: original_bytes,
+                });
+            };
+            let mut peak_expansion_bytes = 0_usize;
+            let mut final_elements_bytes = 0_usize;
+            let mut final_elements = 0_usize;
+            let mut changed = false;
+            for selector in selectors {
+                if selector.get("type").and_then(serde_json::Value::as_str) == Some("mcp") {
+                    let label = selector
+                        .get("server_label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let name = selector.get("name").and_then(serde_json::Value::as_str);
+                    let (reference_bytes, reference_count) = selector_refs(label, name);
+                    peak_expansion_bytes = peak_expansion_bytes
+                        .checked_add(reference_bytes)?
+                        .checked_add(reference_count)?;
+                    if reference_count > 0 {
+                        changed = true;
+                        final_elements_bytes = final_elements_bytes.checked_add(reference_bytes)?;
+                        final_elements = final_elements.checked_add(reference_count)?;
+                        continue;
+                    }
+                    if selector
+                        .get("server_label")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|label| resolved_labels.contains(label))
+                    {
+                        changed = true;
+                        continue;
+                    }
+                }
+                final_elements_bytes = final_elements_bytes.checked_add(retained_json_bytes(selector)?)?;
+                final_elements = final_elements.checked_add(1)?;
+            }
+            let final_choice_bytes = if !changed
+                || (final_elements == 0
+                    && choice_obj.get("mode").and_then(serde_json::Value::as_str) == Some("required"))
+            {
+                original_bytes
+            } else if final_elements == 0 {
+                br#""none""#.len()
+            } else {
+                let original_tools_bytes = retained_json_bytes(choice_obj.get("tools")?)?;
+                let final_tools_bytes = 2_usize
+                    .checked_add(final_elements_bytes)?
+                    .checked_add(final_elements.checked_sub(1)?)?;
+                original_bytes
+                    .checked_sub(original_tools_bytes)?
+                    .checked_add(final_tools_bytes)?
+            };
+            Some(ToolChoiceProjection {
+                peak_expansion_bytes,
+                final_choice_bytes,
+            })
         },
-        _ => Some(0),
+        _ => Some(ToolChoiceProjection {
+            peak_expansion_bytes: 0,
+            final_choice_bytes: original_bytes,
+        }),
     }
 }
 
-/// Include one array separator for each generated function reference.
+/// Exact compact JSON bytes for one generated function reference.
 fn projected_function_ref_bytes(server: &str, tool: &str) -> Option<usize> {
     let name_bytes = server
         .chars()
@@ -2322,7 +2411,7 @@ fn projected_function_ref_bytes(server: &str, tool: &str) -> Option<usize> {
         .checked_add(2)?
         .checked_add(tool.chars().count())?
         .min(MAX_FUNCTION_NAME_LEN);
-    br#"{"type":"function","name":""}"#.len().checked_add(name_bytes)?.checked_add(1)
+    br#"{"type":"function","name":""}"#.len().checked_add(name_bytes)
 }
 
 /// Rewrite a tools array, replacing resolved MCP entries with
