@@ -357,9 +357,6 @@ impl io::Write for BoundedJsonCounter {
 #[cfg(feature = "store")]
 pub const DEFAULT_STORE_NAME: &str = "default";
 
-#[cfg(feature = "openai-responses")]
-pub(crate) use agentic_loop::buffered_parsed_json_bytes_upper_bound;
-
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
 #[cfg(all(
