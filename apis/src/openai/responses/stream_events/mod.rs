@@ -50,10 +50,7 @@ use crate::{
         responses::{
             error::{responses_error_rejection, responses_error_sse_payload},
             openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
-            state::{
-                ClientToolRestore, EmittedItem, PayloadMeter, ResponsesState, retained_json_bytes,
-                retained_json_values_bytes,
-            },
+            state::{EmittedItem, PayloadMeter, ResponsesState, retained_json_bytes, retained_json_values_bytes},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
     },
@@ -507,7 +504,6 @@ impl OpenaiStreamEventsFilter {
             } else {
                 state.replace_response_object(Value::Null);
             }
-            state.mark_current_output_changed();
             (state.iteration, output_index_offset)
         });
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -718,9 +714,6 @@ impl HttpFilter for OpenaiStreamEventsFilter {
             state.local_completion_response_template = Value::Null;
             state.mark_current_output_changed();
         }
-        if let Some(stream) = ctx.get_filter_state::<StreamEventsState>() {
-            stream.shared_current_output_bytes.store(0, Ordering::Relaxed);
-        }
 
         if !is_success_sse_response(ctx) {
             debug!("disarming stream_events: response is not 2xx text/event-stream");
@@ -853,7 +846,7 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_
         // The agentic-loop callback can append streamed output to history
         // immediately before this EOS callback. Re-measure that changed
         // baseline before admitting even the final provider chunk.
-        state.clear_shared_budget_caches();
+        state.clear_shared_budget_cache();
     }
 
     // Aggregate overflow is terminal for the logical stream. Suppress every
@@ -1368,14 +1361,7 @@ fn projected_client_tool_restore_bytes(
             Some(largest.max(bytes))
         })?;
     let mut cached_echo_bytes = None;
-    for (index, event) in events.iter().enumerate() {
-        projected = projected.checked_add(projected_restored_item_name_bytes(
-            responses,
-            stream,
-            events.get(..index)?,
-            event,
-            max_name_bytes,
-        )?)?;
+    for event in events {
         if event.is_terminal() {
             continue;
         }
@@ -1405,113 +1391,6 @@ fn projected_client_tool_restore_bytes(
         projected = projected.checked_add(snapshot_peak)?;
     }
     Some(projected)
-}
-
-/// An individual item event has no `response` snapshot. The restoration plan
-/// still owns a public name and namespace for each lowered item while the
-/// retyped event and growing wire buffer can hold further encoded copies.
-/// Reserve these copies before planning a co-batched set of item events.
-#[expect(
-    clippy::too_many_lines,
-    reason = "identify tracked and co-batched item ownership without allocating keys"
-)]
-fn projected_restored_item_name_bytes(
-    responses: &ResponsesState,
-    stream: &StreamEventsState,
-    prior_events: &[ResponsesEvent],
-    event: &ResponsesEvent,
-    max_name_bytes: usize,
-) -> Option<usize> {
-    let (payload, is_done) = match event {
-        ResponsesEvent::OutputItemAdded(payload) => (payload, false),
-        ResponsesEvent::OutputItemDone(payload) => (payload, true),
-        _ => return Some(0),
-    };
-    let item = payload.get("item");
-    if !is_done && item.and_then(|item| item.get("type")).and_then(Value::as_str) != Some("function_call") {
-        return Some(0);
-    }
-    let name = item.and_then(|item| item.get("name")).and_then(Value::as_str);
-    if is_done {
-        let tracked = stream
-            .client_tool_items
-            .iter()
-            .find(|tracked| tracked_item_key_matches(&tracked.key, payload));
-        if let Some(tracked) = tracked {
-            if name != Some(tracked.private_name.as_str()) {
-                return max_name_bytes.checked_mul(21)?.checked_add(128);
-            }
-        } else if name.is_none_or(|name| !responses.client_tool_lowering.contains_key(name))
-            && !prior_events.iter().any(|prior| {
-                matches!(prior, ResponsesEvent::OutputItemAdded(added)
-                    if item_event_keys_match(added, payload)
-                        && added.get("item")
-                            .and_then(|item| item.get("name"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|name| responses.client_tool_lowering.contains_key(name)))
-            })
-        {
-            // An unrelated native function call does not use any lowering.
-            return Some(0);
-        }
-    }
-    let Some(lowered) = name.and_then(|name| responses.client_tool_lowering.get(name)) else {
-        // A done item is resolved by its previously tracked ID, even when its
-        // name is absent or differs from the added item. Charge the largest
-        // possible restoration when this payload cannot identify the lowering.
-        return if is_done {
-            max_name_bytes.checked_mul(21)?.checked_add(128)
-        } else {
-            Some(0)
-        };
-    };
-    if !matches!(
-        lowered.restore,
-        ClientToolRestore::Namespace | ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom
-    ) {
-        return Some(0);
-    }
-    let native = lowered
-        .original_name
-        .len()
-        .checked_add(lowered.namespace.as_ref().map_or(0, String::len))?
-        .checked_add(64)?;
-    let encoded = retained_json_bytes(lowered.original_name.as_str())?
-        .checked_add(lowered.namespace.as_deref().map_or(Some(0), retained_json_bytes)?)?;
-    native
-        .checked_mul(3)?
-        .checked_add(encoded.checked_mul(3)?)?
-        .checked_add(128)
-}
-
-/// Read the ID chosen by the restoration planner, without copying it.
-fn item_event_id(payload: &Value) -> Option<&str> {
-    payload
-        .get("item")
-        .and_then(|item| item.get("id"))
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("item_id").and_then(Value::as_str))
-}
-
-/// Compare two item events using the planner's ID-first, index-fallback key.
-fn item_event_keys_match(added: &Value, done: &Value) -> bool {
-    match (item_event_id(added), item_event_id(done)) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => added
-            .get("output_index")
-            .and_then(Value::as_u64)
-            .is_some_and(|index| done.get("output_index").and_then(Value::as_u64) == Some(index)),
-        _ => false,
-    }
-}
-
-/// Compare an existing tracked key with an item event without formatting a new key.
-fn tracked_item_key_matches(key: &str, payload: &Value) -> bool {
-    if let Some(id) = item_event_id(payload) {
-        return key.strip_prefix("item:") == Some(id);
-    }
-    key.strip_prefix("index:").and_then(|index| index.parse::<u64>().ok())
-        == payload.get("output_index").and_then(Value::as_u64)
 }
 
 /// Bound the owned key created while accumulating a function-call argument
@@ -1574,18 +1453,6 @@ fn shared_retained_budget(
         (_, Some(_)) => retained_json_values_bytes(&responses.accumulated_output),
         (_, None) => None,
     };
-    let cached_current_output_bytes = stream.shared_current_output_bytes.load(Ordering::Relaxed);
-    let current_output_bytes = (cached_current_output_bytes != 0)
-        .then_some(cached_current_output_bytes)
-        .or_else(|| {
-            let mut meter = PayloadMeter::new(limit);
-            meter.json(&responses.response_object)?;
-            meter.json(&responses.local_completion_response_template)?;
-            meter.json_values(&responses.tool_calls)?;
-            let bytes = meter.used();
-            stream.shared_current_output_bytes.store(bytes, Ordering::Relaxed);
-            Some(bytes)
-        });
     let current = limit
         .checked_sub(stable)
         .and_then(|remaining| remaining.checked_sub(prior_bytes?))
@@ -3469,9 +3336,6 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let parser_deferred_done = ctx
         .get_filter_state::<StreamEventsState>()
         .is_some_and(|state| state.deferred_done);
-    if let Some(stream) = ctx.get_filter_state::<StreamEventsState>() {
-        stream.shared_current_output_bytes.store(0, Ordering::Relaxed);
-    }
     let state = ctx.extensions.get::<ResponsesState>()?;
     let Some(local_output_upper_bound) = local_terminal_output_upper_bound(state) else {
         return Some(encode_retained_payload_error(ctx));
@@ -3514,7 +3378,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
         // `encode_local_error` (which would re-drain those events).
         return Some(encode_local_restore_error(ctx, output, &e));
     }
-    state.mark_current_output_changed();
+    state.mark_response_object_changed();
     if !state.response_object.is_object() {
         return None;
     }
@@ -3894,8 +3758,6 @@ fn emit_deferred_terminal(
         return Err(SseParseError::StreamPoisoned);
     }
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
-    parser_state.shared_current_output_bytes.store(0, Ordering::Relaxed);
-    state.mark_current_output_changed();
     if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
         response.insert("output".to_owned(), Value::Array(accumulated_output));
         if !usage.is_null() {

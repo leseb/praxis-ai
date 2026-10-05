@@ -784,8 +784,6 @@ struct RestoreStablePayloadCache {
     collection_lengths: [usize; 11],
     /// Serialized payload charge of the stable owners.
     bytes: usize,
-    /// Serialized response, local completion template, and tool-call owners.
-    current_output_bytes: usize,
 }
 
 impl RestoreStablePayloadCache {

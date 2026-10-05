@@ -141,6 +141,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+        aggregate_result_policy: super::McpAggregateResultPolicy::Unbudgeted,
         max_control_response_bytes: crate::mcp_client::MAX_CONTROL_RESPONSE_BYTES,
         retain_session: true,
         timeout,

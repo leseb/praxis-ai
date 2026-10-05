@@ -279,6 +279,7 @@ impl McpDispatchFilter {
         connector_identity: Option<&McpCalloutIdentity>,
         session_pool: &mcp_client::McpSessionPool,
         max_total_result_bytes: usize,
+        aggregate_constrained: bool,
         max_control_response_bytes: usize,
         retain_session: bool,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
@@ -303,6 +304,7 @@ impl McpDispatchFilter {
             max_parallel_calls: self.max_parallel_calls,
             max_result_bytes: per_result_limit,
             max_total_result_bytes: execution_batch_limit,
+            aggregate_result_policy,
             max_control_response_bytes,
             retain_session,
             timeout: self.timeout,
@@ -1361,6 +1363,7 @@ impl McpDispatchFilter {
                 connector_identity.as_ref(),
                 &session_pool,
                 admission.result_limit,
+                admission.aggregate_constrained,
                 admission.control_response_bytes,
                 admission.retain_session,
             )
@@ -1880,11 +1883,13 @@ fn aggregate_mcp_result_limit(
         let tool_bytes =
             call.get("name")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown"),
-            retained_json_bytes(call.get("arguments").unwrap_or(&serde_json::Value::Null))?,
-            call.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
-            &tool_index,
-        )?)
+                .and_then(|name| match tool_index.get(name) {
+                    Some(McpToolMatch::Unique { entry, .. }) => retained_json_bytes(entry),
+                    _ => Some(0),
+                })?;
+        used.checked_add(id_bytes)?
+            .checked_add(arguments)?
+            .checked_add(tool_bytes)
     })?;
     let available = limit.checked_sub(current)?.checked_sub(staging)?;
     let minimum = mcp_calls.len().checked_mul(MIN_RETAINED_RESULT_BYTES)?;
@@ -2022,6 +2027,8 @@ struct McpExecutionOptions<'a> {
     max_result_bytes: usize,
     /// Maximum serialized bytes retained by one result batch.
     max_total_result_bytes: usize,
+    /// Whether the request-wide budget lowered this call's result ceiling.
+    aggregate_result_policy: McpAggregateResultPolicy,
     /// Pre-dial ceiling for an initialize response while its parsed peer info is live.
     max_control_response_bytes: usize,
     /// Budgeted calls close their session before returning, so peer metadata

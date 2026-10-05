@@ -1013,6 +1013,7 @@ impl Default for ResponsesState {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
             replay_stable_payload_revision: Some(0),
+            current_output_revision: Some(0),
             response_object_revision: Some(0),
             tool_calls_revision: Some(0),
             retained_stream_parser_bytes: 0,
@@ -1632,13 +1633,23 @@ impl ResponsesState {
 
     /// Invalidate exact response-object charges before an owned or in-place edit.
     pub(crate) fn mark_response_object_changed(&mut self) {
+        self.mark_current_output_changed();
         self.response_object_revision = self
             .response_object_revision
             .and_then(|revision| revision.checked_add(1));
     }
 
+    /// Invalidate the Chat stream charge for the current response, local
+    /// completion template, and completed calls after any owner changes.
+    pub(crate) fn mark_current_output_changed(&mut self) {
+        self.current_output_revision = self
+            .current_output_revision
+            .and_then(|revision| revision.checked_add(1));
+    }
+
     /// Invalidate completed-call byte charges before an append, replacement, or clear.
     pub(crate) fn mark_tool_calls_changed(&mut self) {
+        self.mark_current_output_changed();
         self.tool_calls_revision = self.tool_calls_revision.and_then(|revision| revision.checked_add(1));
     }
 

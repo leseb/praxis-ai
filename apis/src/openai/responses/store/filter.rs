@@ -442,24 +442,7 @@ impl ResponseStoreFilter {
                 ctx.extensions.insert(state);
                 return false;
             };
-            // Completed output stays unchanged across ordinary text deltas. Measure
-            // its three independent JSON owners once per revision, just as the
-            // stream parser does for its own filter-local admission checks.
-            let Some(remaining) = limit.checked_sub(stable) else {
-                ctx.extensions.insert(state);
-                return false;
-            };
-            let mut current_output_meter = PayloadMeter::new(remaining);
-            if current_output_meter.json(&responses.response_object).is_none()
-                || current_output_meter
-                    .json(&responses.local_completion_response_template)
-                    .is_none()
-                || current_output_meter.json_values(&responses.tool_calls).is_none()
-            {
-                ctx.extensions.insert(state);
-                return false;
-            }
-            let Some(cache) = StoreStableCache::new(responses, stable, current_output_meter.used()) else {
+            let Some(cache) = StoreStableCache::new(responses, stable) else {
                 ctx.extensions.insert(state);
                 return false;
             };
@@ -809,34 +792,28 @@ enum PersistenceArm {
     Armed,
 }
 
-/// Cached request, history, prior output, and completed output charges.
+/// Cached stable payload charge and its O(1) invalidation key.
 #[derive(Clone, Copy)]
 struct StoreStableCache {
     /// Logical loop round when the charge was measured.
     iteration: u32,
     /// In-place mutation revision of the cached owners.
     revision: u64,
-    /// In-place mutation revision of the current response owners.
-    current_output_revision: u64,
     /// Lengths of every cached collection. Dispatch may append after synthesis
     /// has already advanced the iteration.
     collection_lengths: [usize; 11],
     /// Serialized payload charge of cached request, history, output, and tools.
     bytes: usize,
-    /// Serialized response, local completion template, and tool-call owners.
-    current_output_bytes: usize,
 }
 
 impl StoreStableCache {
     /// Capture the measured charge and the current O(1) collection shape.
-    fn new(state: &ResponsesState, bytes: usize, current_output_bytes: usize) -> Option<Self> {
+    fn new(state: &ResponsesState, bytes: usize) -> Option<Self> {
         Some(Self {
             iteration: state.iteration,
             revision: state.replay_stable_payload_revision?,
-            current_output_revision: state.current_output_revision?,
             collection_lengths: Self::collection_lengths(state),
             bytes,
-            current_output_bytes,
         })
     }
 
@@ -844,7 +821,6 @@ impl StoreStableCache {
     fn matches(&self, state: &ResponsesState) -> bool {
         self.iteration == state.iteration
             && Some(self.revision) == state.replay_stable_payload_revision
-            && Some(self.current_output_revision) == state.current_output_revision
             && self.collection_lengths == Self::collection_lengths(state)
     }
 
@@ -3415,57 +3391,6 @@ mod encode_replay_event_tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exercises repeated store admission and its cached charge"
-    )]
-    fn replay_meter_reuses_completed_output_across_small_chunks() {
-        let filter =
-            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
-        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
-        let call = json!({"type": "function_call", "arguments": "x".repeat(512 * 1_024)});
-        let mut responses = ResponsesState {
-            response_object: json!({"output": [call.clone()]}),
-            tool_calls: vec![call],
-            ..ResponsesState::default()
-        };
-        responses.apply_retained_payload_limit(4 * 1_048_576);
-        ctx.extensions.insert(responses);
-        let frame = Some(Bytes::from_static(b": heartbeat\n\n"));
-        assert!(filter.capture_stream_events(&mut ctx, &frame, false));
-        let cache = ctx
-            .extensions
-            .get::<super::ResponseStoreRequestState>()
-            .unwrap()
-            .shared_stable_bytes
-            .unwrap();
-        assert!(cache.current_output_bytes > 1_048_576);
-
-        for _ in 0..200 {
-            assert!(filter.capture_stream_events(&mut ctx, &frame, false));
-        }
-        assert!(
-            ctx.extensions
-                .get::<super::ResponseStoreRequestState>()
-                .unwrap()
-                .shared_stable_bytes
-                .unwrap()
-                .matches(ctx.extensions.get::<ResponsesState>().unwrap())
-        );
-        // A deliberately impossible cached charge proves the repeated-chunk
-        // admission reads this measurement instead of rescanning the JSON.
-        ctx.extensions
-            .get_mut::<super::ResponseStoreRequestState>()
-            .unwrap()
-            .shared_stable_bytes
-            .as_mut()
-            .unwrap()
-            .current_output_bytes = usize::MAX;
-        assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
-    }
-
-    #[test]
     #[expect(clippy::indexing_slicing, reason = "the fixture contains one known output item")]
     fn replay_meter_refreshes_same_length_completed_output_rewrite() {
         let filter =
@@ -3480,17 +3405,10 @@ mod encode_replay_event_tests {
         ctx.extensions.insert(responses);
         let frame = Some(Bytes::from_static(b": heartbeat\n\n"));
         assert!(filter.capture_stream_events(&mut ctx, &frame, false));
-        let old_cache = ctx
-            .extensions
-            .get::<super::ResponseStoreRequestState>()
-            .unwrap()
-            .shared_stable_bytes
-            .unwrap();
         let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
         responses.response_object["output"][0]["text"] = json!("\u{0001}".repeat(4_096));
-        responses.mark_current_output_changed();
+        responses.mark_response_object_changed();
         assert_eq!(responses.output_items().len(), 1);
-        assert!(!old_cache.matches(responses));
         assert!(!filter.capture_stream_events(&mut ctx, &frame, false));
     }
 
