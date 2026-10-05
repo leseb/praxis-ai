@@ -4709,10 +4709,7 @@ mod encode_replay_event_tests {
             store_filter.on_response(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ));
-        assert_eq!(
-            ctx.response_body_mode,
-            praxis_filter::body::BodyMode::StreamBuffer { max_bytes: Some(300) }
-        );
+        assert_eq!(ctx.response_body_mode, BodyMode::StreamBuffer { max_bytes: Some(300) });
     }
 
     #[tokio::test]
@@ -4825,7 +4822,7 @@ mod encode_replay_event_tests {
             parsed_bytes,
             wire_bytes
         ));
-        assert_eq!(super::buffered_header_persistence_length(&ctx), None);
+        assert_eq!(buffered_header_persistence_length(&ctx), None);
     }
 
     #[test]
@@ -4854,7 +4851,7 @@ mod encode_replay_event_tests {
         ctx.response_header = Some(&mut response);
 
         assert!(!buffered_persistence_construction_fits(&ctx, bytes));
-        assert_eq!(super::buffered_header_persistence_length(&ctx), None);
+        assert_eq!(buffered_header_persistence_length(&ctx), None);
     }
 
     #[cfg(feature = "openai-conversations")]

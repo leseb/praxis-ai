@@ -208,7 +208,7 @@ fn parsed_body_fits(ctx: &HttpFilterContext<'_>, raw: &[u8]) -> bool {
     }) else {
         return true;
     };
-    let Some(parsed_bytes) = super::buffered_parsed_json_bytes_upper_bound(raw) else {
+    let Some(parsed_bytes) = buffered_parsed_json_bytes_upper_bound(raw) else {
         return false;
     };
     raw.len()
