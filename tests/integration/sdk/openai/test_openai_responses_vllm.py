@@ -1968,7 +1968,7 @@ def usage_less_compact_client(tmp_path_factory, request, compaction_server):
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
         compact_callout_port=compaction_server,
-        retained_limit=65_536,
+        retained_limit=262_144,
     )
     log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
@@ -5779,7 +5779,9 @@ filter_chains:
               - filter: openai_stream_events
               - filter: openai_agentic_loop
                 max_infer_iters: 1
-                max_retained_bytes: 65536
+                # Leave room for the Files API transport's 128 KiB staging
+                # while keeping the declared 48 KiB file over the shared cap.
+                max_retained_bytes: 262144
               - filter: openai_responses_proxy
               - filter: router
                 routes:
