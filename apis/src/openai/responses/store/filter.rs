@@ -1409,68 +1409,6 @@ fn buffered_persistence_construction_fits(ctx: &HttpFilterContext<'_>, bytes: &[
     projected.is_some_and(|response_bytes| persistence_construction_fits_with_wire(ctx, response_bytes, bytes.len()))
 }
 
-/// Admit a noncanonical JSON body before core commits the upstream headers.
-/// Without the body we cannot inspect number tokens. Twelve times a trusted
-/// wire length bounds the scanner's normalized JSON projection. A prior
-/// Rehydrate filter can remove `Content-Length` after validating it; its typed
-/// framing handoff also reserves the escaped replacement ID and any new key.
-/// Missing or ambiguous framing cannot establish the persistence peak before
-/// commitment.
-fn buffered_header_persistence_length(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    let (wire_bytes, replacement_id_bytes) = trusted_persistence_framing(ctx)?;
-    if wire_bytes > MAX_JSON_BODY_BYTES {
-        return None;
-    }
-    let mut parsed_bytes = wire_bytes.checked_mul(12)?;
-    if let Some(previous_id_bytes) = replacement_id_bytes {
-        // JSON control-byte escapes can use six bytes per input byte. Allow
-        // for adding the key when the upstream object omitted it entirely.
-        parsed_bytes = parsed_bytes
-            .checked_add(previous_id_bytes.checked_mul(6)?)?
-            .checked_add(32)?;
-    }
-    // Core's multi-chunk freeze can hold two original wire copies. After
-    // Rehydrate rewrites the body, Store instead holds the replacement wire,
-    // which can be longer than both originals when the ID requires escaping.
-    let transient_wire_bytes = wire_bytes.checked_mul(2)?;
-    let transient_wire_bytes = if replacement_id_bytes.is_some() {
-        transient_wire_bytes.max(parsed_bytes)
-    } else {
-        transient_wire_bytes
-    };
-    persistence_construction_fits_with_wire(ctx, parsed_bytes, transient_wire_bytes).then_some(wire_bytes)
-}
-
-/// Recover trusted upstream framing from the header or Rehydrate's bounded handoff.
-fn trusted_persistence_framing(ctx: &HttpFilterContext<'_>) -> Option<(usize, Option<usize>)> {
-    let response = ctx.response_header.as_ref()?;
-    if response.headers.contains_key(http::header::TRANSFER_ENCODING)
-        || response.headers.contains_key(http::header::CONTENT_ENCODING)
-    {
-        return None;
-    }
-    match &ctx.response_body_mode {
-        BodyMode::Stream => {
-            let mut lengths = response.headers.get_all(http::header::CONTENT_LENGTH).iter();
-            let wire_bytes = lengths.next()?.to_str().ok()?.parse::<usize>().ok()?;
-            if lengths.next().is_some() {
-                return None;
-            }
-            Some((wire_bytes, None))
-        },
-        BodyMode::StreamBuffer {
-            max_bytes: Some(max_bytes),
-        } => {
-            let framing = ctx.extensions.get::<DirectFiniteRestoreFraming>()?;
-            if response.headers.contains_key(http::header::CONTENT_LENGTH) || *max_bytes != framing.wire_bytes {
-                return None;
-            }
-            Some((framing.wire_bytes, Some(framing.previous_id_bytes)))
-        },
-        _ => None,
-    }
-}
-
 /// The response, messages, and input columns may each be zstd-compressed and
 /// then copied once more into `PostgreSQL`'s query arguments. Reserve twice the
 /// maximum frame expansion while the original JSON columns remain live.
