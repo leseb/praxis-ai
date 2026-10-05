@@ -2954,6 +2954,37 @@ async fn compacted_namespace_item_names_are_rejected_before_restore_plan_allocat
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
+#[test]
+fn lowered_completion_reserves_both_full_item_snapshots() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    let item = json!({
+        "type": "function_call", "name": "private", "id": "fc_1",
+        "call_id": "c".repeat(262_144), "arguments": ""
+    });
+    let item_bytes = crate::openai::responses::state::retained_json_bytes(&item).unwrap();
+    let mut state = ResponsesState::from_request_body(json!({}));
+    state.output_items_mut().push(item);
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(state);
+    let done = crate::openai::sse::responses::ResponsesEvent::FunctionCallArgumentsDone(json!({
+        "type": "response.function_call_arguments.done", "item_id": "fc_1",
+        "output_index": 0, "arguments": "{\"input\":\"x\"}"
+    }));
+    let projected = super::projected_responses_state_clone_bytes(&ctx, &[done]).unwrap();
+    assert!(
+        projected >= item_bytes * 2,
+        "tool_calls and ClientToolCompletion each clone the full preexisting item"
+    );
+}
+
 #[tokio::test]
 async fn lifecycle_echo_snapshot_with_headroom_is_emitted() {
     let filter = make_filter();
