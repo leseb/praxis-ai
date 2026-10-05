@@ -2989,7 +2989,7 @@ class TestOpenAIResponsesVLLM:
     def test_budgeted_noncanonical_conversation_rejects_before_success_headers(
         self, witness_noncanonical_budgeted_conversation_client
     ):
-        """A skipped agentic response has unknown append cost at the 200 header.
+        """A chunked, skipped agentic response has unknown append cost at the 200 header.
 
         The safe policy rejects even a small body when the aggregate budget is
         armed, because SQL/cache staging cannot be proven before commitment.
@@ -3000,7 +3000,7 @@ class TestOpenAIResponsesVLLM:
             with pytest.raises(APIStatusError) as exc_info:
                 client.responses.create(
                     model="sdk-conversation-stream",
-                    input="NONCANONICAL-APPEND-HEADER-410",
+                    input="NONCANONICAL-APPEND-HEADER-410 BUDGET-CHUNKED-410",
                     conversation=conversation.id,
                     store=False,
                 )

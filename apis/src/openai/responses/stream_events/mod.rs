@@ -1329,9 +1329,9 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
                 if payload.get("response").is_some() {
                     usage_peak
                 } else {
-                    // Preserve the old bare-response fallback, which clones
-                    // the whole payload so its envelope can still be emitted.
-                    usage_peak.checked_add(response_bytes)?
+                    // The bare-response fallback still clones the whole
+                    // payload. Retain Stage7's three-copy peak for that path.
+                    response_bytes.checked_mul(3)?.checked_add(previous_usage_bytes)?
                 }
             },
             ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
@@ -2061,9 +2061,6 @@ fn release_client_tool_charge(ctx: &mut HttpFilterContext<'_>, bytes: usize) {
         responses.release_external_payload_bytes(bytes);
     }
 }
-
-/// Completion snapshots and the aggregate charge held until restoration ends.
-type ChargedClientToolCompletions = (Vec<client_tools::ClientToolCompletion>, usize);
 
 /// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`
 /// and capture lowered client-tool completion artifacts for phase 2b (#1159).
