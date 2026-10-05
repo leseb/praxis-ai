@@ -3976,7 +3976,7 @@ mod encode_replay_event_tests {
         drop(rehydrate.on_response(&mut ctx).await.unwrap());
         assert_eq!(
             ctx.response_body_mode,
-            praxis_filter::body::BodyMode::StreamBuffer {
+            BodyMode::StreamBuffer {
                 max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
             }
         );
