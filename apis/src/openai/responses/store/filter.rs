@@ -2143,7 +2143,7 @@ fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<B
             && raw_bytes
                 .checked_mul(super::super::INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)
                 .and_then(|peak| existing.checked_add(peak))
-                .is_some_and(|peak| peak <= policy.max_retained_bytes())
+                .is_some_and(|peak| peak <= policy_limit)
     };
     if admitted {
         return Ok(());
