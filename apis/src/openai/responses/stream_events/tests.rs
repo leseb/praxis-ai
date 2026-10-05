@@ -915,6 +915,49 @@ fn deferred_terminal_reserves_metadata_while_serializing_wire() {
 }
 
 #[test]
+fn deferred_terminal_reserves_vec_reallocation_peak() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "sequence_number": 1, "response": null}),
+    };
+    let mut output = Vec::with_capacity(4_096);
+    output.resize(4_000, b'x');
+    let frame_bytes = super::retained_json_bytes(&super::BorrowedTerminalPayload {
+        metadata: &terminal.payload,
+        response: &state.response_object,
+    })
+    .unwrap()
+        + b"event: response.completed\ndata: \n\n".len();
+    let metadata_bytes = terminal.retained_payload_bytes().unwrap();
+    let old_wire_bound = output.len() + frame_bytes + metadata_bytes;
+    let parser_bytes = parser_state.retained_payload_bytes().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + parser_bytes + old_wire_bound + 128);
+    assert!(
+        state.can_replace_retained_payload(state.retained_stream_parser_bytes, parser_bytes, old_wire_bound),
+        "the prior length-only wire check would admit this terminal"
+    );
+    assert!(output.len() + frame_bytes > output.capacity());
+    ctx.extensions.insert(state);
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted
+    );
+}
+
+#[test]
 fn deferred_terminal_reserves_wire_copy_before_serializing() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
