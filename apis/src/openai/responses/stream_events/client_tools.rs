@@ -25,7 +25,9 @@ use crate::openai::{
             custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
             restore_shell_call, restore_snapshot, restore_snapshot_tools, restore_tool_search_call,
         },
-        state::{ClientToolEcho, ClientToolRestore, LoweredClientTool},
+        state::{
+            ClientToolEcho, ClientToolRestore, LoweredClientTool, retained_json_bytes, retained_json_values_bytes,
+        },
     },
     sse::{SseParseError, responses::ResponsesEvent},
 };
@@ -185,6 +187,473 @@ pub(super) fn plan_client_tool_restore(
         plan.dispositions.push(disposition);
     }
     Ok(plan)
+}
+
+/// Bound the additional serialized payload owned when an echoed tool list is
+/// inserted into a response snapshot. The original echo remains in request
+/// state while the restored snapshot owns a separate copy.
+pub(super) fn echoed_tools_bytes(echo: Option<&ClientToolEcho>) -> Option<usize> {
+    let Some(echo) = echo else {
+        return Some(0);
+    };
+    retained_json_values_bytes(&echo.tools)?
+        .checked_add(echo.tools.len())? // commas and array brackets
+        .checked_add(2)?
+        .checked_add(retained_json_bytes(&echo.tool_choice)?.max(6))? // null becomes "auto"
+        .checked_add(32) // tools/tool_choice keys and object punctuation
+}
+
+/// Bound growth when lowered output items are restored to public typed items.
+/// The input item remains live during restoration; argument parsing may expand
+/// numeric tokens, and public name/namespace strings can be larger than the
+/// private name. This is additional staging beyond the original item owner.
+pub(super) fn restored_output_growth_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    output: &[Value],
+) -> Option<usize> {
+    output.iter().try_fold(0_usize, |used, item| {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return Some(used);
+        }
+        let Some(lowered) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| reverse.get(name))
+        else {
+            return Some(used);
+        };
+        let item_bytes = retained_json_bytes(item)?;
+        let parsed_arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map_or(Some(0), |arguments| {
+                super::super::agentic_loop::buffered_parsed_json_bytes_upper_bound(arguments.as_bytes())
+            })?;
+        used.checked_add(item_bytes.checked_mul(2)?)?
+            .checked_add(parsed_arguments)?
+            .checked_add(lowered.original_name.len())?
+            .checked_add(lowered.namespace.as_ref().map_or(0, String::len))?
+            .checked_add(256)
+    })
+}
+
+/// Reserve plan-owned restored snapshots and their enlarged outgoing SSE frames
+/// before `plan_client_tool_restore` clones any lifecycle response.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks both item-level dispositions and response snapshots before their shared plan allocates"
+)]
+pub(super) fn lifecycle_restore_staging_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    echo: Option<&ClientToolEcho>,
+    committed: &[ClientToolStreamItem],
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    if reverse.is_empty() {
+        return Some(0);
+    }
+    // Most chunks carry only deltas. Measure the immutable echoed tool list
+    // once, and only if this chunk actually restores a response snapshot.
+    let mut echo_bytes = None;
+    events.iter().enumerate().try_fold(0_usize, |used, (index, event)| {
+        if event.is_terminal() {
+            return Some(used);
+        }
+        // Item-level events lack a `response` snapshot. Their short private
+        // wire name can nevertheless expand into a large original member name
+        // in every plan disposition, emitted event, and SSE frame in this chunk.
+        // Charge all of those owners before plan_client_tool_restore allocates.
+        let prior_events = events.get(..index)?;
+        let item_growth = match event {
+            ResponsesEvent::OutputItemAdded(payload) => {
+                let lowered = payload
+                    .get("item")
+                    .and_then(|item| item.get("name"))
+                    .and_then(Value::as_str)
+                    .and_then(|name| reverse.get(name));
+                match lowered {
+                    Some(lowered) => restored_item_event_growth_bytes(lowered, payload)?,
+                    None => 0,
+                }
+            },
+            ResponsesEvent::OutputItemDone(payload) => {
+                let lowered = tracked_restore(reverse, committed, prior_events, payload);
+                match lowered {
+                    Some(lowered) => {
+                        let arguments = payload
+                            .get("item")
+                            .and_then(|item| item.get("arguments"))
+                            .and_then(Value::as_str);
+                        restored_item_event_growth_bytes(lowered, payload)?
+                            .checked_add(explicit_arguments_restore_growth_bytes(lowered, arguments)?)?
+                    },
+                    None => 0,
+                }
+            },
+            ResponsesEvent::FunctionCallArgumentsDone(payload) => {
+                // r2c can put the private name on arguments.done. The plan
+                // resolves the tracked item by id, not by the name in this frame.
+                let lowered = tracked_restore(reverse, committed, prior_events, payload);
+                match lowered {
+                    Some(lowered) => {
+                        let name_growth =
+                            if lowered.restore == ClientToolRestore::Namespace && payload.get("name").is_some() {
+                                restored_item_name_growth_bytes(lowered)?
+                            } else {
+                                0
+                            };
+                        name_growth.checked_add(explicit_arguments_restore_growth_bytes(
+                            lowered,
+                            payload.get("arguments").and_then(Value::as_str),
+                        )?)?
+                    },
+                    _ => 0,
+                }
+            },
+            _ => 0,
+        };
+        let used = used.checked_add(item_growth)?;
+        let Some(response) = event.payload().get("response") else {
+            return Some(used);
+        };
+        let echoed = if let Some(bytes) = echo_bytes {
+            bytes
+        } else {
+            let bytes = echoed_tools_bytes(echo)?;
+            echo_bytes = Some(bytes);
+            bytes
+        };
+        let response_bytes = retained_json_bytes(response)?;
+        let growth = response
+            .get("output")
+            .and_then(Value::as_array)
+            .map_or(Some(0), |items| restored_output_growth_bytes(reverse, items))?;
+        // The plan owns a cloned response, the event owns another copy after
+        // disposition application, and the outgoing SSE buffer serializes a
+        // third copy while the whole plan remains live.
+        used.checked_add(response_bytes)?
+            .checked_add(echoed.checked_add(growth)?.checked_mul(3)?)
+    })
+}
+
+/// Match the same id-first, output-index-fallback key used by the restore plan
+/// without allocating a key string during the preflight.
+fn event_item_id(payload: &Value) -> Option<&str> {
+    payload
+        .get("item")
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("item_id").and_then(Value::as_str))
+}
+
+/// Compare two lifecycle events using the same id-first key rule as the plan.
+fn same_event_item(left: &Value, right: &Value) -> bool {
+    match event_item_id(left) {
+        Some(id) => event_item_id(right) == Some(id),
+        None => {
+            event_item_id(right).is_none()
+                && left
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|index| right.get("output_index").and_then(Value::as_u64) == Some(index))
+        },
+    }
+}
+
+/// A done item may omit its private name while still matching an earlier added
+/// item. Only charge that actual tracked restoration, leaving unrelated item
+/// events free of the cost of an unused large namespace declaration.
+fn tracked_restore<'a>(
+    reverse: &'a HashMap<String, LoweredClientTool>,
+    committed: &[ClientToolStreamItem],
+    prior_events: &[ResponsesEvent],
+    payload: &Value,
+) -> Option<&'a LoweredClientTool> {
+    let committed_item = committed.iter().find(|tracked| match event_item_id(payload) {
+        Some(id) => tracked.item_id.as_deref() == Some(id),
+        None => {
+            tracked.item_id.is_none()
+                && payload.get("output_index").and_then(Value::as_u64) == Some(tracked.output_index)
+        },
+    });
+    if let Some(tracked) = committed_item {
+        return reverse.get(tracked.private_name.as_str());
+    }
+    prior_events.iter().find_map(|prior| {
+        let ResponsesEvent::OutputItemAdded(added) = prior else {
+            return None;
+        };
+        if !same_event_item(payload, added) {
+            return None;
+        }
+        let name = added.get("item")?.get("name")?.as_str()?;
+        reverse.get(name)
+    })
+}
+
+/// The plan owns one restored name, the event owns another while it is
+/// normalized, and the outgoing SSE buffer owns its escaped representation.
+fn restored_item_name_growth_bytes(lowered: &LoweredClientTool) -> Option<usize> {
+    retained_json_bytes(&lowered.original_name)?
+        .checked_add(lowered.namespace.as_deref().map_or(Some(0), retained_json_bytes)?)?
+        .checked_mul(3)
+}
+
+/// Custom item plans also retain an owned copy of the incoming payload and the
+/// applier clones it before writing the restored event. The existing event and
+/// frame projections cover the input, so count these two additional owners.
+fn restored_item_event_growth_bytes(lowered: &LoweredClientTool, payload: &Value) -> Option<usize> {
+    let name_growth = restored_item_name_growth_bytes(lowered)?;
+    if matches!(
+        lowered.restore,
+        ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom
+    ) {
+        name_growth.checked_add(retained_json_bytes(payload)?.checked_mul(2)?)
+    } else {
+        Some(name_growth)
+    }
+}
+
+/// Restoring a completed typed call parses the finalized arguments before the
+/// plan is returned. Generic Shell/ToolSearch JSON may expand compact numeric
+/// tokens into a larger Value; Custom unwraps one string envelope. Reserve the
+/// plan value, emitted event, and wire while the original argument stays live.
+/// The generic bound also covers serde's heap cost for dense arrays and objects.
+fn explicit_arguments_restore_growth_bytes(lowered: &LoweredClientTool, arguments: Option<&str>) -> Option<usize> {
+    let Some(arguments) = arguments else {
+        return Some(0);
+    };
+    match lowered.restore {
+        ClientToolRestore::Namespace => Some(0),
+        ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
+            retained_json_bytes(arguments)?.checked_mul(3)?.checked_add(512)
+        },
+        ClientToolRestore::Shell | ClientToolRestore::ToolSearch => {
+            super::super::initial_json_parse_peak_bytes(arguments.as_bytes())?.checked_add(512)
+        },
+    }
+}
+
+/// Reserve the restoration plan's independently owned vectors and tracked-item
+/// string clones. `plan_client_tool_restore` clones every committed item even on
+/// an ordinary delta, then pushes one disposition per event before any later
+/// budget check can run. Vec growth can approach twice its final element count.
+pub(super) fn restoration_plan_staging_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    committed: &[ClientToolStreamItem],
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    if reverse.is_empty() {
+        return Some(0);
+    }
+    let committed_strings = committed.iter().try_fold(0_usize, |used, item| {
+        used.checked_add(item.key.len())?
+            .checked_add(item.private_name.len())?
+            .checked_add(item.item_id.as_ref().map_or(0, String::len))
+    })?;
+    let (added_count, added_strings) = newly_tracked_item_bytes(reverse, events)?;
+    let tracked_slots = committed.len().checked_add(added_count)?;
+    let tracked_capacity = projected_vec_slots(tracked_slots)?.checked_mul(size_of::<ClientToolStreamItem>())?;
+    let disposition_capacity = projected_vec_slots(events.len())?.checked_mul(size_of::<ClientToolDisposition>())?;
+    committed_strings
+        .checked_add(added_strings)?
+        .checked_add(tracked_capacity)?
+        .checked_add(disposition_capacity)
+}
+
+/// Count string owners added to the plan only for lowered output-item openings.
+fn newly_tracked_item_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    events: &[ResponsesEvent],
+) -> Option<(usize, usize)> {
+    events.iter().try_fold((0_usize, 0_usize), |(count, used), event| {
+        let ResponsesEvent::OutputItemAdded(payload) = event else {
+            return Some((count, used));
+        };
+        let Some(name) = payload
+            .get("item")
+            .and_then(|item| item.get("name"))
+            .and_then(Value::as_str)
+            .filter(|name| reverse.contains_key(*name))
+        else {
+            return Some((count, used));
+        };
+        let item_id = event_item_id(payload);
+        let key_bytes = item_id.map_or(Some(26), |id| id.len().checked_add(5))?;
+        let strings = key_bytes
+            .checked_add(name.len())?
+            .checked_add(item_id.map_or(0, str::len))?;
+        Some((count.checked_add(1)?, used.checked_add(strings)?))
+    })
+}
+
+/// Vec starts at at least four nonzero slots for these element types, then can
+/// grow to nearly twice its live length while the plan is being assembled.
+fn projected_vec_slots(count: usize) -> Option<usize> {
+    if count == 0 {
+        Some(0)
+    } else {
+        count.checked_mul(2).map(|slots| slots.max(4))
+    }
+}
+
+/// Reserve the lowered completion artifact and restoration owners when a `done`
+/// frame uses arguments retained from prior deltas. The ordinary done frame is
+/// tiny, so its event payload cannot bound the captured item, parsed input,
+/// synthesized event values, and outgoing SSE wire made from that fallback.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflight each client-tool completion owner before the restore plan allocates"
+)]
+pub(super) fn lifecycle_fallback_staging_bytes(
+    reverse: &HashMap<String, LoweredClientTool>,
+    committed: &[ClientToolStreamItem],
+    buffered_arguments: &HashMap<String, String>,
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    if reverse.is_empty() {
+        return Some(0);
+    }
+    events.iter().enumerate().try_fold(0_usize, |used, (index, event)| {
+        let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
+            return Some(used);
+        };
+        if payload.get("arguments").and_then(Value::as_str).is_some() {
+            return Some(used);
+        }
+        let Some(key) = client_tool_event_key(payload) else {
+            return Some(used);
+        };
+        let Some(prior_events) = events.get(..index) else {
+            return Some(used);
+        };
+        let Some(restore) = fallback_restore_kind(reverse, committed, events, index, &key) else {
+            return Some(used);
+        };
+        let pieces =
+            buffered_arguments
+                .get(&key)
+                .map(String::as_str)
+                .into_iter()
+                .chain(prior_events.iter().filter_map(|prior| {
+                    let ResponsesEvent::FunctionCallArgumentsDelta(delta) = prior else {
+                        return None;
+                    };
+                    same_event_item(payload, delta)
+                        .then(|| delta.get("delta")?.as_str())
+                        .flatten()
+                }));
+        let (completion_bytes, parsed_peak, saw_piece) = joined_fallback_argument_peak_bytes(pieces)?;
+        if !saw_piece {
+            return Some(used);
+        }
+        // `capture_client_tool_completion` retains a third completed-item copy
+        // beyond the output item and tool_calls charged by the common projection.
+        let restoration_bytes = match restore {
+            ClientToolRestore::Namespace => 0,
+            // Custom only parses one string envelope; reserve the plan string
+            // and the two emitted input frames alongside the completion copy.
+            ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
+                completion_bytes.checked_mul(3)?.checked_add(512)?
+            },
+            // Shell/ToolSearch parse a generic Value. The joined structural
+            // bound includes tiny-node heap and numeric normalization.
+            ClientToolRestore::Shell | ClientToolRestore::ToolSearch => parsed_peak.checked_add(512)?,
+        };
+        used.checked_add(completion_bytes)?.checked_add(restoration_bytes)
+    })
+}
+
+/// Count a JSON argument stream across prior chunks and earlier deltas in this
+/// chunk without concatenating it. Carry lexical state across slice boundaries:
+/// scanning each delta independently can miss nodes after a split string closes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "allocation-free lexical scan across fragmented JSON arguments"
+)]
+fn joined_fallback_argument_peak_bytes<S: AsRef<str>>(pieces: impl Iterator<Item = S>) -> Option<(usize, usize, bool)> {
+    let (mut raw, mut escaped, mut objects, mut arrays, mut strings, mut scalars) =
+        (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_usize);
+    let (mut in_string, mut escaped_char, mut in_number, mut saw_piece) = (false, false, false, false);
+    for piece in pieces {
+        let piece = piece.as_ref();
+        saw_piece = true;
+        raw = raw.checked_add(piece.len())?;
+        escaped = escaped.checked_add(retained_json_bytes(piece)?)?;
+        for byte in piece.bytes() {
+            if in_string {
+                if escaped_char {
+                    escaped_char = false;
+                } else if byte == b'\\' {
+                    escaped_char = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => {
+                    strings = strings.checked_add(1)?;
+                    in_string = true;
+                    in_number = false;
+                },
+                b'{' => {
+                    objects = objects.checked_add(1)?;
+                    in_number = false;
+                },
+                b'[' => {
+                    arrays = arrays.checked_add(1)?;
+                    in_number = false;
+                },
+                b'-' | b'0'..=b'9' if !in_number => {
+                    scalars = scalars.checked_add(1)?;
+                    in_number = true;
+                },
+                b'-' | b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' if in_number => {},
+                b't' | b'f' | b'n' => {
+                    scalars = scalars.checked_add(1)?;
+                    in_number = false;
+                },
+                _ => in_number = false,
+            }
+        }
+    }
+    let nodes = objects
+        .checked_add(arrays)?
+        .checked_add(strings)?
+        .checked_add(scalars)?;
+    let parsed_peak = raw.checked_mul(8)?.checked_add(nodes.checked_mul(256)?)?;
+    Some((escaped, parsed_peak, saw_piece))
+}
+
+/// Find a lowered call already tracked or opened earlier in this same chunk.
+fn fallback_restore_kind(
+    reverse: &HashMap<String, LoweredClientTool>,
+    committed: &[ClientToolStreamItem],
+    events: &[ResponsesEvent],
+    index: usize,
+    key: &str,
+) -> Option<ClientToolRestore> {
+    committed
+        .iter()
+        .find(|item| item.key == key)
+        .map(|item| item.restore)
+        .or_else(|| {
+            events.get(..index)?.iter().find_map(|prior| {
+                let ResponsesEvent::OutputItemAdded(added) = prior else {
+                    return None;
+                };
+                if client_tool_event_key(added).as_deref() != Some(key) {
+                    return None;
+                }
+                added
+                    .get("item")
+                    .and_then(|item| item.get("name"))
+                    .and_then(Value::as_str)
+                    .and_then(|name| reverse.get(name))
+                    .map(|lowered| lowered.restore)
+            })
+        })
 }
 
 /// Plan the restoration for a single committed event, advancing `next_items`.
@@ -1242,6 +1711,217 @@ mod tests {
         assert!(
             result.is_err(),
             "output_item.done before arguments.done must fail closed"
+        );
+    }
+
+    #[test]
+    fn ordinary_deltas_do_not_remeasure_large_client_tool_echo() {
+        fn measure(echo_size: usize) -> std::time::Duration {
+            let reverse = reverse_custom();
+            let echo = ClientToolEcho {
+                tools: vec![serde_json::json!({"type": "custom", "description": "x".repeat(echo_size)})],
+                tool_choice: serde_json::json!("auto"),
+            };
+            let delta = ResponsesEvent::OutputTextDelta(serde_json::json!({
+                "type": "response.output_text.delta", "delta": "x"
+            }));
+            let started = std::time::Instant::now();
+            for _ in 0..2_000 {
+                let staged = lifecycle_restore_staging_bytes(&reverse, Some(&echo), &[], std::slice::from_ref(&delta));
+                assert_eq!(std::hint::black_box(staged), Some(0));
+            }
+            let elapsed = started.elapsed();
+
+            let snapshot = ResponsesEvent::ResponseCreated(serde_json::json!({
+                "type": "response.created", "response": {"output": [], "tools": []}
+            }));
+            assert!(
+                lifecycle_restore_staging_bytes(&reverse, Some(&echo), &[], &[delta, snapshot])
+                    .is_some_and(|bytes| bytes > echo_size * 3),
+                "a later response snapshot in the same chunk must still reserve echo copies"
+            );
+            elapsed
+        }
+
+        let small = measure(1_024);
+        let large = measure(1_048_576);
+        assert!(
+            large <= small * 20 + std::time::Duration::from_millis(100),
+            "2,000 plain deltas took {large:?} with 1 MiB echo versus {small:?} with 1 KiB"
+        );
+    }
+
+    #[test]
+    fn nameless_done_reserves_tracked_restoration_name() {
+        let mut reverse = reverse_namespace();
+        let lowered = reverse.get_mut("agentic_ns__fs__read").unwrap();
+        lowered.original_name = "n".repeat(131_072);
+        let committed = [ClientToolStreamItem {
+            key: "item:fc_1".to_owned(),
+            private_name: "agentic_ns__fs__read".to_owned(),
+            restore: ClientToolRestore::Namespace,
+            phase: ClientToolPhase::ArgsComplete,
+            output_index: 0,
+            item_id: Some("fc_1".to_owned()),
+        }];
+        let done = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "fc_1", "call_id": "c1"}
+        }));
+        let projected = lifecycle_restore_staging_bytes(&reverse, None, &committed, &[done]).unwrap();
+        assert!(
+            projected >= 3 * 131_072,
+            "a tracked item can restore by id even when the done item omits type and name"
+        );
+
+        let unrelated = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 1,
+            "item": {"type": "message", "id": "msg_1"}
+        }));
+        assert_eq!(
+            lifecycle_restore_staging_bytes(&reverse, None, &committed, &[unrelated]),
+            Some(0),
+            "an unrelated done item must not pay for an unused large namespace name"
+        );
+
+        let misleading = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "name": "other"}
+        }));
+        assert!(
+            lifecycle_restore_staging_bytes(&reverse, None, &committed, &[misleading]).unwrap() >= 3 * 131_072,
+            "the tracked private name, not an inconsistent done name, determines restoration growth"
+        );
+
+        let args_done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "output_index": 0,
+            "item_id": "fc_1", "name": "other", "arguments": "{}"
+        }));
+        assert!(
+            lifecycle_restore_staging_bytes(&reverse, None, &committed, &[args_done]).unwrap() >= 3 * 131_072,
+            "arguments.done also restores the tracked member name despite an inconsistent event name"
+        );
+
+        let unrelated_added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "name": "other"}
+        }));
+        let lowered_added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "name": "agentic_ns__fs__read"}
+        }));
+        let nameless_done = serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "fc_1"}
+        });
+        assert!(
+            tracked_restore(&reverse, &[], &[unrelated_added, lowered_added], &nameless_done)
+                .is_some_and(|lowered| lowered.original_name.len() == 131_072),
+            "an unrelated same-id added event cannot hide the later lowered item from preflight"
+        );
+    }
+
+    #[test]
+    fn plan_preflight_counts_committed_items_on_plain_deltas() {
+        let reverse = reverse_namespace();
+        let id = "i".repeat(262_144);
+        let committed = [ClientToolStreamItem {
+            key: format!("item:{id}"),
+            private_name: "agentic_ns__fs__read".to_owned(),
+            restore: ClientToolRestore::Namespace,
+            phase: ClientToolPhase::Opened,
+            output_index: 0,
+            item_id: Some(id),
+        }];
+        let delta = ResponsesEvent::OutputTextDelta(serde_json::json!({
+            "type": "response.output_text.delta", "delta": "x"
+        }));
+        let staged = restoration_plan_staging_bytes(&reverse, &committed, &[delta]).unwrap();
+        assert!(
+            staged > 524_288,
+            "the plan clones both the long key and item id on every chunk"
+        );
+        assert_eq!(
+            projected_vec_slots(1),
+            Some(4),
+            "the first Vec push allocates four slots"
+        );
+    }
+
+    #[test]
+    fn explicit_typed_arguments_are_reserved_before_restore_parse() {
+        let reverse = reverse_tool_search();
+        let committed = [ClientToolStreamItem {
+            key: "item:fc_1".to_owned(),
+            private_name: "tool_search".to_owned(),
+            restore: ClientToolRestore::ToolSearch,
+            phase: ClientToolPhase::Opened,
+            output_index: 0,
+            item_id: Some("fc_1".to_owned()),
+        }];
+        let arguments = format!("{{\"values\":[{}]}}", vec!["1e15"; 10_000].join(","));
+        let parsed =
+            super::super::super::agentic_loop::buffered_parsed_json_bytes_upper_bound(arguments.as_bytes()).unwrap();
+        let args_done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "item_id": "fc_1",
+            "output_index": 0, "arguments": arguments.as_str()
+        }));
+        assert!(
+            lifecycle_restore_staging_bytes(&reverse, None, &committed, &[args_done]).unwrap() >= parsed * 4,
+            "explicit arguments must reserve numeric Value expansion before the plan parses them"
+        );
+        let item_done = ResponsesEvent::OutputItemDone(serde_json::json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "name": "tool_search", "arguments": arguments.as_str()}
+        }));
+        assert!(
+            lifecycle_restore_staging_bytes(&reverse, None, &committed, &[item_done]).unwrap() >= parsed * 4,
+            "typed output_item.done must also reserve the parsed argument Value"
+        );
+    }
+
+    #[test]
+    fn same_chunk_fallback_deltas_reserve_typed_parse_before_commit() {
+        let reverse = reverse_tool_search();
+        let committed = [ClientToolStreamItem {
+            key: "item:fc_1".to_owned(),
+            private_name: "tool_search".to_owned(),
+            restore: ClientToolRestore::ToolSearch,
+            phase: ClientToolPhase::Opened,
+            output_index: 0,
+            item_id: Some("fc_1".to_owned()),
+        }];
+        let arguments = format!("{{\"values\":[{}]}}", vec!["1e15"; 2_000].join(","));
+        let (first, second) = arguments.split_at(arguments.len() / 2);
+        let delta = |part: &str| {
+            ResponsesEvent::FunctionCallArgumentsDelta(serde_json::json!({
+                "type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                "output_index": 0, "delta": part
+            }))
+        };
+        let done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done", "item_id": "fc_1", "output_index": 0
+        }));
+        let projected = lifecycle_fallback_staging_bytes(
+            &reverse,
+            &committed,
+            &HashMap::new(),
+            &[delta(first), delta(second), done],
+        )
+        .unwrap();
+        assert!(
+            projected > arguments.len() * 10,
+            "prior deltas in the same chunk must reserve dense numeric parse before accumulation"
+        );
+
+        let pieces = ["{\"x\":\"abc", "\",\"values\":[1e15]}"];
+        let joined = pieces.concat();
+        let (_, parsed_peak, saw_piece) = joined_fallback_argument_peak_bytes(pieces.into_iter()).unwrap();
+        assert!(saw_piece);
+        assert_eq!(
+            parsed_peak,
+            super::super::super::initial_json_parse_peak_bytes(joined.as_bytes()).unwrap(),
+            "a string closing at a delta boundary must not hide later JSON nodes"
         );
     }
 

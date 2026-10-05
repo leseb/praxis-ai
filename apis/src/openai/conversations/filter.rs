@@ -30,12 +30,12 @@ use crate::{
     openai::{
         operation_classifier::OpenAiOperationMatch,
         responses::{
-            bound_body_outcome, buffered_parsed_json_bytes_upper_bound,
+            AgenticBudgetPolicy, bound_body_outcome, buffered_parsed_json_bytes_upper_bound,
             error::responses_error_rejection,
             state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
             store::{
                 PersistedResponseForConversation, ResponseRound, request_persistence_armed, response_round,
-                store_response_header_skipped,
+                store_response_header_skipped, trusted_identity_content_length,
             },
         },
     },
@@ -635,6 +635,9 @@ impl HttpFilter for OpenaiConversationsFilter {
             trace!("conversation append-back skipped (non-2xx or unsupported response content type)");
         }
         if armed {
+            if budgeted_append_state_missing(ctx) {
+                return Ok(conversation_budget_failure(ctx, false, &mut None));
+            }
             let owner = ctx
                 .extensions
                 .get::<CapturedAppendOwner>()
@@ -726,15 +729,11 @@ impl HttpFilter for OpenaiConversationsFilter {
                         // case the completed upstream body is the only source
                         // of append items. Bound the shared framework buffer
                         // to the remaining headroom before its first chunk.
-                        let Some(max_bytes) = buffered_response_headroom(ctx) else {
+                        let Some(max_bytes) = buffered_response_headroom(ctx)
+                            .and_then(|headroom| finite_conversation_buffer_cap(ctx, headroom))
+                        else {
                             return Ok(conversation_budget_failure(ctx, false, &mut None));
                         };
-                        if existing_response_buffer_exceeds(ctx, max_bytes) {
-                            // Core ratchets to the larger StreamBuffer cap. A
-                            // prior filter's buffer cannot be narrowed here,
-                            // so reject before it can retain unadmitted bytes.
-                            return Ok(conversation_budget_failure(ctx, false, &mut None));
-                        }
                         ctx.set_response_body_mode(BodyMode::StreamBuffer {
                             max_bytes: Some(max_bytes),
                         });
@@ -791,11 +790,10 @@ impl HttpFilter for OpenaiConversationsFilter {
         }
 
         if streaming {
-            // Deferred terminals are delivered in this non-EOS chunk. Local
-            // completions leave the flag unset and carry the full terminal in
-            // a single IRR chunk before the empty EOS callback. A completed-looking
-            // state without either frame must not append after a failed stream.
-            if !streaming_terminal_emitted(ctx) && !contains_completed_terminal(body) {
+            // Append only while the successful terminal is still in this
+            // callback. A later [DONE] or EOS cannot replace bytes already
+            // delivered to the client with an admission error.
+            if !contains_completed_terminal(body) {
                 return Ok(FilterAction::Continue);
             }
         } else if !end_of_stream {
@@ -804,6 +802,10 @@ impl HttpFilter for OpenaiConversationsFilter {
         let Some(append_owner) = response_state.and_then(|state| state.append_owner.clone()) else {
             return Ok(FilterAction::Continue);
         };
+
+        if budgeted_append_state_missing(ctx) {
+            return Ok(conversation_budget_failure(ctx, streaming, body));
+        }
 
         if canonical_append_is_empty(ctx) {
             if let Some(state) = ctx.extensions.get_mut::<ConversationResponseState>() {
@@ -890,7 +892,28 @@ fn canonical_append_is_empty(ctx: &HttpFilterContext<'_>) -> bool {
         })
 }
 
-/// Bound a conditional noncanonical JSON buffer by unused request allowance.
+/// Check the canonical local-completion frame delivered as one IRR chunk. The
+/// composer writes this ASCII event header in one chunk; no SSE body is accumulated.
+fn contains_completed_terminal(body: &Option<Bytes>) -> bool {
+    const EVENT_HEADER: &[u8] = b"event: response.completed\n";
+    body.as_deref()
+        .is_some_and(|chunk| chunk.windows(EVENT_HEADER.len()).any(|window| window == EVENT_HEADER))
+}
+
+/// A listener-wide agentic budget cannot be bypassed by a response path that
+/// lost its shared state before append-back.
+fn budgeted_append_state_missing(ctx: &HttpFilterContext<'_>) -> bool {
+    let policy = ctx.extensions.get::<AgenticBudgetPolicy>();
+    if policy.is_none() && ctx.get_metadata("responses.retained_budget_active") != Some("true") {
+        return false;
+    }
+    ctx.extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+        .is_none_or(|limit| policy.is_some_and(|policy| limit > policy.max_retained_bytes()))
+}
+
+/// Bound the extra framework JSON buffer by unused request allowance.
 fn buffered_response_headroom(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>()?;
     let limit = state.retained_payload_limit()?;
@@ -898,20 +921,52 @@ fn buffered_response_headroom(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     limit.checked_sub(current).map(|bytes| bytes.min(MAX_JSON_BODY_BYTES))
 }
 
-/// Detect a prior filter buffer that core's ratchet cannot narrow.
-fn existing_response_buffer_exceeds(ctx: &HttpFilterContext<'_>, cap: usize) -> bool {
-    match &ctx.response_body_mode {
-        BodyMode::StreamBuffer { max_bytes } => max_bytes.is_none_or(|existing| existing > cap),
-        _ => false,
+/// Choose the finite transport cap before Store runs. The loop's finalizer
+/// publishes an exact wire length and digest; a direct response may instead
+/// use one trusted identity-coded Content-Length. Preserve any prior narrower
+/// buffer when no exact length is known because core only ratchets caps upward.
+fn finite_conversation_buffer_cap(ctx: &HttpFilterContext<'_>, headroom: usize) -> Option<usize> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let exact = if state.buffered_canonical_finalized {
+        state.buffered_canonical_body_digest?;
+        Some(state.buffered_canonical_wire_bytes?)
+    } else if ctx.extensions.get::<praxis_filter::IterationState>().is_none() {
+        ctx.response_header
+            .as_ref()
+            .and_then(|response| trusted_identity_content_length(&response.headers))
+    } else {
+        None
+    };
+    let cap = exact.unwrap_or(headroom);
+    if cap == 0 || cap > headroom {
+        return None;
     }
+    if ctx
+        .response_header
+        .as_ref()
+        .and_then(|response| response.headers.get(http::header::CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > cap)
+    {
+        return None;
+    }
+    compatible_finite_buffer_cap(ctx, cap, exact.is_some())
 }
 
-/// Check the canonical local-completion frame delivered as one IRR chunk. The
-/// composer writes this ASCII event header in one chunk; no SSE body is accumulated.
-fn contains_completed_terminal(body: &Option<Bytes>) -> bool {
-    const EVENT_HEADER: &[u8] = b"event: response.completed\n";
-    body.as_deref()
-        .is_some_and(|chunk| chunk.windows(EVENT_HEADER.len()).any(|window| window == EVENT_HEADER))
+/// Core only ratchets a response buffer upward. An exact wire admission must
+/// match an earlier buffer; a headroom cap may retain an earlier narrower one.
+fn compatible_finite_buffer_cap(ctx: &HttpFilterContext<'_>, cap: usize, exact: bool) -> Option<usize> {
+    match &ctx.response_body_mode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(existing),
+        } if *existing > cap || (exact && *existing != cap) => None,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(existing),
+        } => Some(*existing),
+        BodyMode::StreamBuffer { max_bytes: None } => None,
+        _ => Some(cap),
+    }
 }
 
 /// Admit every new JSON owner before parsing buffered output or cloning the
