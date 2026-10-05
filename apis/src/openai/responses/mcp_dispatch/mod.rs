@@ -2263,6 +2263,10 @@ fn aggregate_transport_ceiling_lowered(
 
 /// Distinguish a request-wide size failure from a configured per-tool limit.
 /// The latter stays a bounded tool error so an executed call is not retried.
+#[expect(
+    clippy::too_many_lines,
+    reason = "classify all transport and decoded size ceilings at the call boundary"
+)]
 fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
     if matches!(options.aggregate_result_policy, McpAggregateResultPolicy::Unbudgeted) {
         return false;

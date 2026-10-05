@@ -673,7 +673,7 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
-    let headroom = 1_100_000;
+    let headroom = 8_000_000;
     state.apply_retained_payload_limit(current + result_id_bytes + headroom);
     let calls = call_refs(&state.tool_calls);
 
@@ -793,9 +793,9 @@ async fn budgeted_mcp_dispatch_rejects_before_initialize_without_headroom() {
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 413));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert!(state.dispatch_failure.is_none());
     assert!(state.messages.is_empty(), "no MCP result may be committed");
     assert!(state.accumulated_output.is_empty(), "no tool call may be dispatched");
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));

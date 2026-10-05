@@ -249,10 +249,6 @@ pub(super) struct SseSizeCeilings {
     clippy::too_many_lines,
     reason = "two-budget byte-layer adapter is inherently sequential"
 )]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "wire and parsed limits are separate SSE boundaries"
-)]
 pub(super) fn sse_stream_from_body(
     body: Box<dyn StreamingResponseBody>,
     ceilings: SseSizeCeilings,
@@ -418,6 +414,7 @@ mod tests {
         Arc::new(AtomicBool::new(false))
     }
 
+    #[expect(clippy::too_many_arguments, reason = "exercise all independent SSE ceilings")]
     fn sse_stream_from_body(
         body: Box<dyn StreamingResponseBody>,
         per_event_cap: usize,

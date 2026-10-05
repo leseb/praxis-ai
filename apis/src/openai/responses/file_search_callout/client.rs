@@ -2637,7 +2637,7 @@ mod tests {
             std::iter::repeat_n("1e15", 300).collect::<Vec<_>>().join(",")
         );
         let available = 4_000;
-        let decoded = parse_response_body(body.as_bytes(), "store", 10).expect("valid compact numeric result");
+        let decoded = parse_response_body(body.as_bytes(), "store", 10, None).expect("valid compact numeric result");
         let decoded_bytes =
             crate::openai::responses::state::retained_json_bytes(&decoded.data).expect("decoded size is representable");
         assert!(body.len() < available);
