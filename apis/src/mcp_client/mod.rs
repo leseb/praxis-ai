@@ -542,6 +542,7 @@ async fn open_tool_session(
         signal_state,
         max_result_bytes,
         tool_control_response_cap(initialize_limit, control_response_bytes),
+        preparse_peak_limit,
     ))
 }
 
@@ -669,10 +670,11 @@ pub(crate) async fn call_tool_with_forwarded_headers_with_budget(
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
     if let Some((pool, Some(key))) = pool {
-        let checkout = pool.checkout_with_initialize_limit(
+        let checkout = pool.checkout_with_limits(
             key,
             max_result_bytes,
             tool_control_response_cap(initialize_limit, control_response_bytes),
+            preparse_peak_limit,
             budgeted,
         );
         pool.close_sessions_in_background(checkout.rejected);
