@@ -1397,16 +1397,8 @@ impl McpDispatchFilter {
             .extensions
             .get_or_insert_with(mcp_client::McpSessionPool::new)
             .clone();
-        if ctx
-            .extensions
-            .get::<ResponsesState>()
-            .and_then(ResponsesState::retained_payload_limit)
-            .is_some()
-        {
-            // A prior unbudgeted round may have left rmcp peer metadata in the
-            // request pool. Close it before using the aggregate policy; every
-            // budgeted tool call below then owns only a call-local session.
-            session_pool.drain().await;
+        if !charge_pooled_mcp_sessions(ctx, &session_pool) {
+            return Ok(Self::aggregate_budget_action(ctx));
         }
 
         // Resume approvals from the previous turn before executing any calls.
@@ -1526,6 +1518,11 @@ impl McpDispatchFilter {
             Err(_limit) if admission.aggregate_constrained => return Ok(Self::aggregate_budget_action(ctx)),
             Err(_limit) => return Ok(Self::result_limit_action(ctx)),
         };
+        // rmcp keeps initialize metadata and a possible GET parser in a parked
+        // session. Publish that live charge before admitting the result batch.
+        if !charge_pooled_mcp_sessions(ctx, &session_pool) {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
         if !ctx
             .extensions
             .get::<ResponsesState>()
@@ -2086,7 +2083,7 @@ struct McpResultAdmission {
     result_limit: usize,
     /// Initialize response wire cap enforced by the MCP transport before parse.
     control_response_bytes: usize,
-    /// Whether the request-wide budget narrowed either allowance.
+    /// Whether request-wide admission can reject a transport parse peak.
     aggregate_constrained: bool,
     /// Only unbudgeted calls may retain rmcp peer metadata in a pooled session.
     retain_session: bool,
@@ -2153,8 +2150,7 @@ fn aggregate_mcp_result_limit(
     Some(McpResultAdmission {
         result_limit,
         control_response_bytes,
-        aggregate_constrained: result_limit < configured_limit
-            || control_response_bytes < mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+        aggregate_constrained: true,
         // The request-scoped pool measures parked and closing metadata before
         // another call is admitted, including calls with no reusable key.
         retain_session: true,
@@ -2233,13 +2229,17 @@ fn aggregate_transport_ceiling_lowered(
     kind: mcp_client::McpResponseLimitKind,
     admitted_payload: usize,
     configured_payload: usize,
+    admitted_control: usize,
 ) -> bool {
+    let initialize = admitted_payload
+        .clamp(
+            mcp_client::MIN_TOOL_INITIALIZE_BYTES,
+            mcp_client::MAX_CONTROL_RESPONSE_BYTES,
+        )
+        .min(admitted_control);
     let (admitted, configured) = match kind {
         mcp_client::McpResponseLimitKind::Initialize => (
-            admitted_payload.clamp(
-                mcp_client::MIN_TOOL_INITIALIZE_BYTES,
-                mcp_client::MAX_CONTROL_RESPONSE_BYTES,
-            ),
+            initialize,
             configured_payload.clamp(
                 mcp_client::MIN_TOOL_INITIALIZE_BYTES,
                 mcp_client::MAX_CONTROL_RESPONSE_BYTES,
@@ -2250,16 +2250,13 @@ fn aggregate_transport_ceiling_lowered(
             mcp_client::tool_result_wire_cap(configured_payload),
         ),
         mcp_client::McpResponseLimitKind::GetStream => (
-            mcp_client::tool_stream_cumulative_cap(
-                mcp_client::tool_result_wire_cap(admitted_payload),
-                admitted_payload,
-            ),
+            mcp_client::tool_stream_cumulative_cap(mcp_client::tool_result_wire_cap(admitted_payload), initialize),
             mcp_client::tool_stream_cumulative_cap(
                 mcp_client::tool_result_wire_cap(configured_payload),
                 configured_payload,
             ),
         ),
-        mcp_client::McpResponseLimitKind::Control => return false,
+        mcp_client::McpResponseLimitKind::Control => (admitted_control, mcp_client::MAX_CONTROL_RESPONSE_BYTES),
     };
     lowered_exchange_ceiling(limit, admitted, configured)
 }
@@ -2267,25 +2264,57 @@ fn aggregate_transport_ceiling_lowered(
 /// Distinguish a request-wide size failure from a configured per-tool limit.
 /// The latter stays a bounded tool error so an executed call is not retried.
 fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutionOptions<'_>) -> bool {
-    if !matches!(
-        options.aggregate_result_policy,
-        McpAggregateResultPolicy::PerCallConstrained
-    ) {
+    if matches!(options.aggregate_result_policy, McpAggregateResultPolicy::Unbudgeted) {
         return false;
     }
     let admitted_payload = result_payload_limit(options.max_result_bytes);
     let configured_payload = result_payload_limit(options.configured_max_result_bytes);
+    if let Some(McpSizeLimitFailure::Transport { limit, kind }) = result.size_limit_exceeded {
+        // These are request-wide parse reservations even when the configured
+        // result cap itself did not shrink.
+        let parse_cap = match kind {
+            mcp_client::McpResponseLimitKind::Tool => options.max_result_bytes.saturating_mul(2),
+            mcp_client::McpResponseLimitKind::Initialize | mcp_client::McpResponseLimitKind::Control => options
+                .max_control_response_bytes
+                .saturating_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER),
+            mcp_client::McpResponseLimitKind::GetStream => {
+                let wire = mcp_client::tool_stream_cumulative_cap(
+                    mcp_client::tool_result_wire_cap(admitted_payload),
+                    admitted_payload.min(options.max_control_response_bytes),
+                );
+                options
+                    .max_control_response_bytes
+                    .saturating_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
+                    .min(wire.saturating_mul(12))
+            },
+        };
+        if limit == parse_cap {
+            return true;
+        }
+    }
+    let result_constrained = matches!(
+        options.aggregate_result_policy,
+        McpAggregateResultPolicy::PerCallConstrained
+    );
+    if !result_constrained && options.max_control_response_bytes == mcp_client::MAX_CONTROL_RESPONSE_BYTES {
+        return false;
+    }
     let exceeded_aggregate_cap = match result.size_limit_exceeded {
-        Some(McpSizeLimitFailure::Decoded(actual)) => actual <= configured_payload,
-        Some(McpSizeLimitFailure::Transport { limit, kind }) => {
-            aggregate_transport_ceiling_lowered(limit, kind, admitted_payload, configured_payload)
-        },
+        Some(McpSizeLimitFailure::Decoded(actual)) => result_constrained && actual <= configured_payload,
+        Some(McpSizeLimitFailure::Transport { limit, kind }) => aggregate_transport_ceiling_lowered(
+            limit,
+            kind,
+            admitted_payload,
+            configured_payload,
+            options.max_control_response_bytes,
+        ),
         None => false,
     };
     exceeded_aggregate_cap
-        || result
-            .retained_bytes()
-            .is_none_or(|bytes| bytes > options.max_result_bytes)
+        || result_constrained
+            && result
+                .retained_bytes()
+                .is_none_or(|bytes| bytes > options.max_result_bytes)
 }
 
 /// How the request-wide retained budget affects one MCP call's wire ceiling.
@@ -2316,8 +2345,8 @@ struct McpExecutionOptions<'a> {
     aggregate_result_policy: McpAggregateResultPolicy,
     /// Pre-dial ceiling for an initialize response while its parsed peer info is live.
     max_control_response_bytes: usize,
-    /// Budgeted calls close their session before returning, so peer metadata
-    /// cannot escape the call's request-wide reservation through the pool.
+    /// Whether a keyed session may be parked after its live pool charge is
+    /// published into request-wide admission.
     retain_session: bool,
     /// Timeout applied independently to each MCP call.
     timeout: Duration,
