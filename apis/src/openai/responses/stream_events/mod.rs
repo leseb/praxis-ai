@@ -1027,6 +1027,7 @@ fn parse_and_accumulate(
         let lifecycle = client_tools::lifecycle_restore_staging_bytes(
             &responses.client_tool_lowering,
             responses.client_tool_echo.as_ref(),
+            &state.client_tool_items,
             &events,
         )?;
         let fallback = client_tools::lifecycle_fallback_staging_bytes(
@@ -1035,7 +1036,12 @@ fn parse_and_accumulate(
             &state.tool_call_args,
             &events,
         )?;
-        lifecycle.checked_add(fallback)
+        let plan = client_tools::restoration_plan_staging_bytes(
+            &responses.client_tool_lowering,
+            &state.client_tool_items,
+            &events,
+        )?;
+        lifecycle.checked_add(fallback)?.checked_add(plan)
     });
     if !construction_bytes
         .and_then(|staging| staging.checked_add(projected_item_scratch_bytes?))
