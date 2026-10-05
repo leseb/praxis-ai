@@ -3963,21 +3963,27 @@ mod encode_replay_event_tests {
             .or_default()
             .set("action", "done")
             .unwrap();
+        let mut canonical_body = None;
         ctx.extensions
             .get_mut::<ResponsesState>()
             .unwrap()
-            .buffered_canonical_finalized = true;
+            .finalize_response_body(&mut canonical_body)
+            .unwrap();
+        let canonical_wire_bytes = canonical_body.as_ref().unwrap().len();
         let mut response = crate::test_utils::make_response();
         response
             .headers
             .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
         ctx.response_header = Some(&mut response);
         let rehydrate = crate::openai::RehydrateFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
-        drop(rehydrate.on_response(&mut ctx).await.unwrap());
+        assert!(matches!(
+            rehydrate.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
         assert_eq!(
             ctx.response_body_mode,
             BodyMode::StreamBuffer {
-                max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+                max_bytes: Some(canonical_wire_bytes)
             }
         );
         let store_filter =
