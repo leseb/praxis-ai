@@ -1968,7 +1968,7 @@ def usage_less_compact_client(tmp_path_factory, request, compaction_server):
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
         compact_callout_port=compaction_server,
-        retained_limit=65_536,
+        retained_limit=262_144,
     )
     log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
