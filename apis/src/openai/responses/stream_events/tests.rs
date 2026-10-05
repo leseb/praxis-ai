@@ -4467,14 +4467,19 @@ fn terminal_usage_projection_reserves_merge_and_reinsertion_peak() {
         "usage": {"detail": "x".repeat(65_536)}
     });
     let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let old_usage_bytes =
+        crate::openai::responses::state::retained_json_bytes(&ctx.extensions.get::<ResponsesState>().unwrap().usage)
+            .unwrap();
+    let incoming_usage_bytes = crate::openai::responses::state::retained_json_bytes(&response["usage"]).unwrap();
     let terminal = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
         "type": "response.completed",
         "response": response
     }));
     let projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
+    assert_eq!(projection, (old_usage_bytes + incoming_usage_bytes) * 2);
     assert!(
-        projection >= response_bytes * 3,
-        "event, cloned response, merged usage, and replacement usage clone must fit together"
+        projection < response_bytes * 3,
+        "the terminal response moves out of the parsed event"
     );
 }
 
