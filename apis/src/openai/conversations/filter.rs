@@ -872,13 +872,6 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.stream") == Some("true")
 }
 
-/// Whether the stream composer placed its canonical terminal in this chunk.
-fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.extensions
-        .get::<ResponsesState>()
-        .is_some_and(|state| state.logical_stream_terminal_emitted)
-}
-
 /// Prove no append records exist only after the loop finalized this turn.
 fn canonical_append_is_empty(ctx: &HttpFilterContext<'_>) -> bool {
     crate::openai::responses::buffered_canonical_completed(ctx)
