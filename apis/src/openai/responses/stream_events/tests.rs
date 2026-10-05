@@ -1184,7 +1184,8 @@ fn deferred_terminal_reserves_restored_payload_and_wire_together() {
     state.retained_stream_parser_bytes = terminal.retained_payload_bytes().unwrap();
     let limit = 131_072;
     let baseline = state.retained_payload_bytes().unwrap();
-    state.set_retained_external_payload_bytes(limit - baseline - 25_000);
+    // One restored echo fits, but it must coexist with the outgoing frame.
+    state.set_retained_external_payload_bytes(limit - baseline - 15_000);
     state.apply_retained_payload_limit(limit);
     ctx.extensions.insert(state);
     let mut wire = Vec::new();
@@ -1222,7 +1223,7 @@ fn deferred_terminal_rejects_echo_before_restoring_canonical_response() {
     let baseline = state.retained_payload_bytes().unwrap();
     let terminal_bytes = terminal.retained_payload_bytes().unwrap();
     let echo_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
-    assert!(echo_staging > 40_000, "both restored response owners must be projected");
+    assert!(echo_staging > 20_000, "the restored echo owner must be projected");
     state.apply_retained_payload_limit(baseline + terminal_bytes + 1_024);
     ctx.extensions.insert(state);
     let mut output = Vec::new();
