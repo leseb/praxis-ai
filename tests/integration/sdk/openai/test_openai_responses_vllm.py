@@ -2061,12 +2061,32 @@ def direct_budget_client(tmp_path, request):
         backend_endpoint=f"127.0.0.1:{backend.server_port}",
     )
     budget_param = getattr(request, "param", 16_384)
-    budget_limit, store_response_first = (
-        budget_param if isinstance(budget_param, tuple) else (budget_param, False)
-    )
+    if isinstance(budget_param, tuple) and len(budget_param) == 3:
+        budget_limit, store_response_first, enable_conversations = budget_param
+    else:
+        budget_limit, store_response_first = (
+            budget_param if isinstance(budget_param, tuple) else (budget_param, False)
+        )
+        enable_conversations = False
     config = config.replace(
         "max_retained_bytes: 67108864", f"max_retained_bytes: {budget_limit}"
     )
+    if enable_conversations:
+        config = config.replace("on_invalid: reject", "on_invalid: continue", 1)
+        anchor = "      - filter: openai_response_store\n"
+        assert config.count(anchor) == 1
+        config = config.replace(
+            anchor,
+            "      - filter: openai_operation\n"
+            "\n"
+            "      - filter: openai_conversations\n"
+            "        backend: sqlite\n"
+            '        database_url: "sqlite://responses.db?mode=rwc"\n'
+            "        conversations_table: openai_conversations\n"
+            "        items_table: openai_conversation_items\n"
+            "\n"
+            + anchor,
+        )
     if store_response_first:
         # Put Store on the first response callback while Rehydrate still
         # establishes the request's retained state before the direct branch.
@@ -2145,6 +2165,23 @@ def test_direct_budget_store_rejects_before_success_headers(direct_budget_client
     passthrough = client.responses.create(model="3000", input="hello", store=False)
     assert passthrough.status == "completed"
     assert passthrough.output[0].content[0].text == "x" * 3000
+
+
+@pytest.mark.parametrize("direct_budget_client", [(65_536, False, True)], indirect=True)
+def test_direct_budget_conversation_rejects_unknown_length_before_headers(direct_budget_client):
+    """A direct chunked response cannot commit a Conversation append early."""
+    client = direct_budget_client
+    conversation = client.conversations.create()
+    try:
+        with pytest.raises(APIStatusError) as error:
+            client.responses.create(
+                model="chunked", input="unknown append length", conversation=conversation.id, store=False
+            )
+        assert error.value.status_code == 502
+        assert error.value.response.json()["error"]["type"] == "server_error"
+        assert client.conversations.items.list(conversation.id).data == []
+    finally:
+        client.conversations.delete(conversation.id)
 
 
 @pytest.mark.parametrize("direct_budget_client", [32_768], indirect=True)
@@ -2986,28 +3023,23 @@ class TestOpenAIResponsesVLLM:
         finally:
             client.conversations.delete(conversation.id)
 
-    def test_budgeted_noncanonical_conversation_rejects_before_success_headers(
+    def test_budgeted_internal_noncanonical_conversation_admits_chunked_response(
         self, witness_noncanonical_budgeted_conversation_client
     ):
-        """A chunked, skipped agentic response has unknown append cost at the 200 header.
-
-        The safe policy rejects even a small body when the aggregate budget is
-        armed, because SQL/cache staging cannot be proven before commitment.
-        """
+        """IRR may bound a chunked internal response before its outer headers."""
         client, forwarded = witness_noncanonical_budgeted_conversation_client
         conversation = client.conversations.create()
         try:
-            with pytest.raises(APIStatusError) as exc_info:
-                client.responses.create(
-                    model="sdk-conversation-stream",
-                    input="NONCANONICAL-APPEND-HEADER-410 BUDGET-CHUNKED-410",
-                    conversation=conversation.id,
-                    store=False,
-                )
-            assert exc_info.value.status_code == 502
-            assert exc_info.value.response.json()["error"]["type"] == "server_error"
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="NONCANONICAL-APPEND-HEADER-410 BUDGET-CHUNKED-410",
+                conversation=conversation.id,
+                store=False,
+            )
+            assert response.status == "completed"
             assert forwarded, "the backend response must reach the header hook"
-            assert client.conversations.items.list(conversation.id).data == []
+            items = client.conversations.items.list(conversation.id, order="asc").data
+            assert [item.role for item in items if item.type == "message"] == ["user", "assistant"]
         finally:
             client.conversations.delete(conversation.id)
 
