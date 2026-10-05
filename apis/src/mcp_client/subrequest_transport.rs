@@ -186,6 +186,14 @@ pub(crate) fn streaming_executor_backstop(binding_cap: usize) -> usize {
     binding_cap.saturating_mul(2)
 }
 
+/// Effective control ceiling of a budgeted tool session. The same cap applies
+/// to initialization, later control replies, and its standalone GET parser.
+pub(crate) fn tool_control_response_cap(initialize_limit: usize, control_response_bytes: usize) -> usize {
+    initialize_limit
+        .clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES)
+        .min(control_response_bytes)
+}
+
 /// Bound a tool session's GET stream by its result wire allowance and admitted
 /// handshake ceiling. A budgeted session cannot retain an unrelated 1 MiB
 /// control event in the standalone stream after the tool call completes.
@@ -859,9 +867,7 @@ impl McpSubrequestClient {
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
-        let initialize_bytes = initialize_limit
-            .clamp(MIN_TOOL_INITIALIZE_BYTES, MAX_CONTROL_RESPONSE_BYTES)
-            .min(control_response_bytes);
+        let initialize_bytes = tool_control_response_cap(initialize_limit, control_response_bytes);
         Self::with_wire_cap(
             callout,
             step_timeout,
@@ -2417,6 +2423,21 @@ mod tests {
         assert_eq!(
             McpSubrequestClient::response_limit_kind(&initialize),
             McpResponseLimitKind::Initialize
+        );
+        let wider_control_allowance = McpSubrequestClient::for_tool_with_budget(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            2_048,
+            6_877,
+            Some(8_192),
+            true,
+            None,
+        );
+        assert_eq!(wider_control_allowance.response_limit(&initialize), 2_048);
+        assert_eq!(
+            wider_control_allowance.control_preparse_limit(),
+            Some(2_048 * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
         );
         let initialized: ClientJsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
