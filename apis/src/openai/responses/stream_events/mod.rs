@@ -1400,11 +1400,9 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
                         .and_then(Value::as_str)
                         .is_some_and(|name| state.is_some_and(|state| state.client_tool_lowering.contains_key(name)))
                 });
-                // Completion may own an extracted argument string, grow the
-                // canonical item, and clone that completed item into
-                // `tool_calls` before the event is consumed. A lowered client
-                // tool also clones the full item into ClientToolCompletion for
-                // the restore plan while the tool_calls clone remains live.
+                // Completion may own an extracted argument string and grow
+                // the canonical item. A lowered client tool also clones the
+                // completed item into ClientToolCompletion for its restore plan.
                 event_bytes
                     .checked_mul(3)?
                     .checked_add(item_bytes)?
@@ -2142,7 +2140,7 @@ fn accumulate_chunk(
     };
     for event in events {
         // Earlier completion snapshots remain live until phase 2b. A native
-        // done event also clones its output item without adding a snapshot,
+        // done event can grow the canonical output item from buffered arguments,
         // so admit each done mutation even while completion_bytes is zero.
         if (completion_bytes > 0 || matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_)))
             && !pending_completion_event_fits(ctx, state, event, &mut admission)
@@ -2150,7 +2148,13 @@ fn accumulate_chunk(
             release_client_tool_completions(ctx, completions, completion_bytes);
             return Ok(None);
         }
-        let retained_clone_bytes = accumulate_event(ctx, state, event);
+        let done_growth = match event {
+            ResponsesEvent::FunctionCallArgumentsDone(payload) => {
+                projected_done_mutation_peak_bytes(ctx, state, payload)
+            },
+            _ => None,
+        };
+        accumulate_event(ctx, state, event);
         state.invalidate_tool_calls_for_event(event);
         if let Some(responses) = ctx.extensions.get::<ResponsesState>() {
             state.invalidate_output_item_for_event(responses, event);
@@ -2158,38 +2162,17 @@ fn accumulate_chunk(
         if matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_))
             && let Some(upper) = admission.shared_upper_bound.as_mut()
         {
-            // A done event can grow the response item's arguments/status and
-            // retain one full tool-call clone. Two clone sizes plus the event
-            // JSON and field overhead bound both owners, including arguments
-            // previously held in the parser's delta buffer.
-            let growth = retained_clone_bytes
-                .checked_mul(2)
-                .and_then(|bytes| bytes.checked_add(retained_event_payload_bytes(event)?))
-                .and_then(|bytes| bytes.checked_add(64));
-            *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
+            // The canonical item can grow from arguments buffered in earlier
+            // frames. Carry its pre-mutation projection through later events
+            // in this chunk while completion snapshots remain live.
+            *upper = upper
+                .checked_add(done_growth.unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX);
         } else if let Some(upper) = admission.shared_upper_bound.as_mut() {
             // The preflight's clone projection also bounds the shared growth
             // retained by an interleaved output, delta, or terminal event.
             let growth = projected_responses_state_clone_bytes(ctx, std::slice::from_ref(event));
             *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
-        }
-        // `function_call_arguments.done` can clone a completed item whose
-        // payload arrived in an earlier frame. Keep the stream byte cap sticky.
-        if retained_clone_bytes > 0 {
-            let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-            let Some(total) = responses.stream_accumulated_bytes.checked_add(retained_clone_bytes) else {
-                release_client_tool_completions(ctx, completions, completion_bytes);
-                return Err(SseParseError::AccumulationLimitExceeded {
-                    dimension: "accumulated_bytes",
-                    value: usize::MAX,
-                    limit: state.max_accumulated_bytes,
-                });
-            };
-            responses.stream_accumulated_bytes = total;
-            if let Some(error) = accumulation_bytes_exceeded(state, total) {
-                release_client_tool_completions(ctx, completions, completion_bytes);
-                return Err(error);
-            }
         }
         match capture_client_tool_completion(state, ctx, &mut completions, event, &mut admission) {
             Ok(Some(bytes)) => {
@@ -2253,9 +2236,9 @@ fn pending_completion_event_fits(
     true
 }
 
-/// Bound the new arguments in the response item plus the completed tool-call
-/// clone, including the case where a tiny done event consumes a large delta
-/// string held by the parser from earlier chunks.
+/// Bound the new arguments in the canonical response item, including the case
+/// where a tiny done event consumes a large delta string held by the parser
+/// from earlier chunks.
 fn projected_done_mutation_peak_bytes(
     ctx: &HttpFilterContext<'_>,
     state: &StreamEventsState,
