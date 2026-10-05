@@ -1356,7 +1356,11 @@ fn assert_cached_response_charge_matches_uncached(ctx: &mut praxis_filter::HttpF
     let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
     let cached = parser
-        .response_object_bytes(&responses.response_object, usize::MAX)
+        .response_object_bytes(
+            &responses.response_object,
+            responses.response_object_revision,
+            usize::MAX,
+        )
         .unwrap();
     let cached_tool_calls = parser.completed_tool_calls_bytes(&responses.tool_calls).unwrap();
     assert_eq!(cached, super::retained_json_bytes(&responses.response_object).unwrap());
@@ -1473,6 +1477,123 @@ fn completed_stream_item_is_charged_across_later_small_deltas() {
     eprintln!("completed-item 100-delta budget scan: {:?}", start.elapsed());
     assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
     assert_cached_response_charge_matches_uncached(&mut ctx);
+}
+
+#[test]
+fn current_round_output_array_cache_follows_revision_and_lifecycle_changes() {
+    let mut responses = ResponsesState::from_request_body(json!({}));
+    responses.replace_response_object(json!({
+        "status": "in_progress",
+        "output": [{"id":"msg_1","type":"message","content":[]}]
+    }));
+    let mut stream = make_filter().new_round_state(0, 0);
+    let measure = |stream: &mut StreamEventsState, responses: &ResponsesState| {
+        stream.response_object_bytes(
+            &responses.response_object,
+            responses.response_object_revision,
+            usize::MAX,
+        )
+    };
+    assert_eq!(
+        measure(&mut stream, &responses),
+        super::retained_json_bytes(&responses.response_object)
+    );
+    assert!(stream.output_array_bytes.is_some());
+
+    // A stable revision reads the cached aggregate without revisiting slots.
+    stream.output_item_bytes[0] = None;
+    assert_eq!(
+        measure(&mut stream, &responses),
+        super::retained_json_bytes(&responses.response_object)
+    );
+    assert!(stream.output_item_bytes[0].is_none());
+
+    // A sibling's same-length replacement has no SSE lifecycle invalidation.
+    responses.output_items_mut()[0] = json!({"id":"msg_1","type":"message","content":["larger"]});
+    assert_eq!(
+        measure(&mut stream, &responses),
+        super::retained_json_bytes(&responses.response_object)
+    );
+    assert!(stream.output_item_bytes[0].is_some());
+
+    // An added event can retain the old slots and only measure the new one.
+    responses
+        .output_items_mut()
+        .push(json!({"id":"msg_2","type":"message","content":[]}));
+    stream.invalidate_output_item_for_event(
+        &responses,
+        &crate::openai::sse::responses::ResponsesEvent::OutputItemAdded(json!({
+            "output_index":1,"item":{"id":"msg_2","type":"message","content":[]}
+        })),
+    );
+    assert_eq!(
+        measure(&mut stream, &responses),
+        super::retained_json_bytes(&responses.response_object)
+    );
+
+    responses.replace_response_object(json!({"status":"completed","output":[]}));
+    stream.invalidate_output_item_for_event(
+        &responses,
+        &crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({})),
+    );
+    assert_eq!(
+        measure(&mut stream, &responses),
+        super::retained_json_bytes(&responses.response_object)
+    );
+    assert!(stream.output_item_bytes.is_empty());
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "matched old-path and cached output-array meter timings"
+)]
+fn current_round_output_array_budget_checks_reuse_aggregate() {
+    let mut responses = ResponsesState::from_request_body(json!({}));
+    let output: Vec<_> = (0..10_000)
+        .map(|index| json!({"id":format!("msg_{index}"),"type":"message","content":[]}))
+        .collect();
+    responses.replace_response_object(json!({"status":"in_progress","output":output}));
+    let mut stream = make_filter().new_round_state(0, 0);
+    let expected = super::retained_json_bytes(&responses.response_object).unwrap();
+    assert_eq!(
+        stream.response_object_bytes(
+            &responses.response_object,
+            responses.response_object_revision,
+            64 * 1024 * 1024
+        ),
+        Some(expected)
+    );
+    let start = std::time::Instant::now();
+    for _ in 0..500 {
+        // Emulate the previous loop over cached item slots, without repeating
+        // item serialization. The cached run below sees the same exact state.
+        stream.output_array_bytes = None;
+        std::hint::black_box(stream.response_object_bytes(
+            &responses.response_object,
+            responses.response_object_revision,
+            64 * 1024 * 1024,
+        ));
+    }
+    let old_path = start.elapsed();
+    let start = std::time::Instant::now();
+    for _ in 0..500 {
+        std::hint::black_box(stream.response_object_bytes(
+            &responses.response_object,
+            responses.response_object_revision,
+            64 * 1024 * 1024,
+        ));
+    }
+    let cached = start.elapsed();
+    assert_eq!(
+        stream.response_object_bytes(
+            &responses.response_object,
+            responses.response_object_revision,
+            64 * 1024 * 1024
+        ),
+        Some(expected)
+    );
+    eprintln!("10k output items, 500 unchanged checks: old_slot_walk={old_path:?}; cached_aggregate={cached:?}");
 }
 
 #[test]
@@ -5570,6 +5691,8 @@ fn parse_error_sets_metadata() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
+        output_array_bytes: None,
+        output_revision: None,
         tool_calls_bytes: None,
     });
 
@@ -5626,6 +5749,8 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         stream_failed: false,
         shared_stable_bytes: std::sync::OnceLock::new(),
         output_item_bytes: Vec::new(),
+        output_array_bytes: None,
+        output_revision: None,
         tool_calls_bytes: None,
     });
 
