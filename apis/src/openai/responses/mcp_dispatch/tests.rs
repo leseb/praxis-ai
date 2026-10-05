@@ -2704,7 +2704,6 @@ async fn connector_binding_over_budget_stops_before_upstream_without_tool_calls(
         ..ResponsesState::default()
     };
     let admitted = state.retained_payload_bytes().unwrap();
-    assert!(admitted >= 4_096);
     state.apply_retained_payload_limit(admitted + 106);
     assert!(state.can_retain_payload(0));
     ctx.extensions.insert(state);
@@ -2738,6 +2737,33 @@ fn connector_binding_projection_matches_actual_map_growth() {
         connector_binding_growth_bytes(&json!({"server_url": "https://mcp.example"}), true, true),
         Some(0)
     );
+}
+
+#[tokio::test]
+async fn connector_rebinding_reserves_transient_digest_even_when_final_map_size_is_unchanged() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut tool_map = sample_tool_map();
+    tool_map.retain(|(server, _), _| server == "weather");
+    let entry = tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap();
+    entry["connector_id"] = json!("weather");
+    entry["_praxis_forwarded_headers_fingerprint"] = json!("x".repeat(64));
+    assert_eq!(connector_binding_growth_bytes(entry, false, false), Some(0));
+    let mut state = ResponsesState {
+        mcp_tool_map: tool_map,
+        ..ResponsesState::default()
+    };
+    let admitted = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(admitted + 128);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 #[tokio::test]

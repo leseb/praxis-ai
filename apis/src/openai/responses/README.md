@@ -32,7 +32,7 @@ Body-phase columns show `Access / Mode` when the hook is implemented. When ordin
 | Filter | `on_request` | `on_request_body` | `on_bound_upstream_request_body` | `on_selected_upstream_request_body` | `on_response` | `on_response_body` |
 |--------|:------------:|:-----------------:|:--------------------------------:|:-----------------------------------:|:--------------:|:------------------:|
 | `openai_agentic_loop` | ✓ | ReadOnly / StreamBuffer | — | — | — | ReadWrite / Stream |
-| `openai_client_tool_compat` | — | ReadOnly / Stream | — | — | — | ReadWrite / Stream |
+| `openai_client_tool_compat` | — | ReadOnly / Stream | — | — | ✓ | ReadWrite / Stream |
 | `openai_doc_extract` | — | ReadWrite / StreamBuffer | ReadWrite / StreamBuffer | — | — | — |
 | `openai_file_resolve` | — | ReadWrite / StreamBuffer | ReadWrite / StreamBuffer | — | — | — |
 | `openai_file_search_callout` | — | ReadOnly / StreamBuffer | — | — | — | — |
