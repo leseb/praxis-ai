@@ -48,7 +48,7 @@ pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
         MAX_CONTROL_RESPONSE_BYTES, MIN_TOOL_INITIALIZE_BYTES, McpCallout, McpResponseLimitKind,
-        bind_mcp_outbound_chain, build_bare_outbound_pipeline, streaming_executor_backstop,
+        bind_mcp_outbound_chain, build_bare_outbound_pipeline, streaming_executor_backstop, tool_control_response_cap,
         tool_delete_retained_reserve, tool_result_wire_cap, tool_stream_cumulative_cap, tool_stream_retained_reserve,
         transport_signal_error, validate_mcp_target,
     },
@@ -541,7 +541,7 @@ async fn open_tool_session(
         service,
         signal_state,
         max_result_bytes,
-        initialize_limit.min(control_response_bytes),
+        tool_control_response_cap(initialize_limit, control_response_bytes),
     ))
 }
 
@@ -672,7 +672,7 @@ pub(crate) async fn call_tool_with_forwarded_headers_with_budget(
         let checkout = pool.checkout_with_initialize_limit(
             key,
             max_result_bytes,
-            initialize_limit.min(control_response_bytes),
+            tool_control_response_cap(initialize_limit, control_response_bytes),
             budgeted,
         );
         pool.close_sessions_in_background(checkout.rejected);

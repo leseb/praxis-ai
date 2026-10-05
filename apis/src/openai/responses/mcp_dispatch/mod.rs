@@ -2231,32 +2231,24 @@ fn aggregate_transport_ceiling_lowered(
     configured_payload: usize,
     admitted_control: usize,
 ) -> bool {
-    let initialize = admitted_payload
-        .clamp(
-            mcp_client::MIN_TOOL_INITIALIZE_BYTES,
-            mcp_client::MAX_CONTROL_RESPONSE_BYTES,
-        )
-        .min(admitted_control);
     let (admitted, configured) = match kind {
-        mcp_client::McpResponseLimitKind::Initialize => (
-            initialize,
-            configured_payload.clamp(
-                mcp_client::MIN_TOOL_INITIALIZE_BYTES,
-                mcp_client::MAX_CONTROL_RESPONSE_BYTES,
-            ),
-        ),
+        mcp_client::McpResponseLimitKind::Initialize | mcp_client::McpResponseLimitKind::Control => {
+            (admitted_control, mcp_client::MAX_CONTROL_RESPONSE_BYTES)
+        },
         mcp_client::McpResponseLimitKind::Tool => (
             mcp_client::tool_result_wire_cap(admitted_payload),
             mcp_client::tool_result_wire_cap(configured_payload),
         ),
         mcp_client::McpResponseLimitKind::GetStream => (
-            mcp_client::tool_stream_cumulative_cap(mcp_client::tool_result_wire_cap(admitted_payload), initialize),
+            mcp_client::tool_stream_cumulative_cap(
+                mcp_client::tool_result_wire_cap(admitted_payload),
+                admitted_control,
+            ),
             mcp_client::tool_stream_cumulative_cap(
                 mcp_client::tool_result_wire_cap(configured_payload),
-                configured_payload,
+                mcp_client::MAX_CONTROL_RESPONSE_BYTES,
             ),
         ),
-        mcp_client::McpResponseLimitKind::Control => (admitted_control, mcp_client::MAX_CONTROL_RESPONSE_BYTES),
     };
     lowered_exchange_ceiling(limit, admitted, configured)
 }
@@ -2273,21 +2265,21 @@ fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutio
     }
     let admitted_payload = result_payload_limit(options.max_result_bytes);
     let configured_payload = result_payload_limit(options.configured_max_result_bytes);
+    let admitted_control = mcp_client::tool_control_response_cap(admitted_payload, options.max_control_response_bytes);
     if let Some(McpSizeLimitFailure::Transport { limit, kind }) = result.size_limit_exceeded {
         // These are request-wide parse reservations even when the configured
         // result cap itself did not shrink.
         let parse_cap = match kind {
             mcp_client::McpResponseLimitKind::Tool => options.max_result_bytes.saturating_mul(2),
-            mcp_client::McpResponseLimitKind::Initialize | mcp_client::McpResponseLimitKind::Control => options
-                .max_control_response_bytes
-                .saturating_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER),
+            mcp_client::McpResponseLimitKind::Initialize | mcp_client::McpResponseLimitKind::Control => {
+                admitted_control.saturating_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
+            },
             mcp_client::McpResponseLimitKind::GetStream => {
                 let wire = mcp_client::tool_stream_cumulative_cap(
                     mcp_client::tool_result_wire_cap(admitted_payload),
-                    admitted_payload.min(options.max_control_response_bytes),
+                    admitted_control,
                 );
-                options
-                    .max_control_response_bytes
+                admitted_control
                     .saturating_mul(mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
                     .min(wire.saturating_mul(12))
             },
@@ -2300,18 +2292,14 @@ fn aggregate_result_limit_exceeded(result: &McpCallResult, options: &McpExecutio
         options.aggregate_result_policy,
         McpAggregateResultPolicy::PerCallConstrained
     );
-    if !result_constrained && options.max_control_response_bytes == mcp_client::MAX_CONTROL_RESPONSE_BYTES {
+    if !result_constrained && admitted_control == mcp_client::MAX_CONTROL_RESPONSE_BYTES {
         return false;
     }
     let exceeded_aggregate_cap = match result.size_limit_exceeded {
         Some(McpSizeLimitFailure::Decoded(actual)) => result_constrained && actual <= configured_payload,
-        Some(McpSizeLimitFailure::Transport { limit, kind }) => aggregate_transport_ceiling_lowered(
-            limit,
-            kind,
-            admitted_payload,
-            configured_payload,
-            options.max_control_response_bytes,
-        ),
+        Some(McpSizeLimitFailure::Transport { limit, kind }) => {
+            aggregate_transport_ceiling_lowered(limit, kind, admitted_payload, configured_payload, admitted_control)
+        },
         None => false,
     };
     exceeded_aggregate_cap
