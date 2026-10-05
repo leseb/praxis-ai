@@ -126,6 +126,61 @@ fn terminal_restoration_preflights_public_namespace_for_each_call() {
     );
 }
 
+#[test]
+fn terminal_restoration_counts_existing_wire_capacity_before_copying_namespaces() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        accumulated_output: (0..32)
+            .map(|index| {
+                json!({
+                    "type": "function_call",
+                    "name": "private",
+                    "call_id": format!("call_{index}"),
+                    "arguments": "{}"
+                })
+            })
+            .collect(),
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("n".repeat(8_192)),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": null}),
+    };
+    let mut output = Vec::with_capacity(128 * 1024);
+    output.resize(70 * 1024, b'x');
+    let metadata_bytes = terminal.retained_payload_bytes().unwrap();
+    let parser_bytes = parser_state.retained_payload_bytes().unwrap();
+    let length_staging = super::canonicalization_staging_bytes(&state, output.len()).unwrap() + metadata_bytes;
+    let capacity_staging = super::canonicalization_staging_bytes(&state, output.capacity()).unwrap() + metadata_bytes;
+    assert!(capacity_staging > length_staging + 1_024);
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + parser_bytes + length_staging + 1_024);
+    assert!(state.can_replace_retained_payload(0, parser_bytes, length_staging));
+    assert!(!state.can_replace_retained_payload(0, parser_bytes, capacity_staging));
+    ctx.extensions.insert(state);
+
+    let allocations = allocation_counter::measure(|| {
+        assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    });
+    assert!(output.is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(
+        allocations.bytes_max < 65_536,
+        "capacity must reject before restoring every namespace: {}",
+        allocations.bytes_max
+    );
+}
+
 /// A terminal payload moves into shared state before the restoration plan.
 fn assert_terminal_does_not_pay_moved_staging(lowered: bool) {
     let (filter, mut ctx) = make_armed_context();
