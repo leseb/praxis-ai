@@ -94,6 +94,10 @@ use crate::{
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 
+/// One newly hashed fingerprint and map key can coexist with the old value
+/// during insertion even when the map's final serialized size does not grow.
+const CONNECTOR_BINDING_TRANSIENT_BYTES: usize = 256;
+
 /// Whether this internally resolved tool entry names a configured connector.
 ///
 /// Optional fields are serialized into the tool map as JSON `null`, so field
@@ -330,6 +334,10 @@ impl McpDispatchFilter {
     }
 
     /// Bind connector approvals to the ambient headers this request will send.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the checked projection and connector binding share one mutation boundary"
+    )]
     fn bind_request_forwarded_header_context(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -340,16 +348,29 @@ impl McpDispatchFilter {
             return true;
         };
         if state.retained_payload_limit().is_some() {
-            let growth = state.mcp_tool_map.values().try_fold(0_usize, |used, entry| {
-                used.checked_add(connector_binding_growth_bytes(
-                    entry,
-                    connector_identity.is_some(),
-                    connector_identity
-                        .and_then(McpCalloutIdentity::user_credential)
-                        .is_some(),
-                )?)
+            let growth = state
+                .mcp_tool_map
+                .values()
+                .try_fold((0_usize, false), |(used, connector), entry| {
+                    Some((
+                        used.checked_add(connector_binding_growth_bytes(
+                            entry,
+                            connector_identity.is_some(),
+                            connector_identity
+                                .and_then(McpCalloutIdentity::user_credential)
+                                .is_some(),
+                        )?)?,
+                        connector || is_connector_tool_entry(entry),
+                    ))
+                });
+            let peak = growth.and_then(|(bytes, connector)| {
+                bytes.checked_add(if connector {
+                    CONNECTOR_BINDING_TRANSIENT_BYTES
+                } else {
+                    0
+                })
             });
-            if !growth.is_some_and(|bytes| state.can_retain_payload(bytes)) {
+            if !peak.is_some_and(|bytes| state.can_retain_payload(bytes)) {
                 return false;
             }
         }
@@ -359,9 +380,6 @@ impl McpDispatchFilter {
             bind_credential_context(entry, connector_identity.and_then(McpCalloutIdentity::user_credential));
         }
         if !state.mcp_tool_map.is_empty() {
-            // The resolved map belongs to the cached streaming baseline. Header,
-            // owner, or credential binding may rewrite entries without changing
-            // the map's length, so invalidate store and rehydrate snapshots.
             state.mark_replay_stable_payload_changed();
         }
         true
@@ -1267,8 +1285,6 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Reject(rejection));
         }
 
-        // Binding, parked sessions, and approval resume can each grow retained
-        // state even when this round has no MCP call to execute.
         if ctx
             .extensions
             .get::<ResponsesState>()
@@ -1321,8 +1337,6 @@ impl McpDispatchFilter {
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
             }
-            // Deferred discovery inserts new map entries after the initial
-            // binding check. Its projected commit also needs a final admission.
             if ctx
                 .extensions
                 .get::<ResponsesState>()

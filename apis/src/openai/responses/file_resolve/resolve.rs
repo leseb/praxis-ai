@@ -335,9 +335,12 @@ impl ResolutionBudget {
     /// Reserve space for raw, encoded, cached, and mirrored representations.
     /// Each representation still has its own independent resolver limit.
     pub(crate) fn apply_aggregate_headroom(&mut self, headroom: usize) {
-        let limit = headroom / 16;
+        // A bounded callout may stage one full transport chunk and its copy
+        // before enforcing its requested body cap.
+        let limit = headroom.saturating_sub(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES)
+            / AGGREGATE_RESOLUTION_OWNER_RESERVATION;
         self.aggregate_remaining_bytes = Some(limit);
-        if limit < self.max_resolved_bytes {
+        if limit <= self.max_resolved_bytes {
             self.max_resolved_bytes = limit;
             self.remaining_resolved_bytes = limit;
             self.aggregate_constrained = true;
@@ -1337,6 +1340,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_budget_rejects_before_file_callout_without_transport_headroom() {
+        let client = test_client("http://127.0.0.1:1");
+        let mut budget = client.resolution_budget(None);
+        budget.apply_aggregate_headroom(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES - 1);
+        let mut items = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-a"}]
+        })];
+
+        let result = resolve_items(
+            &mut items,
+            &client,
+            OnMissing::Continue,
+            &http::HeaderMap::new(),
+            None,
+            &mut budget,
+        )
+        .await;
+        assert!(matches!(result, Err(ResolveError::RetainedBudget)));
+        assert_eq!(
+            budget.references_seen, 0,
+            "transport headroom is checked before dispatch"
+        );
+    }
+
+    #[tokio::test]
     #[expect(
         clippy::too_many_lines,
         reason = "HTTP stub demonstrates the equal-cap transport boundary"
@@ -1358,8 +1387,11 @@ mod tests {
         });
         let client = test_client_with_limits(&url, 1024, 1_000);
         let mut budget = client.resolution_budget(None);
-        budget.apply_aggregate_headroom(16 * 1024);
-        assert!(!budget.aggregate_constrained, "inline limit ties shared allowance");
+        budget.apply_aggregate_headroom(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 8 * 1024);
+        assert!(
+            budget.aggregate_constrained,
+            "equal caps still include the shared allowance"
+        );
         let mut items = vec![serde_json::json!({
             "role": "user", "content": [{"type": "input_file", "file_id": "file-a"}]
         })];
@@ -1384,7 +1416,7 @@ mod tests {
     async fn cached_missing_file_does_not_spend_rewrite_framing() {
         let client = test_client("http://127.0.0.1:1");
         let mut budget = client.resolution_budget(None);
-        budget.apply_aggregate_headroom(320);
+        budget.apply_aggregate_headroom(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 320);
         budget
             .cache
             .entry(("input_file", ReferenceKind::FileId))
@@ -1414,14 +1446,14 @@ mod tests {
         .await;
         assert!(matches!(result, Ok(0)));
         assert_eq!(items, vec![original]);
-        assert_eq!(budget.aggregate_remaining_bytes, Some(20));
+        assert_eq!(budget.aggregate_remaining_bytes, Some(40));
     }
 
     #[tokio::test]
     async fn failed_resolution_cache_cannot_exceed_aggregate_headroom() {
         let client = test_client("http://127.0.0.1:1");
         let mut budget = client.resolution_budget(None);
-        let headroom = 2048;
+        let headroom = crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 2048;
         budget.apply_aggregate_headroom(headroom);
         let content: Vec<_> = (0..32)
             .map(|id| serde_json::json!({"type":"input_file","file_id":format!("file-{id}")}))
@@ -1444,7 +1476,7 @@ mod tests {
             .flat_map(|entries| entries.iter())
             .map(|(key, result)| key.len() + retained_error_bytes(result.as_ref().unwrap_err()).unwrap())
             .sum();
-        assert!(cached_bytes <= headroom / AGGREGATE_RESOLUTION_OWNER_RESERVATION);
+        assert!(cached_bytes <= 2048 / AGGREGATE_RESOLUTION_OWNER_RESERVATION);
         assert!(
             budget.references_seen < 32,
             "failure cache must exhaust before all callouts"
@@ -1475,7 +1507,7 @@ mod tests {
         let mut budget = client.resolution_budget(None);
         // Admit the two small Files API replies, then exhaust the allowance
         // through repeated cached rewrites of the same empty value.
-        budget.apply_aggregate_headroom(2048);
+        budget.apply_aggregate_headroom(crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 2048);
         let content: Vec<_> = (0..64)
             .map(|_| serde_json::json!({"type":"input_file","file_id":"a"}))
             .collect();
