@@ -855,6 +855,80 @@ impl InMemoryStore {
     }
 }
 
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "bounded cache helper sits beside its trait implementation"
+)]
+impl InMemoryStore {
+    /// Validate the complete message-cache projection before updating items.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preflight and the mutex-protected commit form one atomic operation"
+    )]
+    fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        require_conversation_scope(&inner, owner, conversation_id, items)?;
+        reject_duplicate_item_ids(&inner, items)?;
+        if let Some(max_rebuild_bytes) = max_rebuild_bytes {
+            let previous = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+            let count = previous
+                .len()
+                .checked_add(items.len())
+                .ok_or(StoreError::PayloadTooLarge)?;
+            let raw_allowance = max_rebuild_bytes
+                .checked_sub(count.checked_mul(4).ok_or(StoreError::PayloadTooLarge)?)
+                .and_then(|bytes| bytes.checked_sub(4))
+                .map(|bytes| bytes / 26)
+                .ok_or(StoreError::PayloadTooLarge)?;
+            let mut remaining = raw_allowance;
+            for item in previous.iter().chain(items) {
+                struct Counter<'a>(&'a mut usize);
+                impl io::Write for Counter<'_> {
+                    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                        *self.0 = self
+                            .0
+                            .checked_sub(buf.len())
+                            .ok_or_else(|| io::Error::other("stored payload exceeds request limit"))?;
+                        Ok(buf.len())
+                    }
+
+                    fn flush(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                serde_json::to_writer(Counter(&mut remaining), &item.item_data)
+                    .map_err(|_error| StoreError::PayloadTooLarge)?;
+            }
+        }
+        let mut next = inner
+            .items
+            .get(&key)
+            .and_then(|items| items.iter().map(|i| i.position).max())
+            .unwrap_or(0);
+        for item in items {
+            next += 1;
+            // Positions are assigned within the "transaction"; the input
+            // position field is ignored.
+            let mut stored = item.clone();
+            stored.position = next;
+            inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
+            inner.items.entry(key.clone()).or_default().push(stored);
+        }
+        let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
+        if let Some(conversation) = inner.conversations.get_mut(&key) {
+            conversation.messages = rebuilt;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]

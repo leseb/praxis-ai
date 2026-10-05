@@ -16,6 +16,8 @@ mod filter;
 pub(crate) use self::filter::PersistedResponseForConversation;
 pub use self::filter::ResponseStoreFilter;
 #[cfg(feature = "openai-conversations")]
+pub(crate) use self::filter::trusted_identity_content_length;
+#[cfg(feature = "openai-conversations")]
 pub(crate) use self::filter::{
     ResponseRound, mark_store_response_header_skipped, response_round, store_response_header_skipped,
 };

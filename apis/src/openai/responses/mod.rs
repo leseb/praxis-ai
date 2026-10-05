@@ -90,6 +90,8 @@ pub(crate) const STREAM_ERROR_FINALIZER_ARMED_KEY: &str = "responses.stream_erro
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
+pub(crate) use agentic_loop::buffered_parsed_json_bytes_upper_bound;
+#[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
@@ -602,7 +604,69 @@ fn may_rehydrate_history(bytes: &[u8]) -> bool {
     true
 }
 
-/// Reject a known oversized create or history-bearing body before parsing JSON.
+/// Reserve JSON node headers and number normalization before the classifier
+/// parses a create request. The raw-byte multiplier covers copies of string
+/// contents; tiny values need separate space because their owned nodes can be
+/// much larger than their wire spelling. This scan allocates no payload.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass JSON token scan before parser allocation"
+)]
+fn initial_json_parse_peak_bytes(bytes: &[u8]) -> Option<usize> {
+    let (mut objects, mut arrays, mut strings, mut scalars) = (0_usize, 0_usize, 0_usize, 0_usize);
+    let (mut in_string, mut escaped, mut in_number) = (false, false, false);
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => {
+                strings = strings.checked_add(1)?;
+                in_string = true;
+                in_number = false;
+            },
+            b'{' => {
+                objects = objects.checked_add(1)?;
+                in_number = false;
+            },
+            b'[' => {
+                arrays = arrays.checked_add(1)?;
+                in_number = false;
+            },
+            b'-' | b'0'..=b'9' if !in_number => {
+                scalars = scalars.checked_add(1)?;
+                in_number = true;
+            },
+            b'-' | b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' if in_number => {},
+            b't' | b'f' | b'n' => {
+                scalars = scalars.checked_add(1)?;
+                in_number = false;
+            },
+            _ => in_number = false,
+        }
+    }
+    // Four canonical input projections can coexist with the parsed classifier
+    // value and the raw body. Per-node reserves include container capacity,
+    // scalar normalization (e.g. `1e15` expands when serialized), and clones.
+    let nodes = objects
+        .checked_add(arrays)?
+        .checked_add(strings)?
+        .checked_add(scalars)?;
+    bytes
+        .len()
+        .checked_mul(INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER)?
+        .checked_add(nodes.checked_mul(256)?)
+}
+
+/// Reject a known oversized create body before classification parses JSON.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
     let policy = ctx.extensions.get::<AgenticBudgetPolicy>()?;
@@ -624,6 +688,13 @@ pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]
                 413,
                 "invalid_request_error",
                 &message,
+            )));
+        }
+        if initial_json_parse_peak_bytes(bytes).is_none_or(|peak| peak > policy.max_retained_bytes()) {
+            return Some(FilterAction::Reject(error::responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "request JSON structure exceeds openai_agentic_loop.max_retained_bytes before parsing",
             )));
         }
     }

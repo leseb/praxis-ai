@@ -27,6 +27,7 @@ use sse_stream::{Error as SseError, Sse, SseStream};
 use super::subrequest_transport::{McpResponseLimitKind, TransportSignal, TransportSignalState};
 
 /// Destination for an SSE size classification.
+#[derive(Clone)]
 pub(super) enum SseSignalTarget {
     /// One POST response owns a fixed signal generation.
     Fixed(Arc<OnceLock<TransportSignal>>),
@@ -84,6 +85,11 @@ pub(super) enum SseByteStreamError {
         /// The per-event ceiling that was exceeded.
         max_size: usize,
     },
+    /// A JSON-RPC event would exceed the request's parse-peak allowance.
+    JsonExpansion {
+        /// Maximum raw plus parsed bytes admitted for this call.
+        limit: usize,
+    },
     /// The underlying subrequest body errored mid-stream.
     Upstream,
 }
@@ -93,6 +99,7 @@ impl std::fmt::Display for SseByteStreamError {
         match self {
             Self::Ceiling { limit } => write!(f, "mcp sse stream exceeded the {limit}-byte ceiling"),
             Self::EventTooLarge { max_size } => write!(f, "mcp sse event exceeded the {max_size}-byte limit"),
+            Self::JsonExpansion { limit } => write!(f, "mcp sse JSON exceeded the {limit}-byte parse limit"),
             Self::Upstream => write!(f, "mcp sse upstream body error"),
         }
     }
@@ -242,12 +249,18 @@ pub(super) struct SseSizeCeilings {
     clippy::too_many_lines,
     reason = "two-budget byte-layer adapter is inherently sequential"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wire and parsed limits are separate SSE boundaries"
+)]
 pub(super) fn sse_stream_from_body(
     body: Box<dyn StreamingResponseBody>,
     ceilings: SseSizeCeilings,
     signal: SseSignalTarget,
+    preparse_peak_limit: Option<usize>,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     let effective_per_event = ceilings.per_event.min(ceilings.max_event);
+    let parse_signal = signal.clone();
     let state = ByteState {
         body,
         emitted: 0,
@@ -295,7 +308,22 @@ pub(super) fn sse_stream_from_body(
         }
     });
 
-    SseStream::from_bytes_stream(byte_stream).boxed()
+    SseStream::from_bytes_stream(byte_stream)
+        .map(move |event| {
+            let frame: Sse = event?;
+            if let Some(data) = frame.data.as_deref()
+                && !super::subrequest_transport::json_preparse_fits(data.as_bytes(), preparse_peak_limit)
+            {
+                let limit = preparse_peak_limit.unwrap_or(0);
+                parse_signal.record(TransportSignal::ResponseTooLarge {
+                    limit,
+                    kind: ceilings.per_event_kind,
+                });
+                return Err(SseError::Body(Box::new(SseByteStreamError::JsonExpansion { limit })));
+            }
+            Ok(frame)
+        })
+        .boxed()
 }
 
 /// Test double for [`StreamingResponseBody`] that yields queued chunks and
@@ -396,6 +424,7 @@ mod tests {
         operation_cap: usize,
         max_sse_event_size: usize,
         signal: super::SseSignalTarget,
+        preparse_peak_limit: Option<usize>,
     ) -> BoxStream<'static, Result<Sse, SseError>> {
         with_limit_kinds(
             body,
@@ -407,6 +436,7 @@ mod tests {
                 operation_kind: McpResponseLimitKind::GetStream,
             },
             signal,
+            preparse_peak_limit,
         )
     }
 
@@ -417,12 +447,38 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_024, 4_096, 16 * 1024 * 1024, Arc::clone(&signal).into());
+        let mut stream = sse_stream_from_body(body, 1_024, 4_096, 16 * 1024 * 1024, Arc::clone(&signal).into(), None);
 
         let first = stream.next().await.expect("one event").expect("ok event");
         assert_eq!(first.data.as_deref(), Some("{\"jsonrpc\":\"2.0\"}"));
         assert!(stream.next().await.is_none(), "clean EOF");
         assert!(signal.get().is_none(), "no size signal on a clean stream");
+    }
+
+    #[tokio::test]
+    async fn rejects_expanding_json_before_rmcp_reads_sse_event() {
+        let numbers = vec!["1e15"; 3_000].join(",");
+        let event = format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32000,\"message\":\"failure\",\"data\":[{numbers}]}}}}\n\n"
+        );
+        let body = Box::new(FakeStreamingBody::from_chunks([Bytes::from(event)], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            body,
+            100_000,
+            100_000,
+            100_000,
+            Arc::clone(&signal).into(),
+            Some(40_000),
+        );
+        assert!(
+            stream.next().await.expect("one event").is_err(),
+            "the expanding JSON event must be rejected before rmcp parses it"
+        );
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 40_000, .. })
+        ));
     }
 
     #[tokio::test]
@@ -433,7 +489,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_024, 4, 16 * 1024 * 1024, Arc::clone(&signal).into());
+        let mut stream = sse_stream_from_body(body, 1_024, 4, 16 * 1024 * 1024, Arc::clone(&signal).into(), None);
 
         // The underlying byte stream errors; SseStream surfaces it as an Err item.
         let mut saw_err = false;
@@ -473,6 +529,7 @@ mod tests {
             15,
             1_024,
             super::SseSignalTarget::Active(Arc::clone(&signal_state)),
+            None,
         );
         assert!(stream.next().await.expect("first event").is_ok());
         drop(stream);
@@ -487,6 +544,7 @@ mod tests {
             15,
             1_024,
             super::SseSignalTarget::Active(Arc::clone(&signal_state)),
+            None,
         );
         assert!(
             reconnected.next().await.expect("cumulative breach").is_err(),
@@ -515,6 +573,7 @@ mod tests {
                 15,
                 1_024,
                 super::SseSignalTarget::Active(Arc::clone(&signal_state)),
+                None,
             );
             assert!(stream.next().await.expect("event").is_ok());
         }
@@ -528,7 +587,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 8, 1_000_000, 16 * 1024 * 1024, Arc::clone(&signal).into());
+        let mut stream = sse_stream_from_body(body, 8, 1_000_000, 16 * 1024 * 1024, Arc::clone(&signal).into(), None);
 
         let mut saw_err = false;
         while let Some(item) = stream.next().await {
@@ -558,7 +617,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_000_000, 1_000_000, 8, Arc::clone(&signal).into());
+        let mut stream = sse_stream_from_body(body, 1_000_000, 1_000_000, 8, Arc::clone(&signal).into(), None);
         let mut saw_err = false;
         while let Some(item) = stream.next().await {
             if item.is_err() {
@@ -583,7 +642,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 16 * 1024 * 1024, Arc::clone(&signal).into());
+        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 16 * 1024 * 1024, Arc::clone(&signal).into(), None);
         let mut saw_err = false;
         while let Some(item) = stream.next().await {
             if item.is_err() {

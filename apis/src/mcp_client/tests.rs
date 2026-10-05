@@ -1024,7 +1024,6 @@ struct SlowRequest {
 struct TestMcpServer {
     tool_router: ToolRouter<Self>,
     echo_calls: StdArc<AtomicUsize>,
-    instructions: StdArc<str>,
 }
 
 #[expect(clippy::unused_self, reason = "rmcp macro-generated code")]
@@ -1038,15 +1037,6 @@ impl TestMcpServer {
         Self {
             tool_router: Self::tool_router(),
             echo_calls,
-            instructions: StdArc::from("Test MCP server for integration tests"),
-        }
-    }
-
-    fn with_instructions(echo_calls: StdArc<AtomicUsize>, instructions: StdArc<str>) -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-            echo_calls,
-            instructions,
         }
     }
 
@@ -1077,41 +1067,20 @@ impl TestMcpServer {
 impl ServerHandler for TestMcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(self.instructions.as_ref())
+            .with_instructions("Test MCP server for integration tests")
     }
 }
 
 async fn start_test_mcp_server() -> (String, tokio_util::sync::CancellationToken) {
-    let (url, ct, _calls) =
-        start_test_mcp_server_with_instructions("Test MCP server for integration tests".to_owned()).await;
-    (url, ct)
-}
-
-async fn start_test_mcp_server_with_instructions(
-    instructions: String,
-) -> (String, tokio_util::sync::CancellationToken, StdArc<AtomicUsize>) {
     let ct = tokio_util::sync::CancellationToken::new();
-    let echo_calls = StdArc::new(AtomicUsize::new(0));
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_sse_keep_alive(None)
         .with_cancellation_token(ct.child_token());
 
-    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> = StreamableHttpService::new(
-        {
-            let echo_calls = StdArc::clone(&echo_calls);
-            let instructions = StdArc::<str>::from(instructions);
-            move || {
-                Ok(TestMcpServer::with_instructions(
-                    StdArc::clone(&echo_calls),
-                    StdArc::clone(&instructions),
-                ))
-            }
-        },
-        Arc::default(),
-        config,
-    );
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), Arc::default(), config);
 
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1126,7 +1095,7 @@ async fn start_test_mcp_server_with_instructions(
         );
     });
 
-    (format!("http://{addr}/mcp"), ct, echo_calls)
+    (format!("http://{addr}/mcp"), ct)
 }
 
 #[derive(Debug, Clone)]
@@ -1671,6 +1640,7 @@ async fn scoped_connector_context_reaches_initialize_and_tools_call_unchanged() 
         serde_json::json!({"message": "hello"}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &McpCallout::fabricated(true).unwrap(),
     )
     .await
@@ -2123,8 +2093,8 @@ async fn call_tool_timeout() {
 // Session pooling / reuse (#1019)
 // =========================================================================
 
-/// A tool session must reject a large initialize body before rmcp can retain
-/// its instructions or issue the side-effecting `tools/call`.
+/// A legal minimum result limit must still reach the tool call after initialize.
+/// This server's tool reply exceeds the separate 2 KiB result parse allowance.
 #[tokio::test]
 async fn oversized_tool_initialize_is_rejected_before_tool_call() {
     let (url, ct, echo_calls) = start_test_mcp_server_with_instructions("x".repeat(256 * 1024)).await;
@@ -2182,11 +2152,13 @@ async fn pooled_tool_initialize_peer_info_is_counted() {
         &McpCallout::fabricated(true).unwrap(),
     )
     .await;
-    assert!(result.is_ok(), "small initialize should permit a tool call: {result:?}");
-    let retained = pool.retained_payload_bytes().unwrap();
-    assert!(retained >= 32 * "instruction".len() + "small-initialize".len());
-    pool.drain().await;
     ct.cancel();
+    assert_eq!(method_count(&methods, "initialize"), 1);
+    assert_eq!(method_count(&methods, "tools/call"), 1);
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
 }
 
 #[tokio::test]
@@ -2251,6 +2223,7 @@ async fn pooled_session_reused_across_rounds_runs_single_initialize() {
             serde_json::json!({ "message": message }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2279,6 +2252,48 @@ async fn pooled_session_reused_across_rounds_runs_single_initialize() {
     );
 }
 
+/// Budgeted dispatch passes no pool handle, so a completed tool call releases
+/// its initialized peer metadata before the next agentic round.
+#[tokio::test]
+async fn unpooled_tool_calls_close_peer_metadata_between_rounds() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "budgeted".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    for message in ["round-1", "round-2"] {
+        let result = call_tool_with_forwarded_headers(
+            None,
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "echo",
+            serde_json::json!({ "message": message }),
+            INTEGRATION_TIMEOUT,
+            TEST_MAX_RESULT_BYTES,
+            16_384,
+            &callout,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str()),
+            Some(message)
+        );
+        assert!(pool.checkout(&key, TEST_MAX_RESULT_BYTES).session.is_none());
+    }
+    ct.cancel();
+    assert_eq!(method_count(&methods, "initialize"), 2);
+    assert_eq!(method_count(&methods, "tools/call"), 2);
+}
+
 /// Sessions never cross security contexts: two calls with different identity
 /// keys (same endpoint) each open their own session, so each runs its own
 /// `initialize`.
@@ -2303,6 +2318,7 @@ async fn distinct_identity_keys_never_reuse_a_session() {
             serde_json::json!({ "message": key }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2338,6 +2354,7 @@ async fn empty_fingerprint_never_pools_a_session() {
             serde_json::json!({ "message": "x" }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2382,6 +2399,7 @@ async fn reused_session_failure_evicts_without_retry() {
         serde_json::json!({ "message": "round-1" }),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &callout,
     )
     .await
@@ -2405,6 +2423,7 @@ async fn reused_session_failure_evicts_without_retry() {
         serde_json::json!({ "message": "round-2" }),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &callout,
     )
     .await;
@@ -2453,6 +2472,7 @@ async fn reused_session_transparently_reinitializes_after_server_404() {
             serde_json::json!({ "message": message }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2517,6 +2537,7 @@ async fn payload_limit_change_replaces_session_without_fragmenting_identity_key(
             serde_json::json!({ "message": "ok" }),
             INTEGRATION_TIMEOUT,
             limit,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -2552,6 +2573,7 @@ async fn pool_drain_explicitly_closes_idle_server_session() {
         serde_json::json!({ "message": "ok" }),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
         &callout,
     )
     .await
@@ -2593,6 +2615,7 @@ async fn dispatcher_namespaces_prevent_cross_filter_session_reuse() {
             serde_json::json!({ "message": "ok" }),
             INTEGRATION_TIMEOUT,
             TEST_MAX_RESULT_BYTES,
+            MAX_CONTROL_RESPONSE_BYTES,
             &callout,
         )
         .await
@@ -3346,4 +3369,36 @@ fn classify_deadline_maps_size_signal_to_413_else_timeout() {
     );
     let err = classify_deadline(&signal, &url, Duration::from_secs(1));
     assert!(matches!(err, McpClientError::ResponseTooLarge { .. }));
+}
+
+#[tokio::test]
+async fn budgeted_minimum_result_limit_reaches_tool_after_initialize() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let callout = McpCallout::fabricated(true).unwrap();
+    let result = call_tool_with_forwarded_headers_with_budget(
+        None,
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "ok"}),
+        INTEGRATION_TIMEOUT,
+        1_024,
+        1_024,
+        1_024,
+        Some(2_048),
+        true,
+        &callout,
+    )
+    .await;
+    ct.cancel();
+    assert_eq!(method_count(&methods, "initialize"), 1);
+    assert_eq!(method_count(&methods, "tools/call"), 1);
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
 }
