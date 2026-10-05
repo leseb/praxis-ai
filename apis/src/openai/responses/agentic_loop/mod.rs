@@ -1677,6 +1677,10 @@ fn mark_provider_history(state: &mut ResponsesState) {
 /// call is terminalized to `incomplete` in place and no assignment is recorded —
 /// leaving `has_dispatchable_calls` free to exit the loop. The dispatcher applies
 /// only its independent per-continuation server cap to the recorded assignments.
+#[expect(
+    clippy::too_many_lines,
+    reason = "collects selected file-search calls and terminalizes denied calls together"
+)]
 fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usize, usize, SynthesisKind)>) {
     if pending.is_empty() {
         return;
