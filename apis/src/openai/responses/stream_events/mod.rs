@@ -2137,7 +2137,7 @@ fn accumulate_chunk(
 /// charge for their distinct mutations.
 fn pending_completion_event_fits(
     ctx: &HttpFilterContext<'_>,
-    state: &StreamEventsState,
+    state: &mut StreamEventsState,
     event: &ResponsesEvent,
     admission: &mut CompletionAdmission,
 ) -> bool {
@@ -2298,7 +2298,7 @@ fn capture_client_tool_completion(
 /// co-batched completion.
 fn completion_snapshot_fits(
     ctx: &HttpFilterContext<'_>,
-    state: &StreamEventsState,
+    state: &mut StreamEventsState,
     staging_bytes: usize,
     snapshot_bytes: usize,
     shared_upper_bound: &mut Option<usize>,
