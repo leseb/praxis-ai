@@ -333,7 +333,7 @@ impl ResponseStoreFilter {
             if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
                 return Ok(FilterAction::Continue);
             }
-            return Ok(persistence_budget_failure(ctx, true, body));
+            return streaming_persistence_budget_failure(ctx, body);
         };
         let response_bytes = retained_json_bytes(&state.response_object);
         if !response_bytes.is_some_and(|bytes| persistence_construction_fits(ctx, bytes)) {
@@ -364,7 +364,7 @@ impl ResponseStoreFilter {
             match persist_response_if_absent_blocking(&persist.store, &record, &pending_approvals) {
                 Ok(true) => {},
                 Ok(false) | Err(StoreError::PayloadTooLarge) => {
-                    return Ok(persistence_budget_failure(ctx, true, body));
+                    return streaming_persistence_budget_failure(ctx, body);
                 },
                 Err(error) => return Err(Box::new(error)),
             }
