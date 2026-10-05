@@ -6111,14 +6111,14 @@ impl ConversationItemStore for FailingItemStore {
         _conversation_id: &str,
         _items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        match self.append_failure {
+        match &self.append_failure {
             AppendFailure::CreateItems => {
                 return Err(StoreError::Database("mock item insert failure".to_owned()));
             },
             AppendFailure::MessageSync => {
                 return Err(StoreError::Database("mock message sync failure".to_owned()));
             },
-            AppendFailure::CommittedThenError(ref committed) => {
+            AppendFailure::CommittedThenError(committed) => {
                 committed.fetch_add(1, Ordering::SeqCst);
                 return Err(StoreError::Database("mock post-commit failure".to_owned()));
             },

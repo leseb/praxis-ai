@@ -1176,6 +1176,10 @@ impl ResponsesState {
     /// Request, history, and resolved tool snapshots stay fixed during one
     /// upstream round. Streaming owners cache these while measuring changing
     /// response state on each callback.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one pass lists every stable independently owned stream payload"
+    )]
     pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         meter.json(&self.request_body)?;
