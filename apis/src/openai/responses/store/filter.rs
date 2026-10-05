@@ -681,6 +681,7 @@ impl ResponseStoreFilter {
                     store_stream_budget_fits(
                         responses,
                         state.shared_stable_bytes,
+                        &mut state.changing_charge_caches,
                         state.charged_retained_bytes.unwrap_or(0),
                         peak,
                     )
