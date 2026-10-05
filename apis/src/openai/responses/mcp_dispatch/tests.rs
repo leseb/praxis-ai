@@ -1479,6 +1479,29 @@ fn aggregate_lowered_streaming_backstops_are_terminal() {
 }
 
 #[test]
+fn budgeted_get_json_parse_overflow_is_a_shared_budget_failure() {
+    let mut options = execution_options(false, std::time::Duration::from_secs(1));
+    options.max_result_bytes = 16 * 1024;
+    options.configured_max_result_bytes = 16 * 1024;
+    options.max_control_response_bytes = 1_024;
+    options.aggregate_result_policy = super::McpAggregateResultPolicy::Budgeted;
+    let admitted_payload = result_payload_limit(options.max_result_bytes);
+    let stream_cap = crate::mcp_client::tool_stream_cumulative_cap(
+        crate::mcp_client::tool_result_wire_cap(admitted_payload),
+        admitted_payload.min(options.max_control_response_bytes),
+    );
+    let parse_cap = (options.max_control_response_bytes * crate::mcp_client::MCP_CONTROL_RESPONSE_PEAK_MULTIPLIER)
+        .min(stream_cap * 12);
+    let error = crate::mcp_client::McpClientError::ResponseTooLarge {
+        url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
+        limit: parse_cap,
+        kind: crate::mcp_client::McpResponseLimitKind::GetStream,
+    };
+    let result = process_call_result(Err(error), "c1", "srv", "tool", "{}", None, admitted_payload);
+    assert!(super::aggregate_result_limit_exceeded(&result, &options));
+}
+
+#[test]
 fn configured_streaming_backstops_remain_recoverable() {
     let mut options = execution_options(false, std::time::Duration::from_secs(1));
     options.max_result_bytes = 16 * 1024;

@@ -313,7 +313,9 @@ pub(super) fn sse_stream_from_body(
                 let limit = preparse_peak_limit.unwrap_or(0);
                 parse_signal.record(TransportSignal::ResponseTooLarge {
                     limit,
-                    kind: ceilings.per_event_kind,
+                    // GET uses the control parse reservation, even though
+                    // its raw per-event wire cap is the tool result cap.
+                    kind: ceilings.operation_kind,
                 });
                 return Err(SseError::Body(Box::new(SseByteStreamError::JsonExpansion { limit })));
             }
@@ -453,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_expanding_json_before_rmcp_reads_sse_event() {
+    async fn get_stream_rejects_expanding_json_with_get_stream_signal() {
         let numbers = vec!["1e15"; 3_000].join(",");
         let event = format!(
             "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32000,\"message\":\"failure\",\"data\":[{numbers}]}}}}\n\n"
@@ -474,7 +476,10 @@ mod tests {
         );
         assert!(matches!(
             signal.get(),
-            Some(TransportSignal::ResponseTooLarge { limit: 40_000, .. })
+            Some(TransportSignal::ResponseTooLarge {
+                limit: 40_000,
+                kind: McpResponseLimitKind::GetStream
+            })
         ));
     }
 
