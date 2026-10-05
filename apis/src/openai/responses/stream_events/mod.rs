@@ -1297,6 +1297,10 @@ fn find_projected_output_item<'a>(items: &[&'a Value], payload: &Value) -> Optio
 /// This is intentionally an upper bound: replacement writes may release the
 /// previous state owner during commit, but charging the projected owner keeps
 /// the preflight transactional at the allocation peak.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflight accounts for every event kind before accumulation mutates shared state"
+)]
 fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>();
     let scratch_capacity = projected_output_item_scratch_capacity(ctx, events)?;

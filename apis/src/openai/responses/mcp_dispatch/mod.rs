@@ -740,10 +740,6 @@ impl McpDispatchFilter {
 
 /// Stage approved calls only while measuring their dispatch peak, then restore
 /// every provisional owner before the durable approval claim can fail.
-#[expect(
-    clippy::too_many_lines,
-    reason = "all provisional approval owners roll back together"
-)]
 fn approval_execution_fits(
     state: &mut ResponsesState,
     decisions: &[ResolvedApproval],

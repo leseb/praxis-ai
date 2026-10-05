@@ -4269,8 +4269,8 @@ fn over_budget_file_search_reconciles_persisted_history_in_both_collectors() {
             state.response_object = json!({"output": [file.clone()]});
             super::collect_streaming_output_items(&mut state).unwrap();
         } else {
-            let response = json!({"output": [file.clone()]});
-            super::collect_output_items(&response, &mut state, &[]);
+            let mut response = json!({"output": [file.clone()]});
+            super::collect_output_items(&mut response, &mut state, &[]);
         }
 
         assert_eq!(state.accumulated_output[0]["status"], "incomplete");
@@ -4287,12 +4287,12 @@ fn over_budget_file_search_with_reused_id_updates_only_rejected_history_item() {
         max_tool_calls: Some(1),
         ..ResponsesState::default()
     };
-    let response = json!({"output": [
+    let mut response = json!({"output": [
         {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["first"]},
         {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["second"]}
     ]});
 
-    super::collect_output_items(&response, &mut state, &[]);
+    super::collect_output_items(&mut response, &mut state, &[]);
 
     assert_eq!(state.file_search_assignments.len(), 1);
     assert_eq!(state.persisted_messages[0]["status"], "searching");

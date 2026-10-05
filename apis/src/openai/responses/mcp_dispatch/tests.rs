@@ -108,7 +108,7 @@ fn approved_call_budget_probe_restores_temporary_selection() {
     let headers = http::HeaderMap::new();
     assert!(approval_execution_fits(
         &mut state,
-        &[decision.clone()],
+        std::slice::from_ref(&decision),
         8_192,
         &headers,
         None
