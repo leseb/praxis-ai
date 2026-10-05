@@ -4262,6 +4262,30 @@ fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
     assert!(terminal_projection >= response_bytes * 2);
 }
 
+#[test]
+fn terminal_usage_projection_reserves_merge_and_reinsertion_peak() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.extensions.insert(ResponsesState::default());
+    let response = json!({
+        "id": "resp_usage_peak",
+        "object": "response",
+        "status": "completed",
+        "output": [],
+        "usage": {"detail": "x".repeat(65_536)}
+    });
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let terminal = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+        "type": "response.completed",
+        "response": response
+    }));
+    let projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
+    assert!(
+        projection >= response_bytes * 3,
+        "event, cloned response, merged usage, and replacement usage clone must fit together"
+    );
+}
+
 /// Record execution provenance for every item currently in `accumulated_output`,
 /// mirroring what a dispatch filter (`openai_mcp_dispatch`, `openai_web_search`)
 /// records when it actually executes a tool. Tests that seed `accumulated_output`

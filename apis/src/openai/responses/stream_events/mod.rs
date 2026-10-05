@@ -1317,9 +1317,11 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
             | ResponsesEvent::ResponseFailed(payload) => {
                 let response_bytes = retained_json_bytes(payload.get("response").unwrap_or(payload))?;
                 let usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
-                // The terminal response is retained while the event payload
-                // remains live; usage is a distinct owner.
-                response_bytes.checked_mul(2)?.checked_add(usage_bytes)?
+                // The parsed event, cloned response, merged shared usage, and
+                // a new usage clone inserted into the response can coexist.
+                // Three response sizes cover the incoming usage owners while
+                // the old shared usage remains independently live.
+                response_bytes.checked_mul(3)?.checked_add(usage_bytes)?
             },
             ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
                 let item_bytes = payload.get("item").map_or(Some(0), retained_json_bytes)?;
@@ -2021,9 +2023,6 @@ fn release_client_tool_charge(ctx: &mut HttpFilterContext<'_>, bytes: usize) {
         responses.release_external_payload_bytes(bytes);
     }
 }
-
-/// Completion snapshots and the aggregate charge held until restoration ends.
-type ChargedClientToolCompletions = (Vec<client_tools::ClientToolCompletion>, usize);
 
 /// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`
 /// and capture lowered client-tool completion artifacts for phase 2b (#1159).
