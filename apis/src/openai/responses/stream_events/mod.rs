@@ -1735,17 +1735,11 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
     } else {
         retained_json_bytes(&state.usage)?
     };
-    let client_tool_bytes = if state.client_tool_lowering.is_empty() {
-        0
-    } else {
-        // Rich client-tool restoration parses and rebuilds individual output
-        // items in place. A second output-sized allowance bounds those local
-        // construction owners without charging a full-tree copy on native paths.
-        retained_json_values_bytes(output)?.checked_mul(2)?
-    };
-    let echo_bytes = state.client_tool_echo.as_ref().map_or(Some(0), |echo| {
-        retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)
-    })?;
+    // Each private call can expand by its public namespace and parsed
+    // arguments. Bound that work per item before restoration mutates the
+    // canonical tree; the original output moves, so no full-tree copy applies.
+    let client_tool_bytes = client_tools::restored_output_growth_bytes(&state.client_tool_lowering, output)?;
+    let echo_bytes = client_tools::echoed_tools_bytes(state.client_tool_echo.as_ref())?;
     annotation_bytes
         .checked_mul(3)?
         .checked_add(id_bytes)?

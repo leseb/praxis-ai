@@ -79,6 +79,53 @@ fn lowered_terminal_does_not_pay_restoration_staging_after_move() {
     assert_terminal_does_not_pay_moved_staging(true);
 }
 
+#[test]
+fn terminal_restoration_preflights_public_namespace_for_each_call() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        accumulated_output: (0..32)
+            .map(|index| {
+                json!({
+                    "type": "function_call",
+                    "name": "private",
+                    "call_id": format!("call_{index}"),
+                    "arguments": "{}"
+                })
+            })
+            .collect(),
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("n".repeat(8_192)),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    state.apply_retained_payload_limit(65_536);
+    assert!(state.can_retain_payload(0));
+    ctx.extensions.insert(state);
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": null}),
+    };
+    let mut output = Vec::new();
+
+    let allocations = allocation_counter::measure(|| {
+        assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    });
+    assert!(output.is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert!(
+        allocations.bytes_max < 65_536 * 2,
+        "restoration must reject before allocating every public namespace: {}",
+        allocations.bytes_max
+    );
+}
+
 /// A terminal payload moves into shared state before the restoration plan.
 fn assert_terminal_does_not_pay_moved_staging(lowered: bool) {
     let (filter, mut ctx) = make_armed_context();
