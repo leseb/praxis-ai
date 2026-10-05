@@ -3365,3 +3365,35 @@ fn classify_deadline_maps_size_signal_to_413_else_timeout() {
     let err = classify_deadline(&signal, &url, Duration::from_secs(1));
     assert!(matches!(err, McpClientError::ResponseTooLarge { .. }));
 }
+
+#[tokio::test]
+async fn budgeted_minimum_result_limit_reaches_tool_after_initialize() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let callout = McpCallout::fabricated(true).unwrap();
+    let result = call_tool_with_forwarded_headers_with_budget(
+        None,
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "ok"}),
+        INTEGRATION_TIMEOUT,
+        1_024,
+        1_024,
+        1_024,
+        Some(2_048),
+        true,
+        &callout,
+    )
+    .await;
+    ct.cancel();
+    assert_eq!(method_count(&methods, "initialize"), 1);
+    assert_eq!(method_count(&methods, "tools/call"), 1);
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
+}
