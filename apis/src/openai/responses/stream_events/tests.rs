@@ -70,6 +70,81 @@ fn lowered_snapshot_echo_fails_before_planning_many_owned_copies() {
 }
 
 #[test]
+fn multiline_data_rejects_before_reallocating_prior_frame_buffer() {
+    let (filter, mut ctx) = make_armed_context();
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model", "input": "hello", "stream": true
+    })));
+
+    let mut first_line = Some(Bytes::from(format!("data: {}\n", "x".repeat(30_000))));
+    filter.on_response_body(&mut ctx, &mut first_line, false).unwrap();
+    let response = ctx.extensions.get::<ResponsesState>().unwrap();
+    let shared = response.retained_payload_bytes().unwrap() - response.retained_stream_parser_bytes;
+    let local = ctx
+        .get_filter_state::<StreamEventsState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let second_line = Bytes::from_static(b"data: x\n");
+    let limit = shared + local + second_line.len() * 4 + 30_000 - 1;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(limit);
+
+    let mut body = Some(second_line);
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        body.is_none(),
+        "reallocating the existing data buffer must be preflighted"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn crlf_does_not_hide_carried_data_buffer_copy() {
+    for split_crlf in [false, true] {
+        let (filter, mut ctx) = make_armed_context();
+        ctx.extensions.insert(ResponsesState::from_request_body(json!({
+            "model": "test-model", "input": "hello", "stream": true
+        })));
+
+        let mut first_line = Some(Bytes::from(format!("data: {}\n", "x".repeat(30_000))));
+        filter.on_response_body(&mut ctx, &mut first_line, false).unwrap();
+        if split_crlf {
+            let mut event_line = Some(Bytes::from_static(b"event: ping\r"));
+            filter.on_response_body(&mut ctx, &mut event_line, false).unwrap();
+        }
+
+        let suffix = if split_crlf {
+            Bytes::from_static(b"\ndata: x\n")
+        } else {
+            Bytes::from_static(b"event: ping\r\ndata: x\n")
+        };
+        let response = ctx.extensions.get::<ResponsesState>().unwrap();
+        let shared = response.retained_payload_bytes().unwrap() - response.retained_stream_parser_bytes;
+        let local = ctx
+            .get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        let limit = shared + local + suffix.len() * 4 + 30_000 - 1;
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .unwrap()
+            .apply_retained_payload_limit(limit);
+
+        let mut body = Some(suffix);
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed,
+            "carried data must stay live across CRLF, split={split_crlf}"
+        );
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+}
+
+#[test]
 fn lowered_heartbeat_does_not_reserve_unused_tool_echo_copies() {
     let (filter, mut ctx) = make_armed_context_with_filter(make_filter());
     let mut responses = ResponsesState::default();
@@ -211,6 +286,112 @@ fn lowered_completion_uses_post_accumulation_staging_near_cap() {
     filter.on_response_body(&mut ctx, &mut done, false).unwrap();
     assert!(done.is_some(), "the live owners fit within the 64 KiB request budget");
     assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn co_batched_completions_do_not_reserialize_unrelated_large_output() {
+    assert_completion_batch_does_not_reserialize_unrelated_output(false);
+}
+
+#[test]
+fn interleaved_item_done_does_not_reserialize_unrelated_large_output() {
+    assert_completion_batch_does_not_reserialize_unrelated_output(true);
+}
+
+fn assert_completion_batch_does_not_reserialize_unrelated_output(interleave_done: bool) {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    responses.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(responses);
+    let mut added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "x".repeat(1_048_576)}]}}),
+    )
+    .to_vec();
+    let mut done = Vec::new();
+    for index in 0..300 {
+        added.extend_from_slice(&make_sse_chunk(
+            "response.output_item.added",
+            &json!({"output_index": index + 1, "item": {"type": "function_call", "name": "private", "id": format!("fc_{index}"), "call_id": format!("c{index}"), "arguments": "", "status": "in_progress"}}),
+        ));
+        done.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": index + 1, "item_id": format!("fc_{index}"), "arguments": "{}"}),
+        ));
+        if interleave_done {
+            done.extend_from_slice(&make_sse_chunk(
+                "response.output_item.done",
+                &json!({"output_index": index + 1, "item": {"type": "function_call", "name": "private", "id": format!("fc_{index}"), "call_id": format!("c{index}"), "arguments": "{}", "status": "completed"}}),
+            ));
+        }
+    }
+    let mut body = Some(Bytes::from(added));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_some());
+    body = Some(Bytes::from(done));
+    let started = std::time::Instant::now();
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(body.is_some(), "the completion batch must fit its 64 MiB budget");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "300 small completions (interleaved={interleave_done}) must not rescan a 1 MiB output per event: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn co_batched_completion_snapshots_reject_before_next_large_clone() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    ctx.extensions.insert(responses);
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "function_call", "name": "private", "id": "fc_1", "call_id": "c1", "arguments": "", "status": "in_progress", "padding": "x".repeat(16_384)}}),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    let baseline = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(65_536);
+    let frame = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
+    );
+    let mut body = Some(Bytes::from([frame.as_ref(), frame.as_ref()].concat()));
+    let allocations = allocation_counter::measure(|| {
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    });
+    assert!(body.is_none());
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+    assert!(
+        allocations.bytes_max < u64::try_from(65_536 - baseline).unwrap(),
+        "reject before the next clone exceeds remaining headroom: {allocations:?}"
+    );
 }
 
 /// A terminal response is retained in shared state before restoration planning.
@@ -985,6 +1166,37 @@ fn streaming_budget_caches_client_tool_echo_captured_after_arm() {
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(responses.stream_changing_payload_bytes_bounded(1_024).is_some());
     assert!(!responses.retained_payload_failed);
+}
+
+#[test]
+fn unbounded_stream_skips_echo_projection_without_snapshots() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::default();
+    responses.client_tool_echo = Some(ClientToolEcho {
+        tools: vec![json!({"type": "function", "name": "large", "description": "x".repeat(1_048_576)})],
+        tool_choice: json!("auto"),
+    });
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+        },
+    );
+    ctx.extensions.insert(responses);
+
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let mut body = Some(Bytes::from_static(b": ping\n\n"));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "heartbeat chunks must not serialize a 1 MiB echo without snapshots: {:?}",
+        started.elapsed()
+    );
+    assert!(ctx.get_metadata("responses.stream_error_message").is_none());
 }
 
 #[test]

@@ -1017,6 +1017,7 @@ fn mcp_tool_index_charge(state: &ResponsesState) -> Option<usize> {
 }
 
 #[cfg(not(feature = "openai-mcp-tools"))]
+/// Without MCP tool resolution there is no reverse index to allocate.
 const fn mcp_tool_index_fits(_state: &ResponsesState) -> bool {
     true
 }

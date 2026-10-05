@@ -1381,7 +1381,7 @@ fn projected_client_tool_restore_bytes(
     if responses.client_tool_lowering.is_empty() {
         return Some(0);
     }
-    // The plan clones its tracked item list even if this chunk has no snapshot.
+    // The plan clones tracked item keys even when no snapshot is present.
     let tracked = stream.client_tool_items.iter().try_fold(0_usize, |used, item| {
         used.checked_add(item.key.len())?
             .checked_add(item.private_name.len())?
@@ -1392,12 +1392,9 @@ fn projected_client_tool_restore_bytes(
         .iter()
         .any(|event| !event.is_terminal() && event.payload().get("response").is_some())
     {
-        // Ordinary deltas and heartbeats cannot clone the echoed tools.
+        // Deltas and heartbeats never clone echoed tools.
         return Some(projected);
     }
-    let echo_bytes = responses.client_tool_echo.as_ref().map_or(Some(0), |echo| {
-        retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)
-    })?;
     let max_name_bytes = responses
         .client_tool_lowering
         .values()
@@ -1409,12 +1406,22 @@ fn projected_client_tool_restore_bytes(
                 .checked_add(64)?;
             Some(largest.max(bytes))
         })?;
+    let mut cached_echo_bytes = None;
     for event in events {
         if event.is_terminal() {
             continue;
         }
         let Some(snapshot) = event.payload().get("response") else {
             continue;
+        };
+        let echo_bytes = if let Some(bytes) = cached_echo_bytes {
+            bytes
+        } else {
+            let bytes = responses.client_tool_echo.as_ref().map_or(Some(0), |echo| {
+                retained_json_values_bytes(&echo.tools)?.checked_add(retained_json_bytes(&echo.tool_choice)?)
+            })?;
+            cached_echo_bytes = Some(bytes);
+            bytes
         };
         let source_bytes = retained_json_bytes(snapshot)?;
         let item_count = snapshot.get("output").and_then(Value::as_array).map_or(0, Vec::len);
@@ -2001,6 +2008,14 @@ fn commit_chunk_events(
 /// Completion snapshots and the aggregate charge held until restoration ends.
 type ChargedClientToolCompletions = (Vec<client_tools::ClientToolCompletion>, usize);
 
+/// Parsed owners stay live for a chunk while its shared-state estimate grows.
+struct CompletionAdmission {
+    /// Parsed SSE frames and event values still owned during accumulation.
+    parsed_owner_bytes: usize,
+    /// Conservative shared charge after prior events and their snapshots.
+    shared_upper_bound: Option<usize>,
+}
+
 /// Drop completion snapshots before releasing their shared budget charge.
 fn release_client_tool_completions(
     ctx: &mut HttpFilterContext<'_>,
@@ -2039,19 +2054,45 @@ fn accumulate_chunk(
 ) -> Result<Option<ChargedClientToolCompletions>, SseParseError> {
     let mut completions = Vec::new();
     let mut completion_bytes = 0_usize;
+    // A chunk may contain hundreds of completed calls and interleaved item
+    // events. Keep a conservative shared-state charge instead of serializing
+    // the entire response tree again for every snapshot admission.
+    let mut admission = CompletionAdmission {
+        parsed_owner_bytes,
+        shared_upper_bound: None,
+    };
     for event in events {
+        // Earlier completion snapshots remain live until phase 2b. Admit this
+        // event's mutation peak before it clones another shared-state owner.
+        if completion_bytes > 0 && !pending_completion_event_fits(ctx, state, event, &mut admission) {
+            release_client_tool_completions(ctx, completions, completion_bytes);
+            return Ok(None);
+        }
         let retained_clone_bytes = accumulate_event(ctx, state, event);
         state.invalidate_tool_calls_for_event(event);
         if let Some(responses) = ctx.extensions.get::<ResponsesState>() {
             state.invalidate_output_item_for_event(responses, event);
         }
-        // A `function_call_arguments.done` clones a whole retained output item into
-        // `tool_calls` — the one accumulator whose growth the driving `done` frame
-        // does not bound. Charge that measured clone here, where it happens, and fail
-        // the chunk closed the instant the request-wide byte total exceeds the cap.
-        // Charging the actual clone (not a phase-1 prediction) is exact and
-        // O(clone size): it cannot diverge from the item the commit retained, and the
-        // per-event check bounds transient overshoot to a single clone.
+        if matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_))
+            && let Some(upper) = admission.shared_upper_bound.as_mut()
+        {
+            // A done event can grow the response item's arguments/status and
+            // retain one full tool-call clone. Two clone sizes plus the event
+            // JSON and field overhead bound both owners, including arguments
+            // previously held in the parser's delta buffer.
+            let growth = retained_clone_bytes
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(retained_event_payload_bytes(event)?))
+                .and_then(|bytes| bytes.checked_add(64));
+            *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
+        } else if let Some(upper) = admission.shared_upper_bound.as_mut() {
+            // The preflight's clone projection also bounds the shared growth
+            // retained by an interleaved output, delta, or terminal event.
+            let growth = projected_responses_state_clone_bytes(ctx, std::slice::from_ref(event));
+            *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
+        }
+        // `function_call_arguments.done` can clone a completed item whose
+        // payload arrived in an earlier frame. Keep the stream byte cap sticky.
         if retained_clone_bytes > 0 {
             let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
             let Some(total) = responses.stream_accumulated_bytes.checked_add(retained_clone_bytes) else {
@@ -2068,7 +2109,7 @@ fn accumulate_chunk(
                 return Err(error);
             }
         }
-        match capture_client_tool_completion(state, ctx, &mut completions, event, parsed_owner_bytes) {
+        match capture_client_tool_completion(state, ctx, &mut completions, event, &mut admission) {
             Ok(Some(bytes)) => {
                 let Some(total) = completion_bytes.checked_add(bytes) else {
                     release_client_tool_completions(ctx, completions, completion_bytes);
@@ -2090,6 +2131,77 @@ fn accumulate_chunk(
     Ok(Some((completions, completion_bytes)))
 }
 
+/// Preflight an event while earlier completion snapshots are still retained.
+/// Repeated done events use their matching item and argument sizes; other
+/// events use the ordinary per-event clone projection to extend the running
+/// charge for their distinct mutations.
+fn pending_completion_event_fits(
+    ctx: &HttpFilterContext<'_>,
+    state: &mut StreamEventsState,
+    event: &ResponsesEvent,
+    admission: &mut CompletionAdmission,
+) -> bool {
+    let Some(limit) = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+    else {
+        return true;
+    };
+    let projection = match event {
+        ResponsesEvent::FunctionCallArgumentsDone(payload) => projected_done_mutation_peak_bytes(ctx, state, payload),
+        _ => projected_responses_state_clone_bytes(ctx, std::slice::from_ref(event)),
+    };
+    let Some(staging) = projection.and_then(|bytes| bytes.checked_add(admission.parsed_owner_bytes)) else {
+        return false;
+    };
+    let mut current = admission.shared_upper_bound.unwrap_or(usize::MAX);
+    if admission.shared_upper_bound.is_none()
+        || !stream_payload_fits_with_budget(state, staging, Some((limit, Some(current))))
+    {
+        let Some((_, Some(exact))) = shared_retained_budget(ctx, state) else {
+            return false;
+        };
+        current = exact;
+        if !stream_payload_fits_with_budget(state, staging, Some((limit, Some(current)))) {
+            return false;
+        }
+    }
+    admission.shared_upper_bound = Some(current);
+    true
+}
+
+/// Bound the new arguments in the response item plus the completed tool-call
+/// clone, including the case where a tiny done event consumes a large delta
+/// string held by the parser from earlier chunks.
+fn projected_done_mutation_peak_bytes(
+    ctx: &HttpFilterContext<'_>,
+    state: &StreamEventsState,
+    payload: &Value,
+) -> Option<usize> {
+    let item = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|responses| find_output_item(responses.output_items(), payload));
+    let Some(item) = item.filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call")) else {
+        return Some(0);
+    };
+    let key = tool_call_key(payload);
+    let arguments = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            key.as_ref()
+                .and_then(|key| state.tool_call_args.get(key).map(String::as_str))
+        })
+        .unwrap_or_default();
+    let arguments_bytes = retained_json_bytes(arguments)?;
+    retained_json_bytes(item)?
+        .checked_add(arguments_bytes.checked_mul(2)?)?
+        .checked_add(key.as_ref().map_or(0, String::len))?
+        .checked_add(128)
+}
+
 /// Capture one completed lowered call for the restoration plan. The snapshot
 /// is charged before cloning and stays charged until phase 2b releases it.
 #[expect(
@@ -2101,7 +2213,7 @@ fn capture_client_tool_completion(
     ctx: &mut HttpFilterContext<'_>,
     completions: &mut Vec<client_tools::ClientToolCompletion>,
     event: &ResponsesEvent,
-    parsed_owner_bytes: usize,
+    admission: &mut CompletionAdmission,
 ) -> Result<Option<usize>, SseParseError> {
     let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
         return Ok(Some(0));
@@ -2144,9 +2256,12 @@ fn capture_client_tool_completion(
     if let Some(error) = accumulation_bytes_exceeded(state, responses.stream_accumulated_bytes) {
         return Err(error);
     }
-    if !parsed_owner_bytes
+    if !admission
+        .parsed_owner_bytes
         .checked_add(snapshot_bytes)
-        .is_some_and(|bytes| stream_payload_fits(ctx, state, bytes))
+        .is_some_and(|bytes| {
+            completion_snapshot_fits(ctx, state, bytes, snapshot_bytes, &mut admission.shared_upper_bound)
+        })
     {
         return Ok(None);
     }
@@ -2175,6 +2290,40 @@ fn capture_client_tool_completion(
         item: item.clone(),
     });
     Ok(Some(snapshot_bytes))
+}
+
+/// Admit one snapshot against the current chunk's shared-state upper bound.
+/// Remeasure exact shared owners only when that conservative bound reaches the
+/// ceiling; this preserves near-cap requests without a large JSON scan per
+/// co-batched completion.
+fn completion_snapshot_fits(
+    ctx: &HttpFilterContext<'_>,
+    state: &mut StreamEventsState,
+    staging_bytes: usize,
+    snapshot_bytes: usize,
+    shared_upper_bound: &mut Option<usize>,
+) -> bool {
+    let Some(limit) = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+    else {
+        return stream_payload_fits_with_budget(state, staging_bytes, None);
+    };
+    let mut current = shared_upper_bound.unwrap_or(usize::MAX);
+    if shared_upper_bound.is_none()
+        || !stream_payload_fits_with_budget(state, staging_bytes, Some((limit, Some(current))))
+    {
+        let Some((_, Some(exact))) = shared_retained_budget(ctx, state) else {
+            return false;
+        };
+        current = exact;
+        if !stream_payload_fits_with_budget(state, staging_bytes, Some((limit, Some(current)))) {
+            return false;
+        }
+    }
+    *shared_upper_bound = current.checked_add(snapshot_bytes);
+    shared_upper_bound.is_some()
 }
 
 /// Phase 2b of the chunk commit: plan lowered client-tool restoration, then append

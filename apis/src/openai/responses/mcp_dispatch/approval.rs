@@ -25,7 +25,10 @@ use std::{
 use praxis_ai_store::PendingApprovalRecord;
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::{StateOwner, hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name};
+use crate::{
+    StateOwner, hash::Sha256, json_body::serialized_len,
+    openai::responses::openai_mcp_tool_resolve::encode_function_name,
+};
 
 // -----------------------------------------------------------------------------
 // Approval Response Round Trip
@@ -363,6 +366,34 @@ fn credential_fingerprint(credential: &SecretString) -> String {
     hash_segment(&mut hasher, b"praxis.ai/mcp-credential/v1");
     hash_segment(&mut hasher, credential.expose_secret().as_bytes());
     hex_digest(hasher.finish())
+}
+
+/// Project the map bytes added by request-scoped connector bindings before
+/// allocating their digests. Existing fields can be replaced by a shorter
+/// digest, and absent fields add a comma, key, colon, and 64-byte hex string.
+pub(crate) fn connector_binding_growth_bytes(
+    entry: &serde_json::Value,
+    bind_owner: bool,
+    bind_credential: bool,
+) -> Option<usize> {
+    if !super::is_connector_tool_entry(entry) {
+        return Some(0);
+    }
+    let object = entry.as_object()?;
+    [
+        (FORWARDED_HEADERS_FINGERPRINT, true),
+        (OWNER_FINGERPRINT, bind_owner),
+        (CREDENTIAL_FINGERPRINT, bind_credential),
+    ]
+    .into_iter()
+    .filter(|(_, bind)| *bind)
+    .try_fold(0_usize, |used, (name, _)| {
+        let growth = match object.get(name) {
+            Some(previous) => 66_usize.saturating_sub(serialized_len(previous).ok()?),
+            None => name.len().checked_add(70)?,
+        };
+        used.checked_add(growth)
+    })
 }
 
 /// Bind a connector tool-map entry to the exact ambient headers used for calls.
