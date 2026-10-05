@@ -66,18 +66,19 @@ use tracing::{debug, warn};
 use self::{
     approval::{
         ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context, bind_owner_context,
-        build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
-        parse_approval_response, resolve_approval, target_fingerprint,
+        build_approved_tool_call, build_denial_message, connector_binding_growth_bytes, extract_approval_responses,
+        is_approval_response, parse_approval_response, resolve_approval, target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
 use super::{
-    DEFAULT_STORE_NAME, budget_error,
+    DEFAULT_STORE_NAME,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
         McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
+        resolve_error_action_from_request_state,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes},
 };
@@ -92,6 +93,10 @@ use crate::{
 
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
+
+/// One newly hashed fingerprint and map key can coexist with the old value
+/// during insertion even when the map's final serialized size does not grow.
+const CONNECTOR_BINDING_TRANSIENT_BYTES: usize = 256;
 
 /// Whether this internally resolved tool entry names a configured connector.
 ///
@@ -317,20 +322,55 @@ impl McpDispatchFilter {
     }
 
     /// Bind connector approvals to the ambient headers this request will send.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the checked projection and connector binding share one mutation boundary"
+    )]
     fn bind_request_forwarded_header_context(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         headers: &http::HeaderMap,
         connector_identity: Option<&McpCalloutIdentity>,
-    ) {
+    ) -> bool {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
-            return;
+            return true;
         };
+        if state.retained_payload_limit().is_some() {
+            let growth = state
+                .mcp_tool_map
+                .values()
+                .try_fold((0_usize, false), |(used, connector), entry| {
+                    Some((
+                        used.checked_add(connector_binding_growth_bytes(
+                            entry,
+                            connector_identity.is_some(),
+                            connector_identity
+                                .and_then(McpCalloutIdentity::user_credential)
+                                .is_some(),
+                        )?)?,
+                        connector || is_connector_tool_entry(entry),
+                    ))
+                });
+            let peak = growth.and_then(|(bytes, connector)| {
+                bytes.checked_add(if connector {
+                    CONNECTOR_BINDING_TRANSIENT_BYTES
+                } else {
+                    0
+                })
+            });
+            if !peak.is_some_and(|bytes| state.can_retain_payload(bytes)) {
+                return false;
+            }
+        }
         for entry in state.mcp_tool_map.values_mut() {
             bind_forwarded_header_context(entry, &self.forward_headers, headers);
             bind_owner_context(entry, connector_identity.map(McpCalloutIdentity::owner));
             bind_credential_context(entry, connector_identity.and_then(McpCalloutIdentity::user_credential));
         }
+        if !state.mcp_tool_map.is_empty() {
+            state.mark_replay_stable_payload_changed();
+        }
+        true
     }
 
     /// Append MCP execution results to private continuation and public output state.
@@ -387,6 +427,9 @@ impl McpDispatchFilter {
 
     /// Stop the request after an aggregate MCP result admission failure.
     fn aggregate_budget_action(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+        if let Some(pool) = ctx.extensions.get::<mcp_client::McpSessionPool>() {
+            pool.drain_in_background();
+        }
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.discard_payload_for_budget_error();
             state.dispatch_failure = Some(DispatchFailure {
@@ -1197,7 +1240,9 @@ impl McpDispatchFilter {
         } else {
             None
         };
-        self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
+        if !self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref()) {
+            return Ok(Self::aggregate_budget_action(ctx));
+        }
 
         // Fetch (or lazily create) the per-execution MCP session pool. It lives
         // in the request's threaded `RequestExtensions`, so this same pool is
@@ -1226,6 +1271,14 @@ impl McpDispatchFilter {
         // `function_call_output` so inference resumes without a tool call.
         if let Err(rejection) = self.resume_approvals(ctx).await {
             return Ok(FilterAction::Reject(rejection));
+        }
+
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| !state.can_retain_payload(0))
+        {
+            return Ok(Self::aggregate_budget_action(ctx));
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -1259,18 +1312,7 @@ impl McpDispatchFilter {
         };
 
         if needs_discovery {
-            let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
-                ctx.extensions
-                    .get::<ResponsesState>()
-                    .and_then(|state| serde_json::to_vec(&state.request_body).ok())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let bytes = body
-                .as_ref()
-                .filter(|bytes| !bytes.is_empty())
-                .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
+            let bytes = body.as_ref().filter(|bytes| !bytes.is_empty()).map(Bytes::as_ref);
             let action = discover_pending_connectors(
                 ctx,
                 bytes,
@@ -1282,6 +1324,13 @@ impl McpDispatchFilter {
             .await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
+            }
+            if ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| !state.can_retain_payload(0))
+            {
+                return Ok(Self::aggregate_budget_action(ctx));
             }
         }
 
@@ -1337,11 +1386,12 @@ impl McpDispatchFilter {
 /// Load deferred connector tools when a hosted `tool_search_call` is pending.
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "deferred discovery needs request state, trusted headers, executor, and scoped identity"
 )]
 async fn discover_pending_connectors(
     ctx: &mut HttpFilterContext<'_>,
-    body: &[u8],
+    body: Option<&[u8]>,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
@@ -1362,13 +1412,25 @@ async fn discover_pending_connectors(
     {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
-            if matches!(err, ResolveError::RetainedBudget) {
-                return Ok(budget_error::reject_request(ctx, &err.to_string()));
+            if matches!(&err, ResolveError::RetainedBudget) {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.discard_payload_for_budget_error();
+                    state.dispatch_failure = Some(DispatchFailure {
+                        status: 502,
+                        code: "server_error",
+                        message: err.to_string(),
+                    });
+                }
+                ctx.set_metadata("responses.skip_persist", "true");
+                return Ok(FilterAction::Continue);
             }
             let streaming = ctx
                 .get_metadata("openai_responses_format.stream")
                 .is_some_and(|v| v == "true");
-            Ok(resolve_error_action(ctx, &err, streaming, body))
+            Ok(match body {
+                Some(body) => resolve_error_action(ctx, &err, streaming, body),
+                None => resolve_error_action_from_request_state(ctx, &err, streaming),
+            })
         },
     }
 }

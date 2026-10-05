@@ -918,6 +918,197 @@ async fn rejects_oversized_base64_before_decode() {
     }
 }
 
+#[tokio::test]
+async fn aggregate_budget_rejects_escaped_file_growth_before_state_rewrite() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "controls.txt", "file_data": text_file_data(&"\u{0001}".repeat(8_192))}
+        ]}
+    ]));
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.apply_retained_payload_limit(131_072);
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&body_json).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("escaped file growth must be rejected before the request mutates");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(
+        std::str::from_utf8(rejection.body.as_deref().unwrap())
+            .unwrap()
+            .contains("max_retained_bytes")
+    );
+    assert_eq!(body, Some(raw));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.messages.is_empty());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn aggregate_budget_preflights_extraction_before_state_initialization() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let config = serde_yaml::from_str("max_retained_bytes: 100000").unwrap();
+    let policy = AgenticBudgetPolicy::from_config(&config).unwrap();
+    ctx.extensions.insert(policy);
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "controls.txt", "file_data": text_file_data(&"\u{0001}".repeat(8_192))}
+        ]}
+    ]));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let raw = body.as_ref().unwrap();
+    assert!(super::super::initial_json_parse_peak_bytes(raw).unwrap() <= 100_000);
+    assert!(projected_extraction_peak(&ctx, &body_json, raw.len()).unwrap() > 100_000);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("pipeline budget must apply before ResponsesState exists");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(
+        std::str::from_utf8(rejection.body.as_deref().unwrap())
+            .unwrap()
+            .contains("during document extraction")
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_raw_body_before_json_parse() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let config = serde_yaml::from_str("max_retained_bytes: 131072").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    // Invalid JSON would ordinarily be released by this adapter. The policy
+    // must reject it before serde_json can allocate a large parsed tree.
+    let mut body = Some(Bytes::from(vec![b'x'; 16_385]));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("oversized raw body must be rejected before parsing");
+    };
+    assert_eq!(rejection.status, 413);
+    assert!(
+        std::str::from_utf8(rejection.body.as_deref().unwrap())
+            .unwrap()
+            .contains("during document extraction")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_budget_allows_small_document_extraction() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "small.txt", "file_data": text_file_data("hello")}
+        ]}
+    ]));
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.apply_retained_payload_limit(131_072);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages[0]["content"][0]["type"], "input_text");
+    assert!(state.can_retain_payload(0));
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_escaped_history_file_before_rewrite() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+    ]));
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    let prior = serde_json::json!({"type": "message", "role": "user", "content": [
+        {"type": "input_file", "filename": "prior.txt", "file_data": text_file_data(&"\u{0001}".repeat(8_192))}
+    ]});
+    state.messages.insert(0, prior.clone());
+    state.persisted_messages.insert(0, prior.clone());
+    state.apply_retained_payload_limit(131_072);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("escaped history must be rejected before rewriting either state owner");
+    };
+    assert_eq!(rejection.status, 413);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.messages.is_empty());
+    assert!(state.persisted_messages.is_empty());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn aggregate_budget_failure_after_stream_commit_is_terminal_sse() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let mut body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "controls.txt", "file_data": text_file_data(&"\u{0001}".repeat(8_192))}
+        ]}
+    ]));
+    body_json["stream"] = serde_json::Value::Bool(true);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.iteration = 1;
+    state.apply_retained_payload_limit(131_072);
+    ctx.extensions.insert(state);
+    ctx.extensions.insert(praxis_filter::ClientResponseHeadersCommitted);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a committed stream must end in an SSE error");
+    };
+    assert_eq!(rejection.status, 200);
+    assert!(
+        rejection
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type") && value == "text/event-stream")
+    );
+    let wire = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(wire.contains("event: error"), "{wire}");
+    assert!(wire.contains("during document extraction"), "{wire}");
+    assert!(!wire.contains("{\"error\":"), "{wire}");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.messages.is_empty());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
 #[test]
 fn base64_precheck_does_not_reject_at_exact_limit() {
     let cfg = DocExtractConfig {

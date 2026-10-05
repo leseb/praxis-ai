@@ -1824,9 +1824,17 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        None,
+        usize::MAX,
+    )
+    .expect("rewrite must not error")
+    .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     assert_eq!(
@@ -1884,9 +1892,17 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("mixed request must be rewritten");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        None,
+        usize::MAX,
+    )
+    .expect("rewrite must not error")
+    .expect("mixed request must be rewritten");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     let tools = rewritten["tools"].as_array().expect("tools array");
@@ -1935,9 +1951,17 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("resolved-empty entry must trigger a rewrite");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        None,
+        usize::MAX,
+    )
+    .expect("rewrite must not error")
+    .expect("resolved-empty entry must trigger a rewrite");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     assert_eq!(
@@ -3223,6 +3247,81 @@ async fn expanded_body_at_exact_limit_continues() {
     );
 }
 
+/// Replacing a named MCP selector shrinks it. The local wire cap applies to
+/// the rewritten body, not the original selector plus its replacement.
+#[tokio::test]
+async fn named_selector_rewrite_at_exact_body_limit_continues() {
+    let server_url = "http://8.8.8.8/mcp";
+    let mut body_json = mcp_body(server_url);
+    body_json["tool_choice"] = serde_json::json!({
+        "type": "mcp", "server_label": "weather", "name": "get_weather"
+    });
+    let cached = vec![serde_json::json!({"name": "get_weather"})];
+    let mut rewritten_len = None;
+
+    for cap in [1_048_576, 0] {
+        let filter = filter_with_max_rewritten_body_bytes(rewritten_len.unwrap_or(cap));
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+        let mut state = ResponsesState::from_request_body(body_json.clone());
+        state.previous_tools = vec![serde_json::json!({
+            "server_label": "weather", "server_url": server_url, "tools": cached,
+        })];
+        ctx.extensions.insert(state);
+        let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "named selector should fit its final wire cap"
+        );
+        let len = body.unwrap().len();
+        if let Some(exact) = rewritten_len {
+            assert_eq!(len, exact);
+        } else {
+            rewritten_len = Some(len);
+        }
+    }
+}
+
+/// Wire preflight must match the actual replacement across named, server-wide,
+/// repeated, unresolved, and resolved-empty selectors.
+#[test]
+fn tool_choice_wire_projection_matches_rewritten_choices() {
+    let tool_map = HashMap::from([
+        (("weather".to_owned(), "rain".to_owned()), serde_json::json!({})),
+        (("weather".to_owned(), "sun".to_owned()), serde_json::json!({})),
+    ]);
+    let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
+    let choices = [
+        serde_json::json!({"type":"mcp","server_label":"weather","name":"rain"}),
+        serde_json::json!({"type":"mcp","server_label":"weather"}),
+        serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[
+            {"type":"mcp","server_label":"weather"},
+            {"type":"mcp","server_label":"weather","name":"sun"},
+            {"type":"mcp","server_label":"unknown"},
+            {"type":"function","name":"plain"}
+        ]}),
+        serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[
+            {"type":"mcp","server_label":"empty"}
+        ]}),
+        serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[
+            {"type":"mcp","server_label":"unknown"}
+        ]}),
+        serde_json::json!("none"),
+    ];
+    for choice in choices {
+        let original = retained_json_bytes(&choice).unwrap();
+        let projection = projected_tool_choice_bytes(Some(&choice), &tool_map, &resolved_labels).unwrap();
+        let mut obj = serde_json::Map::new();
+        obj.insert("tool_choice".to_owned(), choice);
+        rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+        let actual = retained_json_bytes(&obj["tool_choice"]).unwrap();
+        assert_eq!(projection.final_choice_bytes, actual);
+        assert!(original + projection.peak_expansion_bytes >= actual);
+    }
+}
+
 /// `BodyTooLarge` maps to HTTP 413 with `invalid_request_error`.
 #[test]
 fn body_too_large_maps_to_413() {
@@ -3879,6 +3978,7 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
 
     discover_deferred_connectors(&mut state).await.unwrap();
     ct.cancel();
+    assert!(state.retained_payload_bytes().unwrap() <= 64 * 1024 * 1024);
 
     assert!(
         state.deferred_mcp.is_empty(),
@@ -5272,6 +5372,23 @@ fn capture_echoed_options_drops_oversized_field_keeps_small_ones() {
     );
 }
 
+#[test]
+fn bodyless_failure_echo_omits_fields_that_exceed_remaining_aggregate_budget() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o-mini",
+        "metadata": {"trace": "x".repeat(2_048)},
+    }));
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + 1_024);
+
+    let captured = capture_echoed_options_from_state(&state).expect("model fits in the headroom");
+    assert_eq!(captured["model"], "gpt-4o-mini");
+    assert!(
+        captured.get("metadata").is_none(),
+        "metadata would multiply past the headroom"
+    );
+}
+
 /// End to end, an oversized `instructions` must not be amplified across the three
 /// SSE snapshots: the terminal failure echoes the default `instructions` (null)
 /// while still echoing the small fields, and the whole SSE body stays far below
@@ -5626,6 +5743,7 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     assert!(matches!(action, FilterAction::Continue), "cache hit should continue");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert!(state.retained_payload_bytes().unwrap() <= 64 * 1024 * 1024);
     let items = list_tools_items(state);
     assert_eq!(items.len(), 1, "one discovery item for the resolved server");
     let item = items[0];
@@ -5672,7 +5790,7 @@ async fn eager_listing_rejects_exhausted_shared_budget_before_rewrite() {
     let FilterAction::Reject(rejection) = action else {
         panic!("exhausted budget must reject before tools/list");
     };
-    assert_eq!(rejection.status, 502);
+    assert_eq!(rejection.status, 413);
     assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default()).contains("retained payload"));
     assert_eq!(
         body.as_deref(),
@@ -5739,7 +5857,7 @@ async fn eager_listing_with_policy_rejects_missing_shared_state() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(ctx.extensions.get::<ResponsesState>().is_none());
@@ -5997,4 +6115,212 @@ async fn malformed_allowed_tools_string_rejects_before_rewrite() {
         state.is_none() || state.unwrap().mcp_tool_map.is_empty(),
         "mcp_tool_map must not be populated on validation failure"
     );
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_cached_mcp_listing_before_commit() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let body_json = mcp_body(server_url);
+    let mut listing = cached_weather_listing(server_url);
+    listing["tools"][0]["description"] = serde_json::json!("x".repeat(4_096));
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![listing];
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + 1_024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_fresh_mcp_listing_before_callout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let body_json = mcp_body(&server_url);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json);
+    state.apply_retained_payload_limit(8_192);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "tools/list must not start without enough room for its bounded response"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_budget_mcp_listing_uses_response_commitment_phase() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    for (iteration, committed, expected_status) in [(0, false, 413), (1, false, 502), (1, true, 200)] {
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+        let mut body_json = mcp_body("https://example.com/mcp");
+        body_json["stream"] = serde_json::json!(true);
+        let mut state = ResponsesState::from_request_body(body_json.clone());
+        state.iteration = iteration;
+        state.apply_retained_payload_limit(8_192);
+        ctx.extensions.insert(state);
+        if committed {
+            ctx.extensions.insert(praxis_filter::ClientResponseHeadersCommitted);
+        }
+        let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("budget failure must reject the current MCP discovery");
+        };
+        assert_eq!(rejection.status, expected_status);
+        let text = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(text.contains("event: error"), committed);
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    }
+}
+
+#[tokio::test]
+async fn aggregate_budget_rejects_deferred_mcp_listing_before_callout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mut state = ResponsesState {
+        deferred_mcp: vec![deferred_connector(&server_url, None, None)],
+        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(state.deferred_mcp.len(), 1);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "deferred tools/list must not start without enough room for its bounded response"
+    );
+}
+
+#[test]
+fn aggregate_budget_rejects_repeated_mcp_selectors_before_expansion() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let names: Vec<String> = (0..128).map(|i| format!("t{i:03}_{}", "x".repeat(60))).collect();
+    let listed_tools: Vec<_> = names
+        .iter()
+        .map(|name| serde_json::json!({"name": name, "inputSchema": {"type": "object"}}))
+        .collect();
+    let selectors = vec![serde_json::json!({"type": "mcp", "server_label": "weather"}); 4_000];
+    let body_json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "tools": [{
+            "type": "mcp", "server_label": "weather", "server_url": server_url,
+            "allowed_tools": names,
+        }],
+        "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": selectors},
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url, "tools": listed_tools,
+    })];
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut action = None;
+    let allocation = allocation_counter::measure(|| {
+        action = Some(
+            runtime
+                .block_on(filter.on_request_body(&mut ctx, &mut body, true))
+                .unwrap(),
+        );
+    });
+
+    assert!(matches!(&action, Some(FilterAction::Reject(rejection)) if rejection.status == 413));
+    assert!(
+        allocation.bytes_max < 16 * 1024 * 1024,
+        "expanded selectors must be projected before building JSON or wire owners: {allocation:?}"
+    );
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.mcp_tool_map.is_empty());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[tokio::test]
+async fn aggregate_budget_admits_small_repeated_mcp_selectors() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let server_url = "http://8.8.8.8/mcp";
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "weather", "server_url": server_url,
+            "allowed_tools": ["forecast", "temperature"]}],
+        "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [
+            {"type": "mcp", "server_label": "weather"},
+            {"type": "mcp", "server_label": "weather"}
+        ]}
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": [
+            {"name": "forecast", "inputSchema": {"type": "object"}},
+            {"name": "temperature", "inputSchema": {"type": "object"}}
+        ]
+    })];
+    state.apply_retained_payload_limit(64 * 1024 * 1024);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "small selector expansion: {action:?}"
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(rewritten["tool_choice"]["tools"].as_array().unwrap().len(), 4);
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().can_retain_payload(0));
 }

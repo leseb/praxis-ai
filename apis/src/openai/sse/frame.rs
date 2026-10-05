@@ -155,15 +155,69 @@ impl SseFrameParser {
     /// A lossy `event:` conversion can expand each invalid byte to three bytes;
     /// `data:` copies the raw line while the old line buffer remains live.
     pub(crate) fn pending_line_transition_bytes(&self, chunk: &[u8]) -> Option<usize> {
-        if self.line_buf.is_empty() || !chunk.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        let line_bytes = if self.line_buf.is_empty() || !chunk.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            0
+        } else {
+            let factor = if std::str::from_utf8(&self.line_buf).is_ok() {
+                1
+            } else {
+                3
+            };
+            self.line_buf.len().checked_mul(factor)?
+        };
+        line_bytes.checked_add(self.pending_data_reallocation_bytes(chunk)?)
+    }
+
+    /// The previous chunk's data buffer can coexist with a larger allocation
+    /// when a later `data:` line extends it. Only inspect this chunk's lines;
+    /// a blank line releases the old frame before any following data field.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single-pass borrowed SSE line scan before allocation"
+    )]
+    fn pending_data_reallocation_bytes(&self, chunk: &[u8]) -> Option<usize> {
+        let prior_bytes = self.data_buf.len();
+        if prior_bytes == 0 {
             return Some(0);
         }
-        let factor = if std::str::from_utf8(&self.line_buf).is_ok() {
-            1
-        } else {
-            3
-        };
-        self.line_buf.len().checked_mul(factor)
+        let mut line_start = usize::from(self.prev_cr && chunk.first() == Some(&b'\n'));
+        let mut carried = self.line_buf.as_slice();
+        let mut projected = prior_bytes;
+        let mut has_data = self.has_data;
+        while let Some(relative_end) = chunk
+            .get(line_start..)?
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            let line_end = line_start.checked_add(relative_end)?;
+            let line = chunk.get(line_start..line_end)?;
+            if carried.is_empty() && line.is_empty() {
+                break;
+            }
+            if let Some(value_bytes) = Self::data_field_value_len(carried, line) {
+                projected = projected.checked_add(usize::from(has_data))?.checked_add(value_bytes)?;
+                has_data = true;
+                if projected > self.data_buf.capacity() {
+                    return Some(prior_bytes);
+                }
+            }
+            carried = &[];
+            line_start = line_end.checked_add(1)?;
+            if chunk.get(line_end) == Some(&b'\r') && chunk.get(line_start) == Some(&b'\n') {
+                line_start = line_start.checked_add(1)?;
+            }
+        }
+        Some(0)
+    }
+
+    /// Return the data value length for a line split across two borrowed slices.
+    fn data_field_value_len(carried: &[u8], line: &[u8]) -> Option<usize> {
+        let mut bytes = carried.iter().chain(line).copied();
+        for expected in b"data:" {
+            (bytes.next() == Some(*expected)).then_some(())?;
+        }
+        let value_start = if bytes.next() == Some(b' ') { 6 } else { 5 };
+        carried.len().checked_add(line.len())?.checked_sub(value_start)
     }
 
     /// Release all partial frame payload after a terminal aggregate failure.
