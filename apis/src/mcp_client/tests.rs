@@ -2584,6 +2584,56 @@ async fn payload_limit_change_replaces_session_without_fragmenting_identity_key(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercise two rounds with equal wire caps and distinct immutable parse caps"
+)]
+async fn parse_peak_change_replaces_session_with_same_rounded_payload_limit() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "parse-peak".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+    let payload_limit = 8_192 / 4;
+    assert_eq!(payload_limit, 8_193 / 4);
+
+    for preparse_peak_limit in [Some(8_193 * 2), Some(8_192 * 2), Some(8_192 * 2)] {
+        let result = call_tool_with_forwarded_headers_with_budget(
+            Some((&pool, Some(&key))),
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "echo",
+            serde_json::json!({"message": "ok"}),
+            INTEGRATION_TIMEOUT,
+            payload_limit,
+            payload_limit,
+            payload_limit,
+            preparse_peak_limit,
+            true,
+            &callout,
+        )
+        .await;
+        assert!(result.is_ok(), "bounded tool call must complete: {result:?}");
+    }
+
+    assert_eq!(
+        method_count(&methods, "initialize"),
+        2,
+        "changed parse cap must open a fresh session"
+    );
+    assert_eq!(
+        method_count(&methods, "tools/call"),
+        3,
+        "same parse cap may reuse the fresh session"
+    );
+    pool.drain().await;
+    ct.cancel();
+}
+
+#[tokio::test]
 async fn pool_drain_explicitly_closes_idle_server_session() {
     let (url, ct, _methods, sessions, _echo_calls) = start_expirable_mcp_server().await;
     let pool = McpSessionPool::new();
@@ -2733,7 +2783,13 @@ async fn budgeted_checkout_rejects_unbudgeted_get_stream_session() {
     let rejected = pool.checkin(key.clone(), open_pooled_session(&url, &callout).await);
     close_sessions(rejected).await;
 
-    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, true);
+    let checkout = pool.checkout_with_limits(
+        &key,
+        TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
+        Some(TEST_MAX_RESULT_BYTES.saturating_mul(8)),
+        true,
+    );
     assert!(
         checkout.session.is_none(),
         "an unbounded GET session cannot satisfy a budgeted checkout"
@@ -2756,7 +2812,7 @@ async fn background_closing_session_remains_charged_until_delete_finishes() {
     let parked_bytes = pool.retained_payload_bytes().unwrap();
     assert!(parked_bytes > "closing-owner".len());
 
-    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, false);
+    let checkout = pool.checkout_with_limits(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, None, false);
     assert!(checkout.session.is_none());
     assert_eq!(checkout.rejected.len(), 1);
     pool.close_sessions_in_background(checkout.rejected);
@@ -2819,7 +2875,7 @@ async fn budgeted_background_delete_charges_its_buffered_response_while_in_fligh
         "small admitted initialize should open a session: {result:?}"
     );
     let parked = pool.retained_payload_bytes().unwrap();
-    let checkout = pool.checkout_with_initialize_limit(&key, 256, 1_024, true);
+    let checkout = pool.checkout_with_limits(&key, 256, 1_024, Some(256 * 8 + 16 * 1_024), true);
     assert!(checkout.rejected.is_empty());
     let session = checkout.session.expect("warm session must be reusable");
     let peer_bytes =
@@ -2978,7 +3034,13 @@ async fn checkout_rejects_session_whose_idle_get_exhausted_its_budget() {
     assert!(pool.checkin(key.clone(), session).is_empty());
 
     assert!(!signal_state.admit_get_stream_bytes(usize::MAX));
-    let checkout = pool.checkout_with_initialize_limit(&key, TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, true);
+    let checkout = pool.checkout_with_limits(
+        &key,
+        TEST_MAX_RESULT_BYTES,
+        MAX_CONTROL_RESPONSE_BYTES,
+        Some(TEST_MAX_RESULT_BYTES.saturating_mul(8)),
+        true,
+    );
     assert!(
         checkout.session.is_none(),
         "an exhausted session cannot resume a later tool call"

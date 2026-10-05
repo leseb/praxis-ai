@@ -116,6 +116,8 @@ pub(crate) struct PooledSession {
     payload_limit: usize,
     /// Immutable initialize ceiling baked into this session's transport.
     initialize_limit: usize,
+    /// Immutable JSON parse ceiling baked into this session's transport.
+    preparse_peak_limit: Option<usize>,
     /// Bound for the standalone GET parser while rmcp keeps polling this
     /// session after a successful tool call.
     stream_retained_reserve: Option<NonZeroUsize>,
@@ -133,12 +135,14 @@ impl PooledSession {
         signal_state: Arc<TransportSignalState>,
         payload_limit: usize,
         initialize_limit: usize,
+        preparse_peak_limit: Option<usize>,
     ) -> Self {
         Self {
             service,
             signal_state,
             payload_limit,
             initialize_limit,
+            preparse_peak_limit,
             stream_retained_reserve: super::subrequest_transport::tool_stream_retained_reserve(
                 payload_limit,
                 initialize_limit,
@@ -400,16 +404,21 @@ impl McpSessionPool {
     /// so the caller can close them outside the synchronous mutex boundary.
     #[cfg(test)]
     pub(crate) fn checkout(&self, key: &McpPoolKey, payload_limit: usize) -> PoolCheckout {
-        self.checkout_with_initialize_limit(key, payload_limit, super::MAX_CONTROL_RESPONSE_BYTES, false)
+        self.checkout_with_limits(key, payload_limit, super::MAX_CONTROL_RESPONSE_BYTES, None, false)
     }
 
-    /// Checkout additionally binds the immutable handshake limit, preventing a
-    /// session initialized without a budget from being reused under a smaller one.
-    pub(crate) fn checkout_with_initialize_limit(
+    /// Checkout binds every immutable transport limit, preventing a session
+    /// initialized under a different budget from being reused.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pool identity, wire, control, parse, and budget mode must match the live transport"
+    )]
+    pub(crate) fn checkout_with_limits(
         &self,
         key: &McpPoolKey,
         payload_limit: usize,
         initialize_limit: usize,
+        preparse_peak_limit: Option<usize>,
         budgeted: bool,
     ) -> PoolCheckout {
         let mut map = self.lock();
@@ -429,6 +438,7 @@ impl McpSessionPool {
                 && idle_timer_disarmed
                 && candidate.payload_limit == payload_limit
                 && candidate.initialize_limit == initialize_limit
+                && candidate.preparse_peak_limit == preparse_peak_limit
                 && candidate.signal_state.has_get_stream_budget() == budgeted
                 && !candidate.signal_state.get_stream_exhausted()
                 && !candidate.is_closed()
@@ -455,6 +465,7 @@ impl McpSessionPool {
             for prior in std::mem::take(existing) {
                 if prior.payload_limit == session.payload_limit
                     && prior.initialize_limit == session.initialize_limit
+                    && prior.preparse_peak_limit == session.preparse_peak_limit
                     && prior.signal_state.has_get_stream_budget() == session.signal_state.has_get_stream_budget()
                 {
                     retained.push(prior);
@@ -619,7 +630,7 @@ mod tests {
             },
             Some(rmcp::model::ServerConfig::default().into()),
         );
-        let session = PooledSession::new(service, Arc::new(TransportSignalState::new(None)), 1_024, 1_024);
+        let session = PooledSession::new(service, Arc::new(TransportSignalState::new(None)), 1_024, 1_024, None);
         let pool = McpSessionPool::new();
         pool.close_sessions_in_background(vec![session]);
         assert!(
