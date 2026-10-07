@@ -23,7 +23,10 @@ translated path for a backend that only exposes OpenAI Chat Completions.
 In GitHub Actions, open **vLLM Dev Endpoint**, choose **Run workflow**, and keep
 the defaults for Qwen3-8B. The workflow provisions a temporary GPU, publishes a
 Cloudflare URL in the run summary, and tears everything down at the requested
-deadline or when the run is cancelled.
+deadline or when the run is cancelled. Its defaults already serve Qwen3-8B with
+`--reasoning-parser qwen3` and thinking off, which is what the coding clients
+below expect; change the `reasoning_parser` and `enable_thinking` inputs only
+for a different model or when you specifically want visible reasoning.
 
 Record the two summary values:
 
@@ -48,7 +51,8 @@ vllm serve Qwen/Qwen3-8B \
   --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
-  --reasoning-parser deepseek_r1 \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
   --gpu-memory-utilization 0.97 \
   --enforce-eager \
   --api-key "$VLLM_API_KEY"
@@ -74,7 +78,8 @@ docker run --rm --name vllm \
   --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
-  --reasoning-parser deepseek_r1 \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
   --gpu-memory-utilization 0.97 \
   --enforce-eager
 ```
@@ -86,6 +91,35 @@ run downloads a multi-gigabyte image plus the model weights, and the Hugging
 Face cache mount keeps the weights for later runs.
 
 Use `VLLM_URL=http://127.0.0.1:8000` for either local server.
+
+### Reasoning flags matter for Claude Code
+
+The two reasoning-related flags above are deliberate for this setup and are the
+main difference from the flags CI serves:
+
+- `--reasoning-parser qwen3` matches the served model family. The parser name
+  selects how vLLM splits a `<think>` block out of the completion into
+  `reasoning_content`; a parser written for a different family can leave that
+  text in the assistant message instead.
+- `--default-chat-template-kwargs '{"enable_thinking":false}'` turns Qwen3's
+  thinking off at the chat-template level, so the model does not emit a
+  `<think>` block for the agentic turns Claude Code drives in the first place.
+
+Serving Qwen3-8B with `--reasoning-parser deepseek_r1` and thinking left on
+made Claude Code's plan mode loop endlessly, emitting reasoning text into the
+rendered plan instead of a finished one. Switching to the two flags above
+resolved it. They were verified together, so change them as a pair; if you need
+visible reasoning for other work, expect agentic clients to degrade.
+
+A nightly GPU regression guards this pairing. The
+`vllm-gpu-claude-acceptance` job drives a read-only planning turn through the
+native Anthropic path and fails if the run exhausts its turn budget instead of
+answering, or if a `<think>` delimiter reaches the user-visible text. The
+scenario is pinned in `[claude_code.launch.planning]` of
+`tests/integration/fixtures/claude-code-cli/pin.toml`; reverting either flag
+above is expected to turn it red. It is a headless approximation of the turn
+that broke, not interactive plan mode, which the CLI does not expose to
+`claude -p`.
 
 The 32,768-token window is intentional for Claude Code auto mode. Its
 client-initiated safety classifier reserves 2,112 output tokens independently
@@ -254,58 +288,48 @@ container with
 from the host under `--network host`). When finished, replace the `kill` in
 the cleanup section with `docker rm -f praxis-vllm`.
 
-#### The native Codex example needs a rebuilt image
+#### The native Codex example needs a writable database path
 
-The published image is built with `PRAXIS_AI_FEATURES=full`, and `full` does
-not include `store-sqlite` (it selects `store-postgres` as the store backend).
-`client-tool-compat.yaml` — the preferred native Codex example — therefore
-cannot run on the stock image; `--validate` rejects it up front:
+The image is built with `full,store-sqlite`, so `client-tool-compat.yaml` — the
+preferred native Codex example — runs on the stock image. The other three
+configurations in this section have no store filter and need no change at all.
 
-```text
-invalid configuration: openai_response_store: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature
-```
-
-The other three configurations in this section have no store filter and run on the
-published image unchanged. For the native Codex path, build the image locally
-with SQLite compiled in:
-
-```console
-docker build -f Containerfile \
-  --build-arg PRAXIS_AI_FEATURES=full,store-sqlite \
-  -t praxis-ai:sqlite .
-```
-
-Then give the store a writable path. The image's `/etc/praxis` working
-directory is root-owned while the process runs as `praxis`, so the example's
-relative `sqlite://responses.db?mode=rwc` cannot be created: the proxy starts,
-and the first `/v1/responses` request fails with HTTP 500 and
-`unable to open database file`. Point `database_url` at a mounted directory the
-container user can write instead:
+The one edit the store example does need is an absolute `database_url`. The
+image's `/etc/praxis` working directory is root-owned while the process runs as
+`praxis` (UID 100), so the example's relative `sqlite://responses.db?mode=rwc`
+cannot be created: the proxy starts, and the first `/v1/responses` request
+fails with HTTP 500 and `unable to open database file`. Point `database_url` at
+`/var/lib/praxis`, the writable state directory owned by the container user:
 
 ```yaml
 - filter: openai_response_store
   backend: sqlite
-  database_url: "sqlite:///data/responses.db?mode=rwc"
+  database_url: "sqlite:///var/lib/praxis/responses.db?mode=rwc"
 ```
 
 ```console
-mkdir -m 0777 -p "$PWD/praxis-responses"
 docker run -d --rm --name praxis-vllm \
   --network host \
+  -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  -v "$PWD/praxis-responses:/data:z" \
-  praxis-ai:sqlite -c /etc/praxis/praxis.yaml
+  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
 ```
 
-The permissive mode is what lets UID 100 create the database in a host
-directory owned by your user; a directory `chown`ed to UID 100 works too.
-Podman can use a named volume instead, with the `:U` suffix asking it to chown
-the volume to the container user: `-v praxis-responses:/data:U`.
+The database then lives in the container's writable layer and disappears with
+`--rm`, which is usually what a CLI test loop wants. To keep responses across
+restarts, mount a volume at `/var/lib/praxis`: `-v praxis-state:/var/lib/praxis`
+with Podman adds `:U` to chown it to the container user, and a host directory
+needs `chown 100:100` (or `-m 0777`) before the first run.
 
-The published image can also serve this example with `backend: postgres`,
+SQLite in the image landed after `v0.5.0`, so a pinned older tag still rejects
+the config at startup with
+`backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature`. Use
+`latest` or a tag newer than `v0.5.0`.
+
+The image can also serve this example with `backend: postgres`,
 `allow_private_database_url: true`, and a reachable PostgreSQL instance — see
 `examples/configs/openai/responses/response-store-postgres-mtls.yaml` — but for
-a single-developer CLI loop the locally built SQLite image is less setup.
+a single-developer CLI loop SQLite is less setup.
 
 ## 3. Connect Codex
 
@@ -504,6 +528,14 @@ kill "$PRAXIS_PID"
   `--strict-mcp-config` to drop globally configured MCP servers, disable
   unneeded plugins with `/plugin`, and prefer a working directory whose
   `CLAUDE.md` is small or absent.
+- Claude Code never finishes a turn — plan mode keeps looping, or reasoning
+  text appears in the answer or the rendered plan: the server is emitting
+  thinking that the client is not meant to see. Serve Qwen3 with
+  `--reasoning-parser qwen3` and
+  `--default-chat-template-kwargs '{"enable_thinking":false}'` as shown in
+  section 1, and restart vLLM; the reasoning parser is a server flag, so
+  nothing on the Praxis or client side changes it. On the on-demand endpoint,
+  check the `reasoning_parser` and `enable_thinking` inputs of the run.
 - TLS or connection failure: use only the tunnel hostname in the endpoint and
   `tls.sni`; do not include `https://` in Praxis's `endpoints` entry.
 - Connection refused on 8080 from another machine, while vLLM on 8000 answers:
