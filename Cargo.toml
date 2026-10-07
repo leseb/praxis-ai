@@ -338,3 +338,12 @@ bare_urls = "deny"
 invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
+
+# Dependency for committed-stream failure markers and bounded streaming callouts
+# from praxis-proxy/praxis#1349 (merged). Return to versioned crates after release.
+[patch.crates-io]
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "50cec44f01b11c0a1460ed98ee660017ed55f403" }
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "50cec44f01b11c0a1460ed98ee660017ed55f403" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "50cec44f01b11c0a1460ed98ee660017ed55f403" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "50cec44f01b11c0a1460ed98ee660017ed55f403" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "50cec44f01b11c0a1460ed98ee660017ed55f403" }

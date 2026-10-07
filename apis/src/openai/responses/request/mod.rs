@@ -152,6 +152,10 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "classification and budget admission share one body pass"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -160,6 +164,18 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        // Compact owns its parse and retained-payload ledger. The fused
+        // classifier must not retain a second unmetered request state.
+        if ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
+            && ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(
+                super::initial_agentic_budget_rejection(ctx, body.as_deref().unwrap_or_default())
+                    .unwrap_or(FilterAction::Release),
+            );
         }
 
         let Some(matched) = matched_body_bearing_operation(ctx) else {
@@ -182,6 +198,11 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return publish_bodyless_operation(ctx, &self.config.shared);
         }
 
+        let raw = body.as_deref().unwrap_or_default();
+        if let Some(action) = super::initial_agentic_budget_rejection(ctx, raw) {
+            return Ok(action);
+        }
+
         // The one parse feeds classification, promotion, and state alike. A body
         // that cannot be classified follows `on_invalid` instead.
         let (parsed, classified) = match parse_and_classify_create_body(body) {
@@ -197,7 +218,18 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(action);
         }
 
-        publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation)?;
+        let budget = if matched.operation == ResponsesOperation::CreateResponse
+            && classified.format == AiRequestFormat::Responses
+        {
+            match super::plain_agentic_budget(ctx, &parsed, raw) {
+                Ok(budget) => budget,
+                Err(action) => return Ok(action),
+            }
+        } else {
+            None
+        };
+
+        publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation, budget)?;
 
         Ok(FilterAction::Release)
     }
@@ -269,12 +301,17 @@ fn reject_unsupported_managed_fields(
 /// # Errors
 ///
 /// Returns [`FilterError`] when a filter result cannot be published.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "publishes one classified create and its budget at one ownership boundary"
+)]
 fn publish_request_facts(
     ctx: &mut HttpFilterContext<'_>,
     classified: &ClassifiedRequest,
     parsed: serde_json::Value,
     config: &ResponsesRequestConfig,
     operation: ResponsesOperation,
+    budget: Option<super::agentic_loop::budget::SimpleBudget>,
 ) -> Result<(), FilterError> {
     let mode = super::compute_mode(classified);
 
@@ -296,7 +333,7 @@ fn publish_request_facts(
     // reads this immutable owner when appending the completed turn.
     #[cfg(feature = "openai-conversations")]
     crate::openai::conversations::capture_validated_append_owner(ctx);
-    insert_responses_state(ctx, parsed, &response_id);
+    insert_responses_state(ctx, parsed, &response_id, budget);
 
     debug!(
         response_id = %response_id,
@@ -534,8 +571,14 @@ fn enrich_context(
 }
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
+fn insert_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+    budget: Option<super::agentic_loop::budget::SimpleBudget>,
+) {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
+    state.simple_budget = budget;
     ctx.extensions.insert(state);
 }
