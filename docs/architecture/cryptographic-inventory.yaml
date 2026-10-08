@@ -209,8 +209,6 @@ allow:
     note: Locates the system CA-bundle path; performs no crypto.
   - crate: spin
     note: Spinlock library (pulled by the regorus policy engine); not cryptographic.
-  - crate: praxis-policy-plugin-identity-jwt
-    note: praxis-core JWT caller plugin; the primitive executes in aws-lc-rs (A1).
   - crate: praxis-proxy-tls
     note: praxis-core TLS setup wrapper; installs the OpenSSL rustls provider (rustls_openssl) as the process default — the primitive is rustls/OpenSSL (T1).
   - crate: quixotic-plecostomus-rustls
@@ -224,8 +222,6 @@ allow:
     note: RustCrypto digest support layer (blake2 in both profiles; sha2/hmac/hkdf/md-5 in full).
   - crate: untrusted
     note: Safe input parser (support); enters via rustls-webpki (both) and aws-lc-rs (full). Ring is absent from the graph.
-  - crate: hkdf
-    note: HKDF — sqlx PgAdvisoryLock key derivation; compiled but NOT invoked by the AI store (full).
   - crate: blake2
     note: BLAKE2b-128 Pingora HTTP cache key (non-secret). Upstream-owned; not a security function.
   - crate: rand_xoshiro
@@ -286,8 +282,8 @@ providers:
     note: JWT signature verify executes on aws-lc-rs (A1). Full profile only.
   - crate: native-tls
     version: "0.2.18"
-    profiles: [full]
-    note: "PostgreSQL store TLS backend — diverges from the rustls data plane (A10; #1217 / R4). Full profile only."
+    profiles: [full, fips]
+    note: "PostgreSQL store TLS backend — diverges from the rustls data plane (A10; #1217 / R4). In full (store-postgres) and fips (store-postgres-cert-auth): the certificate-only PostgreSQL store ships in the FIPS image, so its TLS backend resolves in both profiles."
 
 # --------------------------------------------------------------------------
 # Cryptographic operations (operation-centric view, #1220 AC#1).
@@ -347,16 +343,16 @@ operations:
     remediation: "docs/fips.md"
     note: "Downstream listener TLS via praxis-proxy-tls ServerConfig on the installed OpenSSL provider; optional WebPKI client-cert verification; cert served through ReloadableCertResolver."
   - id: T5
-    name: "Outbound reqwest TLS (file_resolve file_url download)"
+    name: "Outbound file_resolve file_url download TLS (SSRF-guarded sub-request)"
     owner: "praxis-ai (apis/openai/responses/file_resolve)"
-    caller: "apis/src/openai/responses/file_resolve/resolve_url.rs:575 build_pinned_client -> configure_pinned_client -> reqwest::Client::builder() (download path :363)"
-    algorithm: "HTTPS GET over reqwest (rustls-no-provider) on the installed OpenSSL provider; DNS-pinned, redirect-free, proxy-free"
-    provider: "OpenSSL via the installed rustls_openssl provider (reqwest rustls-no-provider)"
-    crates: [hyper-rustls, rustls, rustls-webpki, tokio-rustls, rustls-platform-verifier, quixotic-plecostomus-rustls-openssl, openssl, openssl-sys]
-    profiles: [full]
+    caller: "client built at apis/src/openai/responses/file_resolve/mod.rs:211 isolated_client -> apis/src/subrequest.rs:28 (install provider + SubRequestConnector); download via resolve_url.rs:386 execute_url (apis/src/subrequest.rs:178)"
+    algorithm: "TLS 1.2/1.3 handshake over the SubRequestConnector rustls config on the installed OpenSSL provider; DNS/SSRF-guarded, redirect-free"
+    provider: "OpenSSL via the installed rustls_openssl provider (SubRequestConnector)"
+    crates: [quixotic-plecostomus-rustls-openssl, rustls, rustls-webpki, tokio-rustls, openssl, openssl-sys]
+    profiles: [full, fips]
     disposition: non-validated
     remediation: "docs/fips.md"
-    note: "file_url download over a DNS-pinned, redirect-free, proxy-free reqwest client built with rustls-no-provider, so the process-installed OpenSSL provider performs the handshake. openai-file-resolve-filter is full-only (absent from fips)."
+    note: "file_url download runs over the praxis-core SubRequestConnector (Pingora HttpPeer) on the process-installed OpenSSL provider — the same connector as the other AI callouts (T3), not a reqwest client (the former reqwest/rustls-platform-verifier path was removed in #960/#1186). DNS/SSRF-guarded and redirect-free. openai-file-resolve-filter is in both the full and fips feature sets."
   - id: T7
     name: "Redis/Valkey policy session-store TLS (rediss://)"
     owner: "praxis-proxy/policy (upstream) via redis tls-rustls"
@@ -380,16 +376,16 @@ operations:
     remediation: "docs/fips.md"
     note: "The installed provider's SecureRandom (OpenSSL RAND_bytes) supplies ClientHello/ServerHello randoms and TLS key material for every handshake."
   - id: C1
-    name: "Upstream + reqwest server-cert chain & hostname verification"
-    owner: "praxis core (pingora connector) + praxis-ai (file_resolve reqwest)"
-    caller: "pingora connector in quixotic-plecostomus-core (data plane); reqwest client apis/src/openai/responses/file_resolve/resolve_url.rs:599 (default TLS)"
+    name: "Upstream + sub-request server-cert chain & hostname verification"
+    owner: "praxis core (pingora connector) + praxis-ai (file_resolve sub-request)"
+    caller: "pingora connector in quixotic-plecostomus-core (data plane); file_resolve SubRequestClient apis/src/subrequest.rs:28 (installed OpenSSL provider)"
     algorithm: "X.509 path validation + RSA/ECDSA CertificateVerify signature check + hostname match"
-    provider: "rustls-webpki (chain) + installed OpenSSL provider (signatures); reqwest via rustls-platform-verifier (OpenSSL/Security.framework/CryptoAPI). ring absent."
-    crates: [rustls-webpki, quixotic-plecostomus-rustls-openssl, openssl, security-framework, security-framework-sys, schannel]
+    provider: "rustls-webpki (chain) + installed OpenSSL provider (signatures), for both the data plane and the file_resolve sub-request client. ring absent."
+    crates: [rustls-webpki, quixotic-plecostomus-rustls-openssl, openssl]
     profiles: [full, fips]
     disposition: non-validated
     remediation: "docs/fips.md"
-    note: "Upstream server-cert chain and hostname verification: rustls-webpki builds the path and the CertificateVerify signature check routes through the installed OpenSSL provider. The in-repo reqwest client uses the default rustls-platform-verifier path (Linux WebPKI on OpenSSL, macOS Security.framework, Windows CryptoAPI); that platform-verifier crate is full-only and covered by T5."
+    note: "Upstream server-cert chain and hostname verification: rustls-webpki builds the path and the CertificateVerify signature check routes through the installed OpenSSL provider, for both the data-plane pingora connector and the file_resolve sub-request client (T5). No platform trust-store verifier runs on this path — the file_resolve client dropped its former reqwest/rustls-platform-verifier default (#960/#1186)."
   - id: C2
     name: "Downstream mTLS client-cert verification"
     owner: "praxis-proxy-tls (praxis core)"
@@ -443,18 +439,18 @@ operations:
     note: "Structural ASN.1 X.509 v3 DER parse for mTLS/CA extraction via the rusticata parser stack. Upstream-maintained; parses, does not verify signatures."
   - id: C7
     name: "JWT verification-key ASN.1/PEM parse"
-    owner: "praxis-proxy/policy (upstream identity-jwt)"
-    caller: "praxis-policy-plugin-identity-jwt via jsonwebtoken DecodingKey builders"
+    owner: "praxis-proxy/policy (upstream identity-jwt capability)"
+    caller: "praxis-policy-builtins (identity-jwt capability) via jsonwebtoken DecodingKey builders"
     algorithm: "PKCS1/PKCS8/SEC1 DER + PEM decode of JWT verification keys"
     provider: "simple_asn1 + pem, invoked by jsonwebtoken"
     crates: [simple_asn1, pem]
     profiles: [full]
     disposition: n-a
-    note: "PKCS1/PKCS8/SEC1 DER + PEM decode of JWT verification keys via simple_asn1/pem, invoked by jsonwebtoken in the upstream identity-jwt policy plugin. Full-only; key parsing, no primitive."
+    note: "PKCS1/PKCS8/SEC1 DER + PEM decode of JWT verification keys via simple_asn1/pem, invoked by jsonwebtoken in the upstream praxis-policy-builtins identity-jwt capability. Full-only; key parsing, no primitive."
   - id: A1
     name: "JWT signature verification (identity authn)"
-    owner: "praxis-proxy/policy (upstream identity-jwt)"
-    caller: "praxis-policy-plugin-identity-jwt (DecodingKey + Validation only; never signs)"
+    owner: "praxis-proxy/policy (upstream identity-jwt capability)"
+    caller: "praxis-policy-builtins (identity-jwt capability: DecodingKey + Validation only; never signs)"
     algorithm: "HS256/RS256/PS256/ES256/EdDSA signature verification"
     provider: "aws-lc-rs 1.18.1 (without the fips feature) via jsonwebtoken"
     crates: [aws-lc-rs, aws-lc-sys, jsonwebtoken, signature]
@@ -464,14 +460,14 @@ operations:
     note: "JWT signature verification for identity authn (decode/verify only; production builds no EncodingKey). Executes on aws-lc-rs 1.18.1 built WITHOUT its fips feature, via jsonwebtoken. Full-only."
   - id: A2
     name: "OAuth delegated-token cache-key derivation (keyed)"
-    owner: "praxis-proxy/policy (upstream oauth-delegator)"
-    caller: "praxis-policy-plugin-delegator-oauth cache/key.rs derive()"
+    owner: "praxis-proxy/policy (upstream oauth-delegator capability)"
+    caller: "praxis-policy-builtins (oauth-delegator capability) cache-key derive()"
     algorithm: "HMAC-SHA256 over a length-prefixed identity+payload encoding, keyed by the per-process secret (R-4)"
     provider: "RustCrypto hmac + sha2 (pure-Rust); not apis::hash / OpenSSL EVP"
     crates: [hmac, sha2]
     profiles: [full]
     disposition: upstream-owned
-    note: "Per-process-keyed HMAC-SHA256 cache-key derivation in the upstream oauth-delegator policy plugin. Uses RustCrypto hmac/sha2 (pure-Rust), not the OpenSSL EVP seam. Not OAuth state/nonce/PKCE. Upstream-maintained."
+    note: "Per-process-keyed HMAC-SHA256 cache-key derivation in the upstream praxis-policy-builtins oauth-delegator capability. Uses RustCrypto hmac/sha2 (pure-Rust), not the OpenSSL EVP seam. Not OAuth state/nonce/PKCE. Upstream-maintained."
   - id: A3
     name: "AWS SigV4 signing-key derivation and request signature"
     owner: "praxis-ai (filters/aws)"
@@ -497,7 +493,7 @@ operations:
   - id: A5
     name: "PostgreSQL SCRAM-SHA-256 SASL authentication"
     owner: "praxis-ai (apis/store)"
-    caller: "apis/src/store/postgres.rs:118 connect_with (SASL exchange); options at :236"
+    caller: "store-backends/src/postgres.rs:121 connect_with (SASL exchange); options at :319"
     algorithm: "SCRAM-SHA-256 (RFC 5802/7677): SHA-256 digest, HMAC-SHA-256 proofs, PBKDF2-HMAC-SHA-256 salted-password derivation"
     provider: "sqlx-postgres (RustCrypto sha2 + hmac), application-side; not the OpenSSL EVP boundary"
     crates: [sqlx, sqlx-postgres, sqlx-core, sha2, hmac]
@@ -508,7 +504,7 @@ operations:
   - id: A6
     name: "PostgreSQL SCRAM SASLprep password normalization"
     owner: "praxis-ai (apis/store)"
-    caller: "apis/src/store/postgres.rs:118 connect_with (SASLprep within SCRAM)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (SASLprep within SCRAM)"
     algorithm: "RFC 4013 SASLprep Unicode normalization prior to SCRAM-SHA-256"
     provider: "sqlx-postgres via stringprep (encoding, not a primitive)"
     crates: [sqlx-postgres, stringprep]
@@ -518,7 +514,7 @@ operations:
   - id: A7
     name: "PostgreSQL SCRAM client-nonce RNG"
     owner: "praxis-ai (apis/store)"
-    caller: "apis/src/store/postgres.rs:118 connect_with (SCRAM client-first nonce)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (SCRAM client-first nonce)"
     algorithm: "Random client-nonce generation (ChaCha20 CSPRNG, OS getrandom-seeded)"
     provider: "sqlx-postgres via rand 0.10.x -> chacha20 + getrandom (OS CSPRNG); not the validated DRBG"
     crates: [sqlx-postgres, rand, chacha20, rand_core, getrandom]
@@ -529,7 +525,7 @@ operations:
   - id: A8
     name: "PostgreSQL legacy MD5 password authentication"
     owner: "praxis-ai (apis/store)"
-    caller: "apis/src/store/postgres.rs:118 connect_with (AuthenticationMD5Password challenge)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (AuthenticationMD5Password challenge)"
     algorithm: "PostgreSQL MD5 password auth: md5(md5(password || username) || salt)"
     provider: "sqlx-postgres via the md-5 crate (RustCrypto), application-side"
     crates: [sqlx-postgres, md-5]
@@ -540,7 +536,7 @@ operations:
   - id: A9
     name: "PostgreSQL cleartext password authentication"
     owner: "praxis-ai (apis/store)"
-    caller: "apis/src/store/postgres.rs:118 connect_with (AuthenticationCleartextPassword); password parsed at :236-245"
+    caller: "store-backends/src/postgres.rs:121 connect_with (AuthenticationCleartextPassword); options built at :319-344"
     algorithm: "Cleartext password transmission (no local primitive; confidentiality via TLS A10)"
     provider: "sqlx-postgres; password wrapped by secrecy; no local primitive"
     crates: [sqlx-postgres, secrecy]
@@ -550,25 +546,25 @@ operations:
   - id: A10
     name: "PostgreSQL store TLS handshake + server-cert verification"
     owner: "praxis-ai (apis/store)"
-    caller: "apis/src/store/postgres.rs:118 connect_with (TLS handshake); ssl_mode at :247"
+    caller: "store-backends/src/postgres.rs:121 connect_with (TLS handshake); ssl_mode at :330-331"
     algorithm: "TLS 1.2/1.3 handshake with X.509 chain + hostname verification (default sslmode verify-full)"
     provider: "sqlx-postgres via native-tls -> OpenSSL (Linux) / Security.framework (macOS) / schannel (Windows)"
     crates: [sqlx-postgres, native-tls, openssl, security-framework, schannel]
-    profiles: [full]
+    profiles: [full, fips]
     disposition: non-validated
     remediation: "#1217"
-    note: "PostgreSQL store TLS with X.509 chain + hostname verification (default sslmode verify-full), via sqlx-postgres native-tls. Diverges from the rustls-on-OpenSSL data plane (#1217). Full-only."
+    note: "PostgreSQL store TLS with X.509 chain + hostname verification (default sslmode verify-full), via sqlx-postgres native-tls. Diverges from the rustls-on-OpenSSL data plane (#1217). In both profiles: full ships the password-auth store (store-postgres) and fips ships the certificate-only store (store-postgres-cert-auth), both of which open this TLS channel."
   - id: A11
     name: "PostgreSQL store client-certificate mutual TLS"
     owner: "praxis-ai (apis/store)"
-    caller: "apis/src/store/postgres.rs:253-257 ssl_client_cert/ssl_client_key; handshake via connect_with :118"
+    caller: "store-backends/src/postgres.rs:336-340 ssl_client_cert/ssl_client_key; handshake via connect_with :121"
     algorithm: "TLS mutual authentication with a client PEM certificate/key"
     provider: "sqlx-postgres via native-tls -> platform TLS (OpenSSL / Security.framework / schannel)"
     crates: [sqlx-postgres, native-tls, openssl, security-framework, schannel]
-    profiles: [full]
+    profiles: [full, fips]
     disposition: non-validated
     remediation: "#1217"
-    note: "PostgreSQL store mutual TLS: client presents a PEM cert/key, asymmetric client-auth negotiated in the handshake, via sqlx-postgres native-tls. Full-only (#1217)."
+    note: "PostgreSQL store mutual TLS: client presents a PEM cert/key, asymmetric client-auth negotiated in the handshake, via sqlx-postgres native-tls. In both profiles: the certificate-only store (store-postgres-cert-auth) is the FIPS image's PostgreSQL store and relies on this client-cert mTLS (#1217)."
   - id: A12
     name: "HTTP Basic Auth credential verification"
     owner: "praxis-proxy-filter (praxis core basic_auth builtin)"
@@ -582,7 +578,7 @@ operations:
   - id: H1
     name: "MCP approval target-identity fingerprint"
     owner: "praxis-ai (apis/openai/responses/mcp_dispatch)"
-    caller: "apis/src/openai/responses/mcp_dispatch/mod.rs:1309 (approval record) and :1723 (McpPoolKey); recomputed on resume in resolve_approval"
+    caller: "apis/src/openai/responses/mcp_dispatch/mod.rs:1328 (approval record) and :1742 (McpPoolKey); recomputed on resume in resolve_approval"
     algorithm: "SHA-256, length-prefixed field framing, key-sorted headers, hex output"
     provider: "OpenSSL EVP via apis::hash"
     crates: [openssl, openssl-sys]
@@ -735,14 +731,14 @@ operations:
     note: "MCP session id (mcp-session-id header) from the same praxis-core IdGenerator; predictable, not a CSPRNG output. Upstream-maintained; the agentic MCP broker compiles in both profiles."
   - id: R-4
     name: "OAuth delegator cache-key secret (per-process)"
-    owner: "praxis-proxy/policy (upstream oauth-delegator)"
-    caller: "praxis-policy-plugin-delegator-oauth cache/key.rs KeySecret::random()"
+    owner: "praxis-proxy/policy (upstream oauth-delegator capability)"
+    caller: "praxis-policy-builtins (oauth-delegator capability) per-process cache-key secret"
     algorithm: "32-byte per-process secret from the OS CSPRNG (keys the A2 HMAC-SHA256)"
     provider: "getrandom (OS CSPRNG)"
     crates: [getrandom]
     profiles: [full]
     disposition: upstream-owned
-    note: "32-byte per-process secret drawn from the OS CSPRNG (getrandom) that keys the A2 HMAC in the upstream oauth-delegator policy plugin. No state/nonce/PKCE. Full-only. Upstream-maintained."
+    note: "32-byte per-process secret drawn from the OS CSPRNG (getrandom) that keys the A2 HMAC in the upstream praxis-policy-builtins oauth-delegator capability. No state/nonce/PKCE. Full-only. Upstream-maintained."
   - id: R-5
     name: "Prometheus metrics-exporter sampling RNG"
     owner: "metrics-exporter-prometheus (upstream) via praxis-proxy-protocol"

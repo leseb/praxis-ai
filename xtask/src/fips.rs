@@ -38,7 +38,8 @@ use clap::{Parser, Subcommand};
 /// stay in sync with `FIPS_FEATURES` in the `Makefile`. Consumers (the runtime
 /// probe, the crypto-inventory checker) reference this constant rather than
 /// re-spelling the literal.
-pub(crate) const FIPS_FEATURES: &str = "openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth";
+pub(crate) const FIPS_FEATURES: &str =
+    "openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth";
 
 // -----------------------------------------------------------------------------
 // CLI Arguments

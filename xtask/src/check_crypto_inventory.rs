@@ -99,7 +99,8 @@ const PLATFORM_ONLY: &[&str] = &["schannel", "security-framework", "security-fra
 /// The FIPS runtime's load-bearing cryptographic operations: they MUST exist and
 /// MUST declare the `fips` profile. This is the real FIPS-capability assertion,
 /// grounded in the FIPS feature set ([`crate::fips::FIPS_FEATURES`] =
-/// `openai-responses,aws-sigv4-filter`): `T1` is the process TLS provider,
+/// `openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth`):
+/// `T1` is the process TLS provider,
 /// `A3`/`A4` are the AWS `SigV4` HMAC/SHA-256 operations enabled by
 /// `aws-sigv4-filter`, and `A12` is the OpenSSL-backed HTTP Basic Auth digest
 /// compiled into both profiles. If any loses its `fips` declaration the inventory
