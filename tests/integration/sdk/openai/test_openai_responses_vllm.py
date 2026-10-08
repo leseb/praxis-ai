@@ -24,6 +24,7 @@ Usage:
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
+from itertools import islice
 import json
 import os
 import signal
@@ -2253,6 +2254,18 @@ class TestOpenAIResponsesVLLM:
         assert next_page.has_more is False
         assert "Repeat the marker" in next_page.data[0].content[0].text
 
+        desc_page = openai_client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="desc",
+        )
+        assert desc_page.object == "list"
+        assert len(desc_page.data) == 1
+        assert desc_page.first_id == desc_page.data[0].id
+        assert desc_page.last_id == desc_page.data[-1].id
+        assert desc_page.first_id == next_page.data[0].id
+        assert desc_page.has_more is True
+
         assert openai_client.responses.delete(response.id) is None
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(response.id)
@@ -2260,6 +2273,42 @@ class TestOpenAIResponsesVLLM:
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.input_items.list(response.id)
         assert exc_info.value.status_code == 404
+
+    def test_duplicate_input_item_ids_auto_paginate(self, witness_backend_client):
+        client, _forwarded = witness_backend_client
+        response = client.responses.create(
+            model="sdk-conversation-stream",
+            input=[
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "c"},
+            ],
+            store=True,
+            max_output_tokens=16,
+        )
+
+        first = client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="asc",
+        )
+        pages = list(islice(first.iter_pages(), 3))
+        assert len(pages) == 2, (
+            "SDK pagination must advance past an ambiguous duplicate target and terminate"
+        )
+        assert all(len(page.data) == 1 for page in pages), (
+            "the requested one-item page size must remain stable during SDK iteration"
+        )
+        ids = [page.data[0].id for page in pages]
+        assert ids == ["dup", "c"], (
+            "SDK-derived after=dup must reach the later unique item without rewriting the reference target"
+        )
+        assert all(page.last_id == page.data[-1].id for page in pages), (
+            "the documented last_id field must remain the final returned item ID"
+        )
+        assert pages[-1].has_more is False, (
+            "SDK pagination must terminate after reaching the final unique item"
+        )
 
     def test_response_resource_not_found_errors(self, openai_client):
         missing_id = "resp_missing_sdk_integration"
@@ -3413,7 +3462,7 @@ class TestOpenAIResponsesVLLM:
         assert error.body == {
             "code": "invalid_request_error",
             "message": (
-                "prompt templates are supported only for OpenAI-owned upstreams"
+                "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
             ),
             "param": None,
             "type": "invalid_request_error",
@@ -3927,7 +3976,7 @@ class TestResponsesCompactionVLLM:
         assert error.status_code == 400
         assert error.type == "invalid_request_error"
         assert error.body["message"] == (
-            "prompt templates are supported only for OpenAI-owned upstreams"
+            "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
         )
 
     def test_invalid_compaction_threshold_is_rejected(self, compact_client):
@@ -5241,6 +5290,67 @@ class TestClientToolCompatVLLM:
             f"lowered function must not leak: {[i.type for i in response.output]}"
         )
         assert any(t.type == "tool_search" for t in response.tools), response.tools
+
+    def test_mcp_namespace_group_name_with_delimiter_is_accepted(
+        self, client_tool_compat_client
+    ):
+        """A ``namespace`` group whose name carries the ``__`` flattening
+        delimiter lowers rather than failing closed.
+
+        Codex names an MCP tool namespace ``mcp__{server}``, so the ``__`` the
+        compat filter uses to delimit its flattened
+        ``agentic_ns__{namespace}__{member}`` wire names appears inside the group
+        name itself. Reserving the delimiter rejected every Codex session that
+        attaches an MCP server with HTTP 400 before any upstream call; the
+        ambiguous pair now takes the hashed wire-name branch instead.
+
+        Asserts only filter-guaranteed, model-independent invariants: whether the
+        small CI model actually calls the member is model-dependent, so the test
+        does not require a live tool call.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input="Read the hosts file. /no_think",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "mcp__codex_tui",
+                    "description": "Codex MCP tools.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read_file",
+                            "description": "Read a file from the workspace.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                }
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        # Reaching a terminal response at all is the regression guard: pre-fix the
+        # compat filter rejected the group name with HTTP 400 (raised by the SDK as
+        # BadRequestError) before any upstream call.
+        assert response.status == "completed", response
+        # No private flattened wire name may leak to the client.
+        leaked = [
+            name
+            for name in (getattr(item, "name", None) for item in response.output)
+            if isinstance(name, str) and name.startswith("agentic_ns__")
+        ]
+        assert not leaked, f"lowered namespace wire name leaked: {leaked}"
+        # Request-phase echo: the client sees its original namespace tool back with
+        # the group name intact, delimiter and all.
+        echoed = [getattr(t, "name", None) for t in response.tools]
+        assert "mcp__codex_tui" in echoed, response.tools
 
     def test_single_round_declared_and_discovered_tools_lower_without_leaking(
         self, client_tool_compat_client
