@@ -70,7 +70,7 @@ TRUSTED_OWNER_HEADERS = {
     "x-auth-user": "test-user",
 }
 # The full-flow binding router maps model "vllm-chat" to the Chat Completions
-# backend — the ONLY route that runs responses_to_chat_completions. Every
+# backend — the ONLY route that runs openai_responses_to_chat_completions. Every
 # Chat-translation test MUST send this model or it silently routes to the native
 # Responses backend instead. The writer's chat_translation_model kwarg then
 # rewrites the body model (instance A) at whatever the live Chat backend serves.
@@ -191,7 +191,7 @@ def _patch_store_backend(config: str, db_path: str) -> str:
 
 
 def _enable_response_store_compression(config: str) -> str:
-    """Append a zstd compression block to the openai_response_store filter."""
+    """Append a zstd compression block to the openai_responses_store filter."""
     anchor = (
         "        responses_table: openai_responses\n"
         "        conversations_table: openai_conversations\n"
@@ -278,7 +278,7 @@ def _write_full_flow_config(
         backend_endpoint=resolved_backend,
     )
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
-    # The unified gateway wires openai_web_search into the IRR; its config
+    # The unified gateway wires openai_web_search_dispatch into the IRR; its config
     # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
     # These vLLM turns never emit a web_search_call, so a literal placeholder
     # key keeps the dispatcher inert while letting the binary start. The Tavily
@@ -321,7 +321,7 @@ def _write_full_flow_config(
         assert config.count(anchor) == 1, config
         config = config.replace(anchor, f'"vllm-chat": "{chat_translation_model}"')
     if reasoning_dialect is not None:
-        # full-flow hardcodes ``dialect: vllm`` on responses_to_chat_completions.
+        # full-flow hardcodes ``dialect: vllm`` on openai_responses_to_chat_completions.
         # Retarget it so the dialect=none fail-closed path survives convergence
         # (passing "vllm" is a no-op that still runs the drift guard).
         assert config.count("dialect: vllm") == 1, config
@@ -349,7 +349,7 @@ def _write_full_flow_config(
             f"default_model: {compact_default_model}",
         )
     if vector_store_endpoint is not None:
-        # Retarget the IRR openai_file_search_callout at the test vector store
+        # Retarget the IRR openai_file_search_dispatch at the test vector store
         # (a recording shim or OGX directly). The deferred ogx_files credential
         # binds to this authority, so Authorization is injected at the callout.
         anchor = "vector_store_url: http://127.0.0.1:3002"
@@ -1578,7 +1578,7 @@ def chat_streaming_proxy(tmp_path_factory, request, backend_endpoint):
 
     The full-flow router binds model ``vllm-chat`` to the Chat Completions
     backend, so every request on this fixture must send ``CHAT_TRANSLATION_MODEL``
-    to reach ``responses_to_chat_completions``. ``chat_translation_model``
+    to reach ``openai_responses_to_chat_completions``. ``chat_translation_model``
     retargets the managed Chat-translation alias (instance A) at the model the
     live Chat backend actually serves so the rewritten name is accepted.
     """
@@ -2000,7 +2000,7 @@ def _reasoning_capture_session(tmp_path_factory, request):
     # Converged onto full-flow-agentic.yaml: VLLM_MODEL is aliased to the
     # Chat Completions backend so the native model routes through the
     # translator, and full-flow's IRR step already runs openai_agentic_loop
-    # ahead of responses_to_chat_completions (so the "agentic" param needs no
+    # ahead of openai_responses_to_chat_completions (so the "agentic" param needs no
     # extra wiring). Map that param onto the vLLM dialect; "none" disables it.
     param = getattr(request, "param", "vllm")
     config_path = _write_full_flow_config(
@@ -5093,7 +5093,7 @@ class TestResponsesToChatCompletionsVLLM:
 
         A streaming Responses request is translated to Chat Completions,
         the returned private ``web_search`` tool call is restored to a
-        canonical ``web_search_call``, ``openai_web_search`` dispatches the
+        canonical ``web_search_call``, ``openai_web_search_dispatch`` dispatches the
         query, and inference resumes — all exposed to the client as ONE
         logical Responses SSE lifecycle. The terminal event carries the
         completed web-search item and the final assistant message.
@@ -6002,7 +6002,7 @@ class TestClientToolCompatVLLM:
 class TestClientToolCompatChatVLLM:
     """Issue #1206: rich Codex client tools reach a function-only **Chat
     Completions** backend by composing ``openai_client_tool_compat`` with
-    ``responses_to_chat_completions`` in one iterative-router step.
+    ``openai_responses_to_chat_completions`` in one iterative-router step.
 
     Unlike :class:`TestClientToolCompatVLLM` (native Responses backend), here the
     backend only ever sees ``POST /v1/chat/completions`` with plain ``function``
@@ -8126,7 +8126,7 @@ def file_search_backend(backend_endpoint):
 
 @pytest.fixture(scope="session")
 def file_search_proxy(tmp_path_factory, request, file_search_backend):
-    """Start a Praxis proxy with the file-search-callout pipeline.
+    """Start a Praxis proxy with the file-search-dispatch pipeline.
 
     The vector-store callout is pointed at an in-process recording shim
     (:class:`VectorStoreWitnessHandler`) that forwards transparently to OGX, so
@@ -8356,7 +8356,7 @@ class TestFileSearchChatCompletionsVLLM:
     """Issue #296: hosted file_search against a Chat Completions backend.
 
     Unlike TestFileSearchVLLM (which proxies vLLM's native /v1/responses),
-    this drives responses_to_chat_completions: the native file_search tool
+    this drives openai_responses_to_chat_completions: the native file_search tool
     is synthesized into a private chat `function`, vLLM's
     /v1/chat/completions emits the call, the proxy runs the OGX vector-store
     search, and drives one more finite inference round -- without ever
@@ -8390,9 +8390,9 @@ class TestFileSearchChatCompletionsVLLM:
         )
 
         # The backend-lowered private function must not leak into the echoed
-        # request declarations. openai_file_search_callout rewrites
+        # request declarations. openai_file_search_dispatch rewrites
         # request_body.tools into {"type":"function","name":"file_search"} for the
-        # Chat backend, but responses_to_chat_completions must echo the hosted
+        # Chat backend, but openai_responses_to_chat_completions must echo the hosted
         # tool the client sent, derived from the preserved ResponsesState.tools.
         dumped = response.model_dump()
         echoed_tools = dumped.get("tools") or []
@@ -8472,7 +8472,7 @@ class TestFileSearchChatCompletionsVLLM:
 def file_search_streaming_proxy(
     tmp_path_factory, request, file_search_backend
 ):
-    """Start a Praxis proxy with the streaming file-search-callout pipeline."""
+    """Start a Praxis proxy with the streaming file-search-dispatch pipeline."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("file-search-streaming")
     db_path = str(db_dir / "responses.db")
@@ -8548,7 +8548,7 @@ class TestFileSearchStreamingVLLM:
     """Issue #313: streaming hosted file_search (stream=True).
 
     Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
-    example config: openai_stream_events(logical_stream) + openai_file_search_callout
+    example config: openai_stream_events(logical_stream) + openai_file_search_dispatch
     + openai_responses_proxy (streaming transport auto-derived from
     stream=True). vLLM emits a private
     function_call(name=file_search), which the callout suppresses and replaces
