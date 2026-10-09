@@ -169,7 +169,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+    #[cfg(any(feature = "store-sqlite", feature = "_store-postgres"))]
     #[cfg_attr(
         not(feature = "store-sqlite"),
         allow(
@@ -207,7 +207,11 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config
+            http "ai_operation" => crate::operation_classifier::AiOperationFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_responses_request" => crate::openai::OpenaiResponsesRequestFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
