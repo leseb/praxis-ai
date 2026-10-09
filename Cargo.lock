@@ -3509,7 +3509,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "allocation-counter",
  "async-trait",
@@ -3552,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-benchmarks"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "criterion",
  "praxis-ai-apis",
@@ -3564,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-build-support"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "cargo_metadata",
  "tempfile",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3612,7 +3612,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-llmd-ext-proc"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-proxy"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3675,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3688,7 +3688,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-backends"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3709,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-lifecycle"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3980,7 +3980,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-test-utils"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4024,7 +4024,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-environment"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "praxis-ai-proxy",
  "praxis-proxy-core",
@@ -4034,7 +4034,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-integration"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4064,7 +4064,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-schema"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
@@ -7172,7 +7172,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
