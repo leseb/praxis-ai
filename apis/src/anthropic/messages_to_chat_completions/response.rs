@@ -209,8 +209,16 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
             .ok_or_else(|| "tool call arguments must be a JSON-encoded object string".to_owned())?;
-        let input = serde_json::from_str::<Map<String, Value>>(args_str)
-            .map_err(|error| format!("invalid tool call arguments: {error}"))?;
+        // An empty or whitespace-only string is how Chat/vLLM tool parsers encode a
+        // parameterless tool call (the OpenAI streaming spec example uses `"arguments":""`).
+        // Treat it as absent arguments (`{}`), distinct from genuinely malformed input
+        // (`"[]"`, `"null"`, `"not{json"`), which must still be rejected (#550/#874).
+        let input = if args_str.trim().is_empty() {
+            Map::new()
+        } else {
+            serde_json::from_str::<Map<String, Value>>(args_str)
+                .map_err(|error| format!("invalid tool call arguments: {error}"))?
+        };
 
         blocks.push(ContentBlock::tool_use(id, input, name));
     }
@@ -664,6 +672,50 @@ mod tests {
             error.contains("invalid tool call arguments"),
             "malformed arguments should fail response transformation: {error}"
         );
+    }
+
+    #[test]
+    fn empty_string_tool_call_arguments_become_empty_object() {
+        for arguments in ["", "   ", "\n\t"] {
+            let body = json!({
+                "id": "chatcmpl-1",
+                "model": "gpt-4",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "now",
+                                "arguments": arguments
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            });
+            let encoded = serde_json::to_vec(&body).unwrap();
+            let tr = transform_response(&encoded, "gpt-4", &[]).unwrap();
+            let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+            assert_eq!(
+                parsed["stop_reason"], "tool_use",
+                "tool_calls → tool_use for {arguments:?}"
+            );
+            assert_eq!(
+                parsed["content"][0]["type"], "tool_use",
+                "tool_use block for {arguments:?}"
+            );
+            assert_eq!(parsed["content"][0]["name"], "now", "tool name for {arguments:?}");
+            assert_eq!(
+                parsed["content"][0]["input"],
+                json!({}),
+                "empty/whitespace args become an empty object for {arguments:?}"
+            );
+        }
     }
 
     #[test]
