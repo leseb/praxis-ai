@@ -215,9 +215,8 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
 /// Parse a Chat Completions tool call's `function.arguments` into an object map.
 ///
 /// An empty or whitespace-only string is how Chat/vLLM tool parsers encode a
-/// parameterless tool call (the OpenAI streaming spec example uses `"arguments":""`);
-/// treat it as absent arguments (`{}`). Genuinely malformed input (`"[]"`, `"null"`,
-/// `"not{json"`) is still rejected (#550/#874).
+/// parameterless tool call (the OpenAI streaming spec example uses `"arguments":""`),
+/// so it is absent arguments rather than malformed input and maps to `{}`.
 fn parse_tool_call_arguments(tool_call: &Value) -> Result<Map<String, Value>, String> {
     let args_str = tool_call
         .get("function")

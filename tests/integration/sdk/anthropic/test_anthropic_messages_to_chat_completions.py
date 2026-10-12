@@ -411,10 +411,6 @@ class TestRequestFieldHandling:
         assert upstream["messages"][2]["content"] == ""
 
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
-        # vLLM tool parsers encode a parameterless tool call as `"arguments":""`
-        # (the OpenAI streaming spec example does the same). It is spec-valid
-        # absent-arguments, not malformed input, so it must translate to a
-        # `tool_use` block with input `{}` rather than failing as a 500.
         RecordingBackend.bodies.clear()
         RecordingBackend.send_tool_reply_once = True
         RecordingBackend.tool_call_arguments = ""
@@ -427,7 +423,11 @@ class TestRequestFieldHandling:
 
         tool_use = next(block for block in response.content if block.type == "tool_use")
         assert tool_use.name == "lookup"
-        assert tool_use.input == {}
+        assert tool_use.input == {}, (
+            'empty-string arguments ("arguments":"") are absent arguments, per the '
+            "vLLM tool parser / OpenAI streaming spec encoding, and must become input "
+            "{} rather than failing as a 500"
+        )
         assert response.stop_reason == "tool_use"
 
     def test_empty_citations_in_history_reach_the_backend(self, anthropic_client):
