@@ -30,9 +30,9 @@ mod tests;
 use std::sync::Arc;
 
 use praxis_ai_store::StoreRegistry;
-// Pool tuning, TLS mode, and compression config live in the SQL-free contract
-// crate, re-exported here at their old paths.
-pub use praxis_ai_store::{CompressionAlgorithm, PoolConfig, SslMode, StoreCompressionConfig};
+// TLS mode and compression config live in the SQL-free contract crate,
+// re-exported here at their old paths.
+pub use praxis_ai_store::{CompressionAlgorithm, SslMode, StoreCompressionConfig};
 // The persistence contracts moved to praxis-ai-store; re-exported at their old
 // paths so existing `crate::store::*` references keep compiling. OwnerScopedStore
 // keeps its former name here.
