@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 #[cfg(feature = "_store-postgres")]
-use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
+use praxis_ai_store_backends::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_conversations";
