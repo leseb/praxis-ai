@@ -751,9 +751,12 @@ kill "$PRAXIS_PID"
   `--strict-mcp-config` to drop globally configured MCP servers, disable
   unneeded plugins with `/plugin`, and prefer a working directory whose
   `CLAUDE.md` is small or absent.
-- Claude Code never finishes a turn — plan mode keeps looping, or reasoning
-  text appears in the answer or the rendered plan: the server is emitting
-  thinking that the client is not meant to see. Serve Qwen3 with
+- Claude Code never finishes a turn — plan mode keeps looping, reasoning
+  text appears in the answer or the rendered plan, or auto mode fails with
+  `Error: You are not in plan mode. To enter plan mode, call the EnterPlanMode
+  tool first.`: the server is emitting thinking that the client is not meant to
+  see, which bleeds into the response and desynchronizes the agentic loop. Serve
+  Qwen3 with
   `--reasoning-parser qwen3` and
   `--default-chat-template-kwargs '{"enable_thinking":false}'` as shown in
   section 1, and restart vLLM; the reasoning parser is a server flag, so
