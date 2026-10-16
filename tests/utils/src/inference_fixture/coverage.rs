@@ -1306,6 +1306,7 @@ mod tests {
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
+                vec!["responses_native_passthrough"],
             ]
         );
         assert_eq!(
@@ -1453,6 +1454,7 @@ mod tests {
                 "responses/client-tool-compat-stream",
                 "responses/invalid-stream-event-type",
                 "responses/irr-terminal-streaming",
+                "responses/mcp-tool-admission-untrusted-direct",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
                 "responses/native-continuation",
@@ -1826,6 +1828,10 @@ mod tests {
                 (
                     &"vertex.anthropic.request.resolved_target".to_owned(),
                     &vec!["vertex/anthropic-wire-translation".to_owned()]
+                ),
+                (
+                    &"responses.native.mcp_admission_untrusted_excluded".to_owned(),
+                    &vec!["responses/mcp-tool-admission-untrusted-direct".to_owned()]
                 ),
             ]
         );

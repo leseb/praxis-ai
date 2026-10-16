@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+//! Operator-owned MCP tool metadata admission and read-only trust (issue #1724).
+//!
+//! MCP servers supply tool descriptions, schemas, and annotations. A
+//! client-selected server is not an authority for its own safety claims, so its
+//! `annotations.readOnlyHint` cannot establish a trusted read-only
+//! classification. This module makes the trust contract explicit and keeps it
+//! **operator-owned**: an admission verdict is always a typed value
+//! ([`McpToolVerdict`]) computed afresh from operator configuration — the
+//! filter's [`McpAdmissionPolicy`] plus the resolving entry's
+//! [`ConnectorTrust`] — never a field carried in request, cached, or restored
+//! JSON. Client fields, tool descriptions, annotations, labels, or a matching
+//! URL can neither grant nor broaden trust.
+//!
+//! The verdicts are recorded in [`McpAdmissionDecisions`], a request-scoped
+//! snapshot held in `ResponsesState`. Because the resolver re-runs on every
+//! request (fresh, cached, or restored) and extends the decisions through
+//! deferred discovery and IRR re-entry, the applicable policy and target are
+//! re-evaluated each turn, so stale cached policy cannot transfer trust.
+//!
+//! Admitted tools flow into the model-visible function tools and the dispatch
+//! `mcp_tool_map` as before. **Denied** tools are recorded here only: they never
+//! reach the model, but keeping their identity lets the agentic loop recognize a
+//! forged model-generated call as MCP-owned-and-denied and route it to an
+//! explicit dispatch rejection rather than mis-classifying it as a client
+//! function.
+
+#[cfg(feature = "openai-mcp-tools")]
+use std::collections::HashMap;
+
+#[cfg(feature = "openai-mcp-tools")]
+use serde_json::Value;
+
+#[cfg(feature = "openai-mcp-tools")]
+use super::mcp_tool_resolve::encode_function_name;
+
+/// Operator admission mode for MCP tool metadata.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum McpAdmissionMode {
+    /// Standard advisory behavior. The client selector `allowed_tools.read_only`
+    /// keeps using the server-supplied `readOnlyHint`; no operator admission or
+    /// enforcement is applied. This is the default and leaves existing,
+    /// non-protected deployments unchanged.
+    #[default]
+    Advisory,
+    /// Operator-enforced protection. Only tool definitions admitted by the
+    /// operator trust contract reach the model and may dispatch.
+    Protected,
+}
+
+/// Request-scoped snapshot of the operator admission policy.
+///
+/// Carries only the operator decision, never any server- or client-supplied
+/// value. Mirrors the `McpConnectorContextPolicy` snapshot pattern so the
+/// dispatch filter can re-enforce without re-reading filter configuration.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct McpAdmissionPolicy {
+    /// Admission mode.
+    pub mode: McpAdmissionMode,
+    /// Operator-enforced read-only: admit only tools with a trusted affirmative
+    /// read-only classification.
+    pub require_read_only: bool,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl McpAdmissionPolicy {
+    /// Whether protected-mode admission applies.
+    pub(crate) fn is_protected(self) -> bool {
+        matches!(self.mode, McpAdmissionMode::Protected)
+    }
+}
+
+/// Operator trust granted to one connector's tool service.
+///
+/// The scopes are independent: trusting a service for read-only classification
+/// does not grant it catalog-admission trust. A declaration that sets neither
+/// scope leaves the connector untrusted, so it follows the same protected-mode
+/// admission rules as a client-selected direct target.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConnectorTrust {
+    /// Authoritative for catalog admission: its tools are admitted without a
+    /// per-tool digest.
+    pub catalog: bool,
+    /// Authoritative for read-only classification: its `readOnlyHint` is a
+    /// trusted capability decision.
+    pub read_only: bool,
+}
+
+/// Why a discovered tool was denied admission under protected mode.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpDenyReason {
+    /// The resolving target has no operator-granted catalog trust — a
+    /// client-selected direct `server_url` or a connector without a declared
+    /// catalog-trust contract.
+    UntrustedSource,
+    /// Operator-enforced read-only is active but the trusted source is not
+    /// authoritative for read-only classification.
+    NoReadOnlyAuthority,
+    /// A trusted source classifies the tool as writable.
+    Writable,
+    /// A trusted source provides no affirmative read-only classification: the
+    /// hint is missing, malformed, or internally conflicting.
+    UnverifiedReadOnly,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl McpDenyReason {
+    /// Operator-facing explanation used in a truthful dispatch rejection.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::UntrustedSource => "tool denied: source is not an operator-trusted MCP tool service (protected mode)",
+            Self::NoReadOnlyAuthority => {
+                "tool denied: source is not authoritative for read-only classification (protected read-only mode)"
+            },
+            Self::Writable => "tool denied: trusted source classifies this tool as writable (protected read-only mode)",
+            Self::UnverifiedReadOnly => {
+                "tool denied: read-only classification is missing, malformed, or conflicting (protected read-only mode)"
+            },
+        }
+    }
+}
+
+/// Admission verdict for one discovered tool.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpToolVerdict {
+    /// The tool is admitted. `read_only` is the trusted read-only classification
+    /// (only ever `true` when a trusted source affirms it); it is advisory-free.
+    Admitted {
+        /// Trusted read-only classification for this tool.
+        read_only: bool,
+    },
+    /// The tool is denied and must not reach the model or dispatch.
+    Denied(McpDenyReason),
+}
+
+/// Trusted read-only classification of a single tool definition.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadOnlyClass {
+    /// A trusted source affirms the tool is read-only.
+    Affirmative,
+    /// A trusted source reports the tool as writable.
+    Writable,
+    /// No usable classification: missing, malformed, or conflicting.
+    Unverified,
+}
+
+/// Classify the read-only status asserted by a tool definition's annotations.
+///
+/// This is consulted **only** for a source the operator has declared
+/// authoritative for read-only classification. `readOnlyHint: true` is
+/// affirmative unless contradicted by `destructiveHint: true` (conflicting);
+/// `readOnlyHint: false` is writable; absent or non-boolean is unverified.
+#[cfg(feature = "openai-mcp-tools")]
+fn classify_read_only(tool_def: &Value) -> ReadOnlyClass {
+    let annotations = tool_def.get("annotations");
+    let Some(hint) = annotations.and_then(|a| a.get("readOnlyHint")) else {
+        return ReadOnlyClass::Unverified;
+    };
+    let Some(read_only) = hint.as_bool() else {
+        return ReadOnlyClass::Unverified;
+    };
+    if !read_only {
+        return ReadOnlyClass::Writable;
+    }
+    // `destructiveHint: true` alongside `readOnlyHint: true` is contradictory
+    // (a read-only tool makes no destructive modifications): treat as unverified
+    // so a conflicting classification cannot pass operator read-only mode.
+    if annotations
+        .and_then(|a| a.get("destructiveHint"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return ReadOnlyClass::Unverified;
+    }
+    ReadOnlyClass::Affirmative
+}
+
+/// Evaluate the admission verdict for one discovered tool under protected mode.
+///
+/// Advisory mode never reaches here — callers skip verdict construction entirely
+/// so existing behavior is byte-for-byte unchanged.
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) fn evaluate_tool(policy: McpAdmissionPolicy, trust: ConnectorTrust, tool_def: &Value) -> McpToolVerdict {
+    debug_assert!(
+        policy.is_protected(),
+        "evaluate_tool is only meaningful in protected mode"
+    );
+    if !trust.catalog {
+        return McpToolVerdict::Denied(McpDenyReason::UntrustedSource);
+    }
+    if policy.require_read_only {
+        if !trust.read_only {
+            return McpToolVerdict::Denied(McpDenyReason::NoReadOnlyAuthority);
+        }
+        return match classify_read_only(tool_def) {
+            ReadOnlyClass::Affirmative => McpToolVerdict::Admitted { read_only: true },
+            ReadOnlyClass::Writable => McpToolVerdict::Denied(McpDenyReason::Writable),
+            ReadOnlyClass::Unverified => McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly),
+        };
+    }
+    // Admission without operator read-only enforcement: the tool is admitted,
+    // and its trusted read-only classification is recorded only when the source
+    // is authoritative for it and affirms it.
+    let read_only = trust.read_only && matches!(classify_read_only(tool_def), ReadOnlyClass::Affirmative);
+    McpToolVerdict::Admitted { read_only }
+}
+
+/// Request-scoped record of every admission verdict for the current request.
+///
+/// The verdict map is keyed by the canonical `(server_label, tool_name)`
+/// identity. A parallel index of denied encoded function names lets the agentic
+/// loop and dispatcher recognize a model-generated call to a denied tool by the
+/// lossy name the model actually emits, failing closed on encoded-name
+/// collisions.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct McpAdmissionDecisions {
+    /// The operator policy snapshot this request was evaluated under.
+    policy: McpAdmissionPolicy,
+    /// Typed verdicts keyed by canonical `(server_label, tool_name)`.
+    verdicts: HashMap<(String, String), McpToolVerdict>,
+    /// Denied tools indexed by the encoded model-facing function name, with the
+    /// reason, for fast ownership and dispatch lookups.
+    denied_encoded: HashMap<String, McpDenyReason>,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl McpAdmissionDecisions {
+    /// Create an empty decision set bound to an operator policy snapshot.
+    pub(crate) fn new(policy: McpAdmissionPolicy) -> Self {
+        Self {
+            policy,
+            verdicts: HashMap::new(),
+            denied_encoded: HashMap::new(),
+        }
+    }
+
+    /// The operator policy these decisions were evaluated under.
+    pub(crate) fn policy(&self) -> McpAdmissionPolicy {
+        self.policy
+    }
+
+    /// Record a verdict for one tool identity, maintaining the denied index.
+    pub(crate) fn record(&mut self, server_label: &str, tool_name: &str, verdict: McpToolVerdict) {
+        if let McpToolVerdict::Denied(reason) = verdict {
+            self.denied_encoded
+                .insert(encode_function_name(server_label, tool_name), reason);
+        }
+        self.verdicts
+            .insert((server_label.to_owned(), tool_name.to_owned()), verdict);
+    }
+
+    /// Look up a verdict by canonical tool identity.
+    pub(crate) fn verdict(&self, server_label: &str, tool_name: &str) -> Option<McpToolVerdict> {
+        self.verdicts
+            .get(&(server_label.to_owned(), tool_name.to_owned()))
+            .copied()
+    }
+
+    /// Whether the encoded model-facing function name denotes a denied tool.
+    pub(crate) fn is_denied_encoded(&self, encoded_name: &str) -> bool {
+        self.denied_encoded.contains_key(encoded_name)
+    }
+
+    /// The denial reason for an encoded model-facing function name, if denied.
+    pub(crate) fn denied_reason(&self, encoded_name: &str) -> Option<McpDenyReason> {
+        self.denied_encoded.get(encoded_name).copied()
+    }
+
+    /// Whether any tool was denied this request.
+    pub(crate) fn has_denied(&self) -> bool {
+        !self.denied_encoded.is_empty()
+    }
+
+    /// Re-enforce admission at dispatch for a call that resolved to a tool-map
+    /// entry (`server_label`, `tool_name`). Returns the denial reason when the
+    /// call must not execute.
+    ///
+    /// In advisory mode this never denies. In protected mode an admitted entry
+    /// must carry a matching admitted verdict; a missing verdict (a forged or
+    /// bypassed map entry) or a writable verdict under operator read-only mode
+    /// fails closed. This is defense in depth: discovery already excluded denied
+    /// tools, and this guarantees a model-generated call to a resolved entry is
+    /// re-checked against the operator-owned verdict before any side effect.
+    pub(crate) fn admitted_denial(&self, server_label: &str, tool_name: &str) -> Option<McpDenyReason> {
+        if !self.policy.is_protected() {
+            return None;
+        }
+        match self.verdict(server_label, tool_name) {
+            Some(McpToolVerdict::Admitted { read_only }) => {
+                (self.policy.require_read_only && !read_only).then_some(McpDenyReason::Writable)
+            },
+            Some(McpToolVerdict::Denied(reason)) => Some(reason),
+            None => Some(McpDenyReason::UntrustedSource),
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing, reason = "tests")]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        ConnectorTrust, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason, McpToolVerdict,
+        evaluate_tool,
+    };
+
+    fn protected(require_read_only: bool) -> McpAdmissionPolicy {
+        McpAdmissionPolicy {
+            mode: McpAdmissionMode::Protected,
+            require_read_only,
+        }
+    }
+
+    fn tool(annotations: Option<serde_json::Value>) -> serde_json::Value {
+        let mut def = json!({"name": "do_thing", "inputSchema": {"type": "object"}});
+        if let Some(a) = annotations {
+            def["annotations"] = a;
+        }
+        def
+    }
+
+    #[test]
+    fn untrusted_source_denied_regardless_of_hint() {
+        let verdict = evaluate_tool(
+            protected(false),
+            ConnectorTrust::default(),
+            &tool(Some(json!({"readOnlyHint": true}))),
+        );
+        assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::UntrustedSource));
+    }
+
+    #[test]
+    fn catalog_trust_admits_without_read_only_enforcement() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: false,
+        };
+        let verdict = evaluate_tool(protected(false), trust, &tool(None));
+        assert_eq!(verdict, McpToolVerdict::Admitted { read_only: false });
+    }
+
+    #[test]
+    fn catalog_trust_records_trusted_read_only_when_authoritative() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: true,
+        };
+        let verdict = evaluate_tool(protected(false), trust, &tool(Some(json!({"readOnlyHint": true}))));
+        assert_eq!(verdict, McpToolVerdict::Admitted { read_only: true });
+    }
+
+    #[test]
+    fn read_only_without_authority_denied_in_enforced_mode() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: false,
+        };
+        let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": true}))));
+        assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::NoReadOnlyAuthority));
+    }
+
+    #[test]
+    fn affirmative_read_only_admitted_in_enforced_mode() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: true,
+        };
+        let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": true}))));
+        assert_eq!(verdict, McpToolVerdict::Admitted { read_only: true });
+    }
+
+    #[test]
+    fn writable_tool_denied_in_enforced_mode() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: true,
+        };
+        let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": false}))));
+        assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::Writable));
+    }
+
+    #[test]
+    fn missing_hint_denied_in_enforced_mode() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: true,
+        };
+        let verdict = evaluate_tool(protected(true), trust, &tool(None));
+        assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly));
+    }
+
+    #[test]
+    fn malformed_hint_denied_in_enforced_mode() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: true,
+        };
+        let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": "yes"}))));
+        assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly));
+    }
+
+    #[test]
+    fn conflicting_hint_denied_in_enforced_mode() {
+        let trust = ConnectorTrust {
+            catalog: true,
+            read_only: true,
+        };
+        let verdict = evaluate_tool(
+            protected(true),
+            trust,
+            &tool(Some(json!({"readOnlyHint": true, "destructiveHint": true}))),
+        );
+        assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly));
+    }
+
+    #[test]
+    fn decisions_track_denied_encoded_names() {
+        let mut decisions = McpAdmissionDecisions::new(protected(true));
+        decisions.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
+        decisions.record("gw", "search", McpToolVerdict::Admitted { read_only: true });
+
+        assert!(decisions.is_denied_encoded("gw__delete_repo"));
+        assert_eq!(
+            decisions.denied_reason("gw__delete_repo"),
+            Some(McpDenyReason::Writable)
+        );
+        assert!(!decisions.is_denied_encoded("gw__search"));
+        assert_eq!(
+            decisions.verdict("gw", "search"),
+            Some(McpToolVerdict::Admitted { read_only: true })
+        );
+        assert!(decisions.policy().is_protected());
+        assert!(decisions.has_denied());
+    }
+}

@@ -24,6 +24,9 @@ use crate::{
     callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
+        mcp_admission::{
+            ConnectorTrust, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason, McpToolVerdict,
+        },
         mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
@@ -99,6 +102,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
     // nothing is ever pooled; a shared empty pool is inert here.
     static POOL: OnceLock<crate::mcp_client::McpSessionPool> = OnceLock::new();
     static NAMESPACE: OnceLock<crate::mcp_client::McpPoolNamespace> = OnceLock::new();
+    static ADMISSION: OnceLock<McpAdmissionDecisions> = OnceLock::new();
     McpExecutionOptions {
         parallel,
         max_parallel_calls: 8,
@@ -110,6 +114,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         connector_identity: None,
         session_pool: POOL.get_or_init(crate::mcp_client::McpSessionPool::new),
         pool_namespace: *NAMESPACE.get_or_init(crate::mcp_client::McpPoolNamespace::new),
+        admission: ADMISSION.get_or_init(McpAdmissionDecisions::default),
     }
 }
 
@@ -397,7 +402,11 @@ fn extract_mcp_tool_calls_filters_correctly() {
         json!({"name": "my_function", "call_id": "call_2"}),
         json!({"name": "docs__search_docs", "call_id": "call_3"}),
     ];
-    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &McpToolIndex::new(&tool_map));
+    let mcp_calls = extract_mcp_tool_calls(
+        &tool_calls,
+        &McpToolIndex::new(&tool_map),
+        &McpAdmissionDecisions::default(),
+    );
     assert_eq!(mcp_calls.len(), 2, "should extract only MCP tool calls");
     assert_eq!(mcp_calls[0]["name"], "weather__get_weather");
     assert_eq!(mcp_calls[1]["name"], "docs__search_docs");
@@ -431,7 +440,11 @@ fn find_by_encoded_name_rejects_raw_name() {
 fn extract_mcp_tool_calls_empty_when_no_match() {
     let tool_map = sample_tool_map();
     let tool_calls = vec![json!({"name": "my_function", "call_id": "call_1"})];
-    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &McpToolIndex::new(&tool_map));
+    let mcp_calls = extract_mcp_tool_calls(
+        &tool_calls,
+        &McpToolIndex::new(&tool_map),
+        &McpAdmissionDecisions::default(),
+    );
     assert!(mcp_calls.is_empty());
 }
 
@@ -1209,6 +1222,99 @@ fn require_inline_outbound_chain_rejects_named() {
 // execute_single_call (async)
 // =========================================================================
 
+/// Build execution options bound to a specific admission decision set so the
+/// dispatch-time re-enforcement path (#1724) can be exercised.
+fn execution_options_with_admission<'a>(
+    timeout: std::time::Duration,
+    admission: &'a McpAdmissionDecisions,
+) -> McpExecutionOptions<'a> {
+    static POOL: OnceLock<crate::mcp_client::McpSessionPool> = OnceLock::new();
+    static NAMESPACE: OnceLock<crate::mcp_client::McpPoolNamespace> = OnceLock::new();
+    McpExecutionOptions {
+        parallel: false,
+        max_parallel_calls: 8,
+        max_result_bytes: TEST_MAX_RESULT_BYTES,
+        max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
+        timeout,
+        forwarded_header_names: &[],
+        forwarded_headers: None,
+        connector_identity: None,
+        session_pool: POOL.get_or_init(crate::mcp_client::McpSessionPool::new),
+        pool_namespace: *NAMESPACE.get_or_init(crate::mcp_client::McpPoolNamespace::new),
+        admission,
+    }
+}
+
+fn protected_policy(require_read_only: bool) -> McpAdmissionPolicy {
+    McpAdmissionPolicy {
+        mode: McpAdmissionMode::Protected,
+        require_read_only,
+    }
+}
+
+#[tokio::test]
+async fn execute_single_call_rejects_denied_tool_without_dialing() {
+    // A tool denied at discovery is not in the map; a forged model call to it is
+    // rejected explicitly and no `tools/call` is ever dialed.
+    let map = sample_tool_map();
+    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
+    let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
+    let tc = json!({"name": "gw__delete_repo", "call_id": "c1"});
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .expect("denied call yields a truthful error result");
+    assert!(
+        result.output_item["error"].as_str().unwrap().contains("denied"),
+        "denied call must surface a policy rejection: {:?}",
+        result.output_item["error"]
+    );
+}
+
+#[tokio::test]
+async fn execute_single_call_rejects_writable_tool_under_operator_read_only() {
+    // Defense in depth: an admitted entry whose trusted verdict is writable must
+    // not execute when operator read-only mode is active.
+    let map = sample_tool_map();
+    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    admission.record("weather", "get_weather", McpToolVerdict::Admitted { read_only: false });
+    let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
+    let tc = json!({"name": "weather__get_weather", "call_id": "c1"});
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .expect("ineligible call yields a truthful error result");
+    assert!(result.output_item["error"].as_str().unwrap().contains("denied"));
+}
+
+#[tokio::test]
+async fn execute_single_call_rejects_resolved_entry_without_verdict() {
+    // A map entry with no operator verdict in protected mode is treated as a
+    // bypass and fails closed.
+    let map = sample_tool_map();
+    let admission = McpAdmissionDecisions::new(protected_policy(false));
+    let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
+    let tc = json!({"name": "weather__get_weather", "call_id": "c1"});
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .expect("unverified entry yields a truthful error result");
+    assert!(result.output_item["error"].as_str().unwrap().contains("denied"));
+}
+
 #[tokio::test]
 async fn execute_single_call_missing_name_returns_none() {
     let map = sample_tool_map();
@@ -1933,6 +2039,7 @@ async fn configured_deferred_connector_missing_assertion_records_security_failur
             server_label: "drive".to_owned(),
             server_url: "https://mcp.example/mcp".to_owned(),
             timeout: std::time::Duration::from_secs(1),
+            trust: ConnectorTrust::default(),
         }],
         tool_search_calls: vec![search.clone()],
         accumulated_output: vec![search.clone()],
@@ -2056,6 +2163,7 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
             server_label: "drive".to_owned(),
             server_url,
             timeout: std::time::Duration::from_secs(1),
+            trust: ConnectorTrust::default(),
         }],
         max_tool_calls: Some(0),
         tool_search_calls: vec![search.clone()],
@@ -2117,6 +2225,7 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
         server_label: "drive".to_owned(),
         server_url,
         timeout: std::time::Duration::from_secs(1),
+        trust: ConnectorTrust::default(),
     }];
     state.tool_search_calls = vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})];
     ctx.extensions.insert(state);
@@ -2333,7 +2442,11 @@ fn resolve_to_dispatch_encoded_name_roundtrip() {
     assert_eq!((key.0.as_str(), key.1.as_str()), (label, tool_name));
     assert_eq!(entry["server_url"], url);
 
-    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &McpToolIndex::new(&tool_map));
+    let mcp_calls = extract_mcp_tool_calls(
+        &tool_calls,
+        &McpToolIndex::new(&tool_map),
+        &McpAdmissionDecisions::default(),
+    );
     assert_eq!(mcp_calls.len(), 1);
     assert_eq!(mcp_calls[0]["name"], encoded);
 }
