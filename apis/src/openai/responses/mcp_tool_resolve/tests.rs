@@ -5901,7 +5901,7 @@ mod admission {
 
     use super::super::{
         ConnectorTrust, EntryResolution, McpAdmissionDecisions, McpAdmissionPolicy, McpToolResolveFilter,
-        McpToolVerdict, admit_tools, build_entry_resolution, trust_for_entry,
+        McpToolVerdict, admit_tools, build_entry_resolution, excluded_as_untrusted, trust_for_entry,
     };
     use crate::openai::responses::mcp_admission::{McpAdmissionMode, McpDenyReason};
 
@@ -6001,6 +6001,17 @@ mod admission {
     }
 
     // --- Trust resolution ---
+
+    #[test]
+    fn targetless_mcp_entry_is_excluded_in_protected_mode() {
+        // A label-only MCP entry has no server_url and no connector_id. Protected
+        // mode must still exclude it (no trust) rather than passing it through to
+        // the backend (#1724).
+        let entry = json!({"type": "mcp", "server_label": "x"});
+        assert!(excluded_as_untrusted(&entry, protected(false), &HashMap::new()));
+        // Advisory mode leaves it alone (unchanged behavior).
+        assert!(!excluded_as_untrusted(&entry, McpAdmissionPolicy::default(), &HashMap::new()));
+    }
 
     #[test]
     fn direct_entry_is_always_untrusted() {

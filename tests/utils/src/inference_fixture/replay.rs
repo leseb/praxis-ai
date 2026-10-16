@@ -501,34 +501,50 @@ fn validate_replay_literal_credentials(mapping: &serde_yaml::Mapping) -> Result<
 /// (a direct `server_url`, or a connector with no catalog trust) is excluded
 /// without dialing and is therefore replay-contained.
 fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScenario) -> Result<(), FixtureError> {
-    let Some(resolver) = find_mcp_resolve_filter(config) else {
+    let mut resolvers = Vec::new();
+    collect_mcp_resolve_filters(config, &mut resolvers);
+    if resolvers.is_empty() {
         return Ok(());
-    };
-    let protected = resolver
-        .get("tool_admission")
-        .and_then(|admission| admission.get("mode"))
-        .and_then(Value::as_str)
-        == Some("protected");
+    }
     for turn in &scenario.turns {
-        if recorded_body_has_dialing_mcp_tool(&turn.request.body, protected, resolver) {
+        if recorded_body_has_dialing_mcp_tool(&turn.request.body, &resolvers) {
             return Err(runtime_error("scenario MCP listing is not replay-contained"));
         }
     }
     Ok(())
 }
 
-/// Locate the `openai_mcp_tool_resolve` filter object within a config tree.
-fn find_mcp_resolve_filter(value: &Value) -> Option<&Value> {
+/// Collect every `openai_mcp_tool_resolve` filter object in a config tree.
+///
+/// A config can declare more than one resolver (e.g. across chains); the replay
+/// check must consider all of them so a protected resolver in an unused chain
+/// cannot mask an advisory resolver on the active chain that still dials.
+fn collect_mcp_resolve_filters<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
     match value {
         Value::Object(object) => {
             if object.get("filter").and_then(Value::as_str) == Some("openai_mcp_tool_resolve") {
-                return Some(value);
+                out.push(value);
             }
-            object.values().find_map(find_mcp_resolve_filter)
+            for child in object.values() {
+                collect_mcp_resolve_filters(child, out);
+            }
         },
-        Value::Array(values) => values.iter().find_map(find_mcp_resolve_filter),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+        Value::Array(values) => {
+            for child in values {
+                collect_mcp_resolve_filters(child, out);
+            }
+        },
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
     }
+}
+
+/// Whether a resolver filter runs in protected admission mode.
+fn resolver_is_protected(resolver: &Value) -> bool {
+    resolver
+        .get("tool_admission")
+        .and_then(|admission| admission.get("mode"))
+        .and_then(Value::as_str)
+        == Some("protected")
 }
 
 /// Whether a configured connector is operator-trusted for catalog admission.
@@ -549,15 +565,23 @@ fn connector_has_catalog_trust(resolver: &Value, connector_id: &str) -> bool {
 }
 
 /// Whether a scenario request body contains an MCP tool that would call
-/// `tools/list` now, given the resolver's admission mode.
-fn recorded_body_has_dialing_mcp_tool(body: &RecordedBody, protected: bool, resolver: &Value) -> bool {
+/// `tools/list` now under any configured resolver.
+///
+/// A tool is uncontained if ANY resolver would dial it, so a single advisory
+/// resolver keeps an eager entry out of replay even when another resolver is
+/// protected.
+fn recorded_body_has_dialing_mcp_tool(body: &RecordedBody, resolvers: &[&Value]) -> bool {
     let RecordedBody::Json { value } = body else {
         return false;
     };
     let Some(tools) = value.get("tools").and_then(Value::as_array) else {
         return false;
     };
-    tools.iter().any(|tool| mcp_tool_would_dial(tool, protected, resolver))
+    tools.iter().any(|tool| {
+        resolvers
+            .iter()
+            .any(|resolver| mcp_tool_would_dial(tool, resolver_is_protected(resolver), resolver))
+    })
 }
 
 /// Whether one request tool entry would trigger an eager `tools/list` dial.

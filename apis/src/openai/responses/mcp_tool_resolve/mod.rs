@@ -3353,19 +3353,19 @@ fn admit_tools(
 /// Whether protected mode excludes this MCP entry outright because its target
 /// has no operator catalog-admission trust.
 ///
-/// Covers both direct `server_url` targets and connectors, eager or deferred:
-/// an untrusted target's tools are never admitted, so it is resolved to zero
-/// tools without dialing. `resolve_entry` uses this to skip the eager dial;
-/// `collect_resolutions` uses it for deferred entries that never get a
-/// resolution task (#1724).
+/// Called only on `type: "mcp"` entries. Covers direct `server_url` targets,
+/// connectors, and targetless (label-only) entries, eager or deferred: in
+/// protected mode anything without catalog trust is resolved to zero tools
+/// without dialing, so an untrusted — or incomplete — MCP entry can never reach
+/// the backend. `resolve_entry` uses this to skip the eager dial;
+/// `collect_resolutions` uses it for entries that never get a resolution task
+/// (deferred or targetless) (#1724).
 fn excluded_as_untrusted(
     entry: &serde_json::Value,
     policy: McpAdmissionPolicy,
     connector_trust: &HashMap<String, ConnectorTrust>,
 ) -> bool {
-    policy.is_protected()
-        && (entry.get("server_url").is_some() || entry.get("connector_id").is_some())
-        && !trust_for_entry(entry, connector_trust).catalog
+    policy.is_protected() && !trust_for_entry(entry, connector_trust).catalog
 }
 
 /// Resolve the operator trust for one MCP entry.
