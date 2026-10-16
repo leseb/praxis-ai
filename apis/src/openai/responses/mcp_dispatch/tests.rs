@@ -1270,7 +1270,10 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
     .await
     .expect("denied call yields a truthful error result");
     assert!(
-        result.output_item["error"]["content"].as_str().unwrap().contains("denied"),
+        result.output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("denied"),
         "denied call must surface a policy rejection: {:?}",
         result.output_item["error"]
     );
@@ -1293,7 +1296,12 @@ async fn execute_single_call_rejects_writable_tool_under_operator_read_only() {
     )
     .await
     .expect("ineligible call yields a truthful error result");
-    assert!(result.output_item["error"]["content"].as_str().unwrap().contains("denied"));
+    assert!(
+        result.output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("denied")
+    );
 }
 
 #[tokio::test]
@@ -1312,7 +1320,12 @@ async fn execute_single_call_rejects_resolved_entry_without_verdict() {
     )
     .await
     .expect("unverified entry yields a truthful error result");
-    assert!(result.output_item["error"]["content"].as_str().unwrap().contains("denied"));
+    assert!(
+        result.output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("denied")
+    );
 }
 
 #[tokio::test]

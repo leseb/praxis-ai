@@ -14,9 +14,7 @@ use crate::openai::responses::mcp_admission::ConnectorTrust;
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
-    openai::responses::state::{
-        DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind,
-    },
+    openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
     test_utils::{make_filter_context, make_request},
 };
 // `service` (and the store-scoped `StateOwner` path) are gated behind `store`, so
