@@ -6010,7 +6010,11 @@ mod admission {
         let entry = json!({"type": "mcp", "server_label": "x"});
         assert!(excluded_as_untrusted(&entry, protected(false), &HashMap::new()));
         // Advisory mode leaves it alone (unchanged behavior).
-        assert!(!excluded_as_untrusted(&entry, McpAdmissionPolicy::default(), &HashMap::new()));
+        assert!(!excluded_as_untrusted(
+            &entry,
+            McpAdmissionPolicy::default(),
+            &HashMap::new()
+        ));
     }
 
     #[test]

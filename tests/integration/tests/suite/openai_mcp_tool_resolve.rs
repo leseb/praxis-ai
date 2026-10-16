@@ -1322,7 +1322,12 @@ fn protected_mode_excludes_untrusted_deferred_direct_target() {
         r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"evil","server_url":"{mcp_url}","defer_loading":true}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
-    assert_eq!(parse_status(&raw), 200, "request proceeds with the tool excluded: {}", parse_body(&raw));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the tool excluded: {}",
+        parse_body(&raw)
+    );
 
     let echoed = parse_body(&raw);
     assert!(

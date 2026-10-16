@@ -12,9 +12,10 @@ use super::super::state::ResponsesState;
 #[cfg(feature = "openai-mcp-tools")]
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::mcp_admission::ConnectorTrust;
-use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
-    openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
+    openai::responses::state::{
+        DeferredMcpConnector, DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind,
+    },
     test_utils::{make_filter_context, make_request},
 };
 // `service` (and the store-scoped `StateOwner` path) are gated behind `store`, so
@@ -3426,10 +3427,7 @@ fn client_function_stays_client_owned() {
     })];
 
     let (has_server, has_client) = super::mcp_call_ownership(&state);
-    assert!(
-        !has_server && has_client,
-        "a client function must remain client-owned"
-    );
+    assert!(!has_server && has_client, "a client function must remain client-owned");
     assert!(
         !super::has_dispatchable_mcp_work(&state),
         "a client-only round has no dispatchable MCP work"

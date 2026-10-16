@@ -2601,7 +2601,10 @@ async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), 
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
-#[expect(clippy::too_many_lines, reason = "transactional deferred discovery: snapshot, list, commit")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional deferred discovery: snapshot, list, commit"
+)]
 pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     state: &mut ResponsesState,
     forwarded_header_names: &[http::HeaderName],
@@ -2735,7 +2738,10 @@ async fn prepare_deferred_listing(
 }
 
 /// Apply deferred listings after collision and body-size checks succeed.
-#[expect(clippy::too_many_lines, reason = "transactional commit of listings, verdicts, and tool map")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional commit of listings, verdicts, and tool map"
+)]
 fn commit_deferred_listings(
     state: &mut ResponsesState,
     prepared: Vec<PreparedDeferredListing>,

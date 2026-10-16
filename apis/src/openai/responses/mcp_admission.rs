@@ -272,7 +272,8 @@ impl McpAdmissionDecisions {
                     .insert(encode_function_name(server_label, tool_name), reason);
             },
             McpToolVerdict::Admitted { .. } => {
-                self.available_encoded.insert(encode_function_name(server_label, tool_name));
+                self.available_encoded
+                    .insert(encode_function_name(server_label, tool_name));
             },
         }
         self.verdicts
@@ -559,7 +560,11 @@ mod tests {
             decisions.denied_reason("docs__search"),
             Some(McpDenyReason::UntrustedSource)
         );
-        assert_eq!(decisions.denied_reason("other__thing"), None, "unrelated namespaces are unaffected");
+        assert_eq!(
+            decisions.denied_reason("other__thing"),
+            None,
+            "unrelated namespaces are unaffected"
+        );
 
         // A client function sharing the name wins and stays available.
         decisions.mark_available_functions(&[json!({"type": "function", "name": "docs__search"})]);
