@@ -154,8 +154,11 @@ use super::{
 };
 #[cfg(feature = "openai-mcp-tools")]
 use super::{
-    mcp_classify::{McpDisposition, classify_mcp},
-    mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
+    mcp_classify::{ApprovalFloor, McpDisposition, classify_mcp},
+    mcp_dispatch::{
+        configured_max_calls_per_round as configured_mcp_max_calls,
+        configured_minimum_approval as configured_mcp_minimum_approval, prepare_response_round,
+    },
     mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
@@ -397,7 +400,11 @@ fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesSt
     // need MCP ownership/approval preparation, so only the cap becomes
     // effectively unbounded when the metadata is absent.
     #[cfg(feature = "openai-mcp-tools")]
-    prepare_response_round(state, configured_mcp_max_calls(ctx).unwrap_or(usize::MAX))?;
+    prepare_response_round(
+        state,
+        configured_mcp_max_calls(ctx).unwrap_or(usize::MAX),
+        configured_mcp_minimum_approval(ctx),
+    )?;
     Ok(())
 }
 
@@ -717,10 +724,14 @@ fn has_dispatchable_mcp_work(state: &ResponsesState) -> bool {
         return false;
     }
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    // The operator floor only promotes `Automatic` → `ApprovalRequired`; it never
+    // changes whether a call is MCP at all, so `NotMcp` membership is invariant
+    // under it. Pass `None` here: both auto and approval-required calls are
+    // dispatchable work that must keep the loop running.
     state
         .tool_calls
         .iter()
-        .any(|call| classify_mcp(call, &tool_index) != McpDisposition::NotMcp)
+        .any(|call| classify_mcp(call, &tool_index, ApprovalFloor::None) != McpDisposition::NotMcp)
 }
 
 /// Without MCP tool support no call or discovery is MCP-owned.

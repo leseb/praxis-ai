@@ -1,0 +1,57 @@
+# MCP Approval Floor
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
+#
+# Demonstrates the `openai_mcp_dispatch` filter's `minimum_approval` operator
+# approval floor. The floor is combined monotonically with each MCP tool's
+# client-supplied `require_approval` policy:
+#
+#     approval_required = operator_floor || client_requires_approval
+#
+# With `minimum_approval: always`, every MCP tool call in this pipeline must be
+# approved before it executes, even when the client submits
+# `"require_approval": "never"` (or the server annotates the tool
+# `readOnlyHint: true`). A client can never suppress the operator requirement; it
+# can only ever add to it. Omit `minimum_approval` to keep the default
+# client-driven behavior.
+#
+# This enforces an approval *exchange* — it does not prove a human approved the
+# action, since an authorized API client can submit the approval response. See
+# `agentic-loop.yaml` for the end-to-end approval round trip (the model pauses,
+# the proxy emits an `mcp_approval_request`, and a follow-up
+# `mcp_approval_response` resumes or denies the call).
+#
+# Pipeline ordering:
+#   tool_parse → mcp_tool_resolve → mcp_dispatch (minimum_approval: always)
+#
+# SSRF posture: the outbound MCP callout is validated against the pipeline's
+# `insecure_options.allow_private_upstreams` (default: false). There is no
+# per-filter loopback opt-in.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [mcp-approval-floor-pipeline]
+
+filter_chains:
+  - name: mcp-approval-floor-pipeline
+    filters:
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
+        timeout_ms: 5000
+      - filter: openai_mcp_dispatch
+        timeout_ms: 30000
+        # Operator approval floor: force approval for every MCP call regardless of
+        # the client's per-tool require_approval.
+        minimum_approval: always
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "inference"
+      - filter: load_balancer
+        clusters:
+          - name: "inference"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
