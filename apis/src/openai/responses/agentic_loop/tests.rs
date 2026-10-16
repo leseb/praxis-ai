@@ -10,11 +10,12 @@ use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
 #[cfg(feature = "openai-mcp-tools")]
-#[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::mcp_admission::ConnectorTrust;
+#[cfg(feature = "openai-mcp-tools")]
+use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
     openai::responses::state::{
-        DeferredMcpConnector, DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind,
+        DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind,
     },
     test_utils::{make_filter_context, make_request},
 };
