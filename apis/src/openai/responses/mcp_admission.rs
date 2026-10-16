@@ -230,13 +230,14 @@ pub(crate) struct McpAdmissionDecisions {
     /// Denied tools indexed by the encoded model-facing function name, with the
     /// reason, for fast ownership and dispatch lookups.
     denied_encoded: HashMap<String, McpDenyReason>,
-    /// Encoded model-facing function names of admitted tools. A lossy encoding
-    /// can collapse a denied tool and an admitted tool onto the same name; the
-    /// admitted tool is the one shown to the model and present in the dispatch
-    /// map, so it wins — this set lets the denied lookups ignore a name an
-    /// admitted tool still owns, preventing a denied collision from rejecting a
-    /// legitimately admitted call.
-    admitted_encoded: HashSet<String>,
+    /// Every model-visible function name in the outbound request — admitted MCP
+    /// tools and client-declared functions alike. A lossy encoding can collapse a
+    /// denied tool onto the same name as one of these; the available tool is the
+    /// one shown to the model, so it wins. This set lets the denied lookups
+    /// ignore any name that is still a live function, preventing a denied
+    /// collision from rejecting a legitimately admitted tool or a client
+    /// function (#1724).
+    available_encoded: HashSet<String>,
 }
 
 #[cfg(feature = "openai-mcp-tools")]
@@ -247,7 +248,7 @@ impl McpAdmissionDecisions {
             policy,
             verdicts: HashMap::new(),
             denied_encoded: HashMap::new(),
-            admitted_encoded: HashSet::new(),
+            available_encoded: HashSet::new(),
         }
     }
 
@@ -264,11 +265,27 @@ impl McpAdmissionDecisions {
                     .insert(encode_function_name(server_label, tool_name), reason);
             },
             McpToolVerdict::Admitted { .. } => {
-                self.admitted_encoded.insert(encode_function_name(server_label, tool_name));
+                self.available_encoded.insert(encode_function_name(server_label, tool_name));
             },
         }
         self.verdicts
             .insert((server_label.to_owned(), tool_name.to_owned()), verdict);
+    }
+
+    /// Record every model-visible function name from the outbound `tools` array.
+    ///
+    /// Called once the request body is rewritten so both admitted MCP function
+    /// tools and client-declared functions are known. A name recorded here is
+    /// never reported as denied, so a denied tool's lossy encoded-name collision
+    /// cannot reject a legitimately available call.
+    pub(crate) fn mark_available_functions(&mut self, tools: &[Value]) {
+        for name in tools.iter().filter_map(|tool| {
+            (tool.get("type").and_then(Value::as_str) == Some("function"))
+                .then(|| tool.get("name").and_then(Value::as_str))
+                .flatten()
+        }) {
+            self.available_encoded.insert(name.to_owned());
+        }
     }
 
     /// Look up a verdict by canonical tool identity.
@@ -280,17 +297,17 @@ impl McpAdmissionDecisions {
 
     /// Whether the encoded model-facing function name denotes a denied tool.
     ///
-    /// An admitted tool that shares the same lossy encoded name wins: the name is
-    /// still available to the model and resolvable in the dispatch map, so it is
-    /// not reported as denied.
+    /// A model-visible function (an admitted MCP tool or a client function) that
+    /// shares the same lossy encoded name wins: the name is still available to the
+    /// model, so it is not reported as denied.
     pub(crate) fn is_denied_encoded(&self, encoded_name: &str) -> bool {
-        !self.admitted_encoded.contains(encoded_name) && self.denied_encoded.contains_key(encoded_name)
+        !self.available_encoded.contains(encoded_name) && self.denied_encoded.contains_key(encoded_name)
     }
 
     /// The denial reason for an encoded model-facing function name, if denied and
-    /// not shadowed by an admitted tool sharing the same encoded name.
+    /// not shadowed by an available function sharing the same encoded name.
     pub(crate) fn denied_reason(&self, encoded_name: &str) -> Option<McpDenyReason> {
-        if self.admitted_encoded.contains(encoded_name) {
+        if self.available_encoded.contains(encoded_name) {
             return None;
         }
         self.denied_encoded.get(encoded_name).copied()
@@ -483,5 +500,22 @@ mod tests {
         // A denied tool with no admitted collision is still reported denied.
         decisions.record("gw", "delete_all", McpToolVerdict::Denied(McpDenyReason::Writable));
         assert_eq!(decisions.denied_reason("gw__delete_all"), Some(McpDenyReason::Writable));
+    }
+
+    #[test]
+    fn client_function_wins_over_denied_encoded_collision() {
+        // A trusted connector's writable tool is denied under read-only policy,
+        // and the request also declares a client function that encodes to the same
+        // name. The client function stays model-visible, so a call to it must not
+        // be rejected as denied MCP work (#1724).
+        let mut decisions = McpAdmissionDecisions::new(protected(true));
+        decisions.record("gw", "delete", McpToolVerdict::Denied(McpDenyReason::Writable));
+        decisions.mark_available_functions(&[json!({"type": "function", "name": "gw__delete"})]);
+
+        assert!(
+            !decisions.is_denied_encoded("gw__delete"),
+            "a client function sharing a denied tool's encoded name must be preserved"
+        );
+        assert_eq!(decisions.denied_reason("gw__delete"), None);
     }
 }

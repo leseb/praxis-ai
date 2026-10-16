@@ -462,7 +462,7 @@ impl McpToolResolveFilter {
             tool_map,
             resolved_labels,
             listings,
-            decisions,
+            mut decisions,
             ..
         } = resolution;
         let Some(serialized) = rewrite_request_body(&mut parsed, mcp_entries, per_entry, &tool_map, &resolved_labels)?
@@ -471,6 +471,12 @@ impl McpToolResolveFilter {
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         serialized.commit(body, self.name(), "tools");
+        // Record the final model-visible function names so a denied tool's lossy
+        // encoded-name collision can never reject an admitted tool or a client
+        // function (#1724).
+        if let Some(tools) = parsed.get("tools").and_then(serde_json::Value::as_array) {
+            decisions.mark_available_functions(tools);
+        }
         write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy, decisions);
         commit_discovery_items(ctx, listings);
         Ok(FilterAction::Continue)
@@ -2754,6 +2760,9 @@ fn commit_deferred_listings(
         state.persisted_messages.push(item.listing_item.clone());
         state.accumulated_output.push(item.listing_item);
     }
+    // Record the newly model-visible deferred function names so a denied tool's
+    // encoded-name collision cannot reject an admitted or client function (#1724).
+    state.mcp_admission.mark_available_functions(&expanded_tools);
     state.tools = expanded_tools;
     state.request_body = request_body;
     state.mark_request_body_for_rebuild();
