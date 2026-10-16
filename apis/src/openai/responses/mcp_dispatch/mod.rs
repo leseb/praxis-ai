@@ -95,19 +95,6 @@ use crate::{
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 
-/// Step-local metadata carrying the operator approval floor to the owner.
-///
-/// The `openai_agentic_loop` owner runs approval partitioning during its
-/// response phase but does not hold this dispatcher's config, so the floor is
-/// published here (request phase) and read back during the same IRR iteration's
-/// response phase, mirroring [`MAX_CALLS_METADATA`]. Absent metadata means no
-/// floor was configured (or a direct-test harness without this dispatcher ran),
-/// preserving the client-driven policy.
-const MIN_APPROVAL_METADATA: &str = "responses.mcp_minimum_approval";
-
-/// Value published in [`MIN_APPROVAL_METADATA`] for [`ApprovalFloor::Always`].
-const MIN_APPROVAL_ALWAYS: &str = "always";
-
 /// Whether this internally resolved tool entry names a configured connector.
 ///
 /// Optional fields are serialized into the tool map as JSON `null`, so field
@@ -858,11 +845,15 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
-        // Publish the operator approval floor so the owner's response-phase
-        // approval partitioning (`prepare_response_round`) applies it this IRR
-        // iteration. Only a set floor is published; absent metadata means no floor.
-        if self.minimum_approval.forces_approval() {
-            ctx.set_metadata(MIN_APPROVAL_METADATA, MIN_APPROVAL_ALWAYS.to_owned());
+        // Publish the operator approval floor onto typed request state so the
+        // owner's response-phase approval partitioning (`prepare_response_round`)
+        // applies it this IRR iteration. Unlike `set_metadata` (bounded entry
+        // count; silently drops a new key once full), a struct field cannot be
+        // dropped under metadata saturation, so a configured security floor can
+        // never be silently disabled. When there is no `ResponsesState` there is
+        // no MCP tool map to gate, so nothing is lost by skipping.
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.mcp_operator_approval_floor = self.minimum_approval;
         }
         let forwarded_headers = self.forwarded_headers(ctx);
 
@@ -1064,18 +1055,6 @@ async fn discover_pending_connectors(
 /// Return the response fan-out cap this dispatcher published for the owner.
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
-}
-
-/// Return the operator approval floor this dispatcher published for the owner.
-///
-/// Absent metadata means no floor was configured (or no configured dispatcher
-/// ran, as in direct owner tests), so classification stays client-driven
-/// ([`ApprovalFloor::None`]).
-pub(crate) fn configured_minimum_approval(ctx: &HttpFilterContext<'_>) -> ApprovalFloor {
-    match ctx.get_metadata(MIN_APPROVAL_METADATA) {
-        Some(MIN_APPROVAL_ALWAYS) => ApprovalFloor::Always,
-        _ => ApprovalFloor::None,
-    }
 }
 
 /// Validate and partition one model-produced MCP round for request-side execution.

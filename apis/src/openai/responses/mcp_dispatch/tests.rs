@@ -709,22 +709,27 @@ fn config_rejects_non_always_minimum_approval() {
 
 #[tokio::test]
 async fn on_request_body_publishes_configured_minimum_approval() {
-    // The dispatcher publishes the operator floor as step-local metadata during
+    // The dispatcher publishes the operator floor onto typed request state during
     // the request phase so the agentic-loop owner reads it back when it partitions
-    // approvals in the response phase. Prove the publish → read round trip.
+    // approvals in the response phase. A struct field (not step metadata) means a
+    // saturated metadata map can never silently drop the security floor.
     let yaml: serde_yaml::Value = serde_yaml::from_str("minimum_approval: always").unwrap();
     let filter = McpDispatchFilter::from_config(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
 
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        super::configured_minimum_approval(&ctx),
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .mcp_operator_approval_floor,
         ApprovalFloor::Always,
-        "a configured floor must be visible to the owner via step-local metadata"
+        "a configured floor must be visible to the owner via typed request state"
     );
 }
 
@@ -733,15 +738,19 @@ async fn on_request_body_publishes_no_floor_when_unset() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
 
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        super::configured_minimum_approval(&ctx),
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .mcp_operator_approval_floor,
         ApprovalFloor::None,
-        "no metadata means the client-driven policy is preserved"
+        "an unset floor leaves the client-driven policy in place"
     );
 }
 

@@ -155,10 +155,7 @@ use super::{
 #[cfg(feature = "openai-mcp-tools")]
 use super::{
     mcp_classify::{ApprovalFloor, McpDisposition, classify_mcp},
-    mcp_dispatch::{
-        configured_max_calls_per_round as configured_mcp_max_calls,
-        configured_minimum_approval as configured_mcp_minimum_approval, prepare_response_round,
-    },
+    mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
     mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
@@ -398,13 +395,18 @@ fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesSt
     // The configured dispatcher publishes its cap during request processing.
     // Direct owner tests and pipelines without that optional metadata still
     // need MCP ownership/approval preparation, so only the cap becomes
-    // effectively unbounded when the metadata is absent.
+    // effectively unbounded when the metadata is absent. The operator approval
+    // floor rides on typed request state (set by `openai_mcp_dispatch`), not
+    // metadata, so a saturated metadata map can never silently drop it.
     #[cfg(feature = "openai-mcp-tools")]
-    prepare_response_round(
-        state,
-        configured_mcp_max_calls(ctx).unwrap_or(usize::MAX),
-        configured_mcp_minimum_approval(ctx),
-    )?;
+    {
+        let operator_floor = state.mcp_operator_approval_floor;
+        prepare_response_round(
+            state,
+            configured_mcp_max_calls(ctx).unwrap_or(usize::MAX),
+            operator_floor,
+        )?;
+    }
     Ok(())
 }
 
