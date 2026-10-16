@@ -3506,6 +3506,32 @@ fn resolve_approval_target_missing_from_map_is_unresolvable() {
 }
 
 #[test]
+fn resolve_approval_allows_denial_of_revoked_target() {
+    // The tool lost admission between the approval request and this continuation,
+    // so it is absent from the current map. A denial never executes, so it must
+    // still resolve; an approval of the same absent tool stays rejected (#1724).
+    let map = HashMap::new();
+    let pending = pending_record(
+        "call_1",
+        "weather",
+        "get_weather",
+        "{}",
+        target_fingerprint(&weather_entry()),
+    );
+
+    let deny = parse_approval_response(&approval_response("call_1", false, Some("no thanks"))).expect("parse");
+    let resolved = resolve_approval(&deny, &pending, &map).expect("a denial must resolve without a current target");
+    assert!(!resolved.approve, "the denial decision is preserved");
+
+    let approve = parse_approval_response(&approval_response("call_1", true, None)).expect("parse");
+    let err = resolve_approval(&approve, &pending, &map).unwrap_err();
+    assert!(
+        matches!(err, ApprovalError::TargetUnresolvable(_)),
+        "an approval of a revoked target must still fail closed"
+    );
+}
+
+#[test]
 fn resolve_approval_ambiguous_encoded_target_is_rejected() {
     // Two distinct (label, name) pairs collide to the same encoded name. The
     // ambiguity is caught while binding the target, before the fingerprint check.

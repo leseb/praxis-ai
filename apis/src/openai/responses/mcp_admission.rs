@@ -230,6 +230,12 @@ pub(crate) struct McpAdmissionDecisions {
     /// Denied tools indexed by the encoded model-facing function name, with the
     /// reason, for fast ownership and dispatch lookups.
     denied_encoded: HashMap<String, McpDenyReason>,
+    /// Encoded `label__` namespace prefixes of targets excluded without dialing
+    /// (an untrusted target in protected mode). Its individual tool names are
+    /// unknown — they were never listed — so a forged call to any tool in the
+    /// namespace is recognized by prefix and rejected explicitly rather than
+    /// falling through as a client function (#1724).
+    excluded_namespaces: HashMap<String, McpDenyReason>,
     /// Every model-visible function name in the outbound request — admitted MCP
     /// tools and client-declared functions alike. A lossy encoding can collapse a
     /// denied tool onto the same name as one of these; the available tool is the
@@ -248,6 +254,7 @@ impl McpAdmissionDecisions {
             policy,
             verdicts: HashMap::new(),
             denied_encoded: HashMap::new(),
+            excluded_namespaces: HashMap::new(),
             available_encoded: HashSet::new(),
         }
     }
@@ -270,6 +277,16 @@ impl McpAdmissionDecisions {
         }
         self.verdicts
             .insert((server_label.to_owned(), tool_name.to_owned()), verdict);
+    }
+
+    /// Record a target excluded without dialing so forged calls into its encoded
+    /// `label__` namespace can be rejected explicitly, even though its individual
+    /// tool names were never listed.
+    pub(crate) fn record_excluded_namespace(&mut self, server_label: &str, reason: McpDenyReason) {
+        // `encode_function_name(label, "")` yields the sanitized `label__` prefix
+        // every tool of this server encodes under.
+        self.excluded_namespaces
+            .insert(encode_function_name(server_label, ""), reason);
     }
 
     /// Record every model-visible function name from the outbound `tools` array.
@@ -301,21 +318,31 @@ impl McpAdmissionDecisions {
     /// shares the same lossy encoded name wins: the name is still available to the
     /// model, so it is not reported as denied.
     pub(crate) fn is_denied_encoded(&self, encoded_name: &str) -> bool {
-        !self.available_encoded.contains(encoded_name) && self.denied_encoded.contains_key(encoded_name)
+        self.denied_reason(encoded_name).is_some()
     }
 
-    /// The denial reason for an encoded model-facing function name, if denied and
-    /// not shadowed by an available function sharing the same encoded name.
+    /// The denial reason for an encoded model-facing function name.
+    ///
+    /// A model-visible function (admitted MCP tool or client function) sharing the
+    /// name always wins and is never reported denied. Otherwise the name is denied
+    /// if it is a specific discovered-but-denied tool, or falls within the encoded
+    /// namespace of a target excluded without dialing.
     pub(crate) fn denied_reason(&self, encoded_name: &str) -> Option<McpDenyReason> {
         if self.available_encoded.contains(encoded_name) {
             return None;
         }
-        self.denied_encoded.get(encoded_name).copied()
+        if let Some(reason) = self.denied_encoded.get(encoded_name) {
+            return Some(*reason);
+        }
+        self.excluded_namespaces
+            .iter()
+            .find_map(|(prefix, reason)| encoded_name.starts_with(prefix).then_some(*reason))
     }
 
-    /// Whether any tool was denied this request.
+    /// Whether this request denies any MCP call — a specific discovered-but-denied
+    /// tool, or any tool inside an excluded target's namespace.
     pub(crate) fn has_denied(&self) -> bool {
-        !self.denied_encoded.is_empty()
+        !self.denied_encoded.is_empty() || !self.excluded_namespaces.is_empty()
     }
 
     /// Re-enforce admission at dispatch for a call that resolved to a tool-map
@@ -517,5 +544,25 @@ mod tests {
             "a client function sharing a denied tool's encoded name must be preserved"
         );
         assert_eq!(decisions.denied_reason("gw__delete"), None);
+    }
+
+    #[test]
+    fn excluded_target_namespace_is_denied_without_dialing() {
+        // An untrusted target is excluded without dialing, so its individual tool
+        // names are unknown. A forged call into its encoded namespace is still
+        // rejected explicitly by prefix (#1724).
+        let mut decisions = McpAdmissionDecisions::new(protected(false));
+        decisions.record_excluded_namespace("docs", McpDenyReason::UntrustedSource);
+
+        assert!(decisions.has_denied());
+        assert_eq!(
+            decisions.denied_reason("docs__search"),
+            Some(McpDenyReason::UntrustedSource)
+        );
+        assert_eq!(decisions.denied_reason("other__thing"), None, "unrelated namespaces are unaffected");
+
+        // A client function sharing the name wins and stays available.
+        decisions.mark_available_functions(&[json!({"type": "function", "name": "docs__search"})]);
+        assert_eq!(decisions.denied_reason("docs__search"), None);
     }
 }

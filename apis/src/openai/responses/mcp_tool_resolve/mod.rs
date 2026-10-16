@@ -74,7 +74,9 @@ use self::config::{McpToolResolveConfig, build_config};
 use super::{
     bound_body_outcome,
     error::responses_error_rejection,
-    mcp_admission::{ConnectorTrust, McpAdmissionDecisions, McpAdmissionPolicy, McpToolVerdict, evaluate_tool},
+    mcp_admission::{
+        ConnectorTrust, McpAdmissionDecisions, McpAdmissionPolicy, McpDenyReason, McpToolVerdict, evaluate_tool,
+    },
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
 use crate::{
@@ -951,6 +953,14 @@ fn collect_resolutions(
     for (entry, task_idx) in entries.iter().zip(entry_to_task) {
         let tools =
             (*task_idx).and_then(|task_idx| consume_task_result(task_idx, &mut task_results, &mut remaining_consumers));
+        // Record any untrusted target excluded without dialing so a forged call
+        // into its namespace is rejected explicitly. Done for every excluded
+        // entry, whether it reaches the Resolved branch (eager short-circuit) or
+        // the deferred/targetless branch below (#1724).
+        let excluded = excluded_as_untrusted(entry, policy, connector_trust);
+        if excluded {
+            decisions.record_excluded_namespace(server_label(entry), McpDenyReason::UntrustedSource);
+        }
         if let Some((resolution, listing_tools)) =
             build_entry_resolution(entry, tools, &mut tool_map, policy, connector_trust, &mut decisions)?
         {
@@ -963,7 +973,7 @@ fn collect_resolutions(
                 tools: listing_tools,
             });
             per_entry.push(resolution);
-        } else if excluded_as_untrusted(entry, policy, connector_trust) {
+        } else if excluded {
             // A deferred untrusted target gets no resolution task, so the
             // resolve_entry short-circuit never runs for it. Exclude it here —
             // resolving to zero tools drops it from the outbound body rather than
