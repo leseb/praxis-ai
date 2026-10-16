@@ -414,6 +414,7 @@ impl McpToolResolveFilter {
             self.max_tools,
             self.max_rewritten_body_bytes,
             &self.connector_trust,
+            self.admission_policy,
         );
         let resolution = self
             .resolve_request_entries(ctx, &mcp_entries.values, &callout, connector_identity.as_ref())
@@ -586,20 +587,25 @@ impl McpToolResolveFilter {
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
-        let Some(server_url) = resolvable_server_url(entry) else {
-            return Ok(None);
-        };
         let label = server_label(entry);
         let is_connector = entry.get("connector_id").is_some();
         // Protected mode: a target with no operator catalog-admission trust has
-        // every tool excluded regardless of what it would advertise. Skip the
-        // dial entirely and resolve it to zero tools, so exclusion never contacts
-        // an untrusted, client-selected endpoint and does not depend on its
-        // reachability (#1724).
-        if self.admission_policy.is_protected() && !trust_for_entry(entry, &self.connector_trust).catalog {
+        // every tool excluded regardless of what it would advertise. Resolve it to
+        // zero tools without dialing, so exclusion never contacts an untrusted,
+        // client-selected endpoint and does not depend on its reachability.
+        //
+        // This runs BEFORE the `resolvable_server_url` deferral gate so it also
+        // covers `defer_loading: true` entries — a deferred direct `server_url`
+        // (which `resolvable_server_url` reports as `None`) would otherwise
+        // pass through to the backend, and a deferred untrusted connector would
+        // otherwise be dialed later by `openai_mcp_dispatch` (#1724).
+        if excluded_as_untrusted(entry, self.admission_policy, &self.connector_trust) {
             debug!(label, "protected mode: excluding untrusted MCP target without dialing");
             return Ok(Some(Vec::new()));
         }
+        let Some(server_url) = resolvable_server_url(entry) else {
+            return Ok(None);
+        };
         if can_reuse_cached_listing(entry, is_connector)
             && let Some(cached) = find_cached_listing(
                 previous_tools,
@@ -951,6 +957,21 @@ fn collect_resolutions(
                 tools: listing_tools,
             });
             per_entry.push(resolution);
+        } else if excluded_as_untrusted(entry, policy, connector_trust) {
+            // A deferred untrusted target gets no resolution task, so the
+            // resolve_entry short-circuit never runs for it. Exclude it here —
+            // resolving to zero tools drops it from the outbound body rather than
+            // passing a deferred direct `server_url` through to the backend or
+            // leaving a deferred connector stub (#1724).
+            has_resolved = true;
+            let label = server_label(entry).to_owned();
+            resolved_labels.insert(label.clone());
+            listings.push(McpListing {
+                server_label: label,
+                server_url: reusable_listing_server_url(entry).map(str::to_owned),
+                tools: Vec::new(),
+            });
+            per_entry.push(EntryResolution::Resolved(Vec::new()));
         } else if is_deferred_connector(entry) {
             per_entry.push(EntryResolution::SanitizeDeferred);
         } else {
@@ -1750,12 +1771,17 @@ fn has_tool_search(ctx: &HttpFilterContext<'_>) -> bool {
 /// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`
 /// inside the IRR step, so its SSRF posture is governed by that filter's outbound
 /// callout — not captured here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "deferred snapshot threads limits, connector trust, and the admission policy"
+)]
 fn collect_deferred_connectors(
     entries: &[serde_json::Value],
     timeout: Duration,
     max_tools: usize,
     max_rewritten_body_bytes: usize,
     connector_trust: &HashMap<String, ConnectorTrust>,
+    policy: McpAdmissionPolicy,
 ) -> Vec<DeferredMcpConnector> {
     entries
         .iter()
@@ -1763,6 +1789,14 @@ fn collect_deferred_connectors(
         .filter_map(|entry| {
             let connector_id = entry.get("connector_id").and_then(serde_json::Value::as_str)?;
             let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
+            let trust = connector_trust.get(connector_id).copied().unwrap_or_default();
+            // Protected mode excludes an untrusted connector in `resolve_entry`
+            // without dialing, so never queue it for deferred discovery — doing so
+            // would make `openai_mcp_dispatch` dial the untrusted service only to
+            // deny every tool (and abort the request if it is unreachable) (#1724).
+            if policy.is_protected() && !trust.catalog {
+                return None;
+            }
             Some(DeferredMcpConnector {
                 authorization: entry
                     .get("authorization")
@@ -1780,7 +1814,7 @@ fn collect_deferred_connectors(
                 // Trust is stamped from operator configuration at resolve time so
                 // deferred discovery (which runs inside openai_mcp_dispatch) never
                 // needs the resolver's connector config.
-                trust: connector_trust.get(connector_id).copied().unwrap_or_default(),
+                trust,
             })
         })
         .collect()
@@ -3314,6 +3348,24 @@ fn admit_tools(
         }
     }
     admitted
+}
+
+/// Whether protected mode excludes this MCP entry outright because its target
+/// has no operator catalog-admission trust.
+///
+/// Covers both direct `server_url` targets and connectors, eager or deferred:
+/// an untrusted target's tools are never admitted, so it is resolved to zero
+/// tools without dialing. `resolve_entry` uses this to skip the eager dial;
+/// `collect_resolutions` uses it for deferred entries that never get a
+/// resolution task (#1724).
+fn excluded_as_untrusted(
+    entry: &serde_json::Value,
+    policy: McpAdmissionPolicy,
+    connector_trust: &HashMap<String, ConnectorTrust>,
+) -> bool {
+    policy.is_protected()
+        && (entry.get("server_url").is_some() || entry.get("connector_id").is_some())
+        && !trust_for_entry(entry, connector_trust).catalog
 }
 
 /// Resolve the operator trust for one MCP entry.

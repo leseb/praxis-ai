@@ -1081,7 +1081,11 @@ pub(crate) fn prepare_response_round(
     state: &mut ResponsesState,
     max_calls_per_round: usize,
 ) -> Result<(), DispatchFailure> {
-    if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+    // A denied-only round has an empty `mcp_tool_map` but still carries
+    // model-generated calls to policy-denied tools that the dispatcher will
+    // reject. Keep validating them (per-round cap, unique call ids) rather than
+    // skipping straight to dispatch (#1724).
+    if state.tool_calls.is_empty() || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()) {
         return Ok(());
     }
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);

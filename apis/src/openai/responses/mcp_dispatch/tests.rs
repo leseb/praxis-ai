@@ -1873,6 +1873,34 @@ fn prepare_response_round_enforces_configured_cap() {
 }
 
 #[test]
+fn prepare_response_round_enforces_cap_on_denied_only_round() {
+    // Every discovered tool was denied, so `mcp_tool_map` is empty, but the denied
+    // verdict still makes forged calls MCP-owned. The per-round cap must apply
+    // rather than the empty-map early return skipping it (#1724).
+    let mut admission = McpAdmissionDecisions::new(McpAdmissionPolicy {
+        mode: McpAdmissionMode::Protected,
+        require_read_only: true,
+    });
+    admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
+    let mut state = ResponsesState {
+        mcp_admission: admission,
+        tool_calls: vec![
+            json!({"name":"gw__delete_repo", "call_id":"c1"}),
+            json!({"name":"gw__delete_repo", "call_id":"c2"}),
+        ],
+        ..ResponsesState::default()
+    };
+
+    let failure = prepare_response_round(&mut state, 1).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(
+        failure.message.contains("configured MCP call limit"),
+        "a denied-only round over the cap must be rejected, not passed through"
+    );
+}
+
+#[test]
 fn prepare_response_round_emits_resumable_approval() {
     let mut state = ResponsesState {
         mcp_tool_map: sample_tool_map(),

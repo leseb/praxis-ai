@@ -28,7 +28,7 @@
 //! function.
 
 #[cfg(feature = "openai-mcp-tools")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "openai-mcp-tools")]
 use serde_json::Value;
@@ -230,6 +230,13 @@ pub(crate) struct McpAdmissionDecisions {
     /// Denied tools indexed by the encoded model-facing function name, with the
     /// reason, for fast ownership and dispatch lookups.
     denied_encoded: HashMap<String, McpDenyReason>,
+    /// Encoded model-facing function names of admitted tools. A lossy encoding
+    /// can collapse a denied tool and an admitted tool onto the same name; the
+    /// admitted tool is the one shown to the model and present in the dispatch
+    /// map, so it wins — this set lets the denied lookups ignore a name an
+    /// admitted tool still owns, preventing a denied collision from rejecting a
+    /// legitimately admitted call.
+    admitted_encoded: HashSet<String>,
 }
 
 #[cfg(feature = "openai-mcp-tools")]
@@ -240,6 +247,7 @@ impl McpAdmissionDecisions {
             policy,
             verdicts: HashMap::new(),
             denied_encoded: HashMap::new(),
+            admitted_encoded: HashSet::new(),
         }
     }
 
@@ -248,11 +256,16 @@ impl McpAdmissionDecisions {
         self.policy
     }
 
-    /// Record a verdict for one tool identity, maintaining the denied index.
+    /// Record a verdict for one tool identity, maintaining the encoded indexes.
     pub(crate) fn record(&mut self, server_label: &str, tool_name: &str, verdict: McpToolVerdict) {
-        if let McpToolVerdict::Denied(reason) = verdict {
-            self.denied_encoded
-                .insert(encode_function_name(server_label, tool_name), reason);
+        match verdict {
+            McpToolVerdict::Denied(reason) => {
+                self.denied_encoded
+                    .insert(encode_function_name(server_label, tool_name), reason);
+            },
+            McpToolVerdict::Admitted { .. } => {
+                self.admitted_encoded.insert(encode_function_name(server_label, tool_name));
+            },
         }
         self.verdicts
             .insert((server_label.to_owned(), tool_name.to_owned()), verdict);
@@ -266,12 +279,20 @@ impl McpAdmissionDecisions {
     }
 
     /// Whether the encoded model-facing function name denotes a denied tool.
+    ///
+    /// An admitted tool that shares the same lossy encoded name wins: the name is
+    /// still available to the model and resolvable in the dispatch map, so it is
+    /// not reported as denied.
     pub(crate) fn is_denied_encoded(&self, encoded_name: &str) -> bool {
-        self.denied_encoded.contains_key(encoded_name)
+        !self.admitted_encoded.contains(encoded_name) && self.denied_encoded.contains_key(encoded_name)
     }
 
-    /// The denial reason for an encoded model-facing function name, if denied.
+    /// The denial reason for an encoded model-facing function name, if denied and
+    /// not shadowed by an admitted tool sharing the same encoded name.
     pub(crate) fn denied_reason(&self, encoded_name: &str) -> Option<McpDenyReason> {
+        if self.admitted_encoded.contains(encoded_name) {
+            return None;
+        }
         self.denied_encoded.get(encoded_name).copied()
     }
 
@@ -442,5 +463,25 @@ mod tests {
         );
         assert!(decisions.policy().is_protected());
         assert!(decisions.has_denied());
+    }
+
+    #[test]
+    fn admitted_tool_wins_over_denied_encoded_collision() {
+        // `read?docs` and `read_docs` both encode to `gw__read_docs` (lossy `?`
+        // → `_`). One is denied (writable), the other admitted (read-only). The
+        // admitted tool is the one shown to the model and resolvable at dispatch,
+        // so the shared encoded name must not be reported as denied.
+        let mut decisions = McpAdmissionDecisions::new(protected(true));
+        decisions.record("gw", "read?docs", McpToolVerdict::Denied(McpDenyReason::Writable));
+        decisions.record("gw", "read_docs", McpToolVerdict::Admitted { read_only: true });
+
+        assert!(
+            !decisions.is_denied_encoded("gw__read_docs"),
+            "an admitted tool must not be shadowed by a denied encoded-name collision"
+        );
+        assert_eq!(decisions.denied_reason("gw__read_docs"), None);
+        // A denied tool with no admitted collision is still reported denied.
+        decisions.record("gw", "delete_all", McpToolVerdict::Denied(McpDenyReason::Writable));
+        assert_eq!(decisions.denied_reason("gw__delete_all"), Some(McpDenyReason::Writable));
     }
 }

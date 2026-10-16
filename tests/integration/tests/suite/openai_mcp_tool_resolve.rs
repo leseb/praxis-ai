@@ -1299,6 +1299,46 @@ fn protected_mode_excludes_untrusted_direct_server_tools() {
     );
 }
 
+/// A `defer_loading: true` direct `server_url` is still a client-selected
+/// untrusted target: protected mode must exclude it before it reaches the
+/// backend, and must not dial it (#1724 — deferred-passthrough bypass).
+#[test]
+fn protected_mode_excludes_untrusted_deferred_direct_target() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("delete_all")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let admission = "        tool_admission:\n          mode: protected\n          require_read_only: true";
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), admission);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"evil","server_url":"{mcp_url}","defer_loading":true}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+    assert_eq!(parse_status(&raw), 200, "request proceeds with the tool excluded: {}", parse_body(&raw));
+
+    let echoed = parse_body(&raw);
+    assert!(
+        !echoed.contains("delete_all") && !echoed.contains("defer_loading"),
+        "a deferred untrusted direct MCP entry must be stripped, not passed through: {echoed}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tool_count = parsed["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(tool_count, 0, "no untrusted tools reach the model: {echoed}");
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "an untrusted deferred target must never be dialed in protected mode"
+    );
+}
+
 #[test]
 fn unknown_connector_rejected_before_callout() {
     let mcp_config = McpMockConfig {
