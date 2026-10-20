@@ -1909,13 +1909,30 @@ async fn staged_byte_budget_fails_closed_without_committing_delivery() {
         "a staged (held) event must not poison the stream"
     );
 
-    // A large text delta — not accumulation-charged — pushes the staged bytes over the cap.
-    let mut big_delta = Some(make_sse_chunk(
+    // The emission sequence before the overflow chunk; rendering any event advances it.
+    let seq_before = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("responses state")
+        .logical_stream_sequence;
+
+    // Co-batch a renderable snapshot event (which, if rendered, would advance the
+    // sequence counter and flush any pending local-tool milestones) *ahead of* a large
+    // text delta that overflows the staging budget, in ONE chunk. The pre-render
+    // preflight must reject the whole chunk before the snapshot renders, so a rejected
+    // chunk commits no delivery milestone — the sequence counter stays put.
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&make_sse_chunk(
+        "response.in_progress",
+        &json!({"response": {"id": "resp_staged", "status": "in_progress", "output": []}, "sequence_number": 9}),
+    ));
+    combined.extend_from_slice(&make_sse_chunk(
         "response.output_text.delta",
         &json!({"output_index": 1, "item_id": "msg_1", "content_index": 0, "delta": "x".repeat(4096)}),
     ));
-    filter.on_response_body(&mut ctx, &mut big_delta, false).unwrap();
-    assert!(big_delta.is_none(), "the staged-overflow chunk must emit nothing");
+    let mut overflow = Some(Bytes::from(combined));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none(), "the staged-overflow chunk must emit nothing");
     assert_eq!(
         ctx.get_metadata("responses.stream_parse_error"),
         Some("true"),
@@ -1925,6 +1942,14 @@ async fn staged_byte_budget_fails_closed_without_committing_delivery() {
         ctx.get_metadata("responses.skip_persist"),
         Some("true"),
         "overflowed streams must not be persisted"
+    );
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .expect("responses state")
+            .logical_stream_sequence,
+        seq_before,
+        "a rejected chunk must render nothing (and commit no milestone) before the overflow is detected"
     );
 
     // The poison is sticky: a later chunk is dropped too.
