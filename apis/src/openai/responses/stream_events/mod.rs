@@ -1366,10 +1366,11 @@ fn stage_event(
     });
 }
 
-/// Bytes a staged event retains while held: its own payload plus any owned restoration
-/// payload its disposition carries. A synthesized `EmitTypedAdded`/`EmitCustom*`/
-/// `RestoreSnapshot` holds a full restored item that can far exceed the small raw frame
-/// it replaces, so charging only the raw event would let a deferred opening retain far
+/// Bytes a staged event retains while held: its own payload plus every owned payload its
+/// disposition carries. A synthesized `EmitTypedAdded`/`EmitCustom*`/`RestoreSnapshot`
+/// holds a full restored item, and the retype/custom-input variants hold owned
+/// identifier/name strings the raw frame does not bound (names are hashed to shorter
+/// backend forms). Charging only the raw event would let a deferred opening retain far
 /// more than the ceiling admits. Allocation-free via `bounded_json_size` (no throwaway
 /// serialized copy).
 fn staged_event_bytes(event: &ResponsesEvent, disposition: &client_tools::ClientToolDisposition) -> usize {
@@ -1386,8 +1387,14 @@ fn staged_event_bytes(event: &ResponsesEvent, disposition: &client_tools::Client
         | D::EmitTypedAdded { item }
         | D::EmitTypedDone { item } => json_size(item),
         D::RestoreSnapshot { response } => json_size(response),
-        D::EmitCustomInput { input, .. } => input.len(),
-        D::Passthrough | D::Suppress | D::RetypeInPlace { .. } | D::RetypeArgumentsName { .. } => 0,
+        D::EmitCustomInput {
+            key, item_id, input, ..
+        } => key.len().saturating_add(item_id.len()).saturating_add(input.len()),
+        D::RetypeInPlace { name, namespace, .. } => {
+            name.len().saturating_add(namespace.as_ref().map_or(0, String::len))
+        },
+        D::RetypeArgumentsName { name } => name.len(),
+        D::Passthrough | D::Suppress => 0,
     };
     json_size(event.payload()).saturating_add(disposition_bytes)
 }

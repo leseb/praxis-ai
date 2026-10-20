@@ -1824,6 +1824,35 @@ fn projected_staged_bytes_sums_only_events_held_behind_a_deferred_opening() {
         charged > 4096,
         "staged size must include the owned restored item ({charged} bytes), not just the raw frame"
     );
+
+    // Retype/custom-input dispositions carry owned name/identifier strings the raw frame
+    // does not bound (original names are hashed to shorter backend forms); each must be
+    // charged so repeated small frames cannot retain far more than the ceiling admits.
+    let small_event = ResponsesEvent::FunctionCallArgumentsDone(json!({"output_index": 1, "item_id": "fc"}));
+    let retype = ClientToolDisposition::RetypeInPlace {
+        item_type: "function_call",
+        name: "n".repeat(2048),
+        namespace: Some("s".repeat(1024)),
+    };
+    assert!(
+        super::staged_event_bytes(&small_event, &retype) > 3072,
+        "RetypeInPlace must charge its owned name and namespace strings"
+    );
+    let retype_args = ClientToolDisposition::RetypeArgumentsName { name: "n".repeat(2048) };
+    assert!(
+        super::staged_event_bytes(&small_event, &retype_args) > 2048,
+        "RetypeArgumentsName must charge its owned name string"
+    );
+    let custom_input = ClientToolDisposition::EmitCustomInput {
+        key: "k".repeat(512),
+        item_id: "i".repeat(512),
+        output_index: 1,
+        input: "p".repeat(1024),
+    };
+    assert!(
+        super::staged_event_bytes(&small_event, &custom_input) > 2048,
+        "EmitCustomInput must charge its owned key, item_id, and input strings"
+    );
 }
 
 #[tokio::test]
