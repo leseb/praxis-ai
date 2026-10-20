@@ -795,7 +795,9 @@ impl McpToolResolveFilter {
         if let Some(tools) = parsed.get("tools").and_then(serde_json::Value::as_array) {
             decisions.mark_available_functions(tools);
         }
-        write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy, decisions);
+        if let Err(action) = write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy, decisions) {
+            return Ok(action);
+        }
         commit_discovery_items(ctx, listings);
         if let Some(slot) = budget {
             let state = ctx
@@ -2983,7 +2985,7 @@ fn write_state(
     deferred_mcp: Vec<DeferredMcpConnector>,
     connector_context_policy: McpConnectorContextPolicy,
     decisions: McpAdmissionDecisions,
-) {
+) -> Result<(), FilterAction> {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
@@ -2999,6 +3001,9 @@ fn write_state(
         }
         state.set_request_params(parsed);
     } else {
+        // Fresh construction (no managed owner ran): enforce the structural-complexity
+        // bound so this alternate initialization path cannot bypass the guard (#1618).
+        super::complexity::enforce(ctx, &parsed)?;
         let mut state = ResponsesState::from_request_body(parsed);
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
@@ -3006,6 +3011,7 @@ fn write_state(
         state.mcp_admission = decisions;
         ctx.extensions.insert(state);
     }
+    Ok(())
 }
 
 /// Whether deferred connector discovery should run on this IRR iteration.
