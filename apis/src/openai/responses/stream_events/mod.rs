@@ -1236,11 +1236,11 @@ fn append_lowered_chunk(
     Ok(())
 }
 
-/// Sum the serialized bytes this chunk would newly stage behind a deferred opening
-/// (#1767), replaying the opening-hole transitions over a scratch copy of the pending
-/// set without rendering. Intentionally does not model intra-chunk releases, so it is a
-/// safe upper bound on the staged volume this chunk can reach — used to admit the chunk
-/// before any event renders.
+/// Sum the bytes this chunk would newly stage behind a deferred opening (#1767) —
+/// each event plus any owned restoration payload its disposition carries — replaying the
+/// opening-hole transitions over a scratch copy of the pending set without rendering.
+/// Intentionally does not model intra-chunk releases, so it is a safe upper bound on the
+/// staged volume this chunk can reach — used to admit the chunk before any event renders.
 fn projected_staged_bytes(
     pending: &BTreeSet<u64>,
     events: &[ResponsesEvent],
@@ -1266,7 +1266,7 @@ fn projected_staged_bytes(
         if let Some(min_pending) = pending.iter().next().copied()
             && event_index.is_some_and(|idx| idx > min_pending)
         {
-            total = total.saturating_add(event.payload().to_string().len());
+            total = total.saturating_add(staged_event_bytes(event, disposition));
         }
     }
     total
@@ -1347,7 +1347,7 @@ fn render_restored_event(
 }
 
 /// Hold one output-item event behind an earlier still-deferred opening (#1767),
-/// tracking its serialized size in the running staged-byte total. The ceiling is
+/// tracking its retained size in the running staged-byte total. The ceiling is
 /// enforced by the pre-loop preflight in [`restore_and_append_chunk`] before any event
 /// renders, so this records the hold without re-checking (and never fails mid-append).
 fn stage_event(
@@ -1356,7 +1356,7 @@ fn stage_event(
     event: ResponsesEvent,
     disposition: client_tools::ClientToolDisposition,
 ) {
-    let byte_len = event.payload().to_string().len();
+    let byte_len = staged_event_bytes(&event, &disposition);
     state.client_tool_staged_bytes = state.client_tool_staged_bytes.saturating_add(byte_len);
     state.client_tool_staged.push(StagedEvent {
         output_index,
@@ -1364,6 +1364,32 @@ fn stage_event(
         event,
         disposition,
     });
+}
+
+/// Bytes a staged event retains while held: its own payload plus any owned restoration
+/// payload its disposition carries. A synthesized `EmitTypedAdded`/`EmitCustom*`/
+/// `RestoreSnapshot` holds a full restored item that can far exceed the small raw frame
+/// it replaces, so charging only the raw event would let a deferred opening retain far
+/// more than the ceiling admits. Allocation-free via `bounded_json_size` (no throwaway
+/// serialized copy).
+fn staged_event_bytes(event: &ResponsesEvent, disposition: &client_tools::ClientToolDisposition) -> usize {
+    use client_tools::ClientToolDisposition as D;
+    let json_size = |value: &Value| {
+        crate::openai::responses::bounded_json_size(value, usize::MAX)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    let disposition_bytes = match disposition {
+        D::EmitCustomShell { item }
+        | D::EmitCustomItemDone { item }
+        | D::EmitTypedAdded { item }
+        | D::EmitTypedDone { item } => json_size(item),
+        D::RestoreSnapshot { response } => json_size(response),
+        D::EmitCustomInput { input, .. } => input.len(),
+        D::Passthrough | D::Suppress | D::RetypeInPlace { .. } | D::RetypeArgumentsName { .. } => 0,
+    };
+    json_size(event.payload()).saturating_add(disposition_bytes)
 }
 
 /// Render every staged event that is no longer behind a pending earlier opening.

@@ -1807,6 +1807,23 @@ fn projected_staged_bytes_sums_only_events_held_behind_a_deferred_opening() {
         0,
         "no deferred opening means no staging and no projected bytes"
     );
+
+    // A synthesized opening carries an owned restored item far larger than its small raw
+    // `arguments.done` frame; the retained size must include that payload, not just the
+    // raw event, so the ceiling bounds the real memory a deferred opening can retain.
+    let big_item = json!({
+        "type": "shell_call", "id": "sh_big", "call_id": "x".repeat(4096),
+        "action": {"type": "exec", "command": ["pwd"]}, "status": "completed"
+    });
+    let args_done = ResponsesEvent::FunctionCallArgumentsDone(json!({
+        "output_index": 1, "item_id": "fc_big", "name": "shell", "arguments": "{}"
+    }));
+    let big_disposition = ClientToolDisposition::EmitTypedAdded { item: big_item.clone() };
+    let charged = super::staged_event_bytes(&args_done, &big_disposition);
+    assert!(
+        charged > 4096,
+        "staged size must include the owned restored item ({charged} bytes), not just the raw frame"
+    );
 }
 
 #[tokio::test]
