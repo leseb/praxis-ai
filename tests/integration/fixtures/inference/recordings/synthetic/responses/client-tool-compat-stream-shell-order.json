@@ -70,31 +70,31 @@
             "frames": [
               {
                 "event": "response.output_item.added",
-                "data": "{\"item\":{\"action\":{\"commands\":[\"pwd\"],\"max_output_length\":null,\"timeout_ms\":null},\"call_id\":\"call_recorded_0001\",\"environment\":{\"type\":\"local\"},\"id\":\"sh_sh1\",\"status\":\"completed\",\"type\":\"shell_call\"},\"output_index\":0,\"sequence_number\":4,\"type\":\"response.output_item.added\"}",
+                "data": "{\"item\":{\"action\":{\"commands\":[\"pwd\"],\"max_output_length\":null,\"timeout_ms\":null},\"call_id\":\"call_recorded_0001\",\"environment\":{\"type\":\"local\"},\"id\":\"sh_sh1\",\"status\":\"completed\",\"type\":\"shell_call\"},\"output_index\":0,\"sequence_number\":0,\"type\":\"response.output_item.added\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "response.output_item.added",
-                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"in_progress\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":0,\"type\":\"response.output_item.added\"}",
+                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"in_progress\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":1,\"type\":\"response.output_item.added\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "response.function_call_arguments.delta",
-                "data": "{\"delta\":\"{}\",\"item_id\":\"fc_lookup\",\"output_index\":1,\"sequence_number\":1,\"type\":\"response.function_call_arguments.delta\"}",
+                "data": "{\"delta\":\"{}\",\"item_id\":\"fc_lookup\",\"output_index\":1,\"sequence_number\":2,\"type\":\"response.function_call_arguments.delta\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "response.function_call_arguments.done",
-                "data": "{\"arguments\":\"{}\",\"item_id\":\"fc_lookup\",\"name\":\"lookup\",\"output_index\":1,\"sequence_number\":2,\"type\":\"response.function_call_arguments.done\"}",
+                "data": "{\"arguments\":\"{}\",\"item_id\":\"fc_lookup\",\"name\":\"lookup\",\"output_index\":1,\"sequence_number\":3,\"type\":\"response.function_call_arguments.done\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "response.output_item.done",
-                "data": "{\"item\":{\"arguments\":\"{}\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"completed\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":3,\"type\":\"response.output_item.done\"}",
+                "data": "{\"item\":{\"arguments\":\"{}\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"completed\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":4,\"type\":\"response.output_item.done\"}",
                 "id": null,
                 "retry": null
               },

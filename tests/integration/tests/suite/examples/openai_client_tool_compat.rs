@@ -1472,6 +1472,14 @@ fn assert_shell_opening_order_preserved(coalesced: bool) {
          requires contiguous ascending openings): {body}"
     );
 
+    // Reordering the deferred opening ahead of the staged events must not make
+    // sequence numbers run backwards: they are stamped in emission order (#1767).
+    let sequence_numbers: Vec<u64> = events.iter().filter_map(|e| e["sequence_number"].as_u64()).collect();
+    assert!(
+        sequence_numbers.windows(2).all(|pair| pair[0] < pair[1]),
+        "client sequence_numbers must increase monotonically in emission order: {sequence_numbers:?}"
+    );
+
     // The terminal output stays ordered: shell_call at index 0, function_call at 1.
     let completed = events
         .iter()
@@ -1493,4 +1501,147 @@ fn streaming_deferred_shell_opening_precedes_later_function_separate_chunks() {
 #[test]
 fn streaming_deferred_shell_opening_precedes_later_function_coalesced_chunk() {
     assert_shell_opening_order_preserved(true);
+}
+
+/// Two deferred shell openings straddling an ordinary function (indices 0, 1, 2) where
+/// the function completes first and the shells complete in order: the earlier shell's
+/// fill must release the staged function opening even though the later shell is still
+/// pending, so openings stay `[0, 1, 2]` (#1767). A naive "flush only when no opening
+/// is pending" instead emits `[0, 2, 1]`.
+#[test]
+fn streaming_two_deferred_shell_openings_release_prefix_in_order() {
+    // Upstream opens 0 (shell), 1 (function), 2 (shell) in order; the function at
+    // index 1 completes first, then shell 0, then shell 2.
+    let frames: [(&str, &str); 13] = [
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_lookup","delta":"{}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_lookup","name":"lookup","arguments":"{}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_sh_a","delta":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_sh_b","delta":"{\"commands\":[\"ls\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":2,"item_id":"fc_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_order","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"},{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"},{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}","status":"completed"}],"parallel_tool_calls":true,"tool_choice":"auto","tools":[]}}"#,
+        ),
+    ];
+    let body_frames: Vec<String> = frames
+        .iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect();
+    let model = Backend::chunked(body_frames)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_order_multi");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Inspect the environment twice and look up data.",
+        "stream": true,
+        "parallel_tool_calls": true,
+        "tools": [
+            {"type": "shell", "environment": {"type": "local"}},
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false},
+                "strict": true
+            }
+        ]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "multi-shell parallel order should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+
+    let events: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("each streamed data line is JSON"))
+        .collect();
+
+    let openings: Vec<u64> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_item.added")
+        .map(|e| e["output_index"].as_u64().expect("added events carry an output_index"))
+        .collect();
+    assert_eq!(
+        openings,
+        vec![0, 1, 2],
+        "an earlier shell fill must release the staged function opening before the later \
+         shell opens, keeping openings ascending: {body}"
+    );
+
+    let sequence_numbers: Vec<u64> = events.iter().filter_map(|e| e["sequence_number"].as_u64()).collect();
+    assert!(
+        sequence_numbers.windows(2).all(|pair| pair[0] < pair[1]),
+        "client sequence_numbers must increase monotonically: {sequence_numbers:?}"
+    );
+
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "response.completed")
+        .expect("a response.completed frame");
+    let output_types: Vec<&str> = completed["response"]["output"]
+        .as_array()
+        .expect("terminal output array")
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        output_types,
+        vec!["shell_call", "function_call", "shell_call"],
+        "terminal output keeps its index order: {body}"
+    );
 }
