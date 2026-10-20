@@ -1198,12 +1198,78 @@ fn restore_and_append_chunk(
             }
         },
         Some(dispositions) => {
-            for (event, disposition) in events.into_iter().zip(dispositions) {
-                append_or_stage_event(state, ctx, event, disposition, &mut logical_output)?;
-            }
+            append_lowered_chunk(state, ctx, events, dispositions, &mut logical_output)?;
         },
     }
     Ok(logical_output)
+}
+
+/// Append a lowered-traffic chunk, honoring #1767 output-item staging.
+///
+/// Fails the chunk closed BEFORE rendering any event — and therefore before any event
+/// commits a delivery milestone — if the events it would hold behind a deferred opening
+/// push the retained staged volume past the ceiling. Keeping the only fallible step ahead
+/// of every append preserves the invariant that a rejected chunk leaves no milestone for
+/// bytes the client never received.
+fn append_lowered_chunk(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: Vec<ResponsesEvent>,
+    dispositions: Vec<client_tools::ClientToolDisposition>,
+    output: &mut Vec<u8>,
+) -> Result<(), SseParseError> {
+    let projected = state.client_tool_staged_bytes.saturating_add(projected_staged_bytes(
+        &state.client_tool_pending_opens,
+        &events,
+        &dispositions,
+    ));
+    if projected > state.max_accumulated_bytes {
+        return Err(SseParseError::AccumulationLimitExceeded {
+            dimension: "client_tool_staged_bytes",
+            value: projected,
+            limit: state.max_accumulated_bytes,
+        });
+    }
+    for (event, disposition) in events.into_iter().zip(dispositions) {
+        append_or_stage_event(state, ctx, event, disposition, output);
+    }
+    Ok(())
+}
+
+/// Sum the serialized bytes this chunk would newly stage behind a deferred opening
+/// (#1767), replaying the opening-hole transitions over a scratch copy of the pending
+/// set without rendering. Intentionally does not model intra-chunk releases, so it is a
+/// safe upper bound on the staged volume this chunk can reach — used to admit the chunk
+/// before any event renders.
+fn projected_staged_bytes(
+    pending: &BTreeSet<u64>,
+    events: &[ResponsesEvent],
+    dispositions: &[client_tools::ClientToolDisposition],
+) -> usize {
+    let mut pending = pending.clone();
+    let mut total = 0_usize;
+    for (event, disposition) in events.iter().zip(dispositions) {
+        let event_index = event_output_index(event);
+        if matches!(disposition, client_tools::ClientToolDisposition::Suppress) {
+            if matches!(event, ResponsesEvent::OutputItemAdded(_))
+                && let Some(idx) = event_index
+            {
+                pending.insert(idx);
+            }
+            continue;
+        }
+        if matches!(disposition, client_tools::ClientToolDisposition::EmitTypedAdded { .. })
+            && let Some(idx) = event_index
+        {
+            pending.remove(&idx);
+        }
+        if let Some(min_pending) = pending.iter().next().copied()
+            && event_index.is_some_and(|idx| idx > min_pending)
+        {
+            total = total.saturating_add(event.payload().to_string().len());
+        }
+    }
+    total
 }
 
 /// Apply one committed event's client-tool disposition to the logical stream,
@@ -1224,7 +1290,7 @@ fn append_or_stage_event(
     event: ResponsesEvent,
     disposition: client_tools::ClientToolDisposition,
     output: &mut Vec<u8>,
-) -> Result<(), SseParseError> {
+) {
     let event_index = event_output_index(&event);
     if matches!(disposition, client_tools::ClientToolDisposition::Suppress) {
         if matches!(event, ResponsesEvent::OutputItemAdded(_))
@@ -1232,24 +1298,25 @@ fn append_or_stage_event(
         {
             state.client_tool_pending_opens.insert(idx);
         }
-        return Ok(());
+        return;
     }
     let fills_hole = matches!(disposition, client_tools::ClientToolDisposition::EmitTypedAdded { .. });
     if fills_hole && let Some(idx) = event_index {
         state.client_tool_pending_opens.remove(&idx);
     }
-    // Hold events whose index is behind a still-pending earlier opening.
+    // Hold events whose index is behind a still-pending earlier opening. The staged
+    // volume was already admitted by the pre-loop preflight, so holding never fails here.
     if let Some(min_pending) = state.client_tool_pending_opens.iter().next().copied()
         && event_index.is_some_and(|idx| idx > min_pending)
     {
         // `event_index` is Some by the guard above.
-        return stage_event(state, event_index.unwrap_or_default(), event, disposition);
+        stage_event(state, event_index.unwrap_or_default(), event, disposition);
+        return;
     }
     render_restored_event(state, ctx, event, disposition, output);
     if fills_hole {
         release_unblocked_staged(state, ctx, output);
     }
-    Ok(())
 }
 
 /// The raw (pre-offset) output index an event's payload carries, if any. Lifecycle
@@ -1280,46 +1347,40 @@ fn render_restored_event(
 }
 
 /// Hold one output-item event behind an earlier still-deferred opening (#1767),
-/// charging its serialized size against `max_accumulated_bytes`. Fails closed if the
-/// staged volume would exceed the ceiling, so a deferred opening cannot retain an
-/// unbounded number of later (otherwise un-accumulated) events.
+/// tracking its serialized size in the running staged-byte total. The ceiling is
+/// enforced by the pre-loop preflight in [`restore_and_append_chunk`] before any event
+/// renders, so this records the hold without re-checking (and never fails mid-append).
 fn stage_event(
     state: &mut StreamEventsState,
     output_index: u64,
     event: ResponsesEvent,
     disposition: client_tools::ClientToolDisposition,
-) -> Result<(), SseParseError> {
+) {
     let byte_len = event.payload().to_string().len();
-    let projected = state.client_tool_staged_bytes.saturating_add(byte_len);
-    if projected > state.max_accumulated_bytes {
-        return Err(SseParseError::AccumulationLimitExceeded {
-            dimension: "client_tool_staged_bytes",
-            value: projected,
-            limit: state.max_accumulated_bytes,
-        });
-    }
-    state.client_tool_staged_bytes = projected;
+    state.client_tool_staged_bytes = state.client_tool_staged_bytes.saturating_add(byte_len);
     state.client_tool_staged.push(StagedEvent {
         output_index,
         byte_len,
         event,
         disposition,
     });
-    Ok(())
 }
 
 /// Render every staged event that is no longer behind a pending earlier opening.
 ///
 /// Called after a deferred opening is filled: events whose index is below the new
-/// smallest pending opening (or all staged events when none remain) are rendered in
-/// arrival order — which is already ascending by opening index because the upstream
-/// opens items in order — so opening order and `sequence_number` stay monotonic.
+/// smallest pending opening (or all staged events when none remain) are released in
+/// ascending output-index order (a stable sort keeps each item's own events in arrival
+/// order), so both opening order and `sequence_number` stay monotonic. Arrival order
+/// alone is not enough: a synthesized opening is produced at its `arguments.done`, which
+/// can arrive after a later item's events, so the staged queue is not index-ordered.
 fn release_unblocked_staged(state: &mut StreamEventsState, ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
     if state.client_tool_staged.is_empty() {
         return;
     }
     let barrier = state.client_tool_pending_opens.iter().next().copied();
-    let staged = std::mem::take(&mut state.client_tool_staged);
+    let mut staged = std::mem::take(&mut state.client_tool_staged);
+    staged.sort_by_key(|staged_event| staged_event.output_index);
     let mut retained = Vec::new();
     for staged_event in staged {
         if barrier.is_some_and(|barrier| staged_event.output_index >= barrier) {

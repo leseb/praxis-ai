@@ -1763,6 +1763,52 @@ async fn accumulation_byte_budget_fails_closed_across_chunks() {
     );
 }
 
+#[test]
+fn projected_staged_bytes_sums_only_events_held_behind_a_deferred_opening() {
+    // #1767: the pre-loop preflight sizes exactly the events a deferred shell opening
+    // would hold, so an overflow fails the chunk closed before any event renders (and
+    // commits a delivery milestone).
+    use std::collections::BTreeSet;
+
+    use super::client_tools::ClientToolDisposition;
+    use crate::openai::sse::responses::ResponsesEvent;
+
+    let shell_added = ResponsesEvent::OutputItemAdded(json!({
+        "output_index": 0,
+        "item": {"type": "function_call", "id": "fc_sh", "name": "shell", "arguments": ""}
+    }));
+    let func_added = ResponsesEvent::OutputItemAdded(json!({
+        "output_index": 1,
+        "item": {"type": "function_call", "id": "fc_l", "name": "lookup", "arguments": ""}
+    }));
+    let func_delta = ResponsesEvent::FunctionCallArgumentsDelta(json!({
+        "output_index": 1, "item_id": "fc_l", "delta": "{}"
+    }));
+    let events = vec![shell_added, func_added, func_delta];
+
+    // Shell `added` is suppressed (records the deferred opening at index 0); the two
+    // index-1 events are held behind it, so their serialized sizes are summed.
+    let deferred = vec![
+        ClientToolDisposition::Suppress,
+        ClientToolDisposition::Passthrough,
+        ClientToolDisposition::Passthrough,
+    ];
+    let expected = events[1].payload().to_string().len() + events[2].payload().to_string().len();
+    assert_eq!(
+        super::projected_staged_bytes(&BTreeSet::new(), &events, &deferred),
+        expected,
+        "preflight must size exactly the events held behind the deferred opening"
+    );
+
+    // With no opening deferred, nothing is staged and the preflight projects zero.
+    let none_deferred = vec![ClientToolDisposition::Passthrough; 3];
+    assert_eq!(
+        super::projected_staged_bytes(&BTreeSet::new(), &events, &none_deferred),
+        0,
+        "no deferred opening means no staging and no projected bytes"
+    );
+}
+
 #[tokio::test]
 async fn accumulation_item_count_budget_fails_closed() {
     // The item-count dimension trips independently of the byte ceiling: with a
