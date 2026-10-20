@@ -1332,3 +1332,165 @@ fn streaming_namespace_member_never_leaks_private_name() {
         "the restored namespaced call re-adds its namespace: {body}"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Streaming: a deferred shell opening still precedes a later parallel function
+// -----------------------------------------------------------------------------
+
+/// Build the backend SSE body for a parallel shell + ordinary-function round where
+/// the upstream announces openings in order (`[0, 1]`) but the ordinary function at
+/// index 1 streams and completes its arguments *before* the shell at index 0.
+///
+/// A `shell` call cannot be announced as a schema-valid `shell_call` until its
+/// arguments are final, so Praxis suppresses the raw `output_item.added` at index 0
+/// and synthesizes the typed opening at `arguments.done` (#1159 Task 6). Because the
+/// shell's arguments arrive last, that synthesized opening would otherwise be emitted
+/// after index 1's opening, flipping the client-visible order to `[1, 0]` and
+/// tripping the OpenAI SDK streaming accumulator (#1767). Returned as either one
+/// coalesced chunk or one chunk per event.
+fn shell_opening_order_sse(coalesced: bool) -> Vec<String> {
+    // (event, data) pairs for each upstream SSE frame, in the order the backend emits
+    // them: both items open in index order (0 then 1), the ordinary function at index 1
+    // streams and completes first, then the shell at index 0 completes last. Raw-string
+    // data keeps the embedded JSON quotes unescaped and keeps this fixture off the stack
+    // (clippy::large_stack_frames).
+    let frames: [(&str, &str); 9] = [
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_sh1","call_id":"call_sh1","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_lookup","delta":"{}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_lookup","name":"lookup","arguments":"{}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_sh1","delta":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_sh1","name":"shell","arguments":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_sh1","call_id":"call_sh1","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_order","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_sh1","call_id":"call_sh1","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"},{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"tool_choice":"auto","tools":[]}}"#,
+        ),
+    ];
+    let rendered: Vec<String> = frames
+        .iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect();
+    if coalesced { vec![rendered.concat()] } else { rendered }
+}
+
+/// Drive the parallel shell + function round and assert the client-visible openings
+/// stay contiguous and ascending (`[0, 1]`), with the terminal output ordered
+/// `shell_call` then `function_call` (#1767). Parameterized over chunk framing so
+/// both a coalesced chunk and one-event-per-chunk delivery are covered.
+fn assert_shell_opening_order_preserved(coalesced: bool) {
+    let model = Backend::chunked(shell_opening_order_sse(coalesced))
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_order");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Inspect the environment and look up data.",
+        "stream": true,
+        "parallel_tool_calls": true,
+        "tools": [
+            {"type": "shell", "environment": {"type": "local"}},
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false},
+                "strict": true
+            }
+        ]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streaming parallel shell order should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+
+    let events: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("each streamed data line is JSON"))
+        .collect();
+
+    // Exactly one terminal, no error frame.
+    assert_eq!(
+        events.iter().filter(|e| e["type"] == "response.completed").count(),
+        1,
+        "exactly one response.completed: {body}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["type"] == "response.failed" || e["type"] == "error"),
+        "no failure frame may appear: {body}"
+    );
+
+    // The regression: openings must be announced in ascending, contiguous index
+    // order even though the shell's opening is deferred until its arguments.done.
+    let openings: Vec<u64> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_item.added")
+        .map(|e| e["output_index"].as_u64().expect("added events carry an output_index"))
+        .collect();
+    assert_eq!(
+        openings,
+        vec![0, 1],
+        "the deferred shell opening must still precede the later function (SDK accumulator \
+         requires contiguous ascending openings): {body}"
+    );
+
+    // The terminal output stays ordered: shell_call at index 0, function_call at 1.
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "response.completed")
+        .expect("a response.completed frame");
+    assert_eq!(completed["response"]["output"][0]["type"], "shell_call", "{body}");
+    assert_eq!(completed["response"]["output"][1]["type"], "function_call", "{body}");
+}
+
+/// A deferred shell opening still precedes a later parallel function when each SSE
+/// event arrives in its own chunk (#1767).
+#[test]
+fn streaming_deferred_shell_opening_precedes_later_function_separate_chunks() {
+    assert_shell_opening_order_preserved(false);
+}
+
+/// A deferred shell opening still precedes a later parallel function when the whole
+/// round arrives coalesced into a single chunk (#1767).
+#[test]
+fn streaming_deferred_shell_opening_precedes_later_function_coalesced_chunk() {
+    assert_shell_opening_order_preserved(true);
+}

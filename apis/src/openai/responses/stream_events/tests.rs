@@ -4738,6 +4738,8 @@ fn parse_error_sets_metadata() {
         local_synthesis_reserved: false,
         local_tool_items: std::collections::HashMap::new(),
         client_tool_items: Vec::new(),
+        client_tool_pending_opens: std::collections::BTreeSet::new(),
+        client_tool_staged: Vec::new(),
         stream_failed: false,
         retained_budget_failed: false,
     });
@@ -4793,6 +4795,8 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
             output_index: 0,
             item_id: Some("call_1".to_owned()),
         }],
+        client_tool_pending_opens: std::collections::BTreeSet::new(),
+        client_tool_staged: Vec::new(),
         stream_failed: false,
         retained_budget_failed: false,
     });
