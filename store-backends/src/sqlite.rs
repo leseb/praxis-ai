@@ -15,7 +15,7 @@ use tracing::info;
 
 use super::{
     BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
+    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, SweepStats,
     compression::{StoreCompressionConfig, decode, decode_bounded, decode_budgeted, decode_bytes, run_blocking},
     json_payload_charge, json_values_charge, json_values_fit,
     pool::apply_pool_config,
@@ -519,6 +519,7 @@ async fn check_schema_version(pool: &SqlitePool, tables: &TableNames) -> Result<
 #[async_trait]
 #[expect(
     clippy::too_many_lines,
+    clippy::large_stack_frames,
     reason = "owner-scoped SQL methods keep all bindings explicit"
 )]
 impl ResponseStore for SqliteResponseStore {
@@ -1199,6 +1200,108 @@ impl ResponseStore for SqliteResponseStore {
         } else {
             Ok(EventLogStatus::Incomplete { max_sequence })
         }
+    }
+
+    async fn sweep_expired(&self, cutoff_secs: i64, batch_size: u32) -> Result<SweepStats, StoreError> {
+        let mut stats = SweepStats::default();
+
+        // Sweep responses table
+        let responses_sql = format!(
+            "DELETE FROM {} WHERE rowid IN (SELECT rowid FROM {} WHERE created_at < ? LIMIT ?)",
+            self.tables.responses, self.tables.responses
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let result = sqlx::query(AssertSqlSafe(responses_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(batch_size)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        stats.responses = result.rows_affected();
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Sweep conversations table
+        let conversations_sql = format!(
+            "DELETE FROM {} WHERE rowid IN (SELECT rowid FROM {} WHERE created_at < ? LIMIT ?)",
+            self.tables.conversations, self.tables.conversations
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let result = sqlx::query(AssertSqlSafe(conversations_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(batch_size)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        stats.conversations = result.rows_affected();
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Sweep items table if present
+        if let Some(items_table) = &self.tables.items {
+            let items_sql = format!(
+                "DELETE FROM {items_table} WHERE rowid IN (SELECT rowid FROM {items_table} WHERE created_at < ? LIMIT ?)"
+            );
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            let result = sqlx::query(AssertSqlSafe(items_sql.as_str()))
+                .bind(cutoff_secs)
+                .bind(batch_size)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            stats.items = result.rows_affected();
+            tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+
+        // Sweep pending_approvals table
+        let approvals_table = pending_approvals_table(&self.tables.responses);
+        let approvals_sql = format!(
+            "DELETE FROM {approvals_table} WHERE rowid IN (SELECT rowid FROM {approvals_table} WHERE created_at < ? LIMIT ?)"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let result = sqlx::query(AssertSqlSafe(approvals_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(batch_size)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        stats.pending_approvals = result.rows_affected();
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Sweep events table
+        let events_table_name = events_table(&self.tables.responses);
+        let events_sql = format!(
+            "DELETE FROM {events_table_name} WHERE rowid IN (SELECT rowid FROM {events_table_name} WHERE created_at < ? LIMIT ?)"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let result = sqlx::query(AssertSqlSafe(events_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(batch_size)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        stats.events = result.rows_affected();
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(stats)
     }
 }
 

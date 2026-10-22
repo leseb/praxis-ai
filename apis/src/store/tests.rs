@@ -5480,6 +5480,26 @@ async fn sqlite_backend_satisfies_the_store_contract() {
     praxis_ai_store::contract_tests::run_contract_suite(&store).await;
 }
 
+/// The SQLite backend's sweep_expired satisfies the sweep contract.
+#[tokio::test]
+async fn sqlite_sweep_expired_satisfies_contract() {
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "sweep_responses",
+        "sweep_conversations",
+        Some("sweep_items"),
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed");
+
+    praxis_ai_store::contract_tests::sweep_removes_expired_rows_per_table(&store).await;
+    praxis_ai_store::contract_tests::sweep_respects_batch_bound(&store).await;
+    praxis_ai_store::contract_tests::sweep_is_tenant_isolated(&store).await;
+    praxis_ai_store::contract_tests::sweep_leaves_newer_child_until_its_own_cutoff(&store).await;
+}
+
 /// Opening an existing database never converts cache-only conversation history.
 #[tokio::test]
 async fn sqlite_legacy_history_is_preserved_without_startup_conversion() {

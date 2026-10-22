@@ -123,7 +123,7 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// The default implementation is a no-op that returns zero stats, allowing
     /// unrelated `ResponseStore` implementations (test fakes) to compile without
-    /// overriding this method. Production backends (SQLite, PostgreSQL, in-memory)
+    /// overriding this method. Production backends (SQLite, `PostgreSQL`, in-memory)
     /// override it with real sweep logic.
     ///
     /// # Errors
