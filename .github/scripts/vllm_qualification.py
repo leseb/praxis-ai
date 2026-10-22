@@ -308,7 +308,8 @@ def finish(raw, requested, start_result, suite_result, claude_result, codex_resu
                         "test_execution": suite_result}
     report["suites"]["claude_acceptance"] = acceptance(
         claude_raw, claude_result, run_id, attempt, sha,
-        "native Messages, translated Chat, Anthropic SDK and optional tools")
+        "native Messages, translated Chat, selected-provider OpenAI-chat translation, "
+        "Anthropic SDK and optional tools")
     report["suites"]["codex_acceptance"] = acceptance(
         codex_raw, codex_result, run_id, attempt, sha,
         "native Responses and translated Chat")
@@ -354,6 +355,7 @@ def render(report, detailed=False):
     lines = [START, "### vLLM Responses gateway qualification", ""]
     if status == "unavailable":
         lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable exact-commit GPU qualification report was found.")
+        lines += ["", f"Reason: {report.get('reason', 'GPU evidence unavailable')}."]
     elif status == "not_requested":
         lines.append("vLLM Responses gateway qualification: GPU testing was not requested.")
     else:
@@ -422,9 +424,9 @@ def render(report, detailed=False):
     return "\n".join(lines)
 
 
-def compose_notes(existing, section):
-    if START in existing and END in existing:
-        return existing[:existing.index(START)] + section.rstrip() + existing[existing.index(END) + len(END):]
+def compose_notes(existing, section, start=START, end=END):
+    if start in existing and end in existing:
+        return existing[:existing.index(start)] + section.rstrip() + existing[existing.index(end) + len(end):]
     return existing.rstrip() + "\n\n" + section
 
 

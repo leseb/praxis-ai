@@ -306,6 +306,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.multi_choice_rejected
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-multi-choice-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.service_tier
     scopes:
       - openai_responses_to_chat_completions
@@ -358,6 +367,15 @@ features:
     status: synthetic_only
     scenarios:
       - responses/irr-terminal-streaming
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.agentic.committed_stream_budget_overflow
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/budget-overflow-streaming
     providers:
       synthetic:
         status: synthetic_only

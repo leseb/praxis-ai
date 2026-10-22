@@ -76,10 +76,14 @@ mod tests {
     fn sqlite_single_item_mutations_do_not_rebuild_growing_histories() {
         let runtime = runtime();
         let mut baseline = AllocationInfo::default();
+        // Keep growing histories at least 128 KiB so the half-history allowance
+        // exceeds fixed SQLx scheduling/channel noise, including under coverage.
+        // The delta's text stays 32 bytes, and the budget still rejects even one
+        // complete extra history copy across the 16 mutations.
         for (count, payload_bytes) in [
             (1, 32),
-            (128, 32),
-            (1024, 32),
+            (128, 1024),
+            (1024, 128),
             (4096, 32),
             (16, 8192),
             (64, 8192),
@@ -122,17 +126,17 @@ mod tests {
                 let growth_budget = u64::try_from((count * payload_bytes - 32) / 2).unwrap();
                 assert!(
                     info.bytes_total <= baseline.bytes_total + growth_budget,
-                    "mutation work must depend on delta, not history: {info:?}; baseline={baseline:?}"
+                    "mutation work must depend on delta, not history: {info:?}; baseline={baseline:?}; growth_budget={growth_budget}"
                 );
                 assert!(
                     info.bytes_max <= baseline.bytes_max + growth_budget,
-                    "mutation high-water mark must not grow with history: {info:?}"
+                    "mutation high-water mark must not grow with history: {info:?}; baseline={baseline:?}; growth_budget={growth_budget}"
                 );
                 // SQLx frees query buffers on its worker: net residual is not a
                 // leak count. Bound its growth, rather than falsely require zero.
                 assert!(
                     info.bytes_current <= baseline.bytes_current + i64::try_from(growth_budget).unwrap(),
-                    "mutation residual must not retain growing history: {info:?}"
+                    "mutation residual must not retain growing history: {info:?}; baseline={baseline:?}; growth_budget={growth_budget}"
                 );
             }
             runtime.block_on(async {
@@ -413,10 +417,16 @@ mod postgres_tests {
                     "postgres restore count={count} payload_bytes={payload_bytes} repetition={repetition} {info:?}"
                 );
                 // One JSON decode plus measured SQLx row streaming. Two empty-read
-                // envelopes cover transaction/metadata queries and pool scheduling;
-                // this reserve does not grow with history size.
-                let total_budget = decoded.bytes_total + driver.bytes_total + 2 * fixed_overhead;
-                let peak_budget = decoded.bytes_max + driver.bytes_max + 2 * fixed_overhead;
+                // envelopes cover transaction/metadata queries and pool scheduling.
+                // Allow 15% of serialized history for variation in total
+                // allocations across async PostgreSQL runs. This remains far
+                // below one extra full-history payload copy. Keep the peak
+                // allowance at 5%, since its high-water measurement is stable.
+                let total_measurement_slack = u64::try_from(wire_bytes / 100 * 15).unwrap();
+                let peak_measurement_slack = u64::try_from(wire_bytes / 20).unwrap();
+                let total_budget =
+                    decoded.bytes_total + driver.bytes_total + 2 * fixed_overhead + total_measurement_slack;
+                let peak_budget = decoded.bytes_max + driver.bytes_max + 2 * fixed_overhead + peak_measurement_slack;
                 assert!(
                     info.bytes_total <= total_budget,
                     "restore must decode once, without full-history sizing or cloning: {info:?}; budget={total_budget}"

@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Praxis Contributors
 
 #![allow(unreachable_pub, reason = "migration: visibility will be tightened")]
+// The praxis 0.7.5 subrequest connector type graph is deep enough that
+// auto-trait (`Send`/`Sync`) resolution for subrequest-driven filter futures
+// exceeds the default recursion limit.
+#![recursion_limit = "256"]
 
 //! AI provider API types and persistence for Praxis.
 //!
@@ -18,6 +22,7 @@ mod callout_identity;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
+pub mod credential_source;
 pub mod hash;
 #[cfg(all(test, feature = "openai-responses"))]
 mod history_allocation_tests;
