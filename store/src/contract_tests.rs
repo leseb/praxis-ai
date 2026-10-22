@@ -126,6 +126,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     sweep_respects_batch_bound(backend).await;
     sweep_filters_by_time_across_tenants(backend).await;
     sweep_leaves_newer_child_until_its_own_cutoff(backend).await;
+    sweep_allows_reinsert_of_swept_ids(backend).await;
 }
 
 /// A budgeted response read returns the measured charge and rejects a record
@@ -2239,6 +2240,109 @@ pub async fn sweep_leaves_newer_child_until_its_own_cutoff(backend: &dyn Persist
         .await
         .expect("list events after");
     assert!(events_after.is_empty(), "child event survived second sweep");
+}
+
+/// After sweeping a conversation and an item, a new conversation/item with the
+/// same ID can be created (no spurious "already exists" from stale uniqueness
+/// trackers).
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn sweep_allows_reinsert_of_swept_ids(backend: &dyn PersistedStateBackend) {
+    let o = owner("sweep-reinsert");
+
+    // Create a conversation with created_at=10
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_reinsert".to_owned(),
+            owner: o.clone(),
+            created_at: 10,
+            metadata: serde_json::json!({"original": true}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create original conversation");
+
+    // Create an item in that conversation with created_at=10
+    backend
+        .create_conversation_items(&[ConversationItemRecord {
+            item_id: "item_reinsert".to_owned(),
+            owner: o.clone(),
+            conversation_id: "conv_reinsert".to_owned(),
+            item_data: serde_json::json!({"original": true}),
+            created_at: 10,
+            position: 1,
+        }])
+        .await
+        .expect("create original item");
+
+    // Sweep with cutoff=100 to remove both
+    let stats = backend.sweep_expired(100, 1000).await.expect("sweep");
+    assert!(stats.conversations >= 1, "conversation not swept");
+    assert!(stats.items >= 1, "item not swept");
+
+    // Verify conversation was removed
+    assert!(
+        ConversationItemStore::get_conversation(backend, &o, "conv_reinsert")
+            .await
+            .expect("get conversation after sweep")
+            .is_none(),
+        "conversation survived sweep"
+    );
+
+    // Verify item was removed
+    let items_after_sweep = backend
+        .list_conversation_items(&o, "conv_reinsert", None, 10, true)
+        .await
+        .expect("list items after sweep");
+    assert!(items_after_sweep.is_empty(), "item survived sweep");
+
+    // Now create a NEW conversation with the SAME ID
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_reinsert".to_owned(),
+            owner: o.clone(),
+            created_at: 1000,
+            metadata: serde_json::json!({"reinserted": true}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("reinsert conversation with same ID should succeed");
+
+    // Verify the new conversation was created
+    let reinserted_conv = ConversationItemStore::get_conversation(backend, &o, "conv_reinsert")
+        .await
+        .expect("get reinserted conversation")
+        .expect("reinserted conversation not found");
+    assert_eq!(
+        reinserted_conv.metadata.get("reinserted"),
+        Some(&serde_json::json!(true)),
+        "wrong conversation data after reinsertion"
+    );
+
+    // Now create a NEW item with the SAME ID
+    backend
+        .create_conversation_items(&[ConversationItemRecord {
+            item_id: "item_reinsert".to_owned(),
+            owner: o.clone(),
+            conversation_id: "conv_reinsert".to_owned(),
+            item_data: serde_json::json!({"reinserted": true}),
+            created_at: 1000,
+            position: 2,
+        }])
+        .await
+        .expect("reinsert item with same ID should succeed");
+
+    // Verify the new item was created
+    let reinserted_items = backend
+        .list_conversation_items(&o, "conv_reinsert", None, 10, true)
+        .await
+        .expect("list reinserted items");
+    assert_eq!(reinserted_items.len(), 1, "reinserted item not found");
+    let first_item = reinserted_items.first().expect("reinserted item missing");
+    assert_eq!(
+        first_item.item_data.get("reinserted"),
+        Some(&serde_json::json!(true)),
+        "wrong item data after reinsertion"
+    );
 }
 
 #[cfg(test)]

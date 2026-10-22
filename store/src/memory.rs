@@ -619,22 +619,32 @@ impl ResponseStore for InMemoryStore {
         });
 
         // Sweep conversations (independent, no cascade)
+        // Collect removed conversation_ids to clean uniqueness tracker
+        let mut removed_conversation_ids = Vec::new();
         let mut conversations_removed = 0_u64;
-        inner.conversations.retain(|_, record| {
+        inner.conversations.retain(|(_, conversation_id), record| {
             if conversations_removed < batch as u64 && record.created_at < cutoff_secs {
                 conversations_removed += 1;
+                removed_conversation_ids.push(conversation_id.clone());
                 false
             } else {
                 true
             }
         });
+        // Clean uniqueness tracker to allow reinsertion of swept conversation IDs
+        for conversation_id in removed_conversation_ids {
+            inner.conversation_ids.remove(&conversation_id);
+        }
 
         // Sweep items (drain expired elements from vecs, drop empty vecs)
+        // Collect removed (owner, item_id) pairs to clean uniqueness tracker
+        let mut removed_item_ids = Vec::new();
         let mut items_removed = 0_u64;
         inner.items.retain(|_, items| {
             items.retain(|item| {
                 if items_removed < batch as u64 && item.created_at < cutoff_secs {
                     items_removed += 1;
+                    removed_item_ids.push((item.owner.clone(), item.item_id.clone()));
                     false
                 } else {
                     true
@@ -642,6 +652,10 @@ impl ResponseStore for InMemoryStore {
             });
             !items.is_empty()
         });
+        // Clean uniqueness tracker to allow reinsertion of swept item IDs
+        for (owner, item_id) in removed_item_ids {
+            inner.item_ids.remove(&(owner, item_id));
+        }
 
         // Sweep approvals (independent, no cascade)
         let mut approvals_removed = 0_u64;

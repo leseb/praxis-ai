@@ -1206,8 +1206,9 @@ impl ResponseStore for SqliteResponseStore {
         let mut stats = SweepStats::default();
 
         // Sweep responses table
+        // Use primary key (id) instead of rowid to support WITHOUT ROWID tables
         let responses_sql = format!(
-            "DELETE FROM {} WHERE rowid IN (SELECT rowid FROM {} WHERE created_at < ? LIMIT ?)",
+            "DELETE FROM {} WHERE id IN (SELECT id FROM {} WHERE created_at < ? LIMIT ?)",
             self.tables.responses, self.tables.responses
         );
         let mut tx = self
@@ -1225,8 +1226,9 @@ impl ResponseStore for SqliteResponseStore {
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
 
         // Sweep conversations table
+        // Use primary key (conversation_id) instead of rowid to support WITHOUT ROWID tables
         let conversations_sql = format!(
-            "DELETE FROM {} WHERE rowid IN (SELECT rowid FROM {} WHERE created_at < ? LIMIT ?)",
+            "DELETE FROM {} WHERE conversation_id IN (SELECT conversation_id FROM {} WHERE created_at < ? LIMIT ?)",
             self.tables.conversations, self.tables.conversations
         );
         let mut tx = self
@@ -1244,9 +1246,12 @@ impl ResponseStore for SqliteResponseStore {
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
 
         // Sweep items table if present
+        // Use composite primary key (tenant_id, owner_issuer, owner_subject, item_id)
+        // instead of rowid to support WITHOUT ROWID tables
         if let Some(items_table) = &self.tables.items {
             let items_sql = format!(
-                "DELETE FROM {items_table} WHERE rowid IN (SELECT rowid FROM {items_table} WHERE created_at < ? LIMIT ?)"
+                "DELETE FROM {items_table} WHERE (tenant_id, owner_issuer, owner_subject, item_id) IN \
+                 (SELECT tenant_id, owner_issuer, owner_subject, item_id FROM {items_table} WHERE created_at < ? LIMIT ?)"
             );
             let mut tx = self
                 .pool
@@ -1264,9 +1269,12 @@ impl ResponseStore for SqliteResponseStore {
         }
 
         // Sweep pending_approvals table
+        // Use composite primary key (response_id, approval_id) instead of rowid
+        // to support WITHOUT ROWID tables
         let approvals_table = pending_approvals_table(&self.tables.responses);
         let approvals_sql = format!(
-            "DELETE FROM {approvals_table} WHERE rowid IN (SELECT rowid FROM {approvals_table} WHERE created_at < ? LIMIT ?)"
+            "DELETE FROM {approvals_table} WHERE (response_id, approval_id) IN \
+             (SELECT response_id, approval_id FROM {approvals_table} WHERE created_at < ? LIMIT ?)"
         );
         let mut tx = self
             .pool
@@ -1283,9 +1291,12 @@ impl ResponseStore for SqliteResponseStore {
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
 
         // Sweep events table
+        // Use composite primary key (response_id, sequence_number) instead of rowid
+        // to support WITHOUT ROWID tables
         let events_table_name = events_table(&self.tables.responses);
         let events_sql = format!(
-            "DELETE FROM {events_table_name} WHERE rowid IN (SELECT rowid FROM {events_table_name} WHERE created_at < ? LIMIT ?)"
+            "DELETE FROM {events_table_name} WHERE (response_id, sequence_number) IN \
+             (SELECT response_id, sequence_number FROM {events_table_name} WHERE created_at < ? LIMIT ?)"
         );
         let mut tx = self
             .pool
