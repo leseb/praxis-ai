@@ -477,7 +477,13 @@ impl ResponseStore for InMemoryStore {
             return Ok(false);
         }
         upsert_response_into(&mut inner, record)?;
-        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals, record.created_at);
+        record_approvals_into(
+            &mut inner,
+            &record.owner,
+            &record.id,
+            pending_approvals,
+            record.created_at,
+        );
         Ok(true)
     }
 
