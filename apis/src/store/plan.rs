@@ -99,6 +99,41 @@ fn permissive_conversations_ref(config: &serde_yaml::Value) -> Option<StoreRef> 
     }
 }
 
+/// Discover reaper policy bindings reachable from the selected root chains.
+///
+/// Returns one `(store_name, policy)` for each store filter that declares a
+/// `ttl`, keyed by the registry name the backend is provisioned under
+/// ([`DEFAULT_STORE_NAME`] or [`CONVERSATIONS_STORE_NAME`]). Store filters
+/// without a `ttl` contribute nothing. Mirrors
+/// [`discover_store_refs_permissive`]: a malformed filter config is skipped
+/// rather than rejected, because such a config fails separately at pipeline
+/// construction. The raw filter YAML is parsed here, before the ttl fields are
+/// stripped from the forwarded [`StoreRef`] config.
+#[must_use]
+pub fn discover_reaper_bindings_permissive(
+    roots: &[String],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Vec<(Arc<str>, ReaperPolicy)> {
+    let responses = find_store_configs(roots, chains, RESPONSE_STORE_FILTER_NAME)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|config| reaper_policy_from_response_store(&config).ok().flatten())
+        .map(|policy| (Arc::<str>::from(DEFAULT_STORE_NAME), policy));
+    #[cfg(feature = "openai-conversations")]
+    {
+        let conversations = find_store_configs(roots, chains, CONVERSATIONS_STORE_FILTER_NAME)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter_map(|config| reaper_policy_from_conversations(&config).ok().flatten())
+            .map(|policy| (Arc::<str>::from(CONVERSATIONS_STORE_NAME), policy));
+        responses.chain(conversations).collect()
+    }
+    #[cfg(not(feature = "openai-conversations"))]
+    {
+        responses.collect()
+    }
+}
+
 /// Extract reaper policy from a response-store filter configuration.
 ///
 /// Parses the filter config, extracts the TTL fields, and returns a policy
@@ -107,7 +142,7 @@ fn permissive_conversations_ref(config: &serde_yaml::Value) -> Option<StoreRef> 
 /// # Errors
 ///
 /// Returns [`FilterError`] when the config does not parse as a valid
-/// [`ResponseStoreConfig`].
+/// `ResponseStoreConfig`.
 pub fn reaper_policy_from_response_store(
     filter_config: &serde_yaml::Value,
 ) -> Result<Option<ReaperPolicy>, FilterError> {
@@ -129,7 +164,7 @@ pub fn reaper_policy_from_response_store(
 /// # Errors
 ///
 /// Returns [`FilterError`] when the config does not parse as a valid
-/// [`ConversationsConfig`].
+/// `ConversationsConfig`.
 #[cfg(feature = "openai-conversations")]
 pub fn reaper_policy_from_conversations(
     filter_config: &serde_yaml::Value,
@@ -152,8 +187,25 @@ fn backend_error(name: &str, source: BackendError) -> ProvisionError {
     }
 }
 
+/// Response-filter-only options the backend factory never sees, including the
+/// TTL fields consumed by the reaper. They are stripped before dispatch.
+const RESPONSE_FILTER_ONLY_FIELDS: [&str; 6] = [
+    "backend",
+    "max_event_count",
+    "max_event_bytes",
+    "ttl",
+    "sweep_interval",
+    "sweep_batch_size",
+];
+
 /// Remove response-filter options before passing configuration to a factory.
 fn response_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, ProvisionError> {
+    let mapping_error = || {
+        backend_error(
+            DEFAULT_STORE_NAME,
+            BackendError::Config("response store must be a mapping".to_owned()),
+        )
+    };
     let backend = filter_config
         .get("backend")
         .and_then(serde_yaml::Value::as_str)
@@ -163,26 +215,9 @@ fn response_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, Pro
                 BackendError::Config("response store requires a backend".to_owned()),
             )
         })?;
-    let mut config = serde_json::to_value(filter_config).map_err(|_error| {
-        backend_error(
-            DEFAULT_STORE_NAME,
-            BackendError::Config("response store must be a mapping".to_owned()),
-        )
-    })?;
-    let object = config.as_object_mut().ok_or_else(|| {
-        backend_error(
-            DEFAULT_STORE_NAME,
-            BackendError::Config("response store must be a mapping".to_owned()),
-        )
-    })?;
-    for field in [
-        "backend",
-        "max_event_count",
-        "max_event_bytes",
-        "ttl",
-        "sweep_interval",
-        "sweep_batch_size",
-    ] {
+    let mut config = serde_json::to_value(filter_config).map_err(|_error| mapping_error())?;
+    let object = config.as_object_mut().ok_or_else(mapping_error)?;
+    for field in RESPONSE_FILTER_ONLY_FIELDS {
         object.remove(field);
     }
     normalize_sqlite_factory_config(backend, &mut config);

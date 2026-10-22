@@ -32,14 +32,17 @@ use praxis_ai_apis::store::plan::{StoreRefLocation, coalesce_compatible_filter_r
 #[cfg(feature = "openai-conversations")]
 use praxis_ai_apis::store::{CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME};
 use praxis_ai_apis::store::{ResponseStoreRegistry, plan, store_backend_factories};
-#[cfg(feature = "openai-conversations")]
-use praxis_ai_store::BackendError;
-use praxis_ai_store::{StoreBackendFactory, StoreRegistry};
+use praxis_ai_store::{
+    BackendError, BackendNamespaceKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory, StoreRegistry,
+};
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
 use praxis_core::config::{Config, FilterEntry};
 use praxis_filter::FilterPipeline;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
-use tracing::{error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+
+use crate::reaper::{ReaperHandle, run_reaper};
 
 /// Poll interval while an old pipeline generation drains in-flight requests.
 const PIPELINE_DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -114,6 +117,9 @@ struct ListenerStorePlan {
     registry: StoreRegistry,
     /// Store references to provision (one default store, so at most one).
     refs: Vec<StoreRef>,
+    /// TTL reaper policy per store name, parsed from the filter config before its
+    /// ttl fields are stripped from `refs`. Empty when no store declares a `ttl`.
+    reaper_bindings: Vec<(Arc<str>, ReaperPolicy)>,
 }
 
 impl AsRef<[StoreRef]> for ListenerStorePlan {
@@ -277,10 +283,12 @@ fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
     for listener in &config.listeners {
         let refs = plan::discover_store_refs_permissive(&listener.filter_chains, &chains);
         if !refs.is_empty() {
+            let reaper_bindings = plan::discover_reaper_bindings_permissive(&listener.filter_chains, &chains);
             plans.push(ListenerStorePlan {
                 listener: listener.name.clone(),
                 registry: StoreRegistry::new(),
                 refs,
+                reaper_bindings,
             });
         }
     }
@@ -338,10 +346,72 @@ fn validate_and_deduplicate_refs(
         validate_cross_store_collisions(plans, &factories)?;
     }
 
-    for plan in plans {
+    for plan in plans.iter_mut() {
         plan::deduplicate_refs(&format!("listener '{}'", plan.listener), &mut plan.refs, &factories)?;
     }
+    validate_reaper_policy_conflicts(plans, &factories)?;
     Ok(())
+}
+
+/// Reject a configuration whose store filters give one physical store two
+/// different reaper policies.
+///
+/// Reaper policy is keyed on physical store identity (the connection target and
+/// table set), independent of the pool dedup key, so two filters that resolve to
+/// the same backend must agree on `ttl`/`sweep_interval`/`sweep_batch_size`.
+/// Letting them disagree would race two policies over one physical table set.
+fn validate_reaper_policy_conflicts(
+    plans: &[ListenerStorePlan],
+    factories: &HashMap<&str, &dyn StoreBackendFactory>,
+) -> Result<(), ProvisionError> {
+    let mut seen: HashMap<BackendNamespaceKey, ReaperPolicy> = HashMap::new();
+    for plan in plans {
+        for (store_name, policy) in &plan.reaper_bindings {
+            let Some(key) = binding_namespace_key(plan, store_name, factories)? else {
+                continue;
+            };
+            match seen.get(&key) {
+                Some(existing) if existing != policy => {
+                    return Err(ProvisionError::Backend {
+                        name: Arc::clone(store_name),
+                        source: BackendError::Config(
+                            "conflicting reaper policies target the same physical store; configure one \
+                             ttl/sweep_interval/sweep_batch_size for all filters sharing a database and table set"
+                                .to_owned(),
+                        ),
+                    });
+                },
+                Some(_) => {},
+                None => {
+                    seen.insert(key, *policy);
+                },
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the physical namespace key for one reaper binding.
+///
+/// Returns `None` when the binding has no matching store ref, the backend id has
+/// no injected factory, or the factory reports no namespace (a non-SQL backend).
+fn binding_namespace_key(
+    plan: &ListenerStorePlan,
+    store_name: &Arc<str>,
+    factories: &HashMap<&str, &dyn StoreBackendFactory>,
+) -> Result<Option<BackendNamespaceKey>, ProvisionError> {
+    let Some(store_ref) = plan.refs.iter().find(|store_ref| store_ref.name == *store_name) else {
+        return Ok(None);
+    };
+    let Some(factory) = factories.get(store_ref.backend_id.as_ref()) else {
+        return Ok(None);
+    };
+    factory
+        .namespace_key(&store_ref.config)
+        .map_err(|source| ProvisionError::Backend {
+            name: Arc::clone(&store_ref.name),
+            source,
+        })
 }
 
 /// Map each plan to the [`ResponseStoreRegistry`] installed into its pipeline,
@@ -589,6 +659,88 @@ impl StoreProvisionService {
         Ok(leases)
     }
 
+    /// Build the desired reaper set for a committed generation.
+    ///
+    /// One entry per physical store namespace that declares a `ttl`, carrying the
+    /// committed policy and the backend handle resolved from the generation's
+    /// registry. A store without a namespace key, factory, or registered backend
+    /// is skipped. Conflicting policies on one namespace are rejected earlier by
+    /// [`validate_reaper_policy_conflicts`], so the first binding per key wins.
+    fn desired_reapers(
+        &self,
+        plans: &[ListenerStorePlan],
+    ) -> HashMap<BackendNamespaceKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> {
+        let factories: HashMap<&str, &dyn StoreBackendFactory> = self
+            .factories
+            .iter()
+            .map(|factory| (factory.backend_id(), factory.as_ref()))
+            .collect();
+        let mut desired = HashMap::new();
+        for plan in plans {
+            for (store_name, policy) in &plan.reaper_bindings {
+                let key = match binding_namespace_key(plan, store_name, &factories) {
+                    Ok(Some(key)) => key,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        warn!(%error, listener = %plan.listener, "ttl reaper: cannot compute namespace key; skipping");
+                        continue;
+                    },
+                };
+                let Some(backend) = plan.registry.backend(store_name) else {
+                    continue;
+                };
+                desired.entry(key).or_insert((*policy, backend));
+            }
+        }
+        desired
+    }
+
+    /// Reconcile running TTL reapers to a committed generation's policies.
+    ///
+    /// Stops (cancel + await) any reaper whose namespace left the generation or
+    /// whose policy changed, then spawns a reaper for every desired namespace not
+    /// already running the right policy. Stopping before spawning gives the
+    /// design's handoff: the outgoing reaper finishes its current batch and is
+    /// acknowledged stopped before the replacement sweeps, so two policies never
+    /// share one physical table set.
+    ///
+    /// Called only for an accepted generation (initial provisioning and
+    /// `Commit`), never for a prepared-but-aborted one, so a rejected reload
+    /// activates no policy and deletes nothing.
+    async fn reconcile_reapers(
+        &self,
+        reapers: &mut HashMap<BackendNamespaceKey, ReaperHandle>,
+        plans: &[ListenerStorePlan],
+        shutdown: &ShutdownWatch,
+    ) {
+        let desired = self.desired_reapers(plans);
+
+        // Stop reapers whose namespace left the committed generation or whose
+        // policy changed. A changed policy hands off: the outgoing task is
+        // cancelled and awaited here before its replacement is spawned below.
+        let stale: Vec<BackendNamespaceKey> = reapers
+            .iter()
+            .filter(|&(key, handle)| desired.get(key).map(|(policy, _)| *policy) != Some(handle.policy))
+            .map(|(key, _handle)| key.clone())
+            .collect();
+        for key in stale {
+            if let Some(handle) = reapers.remove(&key) {
+                handle.cancel.cancel();
+                let _joined = handle.join.await;
+            }
+        }
+
+        // Spawn a reaper for every desired namespace not already running.
+        for (key, (policy, backend)) in desired {
+            if reapers.contains_key(&key) {
+                continue;
+            }
+            let cancel = CancellationToken::new();
+            let join = tokio::spawn(run_reaper(backend, policy, cancel.clone(), shutdown.clone()));
+            reapers.insert(key, ReaperHandle { cancel, join, policy });
+        }
+    }
+
     /// Own the initial startup gate and every subsequent reload generation.
     ///
     /// Pingora supplies `ready_notifier` in production. Holding it until all
@@ -599,7 +751,8 @@ impl StoreProvisionService {
     #[expect(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
-        reason = "startup and reload commands share one serving-runtime lease owner"
+        clippy::large_stack_frames,
+        reason = "startup and reload commands share one serving-runtime lease owner; its one cold long-lived task holds the concurrent provisioning futures"
     )]
     async fn run(&self, mut shutdown: ShutdownWatch, ready_notifier: Option<ServiceReadyNotifier>) {
         let Some(mut commands) = self.commands.lock().await.take() else {
@@ -634,6 +787,10 @@ impl StoreProvisionService {
             },
         };
         let mut active_plans = self.plans.clone();
+        let mut reapers: HashMap<BackendNamespaceKey, ReaperHandle> = HashMap::new();
+        // Box the reconcile future so the cold reload path does not inflate this
+        // long-lived task's stack frame.
+        Box::pin(self.reconcile_reapers(&mut reapers, &active_plans, &shutdown)).await;
         let mut pending: HashMap<u64, (Vec<BackendLease>, Vec<ListenerStorePlan>)> = HashMap::new();
         let mut next_generation = 1_u64;
 
@@ -676,6 +833,7 @@ impl StoreProvisionService {
                             let result = if let Some((new_leases, new_plans)) = pending.remove(&generation) {
                                 let old_leases = std::mem::replace(&mut active_leases, new_leases);
                                 active_plans = new_plans;
+                                Box::pin(self.reconcile_reapers(&mut reapers, &active_plans, &shutdown)).await;
                                 tokio::spawn(release_after_drain(old_pipelines, old_leases));
                                 let _sent = self.readiness.send(StoreReadiness::Ready);
                                 Ok(())
@@ -703,6 +861,13 @@ impl StoreProvisionService {
         // Pingora's shutdown drain and disappear with the serving runtime.
         for (_, (leases, _plans)) in pending {
             release_leases(leases).await;
+        }
+        // Reapers subscribe to shutdown directly, but cancel and await them here
+        // too so a stuck sweep cannot outlive the service; each finishes its
+        // current bounded batch before stopping.
+        for (_key, handle) in reapers.drain() {
+            handle.cancel.cancel();
+            let _joined = handle.join.await;
         }
         drop(active_leases);
     }
@@ -740,15 +905,16 @@ async fn release_after_drain(old_pipelines: Vec<Weak<FilterPipeline>>, leases: V
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use praxis_ai_store::{
-        BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory, memory::InMemoryStore,
+        BackendError, ConversationItemRecord, ConversationItemStore, ConversationRecord, EffectiveConfigKey,
+        EventLogStatus, PendingApprovalRecord, ProvisionedBackend, ResponseEventRecord, ResponseRecord, ResponseStore,
+        RetireBackend, StateOwner, StoreBackendFactory, StoreError, SweepStats, memory::InMemoryStore,
     };
-    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
-    use praxis_ai_store::{ConversationRecord, StateOwner};
     use praxis_filter::FilterRegistry;
     use serde_json::json;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -844,7 +1010,7 @@ mod tests {
     }
 
     struct HangingFactory {
-        entered: Arc<tokio::sync::Notify>,
+        entered: Arc<Notify>,
     }
 
     struct ReloadFactory {
@@ -1941,6 +2107,7 @@ filter_chains:
                     backend_id: Arc::from("fake"),
                     config: json!({}),
                 }],
+                reaper_bindings: Vec::new(),
             }],
             readiness,
             commands: AsyncMutex::new(Some(command_rx)),
@@ -1993,6 +2160,7 @@ filter_chains:
                         backend_id: Arc::from("unavailable"),
                         config: json!({}),
                     }],
+                    reaper_bindings: Vec::new(),
                 },
                 ListenerStorePlan {
                     listener: "healthy".to_owned(),
@@ -2002,6 +2170,7 @@ filter_chains:
                         backend_id: Arc::from("fake"),
                         config: json!({}),
                     }],
+                    reaper_bindings: Vec::new(),
                 },
             ],
             readiness,
@@ -2068,6 +2237,7 @@ filter_chains:
                             backend_id: Arc::from("unavailable"),
                             config: json!({}),
                         }],
+                        reaper_bindings: Vec::new(),
                     }],
                     readiness,
                     commands: AsyncMutex::new(Some(command_rx)),
@@ -2125,6 +2295,7 @@ filter_chains:
                     backend_id: Arc::from("recovering"),
                     config: json!({}),
                 }],
+                reaper_bindings: Vec::new(),
             }],
             readiness,
             commands: AsyncMutex::new(Some(command_rx)),
@@ -2151,7 +2322,7 @@ filter_chains:
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_reload_preparation_and_unblocks_watcher() {
-        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(Notify::new());
         let factory: Arc<dyn StoreBackendFactory> = Arc::new(HangingFactory {
             entered: Arc::clone(&entered),
         });
@@ -2387,5 +2558,672 @@ filter_chains:
         .await
         .expect("weak observers must not block one another");
         assert_eq!(retires.load(Ordering::SeqCst), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // TTL reaper coordinator lifecycle
+    // -------------------------------------------------------------------------
+
+    /// Shared record of every committed sweep, inspected by the reaper tests.
+    #[derive(Default)]
+    struct SweepSpy {
+        /// Cutoff second recorded by each `sweep_expired` call that returned Ok.
+        cutoffs: std::sync::Mutex<Vec<i64>>,
+        /// Count of committed `sweep_expired` calls.
+        committed: AtomicUsize,
+    }
+
+    impl SweepSpy {
+        /// Snapshot the recorded cutoffs.
+        fn cutoffs(&self) -> Vec<i64> {
+            match self.cutoffs.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
+
+        /// Number of sweeps that committed.
+        fn committed(&self) -> usize {
+            self.committed.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Lets a test hold one sweep batch open, then release it, to drive the
+    /// shutdown-during-active-batch case.
+    struct SweepGate {
+        /// Fired once the gated batch has entered `sweep_expired`.
+        entered: Notify,
+        /// Awaited inside the gated batch until the test lets it proceed.
+        proceed: Notify,
+        /// Gates only the first batch; later batches run through.
+        armed: AtomicBool,
+    }
+
+    /// A `PersistedStateBackend` that records sweeps and never touches real
+    /// storage. Non-sweep methods are never called by the reaper and return
+    /// benign values.
+    struct SpyBackend {
+        spy: Arc<SweepSpy>,
+        gate: Option<Arc<SweepGate>>,
+    }
+
+    #[async_trait]
+    impl ResponseStore for SpyBackend {
+        async fn sweep_expired(&self, cutoff_secs: i64, _batch_size: u32) -> Result<SweepStats, StoreError> {
+            if let Some(gate) = &self.gate
+                && gate.armed.swap(false, Ordering::SeqCst)
+            {
+                gate.entered.notify_one();
+                gate.proceed.notified().await;
+            }
+            match self.spy.cutoffs.lock() {
+                Ok(mut guard) => guard.push(cutoff_secs),
+                Err(poisoned) => poisoned.into_inner().push(cutoff_secs),
+            }
+            self.spy.committed.fetch_add(1, Ordering::SeqCst);
+            // Zero stats end the per-tick sweep loop after this single batch.
+            Ok(SweepStats::default())
+        }
+
+        async fn upsert_response(&self, _record: &ResponseRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_response(&self, _owner: &StateOwner, _id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_response(&self, _owner: &StateOwner, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn get_conversation(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn record_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _records: &[PendingApprovalRecord],
+            _created_at: i64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+        ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn consume_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+            _consumed_at: i64,
+        ) -> Result<Option<usize>, StoreError> {
+            Ok(None)
+        }
+
+        async fn append_events(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _events: &[ResponseEventRecord],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_events_after(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _after: Option<u64>,
+            _limit: u32,
+        ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn event_log_status(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+        ) -> Result<EventLogStatus, StoreError> {
+            Ok(EventLogStatus::Absent)
+        }
+    }
+
+    #[async_trait]
+    impl ConversationItemStore for SpyBackend {
+        async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn update_conversation_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _messages: &serde_json::Value,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn update_conversation_metadata(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _metadata: &serde_json::Value,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn compare_and_swap_conversation_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _expected_messages: &serde_json::Value,
+            _messages: &serde_json::Value,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn get_conversation(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_conversation(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_conversation_items(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _after_item_id: Option<&str>,
+            _limit: u32,
+            _ascending: bool,
+        ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_existing_conversation_item_ids(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_ids: &[&str],
+        ) -> Result<Vec<String>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_item(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<Option<ConversationItemRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_conversation_item(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn conversation_item_position(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<Option<i64>, StoreError> {
+            Ok(None)
+        }
+
+        async fn max_item_position(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<i64, StoreError> {
+            Ok(0)
+        }
+
+        async fn conversation_history(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+            Ok(None)
+        }
+
+        async fn create_items_and_sync_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _items: &[ConversationItemRecord],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn delete_item_and_sync_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+
+    /// Offline factory that deduplicates pool and namespace by `database_url`,
+    /// counts builds, and provisions a [`SpyBackend`]. Identifies as `sqlite` so
+    /// `backend: sqlite` filter configs route to it.
+    struct ReaperFactory {
+        builds: Arc<AtomicUsize>,
+        spy: Arc<SweepSpy>,
+        gate: Option<Arc<SweepGate>>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for ReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let url = config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BackendError::Config("missing database_url".to_owned()))?;
+            Ok(EffectiveConfigKey::new(url))
+        }
+
+        fn namespace_key(&self, config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            Ok(config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .map(BackendNamespaceKey::new))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(ProvisionedBackend {
+                backend: Arc::new(SpyBackend {
+                    spy: Arc::clone(&self.spy),
+                    gate: self.gate.as_ref().map(Arc::clone),
+                }),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
+    /// A single-listener response-store config that opts into the TTL reaper.
+    fn reaper_store_config(database_url: &str, ttl: &str, sweep_interval: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: {ttl}
+        sweep_interval: {sweep_interval}
+"#
+        ))
+        .expect("reaper store config")
+    }
+
+    /// Current Unix time in whole seconds, for cutoff-window assertions.
+    fn unix_now_secs() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+        )
+        .expect("seconds fit i64")
+    }
+
+    /// Build a manually wired provisioner around the spying reaper factory.
+    fn reaper_service(
+        config: &Config,
+        factory: Arc<dyn StoreBackendFactory>,
+    ) -> (
+        Arc<StoreProvisionService>,
+        StoreReloadHandle,
+        watch::Receiver<StoreReadiness>,
+    ) {
+        let factories = vec![factory];
+        let mut plans = build_listener_store_plans(config);
+        validate_and_deduplicate_refs(&mut plans, &factories, None, None).expect("initial plans");
+        let (readiness, readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let service = Arc::new(StoreProvisionService {
+            cache: Arc::new(BackendCache::new(factories.clone())),
+            factories,
+            plans,
+            readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
+        });
+        (service, StoreReloadHandle { commands }, readiness_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ttl_only_reload_reuses_pool_and_swaps_policy() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: None,
+        });
+        // Long ttl, then a reload that changes only the ttl to a short one.
+        let initial = reaper_store_config("sqlite:///ttl_swap.db", "100000s", "50ms");
+        let (service, handle, mut readiness_rx) = reaper_service(&initial, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+        // The long initial policy must sweep before the reload.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.cutoffs().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the initial policy should sweep");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "initial generation opens one pool");
+
+        let next = reaper_store_config("sqlite:///ttl_swap.db", "10s", "50ms");
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&next)
+        })
+        .await
+        .expect("prepare task")
+        .expect("ttl-only replacement should provision");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "a ttl-only reload must reuse the existing pool, not rebuild it"
+        );
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.commit(prepared, Vec::new())
+        })
+        .await
+        .expect("commit task")
+        .expect("replacement generation should commit");
+
+        // Commit awaits the old reaper's handoff, so every cutoff recorded past
+        // this marker belongs to the new short policy alone.
+        let marker = spy.cutoffs().len();
+
+        // After the handoff only the new short policy may sweep.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.cutoffs().len() <= marker + 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the swapped-in policy should sweep");
+        let now = unix_now_secs();
+        let cutoffs = spy.cutoffs();
+        let (before, after) = cutoffs.split_at(marker);
+        assert!(
+            before.iter().any(|&cutoff| cutoff <= now - 1000),
+            "the long initial policy must have swept with an old cutoff"
+        );
+        assert!(
+            after.iter().all(|&cutoff| cutoff > now - 1000),
+            "only the new short policy sweeps after commit; the old reaper must be gone"
+        );
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_reload_never_applies_candidate_policy() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: None,
+        });
+        // No active TTL, so no reaper runs unless a committed policy activates one.
+        let initial = single_store_config("sqlite", "sqlite:///abort_policy.db");
+        let (service, handle, mut readiness_rx) = reaper_service(&initial, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+
+        // Prepare a short-ttl candidate, then abort it without committing.
+        let candidate = reaper_store_config("sqlite:///abort_policy.db", "10s", "50ms");
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&candidate)
+        })
+        .await
+        .expect("prepare task")
+        .expect("candidate should provision");
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.abort(prepared)
+        })
+        .await
+        .expect("abort task")
+        .expect("candidate generation should abort");
+
+        // Give any erroneously-spawned reaper time to sweep, then prove none did.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = unix_now_secs();
+        assert!(
+            spy.cutoffs().iter().all(|&cutoff| cutoff <= now - 1000),
+            "an aborted reload must never sweep with the candidate's short cutoff"
+        );
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_active_batch_stops_promptly() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let gate = Arc::new(SweepGate {
+            entered: Notify::new(),
+            proceed: Notify::new(),
+            armed: AtomicBool::new(true),
+        });
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: Some(Arc::clone(&gate)),
+        });
+        // One immediate sweep (long interval) that blocks inside the batch.
+        let config = reaper_store_config("sqlite:///shutdown_batch.db", "1d", "1h");
+        let (service, _handle, mut readiness_rx) = reaper_service(&config, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("generation should become ready");
+
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("the reaper should enter its first batch");
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        // Release the in-flight batch so it commits and the reaper can stop.
+        gate.proceed.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("run() must return promptly after the in-flight batch finishes")
+            .expect("provisioner task");
+        assert_eq!(
+            spy.committed(),
+            1,
+            "the batch that was in flight at shutdown must still commit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_policy_reload_does_not_restart_reaper() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: None,
+        });
+        // Long interval, so a running reaper sweeps exactly once (the immediate
+        // first tick). A restart would sweep again immediately.
+        let config = reaper_store_config("sqlite:///unchanged_policy.db", "1d", "1h");
+        let (service, handle, mut readiness_rx) = reaper_service(&config, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("generation should become ready");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.committed() < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reaper should sweep once on startup");
+
+        // Reload an identical config: same namespace, same policy.
+        let unchanged = reaper_store_config("sqlite:///unchanged_policy.db", "1d", "1h");
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&unchanged)
+        })
+        .await
+        .expect("prepare task")
+        .expect("identical reload should provision");
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.commit(prepared, Vec::new())
+        })
+        .await
+        .expect("commit task")
+        .expect("identical reload should commit");
+
+        // A restart would have swept again immediately; an unchanged reaper stays idle.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            spy.committed(),
+            1,
+            "an unchanged-policy reload must not cancel and respawn the reaper"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "an unchanged reload reuses the pool");
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[test]
+    fn conflicting_policies_same_namespace_fail_validation() {
+        #[cfg(feature = "store-sqlite")]
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        #[cfg(feature = "store-sqlite")]
+        let (backend, database_url) = (
+            "sqlite",
+            format!("sqlite://{}?mode=rwc", directory.path().join("conflict.db").display()),
+        );
+        #[cfg(all(not(feature = "store-sqlite"), feature = "store-postgres"))]
+        let (backend, database_url) = ("postgres", "postgresql://user:password@8.8.8.8/store".to_owned());
+
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: {backend}
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: {backend}
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 2h
+"#
+        ))
+        .expect("conflicting ttl config");
+
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("two policies on one physical store must fail startup");
+        assert!(
+            error.to_string().contains("conflicting reaper policies"),
+            "actionable conflict error: {error}"
+        );
     }
 }
