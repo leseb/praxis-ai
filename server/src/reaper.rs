@@ -40,6 +40,13 @@ const DB_WAIT_BOUND: Duration = Duration::from_secs(30);
 /// reaper cooperatively (it finishes its current batch first). [`Self::policy`]
 /// is the committed policy the task is running, so a reload can tell an
 /// unchanged policy (keep the task) from a changed one (hand off).
+///
+/// [`Self::backend`] is the exact backend handle the task sweeps. A reload that
+/// changes only `pool`/`compression` keeps the policy and namespace but rebuilds
+/// the backend pool under a new `effective_key`, retiring (closing) the old one.
+/// Comparing the backend identity lets the coordinator notice that swap and
+/// re-spawn the task on the live backend, instead of silently sweeping a closed
+/// pool forever.
 pub(crate) struct ReaperHandle {
     /// Cooperative stop signal, checked between batches and in the wait loop.
     pub(crate) cancel: CancellationToken,
@@ -47,6 +54,9 @@ pub(crate) struct ReaperHandle {
     pub(crate) join: JoinHandle<()>,
     /// The policy this task is sweeping under.
     pub(crate) policy: ReaperPolicy,
+    /// The backend handle this task sweeps, compared by `Arc` identity so a
+    /// pool/compression-only reload (new backend, same policy) re-spawns the task.
+    pub(crate) backend: Arc<dyn PersistedStateBackend>,
 }
 
 /// Current wall-clock time as whole seconds since the Unix epoch.

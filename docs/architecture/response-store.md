@@ -370,8 +370,9 @@ pass-through traffic is not held.
 
 Store filters accept optional `ttl`, `sweep_interval`, and `sweep_batch_size` configuration
 fields that enable automatic purging of expired records. When `ttl` is set, a background
-reaper coordinator runs one reaper task per physical store (database_url + table namespace),
-sweeping records whose `created_at` is older than `now - ttl` in bounded batches.
+reaper coordinator runs one reaper task per physical database identity (the connection
+target — SQLite path or Postgres host/port/db; table names are NOT part of the namespace
+key), sweeping records whose `created_at` is older than `now - ttl` in bounded batches.
 
 **IMPORTANT:** TTL is measured from record CREATION time, not last-accessed time. Activity
 does NOT extend retention. An actively-used conversation or response older than the configured
@@ -386,14 +387,32 @@ Configuration:
 The reaper coordinator persists its policy (ttl, sweep_interval, sweep_batch_size) on each
 config commit. Policy changes take effect when the pipeline reloads. The reaper stops
 gracefully on shutdown and across config reloads. One coordinator instance manages all
-reapers for a given server process; each physical store gets its own reaper task that
+reapers for a given server process; each physical database gets its own reaper task that
 sweeps all record types (responses, conversations, conversation items, events, approvals)
-from that store's tables.
+from that database's tables.
 
-The reaper queries for expired records in batches, deletes them in a single transaction,
-and repeats until no expired records remain or the batch size is reached. Deleted records
-are removed atomically with their dependent rows (conversation items are purged when their
-parent conversation is purged, response events are purged when the response is purged).
+**The TTL reaper sweeps each table INDEPENDENTLY — it does NOT cascade.** Every table is
+swept by its OWN `created_at`, in its own bounded, per-batch-committed transaction, with no
+foreign-key cascade between tables. The reaper repeats batches per table until that table
+has no rows older than the cutoff or the batch size is reached. Because a child row's
+`created_at` (a conversation item, a response event, a pending approval) is caller-supplied
+and can be well after its parent's, a parent (e.g. a response) can be swept while a child
+that still falls inside the TTL window survives. That child is then orphaned (its
+`response_id`/parent id points at a deleted row) and persists until ITS OWN `created_at`
+passes the cutoff — a gap that can be much longer than one sweep interval. This is accepted
+under creation-time semantics: a dead parent id's orphaned children are inert. Note this is
+unlike the request-path `delete_response` / `delete_conversation` endpoints, which DO cascade
+to their dependent rows in one operation; the age-based TTL reaper deliberately does not.
+
+**Limitation — a second store sharing one physical database may not be swept.** The reaper
+namespace key is the physical database identity only; table names are not part of it. If two
+store filters target the SAME database but with a non-coalescing table set (e.g. a different
+`items_table` or `pool`, so they resolve to distinct backends under one namespace), only the
+first backend's tables are swept — the second store's `ttl` is silently not applied to its
+own tables (the coordinator logs a `warn!` when it drops such a binding). The common case
+where both filters share one coalesced backend (one pool, one table set) is swept correctly.
+To get TTL on both, co-locate the stores in a single coalesced backend or give each its own
+database.
 
 Future quota accounting (#1626) must credit storage released by TTL purges at the same
 atomic commit that removes the rows, ensuring exactly-once accounting even if a purge

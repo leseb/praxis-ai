@@ -54,14 +54,18 @@ impl ReaperConfig {
     ///
     /// Returns a message describing the invalid field.
     pub fn validate(&self) -> Result<(), String> {
+        // The reaper fields are flat, top-level filter keys (`ttl`,
+        // `sweep_interval`, `sweep_batch_size`) with no `reaper.` block, so the
+        // messages name the keys the operator actually wrote; the caller wraps
+        // them with the `{FILTER_NAME}:` prefix.
         if self.ttl == Some(Duration::ZERO) {
-            return Err("reaper.ttl must be greater than zero".into());
+            return Err("ttl must be greater than zero".into());
         }
         if self.ttl.is_none() && self.sweep_interval.is_some() {
-            return Err("reaper.sweep_interval requires reaper.ttl to be set".into());
+            return Err("sweep_interval requires ttl to be set".into());
         }
         if self.sweep_interval == Some(Duration::ZERO) {
-            return Err("reaper.sweep_interval must be greater than zero".into());
+            return Err("sweep_interval must be greater than zero".into());
         }
         Ok(())
     }
@@ -120,23 +124,28 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_ttl_and_sweep_interval_without_ttl_and_zero_batch() {
-        assert!(
-            ReaperConfig {
-                ttl: Some(Duration::ZERO),
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            ReaperConfig {
-                ttl: None,
-                sweep_interval: Some(Duration::from_secs(60)),
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
+        let zero_ttl = ReaperConfig {
+            ttl: Some(Duration::ZERO),
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("zero ttl must be rejected");
+        assert_eq!(zero_ttl, "ttl must be greater than zero");
+
+        let sweep_without_ttl = ReaperConfig {
+            ttl: None,
+            sweep_interval: Some(Duration::from_secs(60)),
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("sweep_interval without ttl must be rejected");
+        assert_eq!(sweep_without_ttl, "sweep_interval requires ttl to be set");
+
+        // Messages name the flat top-level keys operators actually write, not a
+        // nonexistent `reaper.` block.
+        assert!(!zero_ttl.contains("reaper."));
+        assert!(!sweep_without_ttl.contains("reaper."));
+
         // sweep_batch_size: 0 fails at deserialize (NonZeroU32); assert the serde error:
         assert!(serde_yaml::from_str::<ReaperConfig>("ttl: 1d\nsweep_batch_size: 0\n").is_err());
     }

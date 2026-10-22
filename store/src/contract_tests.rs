@@ -124,7 +124,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     event_log_removed_with_response(backend).await;
     sweep_removes_expired_rows_per_table(backend).await;
     sweep_respects_batch_bound(backend).await;
-    sweep_is_tenant_isolated(backend).await;
+    sweep_filters_by_time_across_tenants(backend).await;
     sweep_leaves_newer_child_until_its_own_cutoff(backend).await;
 }
 
@@ -2085,13 +2085,14 @@ pub async fn sweep_respects_batch_bound(backend: &dyn PersistedStateBackend) {
     assert_eq!(total_responses, 5, "looping sweep did not remove all 5 responses");
 }
 
-/// Sweep is tenant-isolated: only removes rows matching the cutoff.
+/// Sweep filters by time across tenants: with two owners' rows present, only the
+/// row older than the cutoff is removed regardless of owner.
 #[expect(
     clippy::too_many_lines,
     clippy::missing_panics_doc,
     reason = "linear contract assertions"
 )]
-pub async fn sweep_is_tenant_isolated(backend: &dyn PersistedStateBackend) {
+pub async fn sweep_filters_by_time_across_tenants(backend: &dyn PersistedStateBackend) {
     let a = owner("tenant-a");
     let b = owner("tenant-b");
 

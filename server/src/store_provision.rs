@@ -40,7 +40,7 @@ use praxis_core::config::{Config, FilterEntry};
 use praxis_filter::FilterPipeline;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::reaper::{ReaperHandle, run_reaper};
 
@@ -353,13 +353,14 @@ fn validate_and_deduplicate_refs(
     Ok(())
 }
 
-/// Reject a configuration whose store filters give one physical store two
+/// Reject a configuration whose store filters give one physical database two
 /// different reaper policies.
 ///
-/// Reaper policy is keyed on physical store identity (the connection target and
-/// table set), independent of the pool dedup key, so two filters that resolve to
-/// the same backend must agree on `ttl`/`sweep_interval`/`sweep_batch_size`.
-/// Letting them disagree would race two policies over one physical table set.
+/// Reaper policy is keyed on physical database identity (the connection target;
+/// table names are NOT part of the namespace key), independent of the pool dedup
+/// key, so two filters that resolve to the same namespace must agree on
+/// `ttl`/`sweep_interval`/`sweep_batch_size`. Letting them disagree would race
+/// two policies over one physical database.
 fn validate_reaper_policy_conflicts(
     plans: &[ListenerStorePlan],
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
@@ -375,8 +376,9 @@ fn validate_reaper_policy_conflicts(
                     return Err(ProvisionError::Backend {
                         name: Arc::clone(store_name),
                         source: BackendError::Config(
-                            "conflicting reaper policies target the same physical store; configure one \
-                             ttl/sweep_interval/sweep_batch_size for all filters sharing a database and table set"
+                            "conflicting reaper policies target the same physical database; configure one \
+                             ttl/sweep_interval/sweep_batch_size for all filters sharing a database (table names \
+                             are not part of the reaper namespace key)"
                                 .to_owned(),
                         ),
                     });
@@ -665,7 +667,14 @@ impl StoreProvisionService {
     /// committed policy and the backend handle resolved from the generation's
     /// registry. A store without a namespace key, factory, or registered backend
     /// is skipped. Conflicting policies on one namespace are rejected earlier by
-    /// [`validate_reaper_policy_conflicts`], so the first binding per key wins.
+    /// [`validate_reaper_policy_conflicts`], so the first binding per key wins; a
+    /// second binding whose backend differs is dropped with a `warn!` (see the
+    /// table-set limitation in `docs/architecture/response-store.md`).
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "building the desired set, resolving each namespace key, and diagnosing dropped or absent bindings are one reconciliation step"
+    )]
     fn desired_reapers(
         &self,
         plans: &[ListenerStorePlan],
@@ -675,7 +684,7 @@ impl StoreProvisionService {
             .iter()
             .map(|factory| (factory.backend_id(), factory.as_ref()))
             .collect();
-        let mut desired = HashMap::new();
+        let mut desired: HashMap<BackendNamespaceKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> = HashMap::new();
         for plan in plans {
             for (store_name, policy) in &plan.reaper_bindings {
                 let key = match binding_namespace_key(plan, store_name, &factories) {
@@ -687,9 +696,35 @@ impl StoreProvisionService {
                     },
                 };
                 let Some(backend) = plan.registry.backend(store_name) else {
+                    debug!(
+                        listener = %plan.listener,
+                        store = %store_name,
+                        "ttl reaper: store declares a ttl but has no registered backend in this generation; skipping"
+                    );
                     continue;
                 };
-                desired.entry(key).or_insert((*policy, backend));
+                // The reaper namespace key is the physical database identity only
+                // (connection target; table names are NOT part of it). Two
+                // non-coalescing stores on one database resolve to one namespace
+                // but distinct backends, so only the first backend's tables get
+                // swept. Surface the dropped binding so the silent gap is visible;
+                // the limitation is documented in docs/architecture/response-store.md.
+                match desired.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert((*policy, backend));
+                    },
+                    std::collections::hash_map::Entry::Occupied(existing) => {
+                        if !Arc::ptr_eq(&existing.get().1, &backend) {
+                            warn!(
+                                listener = %plan.listener,
+                                store = %store_name,
+                                "ttl reaper: a second store shares this physical database with a different \
+                                 (non-coalescing) backend; its tables will NOT be swept — co-locate such stores \
+                                 in one coalesced backend or give them separate databases"
+                            );
+                        }
+                    },
+                }
             }
         }
         desired
@@ -697,16 +732,26 @@ impl StoreProvisionService {
 
     /// Reconcile running TTL reapers to a committed generation's policies.
     ///
-    /// Stops (cancel + await) any reaper whose namespace left the generation or
-    /// whose policy changed, then spawns a reaper for every desired namespace not
-    /// already running the right policy. Stopping before spawning gives the
-    /// design's handoff: the outgoing reaper finishes its current batch and is
-    /// acknowledged stopped before the replacement sweeps, so two policies never
-    /// share one physical table set.
+    /// Stops (cancel + await) any reaper whose namespace left the generation,
+    /// whose policy changed, or whose backend handle was replaced, then spawns a
+    /// reaper for every desired namespace not already running on the live backend.
+    /// Stopping before spawning gives the design's handoff: the outgoing reaper
+    /// finishes its current batch and is acknowledged stopped before the
+    /// replacement sweeps, so two policies never share one physical database.
+    ///
+    /// The backend-identity check matters because a reload that changes only
+    /// `pool`/`compression` keeps the policy and namespace but produces a new
+    /// `effective_key`, so [`BackendCache`] builds a fresh backend `Arc` and
+    /// retires (closes) the old one. Without re-spawning on that swap the reaper
+    /// would keep sweeping the closed pool and error on every tick until restart.
     ///
     /// Called only for an accepted generation (initial provisioning and
     /// `Commit`), never for a prepared-but-aborted one, so a rejected reload
     /// activates no policy and deletes nothing.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "staleness detection (policy or backend swap), handoff await, and respawn are one reconciliation step"
+    )]
     async fn reconcile_reapers(
         &self,
         reapers: &mut HashMap<BackendNamespaceKey, ReaperHandle>,
@@ -715,12 +760,16 @@ impl StoreProvisionService {
     ) {
         let desired = self.desired_reapers(plans);
 
-        // Stop reapers whose namespace left the committed generation or whose
-        // policy changed. A changed policy hands off: the outgoing task is
-        // cancelled and awaited here before its replacement is spawned below.
+        // Stop reapers whose namespace left the committed generation, whose
+        // policy changed, or whose backend was replaced. Any of these hands off:
+        // the outgoing task is cancelled and awaited here before its replacement
+        // is spawned below.
         let stale: Vec<BackendNamespaceKey> = reapers
             .iter()
-            .filter(|&(key, handle)| desired.get(key).map(|(policy, _)| *policy) != Some(handle.policy))
+            .filter(|&(key, handle)| match desired.get(key) {
+                Some((policy, backend)) => *policy != handle.policy || !Arc::ptr_eq(backend, &handle.backend),
+                None => true,
+            })
             .map(|(key, _handle)| key.clone())
             .collect();
         for key in stale {
@@ -736,8 +785,21 @@ impl StoreProvisionService {
                 continue;
             }
             let cancel = CancellationToken::new();
-            let join = tokio::spawn(run_reaper(backend, policy, cancel.clone(), shutdown.clone()));
-            reapers.insert(key, ReaperHandle { cancel, join, policy });
+            let join = tokio::spawn(run_reaper(
+                Arc::clone(&backend),
+                policy,
+                cancel.clone(),
+                shutdown.clone(),
+            ));
+            reapers.insert(
+                key,
+                ReaperHandle {
+                    cancel,
+                    join,
+                    policy,
+                    backend,
+                },
+            );
         }
     }
 
@@ -833,6 +895,10 @@ impl StoreProvisionService {
                             let result = if let Some((new_leases, new_plans)) = pending.remove(&generation) {
                                 let old_leases = std::mem::replace(&mut active_leases, new_leases);
                                 active_plans = new_plans;
+                                // The handoff cancels and awaits each stale reaper inline (finishing
+                                // its current bounded batch), so this commit can block the command
+                                // loop up to DB_WAIT_BOUND (30s) per stale reaper before the swap
+                                // completes. Acceptable: it runs only on a policy/backend change.
                                 Box::pin(self.reconcile_reapers(&mut reapers, &active_plans, &shutdown)).await;
                                 tokio::spawn(release_after_drain(old_pipelines, old_leases));
                                 let _sent = self.readiness.send(StoreReadiness::Ready);
@@ -2872,6 +2938,52 @@ filter_chains:
         }
     }
 
+    /// A reaper factory that mints a FRESH spy-backed store on every build and
+    /// records each spy in order, so a test can tell which backend generation a
+    /// reaper is sweeping. Its `effective_key` folds in `pool` (so a pool-only
+    /// reload rebuilds the backend), while its `namespace_key` keys only on
+    /// `database_url` (so the reaper namespace is unchanged across that reload).
+    struct SwappingReaperFactory {
+        builds: Arc<AtomicUsize>,
+        spies: Arc<std::sync::Mutex<Vec<Arc<SweepSpy>>>>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for SwappingReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let field = |name| config.get(name).map_or_else(String::new, serde_json::Value::to_string);
+            Ok(EffectiveConfigKey::new(format!(
+                "{}|{}",
+                field("database_url"),
+                field("pool")
+            )))
+        }
+
+        fn namespace_key(&self, config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            Ok(config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .map(BackendNamespaceKey::new))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            let spy = Arc::new(SweepSpy::default());
+            match self.spies.lock() {
+                Ok(mut guard) => guard.push(Arc::clone(&spy)),
+                Err(poisoned) => poisoned.into_inner().push(Arc::clone(&spy)),
+            }
+            Ok(ProvisionedBackend {
+                backend: Arc::new(SpyBackend { spy, gate: None }),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
     /// A single-listener response-store config that opts into the TTL reaper.
     fn reaper_store_config(database_url: &str, ttl: &str, sweep_interval: &str) -> Config {
         Config::from_yaml(&format!(
@@ -2893,6 +3005,38 @@ filter_chains:
 "#
         ))
         .expect("reaper store config")
+    }
+
+    /// A single-listener response-store config that opts into the TTL reaper and
+    /// sets an explicit pool size, so a reload can change only the pool to force a
+    /// backend rebuild while keeping the reaper policy and namespace.
+    fn reaper_store_config_with_pool(
+        database_url: &str,
+        ttl: &str,
+        sweep_interval: &str,
+        max_connections: u32,
+    ) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: {ttl}
+        sweep_interval: {sweep_interval}
+        pool:
+          max_connections: {max_connections}
+"#
+        ))
+        .expect("reaper store config with pool")
     }
 
     /// Current Unix time in whole seconds, for cutoff-window assertions.
@@ -3005,6 +3149,98 @@ filter_chains:
             after.iter().all(|&cutoff| cutoff > now - 1000),
             "only the new short policy sweeps after commit; the old reaper must be gone"
         );
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_reload_swaps_reaper_backend() {
+        // A reload that keeps the same ttl but changes only the pool rebuilds the
+        // backend (new effective_key → new Arc, old pool retired/closed) while the
+        // reaper namespace is unchanged. The coordinator must re-spawn the reaper
+        // on the new backend; otherwise it keeps sweeping the closed pool forever.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spies = Arc::new(std::sync::Mutex::new(Vec::<Arc<SweepSpy>>::new()));
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(SwappingReaperFactory {
+            builds: Arc::clone(&builds),
+            spies: Arc::clone(&spies),
+        });
+        let initial = reaper_store_config_with_pool("sqlite:///pool_swap.db", "100000s", "50ms", 4);
+        let (service, handle, mut readiness_rx) = reaper_service(&initial, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "gen A opens one pool");
+
+        // Gen A's backend (the first spy) must sweep before the reload.
+        let gen_a = {
+            let guard = spies.lock().expect("spies");
+            Arc::clone(guard.first().expect("gen A spy recorded"))
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gen_a.committed() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("gen A reaper should sweep");
+
+        // Reload with the SAME ttl but a different pool: the backend is rebuilt.
+        let next = reaper_store_config_with_pool("sqlite:///pool_swap.db", "100000s", "50ms", 8);
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&next)
+        })
+        .await
+        .expect("prepare task")
+        .expect("pool-only reload should provision");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "a pool change must rebuild the backend under a new effective key"
+        );
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.commit(prepared, Vec::new())
+        })
+        .await
+        .expect("commit task")
+        .expect("pool-only reload should commit");
+
+        // Commit awaited the old reaper's handoff, so gen A is already stopped.
+        let frozen_gen_a = gen_a.committed();
+
+        // The reaper must now sweep the freshly built backend (the second spy).
+        let gen_b = {
+            let guard = spies.lock().expect("spies");
+            Arc::clone(guard.get(1).expect("gen B spy recorded"))
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gen_b.committed() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reaper must sweep the new backend after a pool reload");
+
+        // Gen A's (closed) backend must no longer be swept.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            gen_a.committed(),
+            frozen_gen_a,
+            "the reaper must stop sweeping the retired backend after the swap"
+        );
+        assert!(gen_b.committed() > 0, "the reaper must sweep the freshly built backend");
 
         shutdown_tx.send(true).expect("service should receive shutdown");
         tokio::time::timeout(Duration::from_secs(2), running)
