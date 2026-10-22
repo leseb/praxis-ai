@@ -349,6 +349,9 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
         )"
     ));
     stmts.push(format!(
+        "CREATE INDEX IF NOT EXISTS idx_{i}_created_at ON {i}(created_at)"
+    ));
+    stmts.push(format!(
         "CREATE INDEX IF NOT EXISTS idx_{i}_conversation \
          ON {i}(conversation_id, position, item_id)"
     ));
@@ -357,9 +360,6 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
     stmts.push(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
          ON {i}(tenant_id, owner_issuer, owner_subject, conversation_id, position)"
-    ));
-    stmts.push(format!(
-        "CREATE INDEX IF NOT EXISTS idx_{i}_created_at ON {i}(created_at)"
     ));
 }
 
@@ -2044,7 +2044,7 @@ mod tests {
             ddl.len(),
             14,
             "should produce 14 DDL statements (responses, responses created_at index, conversations, \
-             conversations created_at index, tenant_id index, items, items indexes, items created_at index, \
+             conversations created_at index, tenant_id index, items, items created_at index, items indexes, \
              events, events created_at index, pending_approvals, pending_approvals created_at index, version)"
         );
         assert!(
@@ -2053,9 +2053,14 @@ mod tests {
             ddl[5]
         );
         assert!(
-            ddl[6].contains("idx_test_items_conversation"),
-            "seventh statement should create items conversation index: {}",
+            ddl[6].contains("idx_test_items_created_at"),
+            "seventh statement should create items created_at index: {}",
             ddl[6]
+        );
+        assert!(
+            ddl[7].contains("idx_test_items_conversation"),
+            "eighth statement should create items conversation index: {}",
+            ddl[7]
         );
         assert!(
             ddl[5].contains("PRIMARY KEY (tenant_id, owner_issuer, owner_subject, item_id)"),
@@ -2063,13 +2068,8 @@ mod tests {
             ddl[5]
         );
         assert!(
-            ddl[7].contains("(tenant_id, owner_issuer, owner_subject, conversation_id, position)"),
+            ddl[8].contains("(tenant_id, owner_issuer, owner_subject, conversation_id, position)"),
             "item positions must be unique only within an owner's conversation: {}",
-            ddl[7]
-        );
-        assert!(
-            ddl[8].contains("idx_test_items_created_at"),
-            "ninth statement should create items created_at index: {}",
             ddl[8]
         );
     }
