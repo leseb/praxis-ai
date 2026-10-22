@@ -33,7 +33,8 @@ use praxis_ai_apis::store::plan::{StoreRefLocation, coalesce_compatible_filter_r
 use praxis_ai_apis::store::{CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME};
 use praxis_ai_apis::store::{ResponseStoreRegistry, plan, store_backend_factories};
 use praxis_ai_store::{
-    BackendError, BackendNamespaceKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory, StoreRegistry,
+    BackendError, BackendNamespaceKey, EffectiveConfigKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory,
+    StoreRegistry,
 };
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
 use praxis_core::config::{Config, FilterEntry};
@@ -353,6 +354,21 @@ fn validate_and_deduplicate_refs(
     Ok(())
 }
 
+/// Conflict-detection key for reaper policy validation.
+///
+/// Two bindings with different reaper policies targeting the same backend must
+/// fail validation. File-backed SQL stores (`PostgreSQL`, `SQLite` with a path) have
+/// a namespace key that identifies the physical database. Namespace-less stores
+/// (in-memory `SQLite` `sqlite::memory:`) share a backend via the effective config
+/// key, so the conflict key falls back to that when no namespace is available.
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum ReaperConflictKey {
+    /// Physical namespace (database) the backend mutates.
+    Namespace(BackendNamespaceKey),
+    /// Effective backend identity when no namespace is available (in-memory).
+    Effective(Arc<str>, EffectiveConfigKey),
+}
+
 /// Reject a configuration whose store filters give one physical database two
 /// different reaper policies.
 ///
@@ -365,20 +381,18 @@ fn validate_reaper_policy_conflicts(
     plans: &[ListenerStorePlan],
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
 ) -> Result<(), ProvisionError> {
-    let mut seen: HashMap<BackendNamespaceKey, ReaperPolicy> = HashMap::new();
+    let mut seen: HashMap<ReaperConflictKey, ReaperPolicy> = HashMap::new();
     for plan in plans {
         for (store_name, policy) in &plan.reaper_bindings {
-            let Some(key) = binding_namespace_key(plan, store_name, factories)? else {
-                continue;
-            };
+            let key = binding_conflict_key(plan, store_name, factories)?;
             match seen.get(&key) {
                 Some(existing) if existing != policy => {
                     return Err(ProvisionError::Backend {
                         name: Arc::clone(store_name),
                         source: BackendError::Config(
-                            "conflicting reaper policies target the same physical database; configure one \
-                             ttl/sweep_interval/sweep_batch_size for all filters sharing a database (table names \
-                             are not part of the reaper namespace key)"
+                            "conflicting reaper policies target the same store backend; configure one \
+                             ttl/sweep_interval/sweep_batch_size for all filters sharing a backend (table names \
+                             are not part of the reaper conflict key)"
                                 .to_owned(),
                         ),
                     });
@@ -391,6 +405,53 @@ fn validate_reaper_policy_conflicts(
         }
     }
     Ok(())
+}
+
+/// Resolve the reaper conflict key for one binding.
+///
+/// For file-backed SQL stores, uses the physical namespace key. For namespace-less
+/// stores (in-memory SQLite), falls back to the effective backend configuration key
+/// so two bindings that share an in-memory backend but differ in policy are rejected.
+#[expect(clippy::too_many_lines, reason = "error handling for dual-path resolution")]
+fn binding_conflict_key(
+    plan: &ListenerStorePlan,
+    store_name: &Arc<str>,
+    factories: &HashMap<&str, &dyn StoreBackendFactory>,
+) -> Result<ReaperConflictKey, ProvisionError> {
+    let Some(store_ref) = plan.refs.iter().find(|store_ref| store_ref.name == *store_name) else {
+        return Err(ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source: BackendError::Config(format!("store reference {store_name} not found in plan")),
+        });
+    };
+    let Some(factory) = factories.get(store_ref.backend_id.as_ref()) else {
+        return Err(ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source: BackendError::Config(format!("no factory injected for backend_id {}", store_ref.backend_id)),
+        });
+    };
+
+    let namespace = factory
+        .namespace_key(&store_ref.config)
+        .map_err(|source| ProvisionError::Backend {
+            name: Arc::clone(&store_ref.name),
+            source,
+        })?;
+
+    if let Some(ns) = namespace {
+        Ok(ReaperConflictKey::Namespace(ns))
+    } else {
+        let effective = factory
+            .effective_key(&store_ref.config)
+            .map_err(|source| ProvisionError::Backend {
+                name: Arc::clone(&store_ref.name),
+                source,
+            })?;
+        Ok(ReaperConflictKey::Effective(
+            Arc::clone(&store_ref.backend_id),
+            effective,
+        ))
+    }
 }
 
 /// Resolve the physical namespace key for one reaper binding.
@@ -3561,6 +3622,93 @@ filter_chains:
         assert!(
             error.to_string().contains("conflicting reaper policies"),
             "actionable conflict error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn conflicting_policies_shared_memory_backend_fail_validation() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 2h
+"#,
+        )
+        .expect("conflicting ttl in-memory config");
+
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("two policies on one shared in-memory backend must fail startup");
+        assert!(
+            error.to_string().contains("conflicting reaper policies"),
+            "actionable conflict error for in-memory backend: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn matching_policies_shared_memory_backend_succeed() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+        sweep_interval: 5m
+        sweep_batch_size: 100
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+        sweep_interval: 5m
+        sweep_batch_size: 100
+"#,
+        )
+        .expect("matching ttl in-memory config");
+
+        let result = build_store_wiring(&config);
+        assert!(
+            result.is_ok(),
+            "two bindings with the same policy on one shared in-memory backend should succeed: {:?}",
+            result.err()
         );
     }
 }
