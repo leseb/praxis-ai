@@ -33,7 +33,8 @@ use praxis_ai_apis::store::plan::{StoreRefLocation, coalesce_compatible_filter_r
 use praxis_ai_apis::store::{CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME};
 use praxis_ai_apis::store::{ResponseStoreRegistry, plan, store_backend_factories};
 use praxis_ai_store::{
-    BackendError, EffectiveConfigKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory, StoreRegistry,
+    BackendError, BackendNamespaceKey, EffectiveConfigKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory,
+    StoreRegistry,
 };
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
 use praxis_core::config::{Config, FilterEntry};
@@ -353,44 +354,180 @@ fn validate_and_deduplicate_refs(
     Ok(())
 }
 
-/// Reject a configuration whose store filters give one store backend two
-/// different reaper policies.
+/// Suffix the responses schema appends to derive its server-owned
+/// pending-approvals table. Mirrors `schemas::pending_approvals_table` in the
+/// store-backends crate; kept in sync so the reaper-overlap check sweeps the exact
+/// physical table the store creates.
+const PENDING_APPROVALS_SUFFIX: &str = "_pending_approvals";
+
+/// Suffix the responses schema appends to derive its durable SSE event-log table.
+/// Mirrors `schemas::events_table` in the store-backends crate.
+const EVENTS_SUFFIX: &str = "_events";
+
+/// Reject a configuration whose store filters assign two different reaper policies
+/// to the same physical table.
 ///
-/// Reaper policy is keyed on backend identity (the factory's [`EffectiveConfigKey`],
-/// which excludes the stripped `ttl`/`sweep_interval`/`sweep_batch_size` fields),
-/// so two filters that resolve to the same effective key -- the same physical
-/// store, including the same table set and pool -- must agree on their policy;
-/// letting them disagree would race two policies over one backend. Two filters with
-/// different table sets resolve to different effective keys, are independent, and
-/// may set different retention policies.
+/// Reapers are keyed on backend identity (the factory's [`EffectiveConfigKey`]) so
+/// every distinct cached backend is swept exactly once (see
+/// [`binding_effective_key`]). Distinct effective keys do not imply disjoint
+/// tables, though: two stores on one physical database with different
+/// `responses_table` but the same `conversations_table` resolve to different keys
+/// yet both sweep that shared conversations table, so a shorter TTL would delete
+/// rows the longer retention still needs. The real rule is therefore physical:
+/// within one database, no two bindings may give different policies to the same
+/// physical table.
+///
+/// Persistent backends expose a [`BackendNamespaceKey`], so they are checked by
+/// `(database, table)` overlap. In-memory backends report no namespace key and
+/// never share a physical table across distinct backends; they keep the
+/// effective-key check, so identical in-memory config with a different ttl (one
+/// shared backend) is still rejected. Both checks must hold. The same policy on a
+/// shared table is idempotent and allowed.
 fn validate_reaper_policy_conflicts(
     plans: &[ListenerStorePlan],
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
 ) -> Result<(), ProvisionError> {
-    let mut seen: HashMap<EffectiveConfigKey, ReaperPolicy> = HashMap::new();
+    let mut by_table = ReaperTableOwners::new();
+    let mut by_effective_key: HashMap<EffectiveConfigKey, ReaperPolicy> = HashMap::new();
     for plan in plans {
         for (store_name, policy) in &plan.reaper_bindings {
-            let key = binding_effective_key(plan, store_name, factories)?;
-            match seen.get(&key) {
-                Some(existing) if existing != policy => {
-                    return Err(ProvisionError::Backend {
-                        name: Arc::clone(store_name),
-                        source: BackendError::Config(
-                            "conflicting reaper policies target the same store backend; configure one \
-                             ttl/sweep_interval/sweep_batch_size for all filters sharing a backend (filters with \
-                             different table sets resolve to different backends and may set different policies)"
-                                .to_owned(),
-                        ),
-                    });
-                },
-                Some(_) => {},
-                None => {
-                    seen.insert(key, *policy);
-                },
+            let store_ref = binding_store_ref(plan, store_name)?;
+            let factory = binding_factory(store_ref, factories)?;
+            let namespace = factory
+                .namespace_key(&store_ref.config)
+                .map_err(|source| ProvisionError::Backend {
+                    name: Arc::clone(store_name),
+                    source,
+                })?;
+            if let Some(namespace) = namespace {
+                check_shared_table_policies(&mut by_table, &namespace, store_ref, store_name, *policy)?;
+            } else {
+                check_in_memory_backend_policy(&mut by_effective_key, factory, store_ref, store_name, *policy)?;
             }
         }
     }
     Ok(())
+}
+
+/// Maps each `(physical database, folded physical table)` to the reaper policy and
+/// the store that first claimed it, so a later binding assigning a different policy
+/// to a shared table can be rejected by name.
+type ReaperTableOwners = HashMap<(BackendNamespaceKey, String), (ReaperPolicy, Arc<str>)>;
+
+/// Record a persistent binding's swept tables, rejecting a different policy on any
+/// physical table another store in the same database already claimed.
+fn check_shared_table_policies(
+    by_table: &mut ReaperTableOwners,
+    namespace: &BackendNamespaceKey,
+    store_ref: &StoreRef,
+    store_name: &Arc<str>,
+    policy: ReaperPolicy,
+) -> Result<(), ProvisionError> {
+    for table in swept_physical_tables(&store_ref.config) {
+        let key = (namespace.clone(), table.to_ascii_lowercase());
+        match by_table.get(&key) {
+            Some((existing_policy, existing_store)) if *existing_policy != policy => {
+                return Err(ProvisionError::Backend {
+                    name: Arc::clone(store_name),
+                    source: BackendError::Config(format!(
+                        "conflicting reaper policies target the shared physical table '{table}' in one database \
+                         (stores '{existing_store}' and '{store_name}'); configure one \
+                         ttl/sweep_interval/sweep_batch_size for every store that sweeps a shared table"
+                    )),
+                });
+            },
+            Some(_) => {},
+            None => {
+                by_table.insert(key, (policy, Arc::clone(store_name)));
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Record an in-memory binding's backend identity, rejecting a different policy on
+/// the same shared in-memory backend (identical config, different ttl).
+fn check_in_memory_backend_policy(
+    by_effective_key: &mut HashMap<EffectiveConfigKey, ReaperPolicy>,
+    factory: &dyn StoreBackendFactory,
+    store_ref: &StoreRef,
+    store_name: &Arc<str>,
+    policy: ReaperPolicy,
+) -> Result<(), ProvisionError> {
+    let key = factory
+        .effective_key(&store_ref.config)
+        .map_err(|source| ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source,
+        })?;
+    match by_effective_key.get(&key) {
+        Some(existing) if *existing != policy => Err(ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source: BackendError::Config(
+                "conflicting reaper policies target the same in-memory store backend; configure one \
+                 ttl/sweep_interval/sweep_batch_size for all filters sharing an in-memory backend"
+                    .to_owned(),
+            ),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            by_effective_key.insert(key, policy);
+            Ok(())
+        },
+    }
+}
+
+/// Physical tables a reaper for this store sweeps, derived from its config.
+///
+/// Mirrors the store's own schema: the configured `responses_table`,
+/// `conversations_table`, and optional `items_table`, plus the two tables the
+/// responses schema derives from the responses name
+/// (`{responses}_pending_approvals` and `{responses}_events`). Names are returned
+/// as configured; the caller folds case so the overlap check matches both
+/// backends' identifier folding.
+fn swept_physical_tables(config: &serde_json::Value) -> Vec<String> {
+    let field = |name| config.get(name).and_then(serde_json::Value::as_str);
+    let mut tables = Vec::new();
+    if let Some(responses) = field("responses_table") {
+        tables.push(responses.to_owned());
+        tables.push(format!("{responses}{PENDING_APPROVALS_SUFFIX}"));
+        tables.push(format!("{responses}{EVENTS_SUFFIX}"));
+    }
+    if let Some(conversations) = field("conversations_table") {
+        tables.push(conversations.to_owned());
+    }
+    if let Some(items) = field("items_table") {
+        tables.push(items.to_owned());
+    }
+    tables
+}
+
+/// Resolve the store reference backing one reaper binding within its plan.
+fn binding_store_ref<'plan>(
+    plan: &'plan ListenerStorePlan,
+    store_name: &Arc<str>,
+) -> Result<&'plan StoreRef, ProvisionError> {
+    plan.refs
+        .iter()
+        .find(|store_ref| store_ref.name == *store_name)
+        .ok_or_else(|| ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source: BackendError::Config(format!("store reference {store_name} not found in plan")),
+        })
+}
+
+/// Resolve the injected factory for one store reference.
+fn binding_factory<'factory>(
+    store_ref: &StoreRef,
+    factories: &HashMap<&str, &'factory dyn StoreBackendFactory>,
+) -> Result<&'factory dyn StoreBackendFactory, ProvisionError> {
+    factories
+        .get(store_ref.backend_id.as_ref())
+        .copied()
+        .ok_or_else(|| ProvisionError::Backend {
+            name: Arc::clone(&store_ref.name),
+            source: BackendError::Config(format!("no factory injected for backend_id {}", store_ref.backend_id)),
+        })
 }
 
 /// Resolve the backend-identity key for one reaper binding.
@@ -409,18 +546,8 @@ fn binding_effective_key(
     store_name: &Arc<str>,
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
 ) -> Result<EffectiveConfigKey, ProvisionError> {
-    let Some(store_ref) = plan.refs.iter().find(|store_ref| store_ref.name == *store_name) else {
-        return Err(ProvisionError::Backend {
-            name: Arc::clone(store_name),
-            source: BackendError::Config(format!("store reference {store_name} not found in plan")),
-        });
-    };
-    let Some(factory) = factories.get(store_ref.backend_id.as_ref()) else {
-        return Err(ProvisionError::Backend {
-            name: Arc::clone(store_name),
-            source: BackendError::Config(format!("no factory injected for backend_id {}", store_ref.backend_id)),
-        });
-    };
+    let store_ref = binding_store_ref(plan, store_name)?;
+    let factory = binding_factory(store_ref, factories)?;
     factory
         .effective_key(&store_ref.config)
         .map_err(|source| ProvisionError::Backend {
@@ -3769,5 +3896,107 @@ filter_chains:
             "two bindings with the same policy on one shared in-memory backend should succeed: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn conflicting_policies_on_shared_table_across_table_sets_fail_validation() {
+        // Two response stores on the SAME physical database with DIFFERENT
+        // responses_table but the SAME conversations_table, each with a different
+        // ttl. They resolve to DISTINCT effective keys (two reapers, full coverage),
+        // yet both sweep the shared conversations table, so the 1h policy would
+        // delete conversations before the 7d retention expires. The overlap must be
+        // rejected even though the effective keys differ.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations
+        ttl: 7d
+"#
+        ))
+        .expect("two stores sharing one conversations table");
+
+        let mut plans = build_listener_store_plans(&config);
+        let error = validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
+            .expect_err("a shared physical table with conflicting ttls must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("conflicting reaper policies"),
+            "actionable shared-table conflict error: {message}"
+        );
+        assert!(
+            message.contains("conversations"),
+            "the error must name the shared physical table: {message}"
+        );
+    }
+
+    #[test]
+    fn independent_policies_on_disjoint_table_sets_same_db_succeed() {
+        // Two response stores on the SAME physical database with fully DISJOINT
+        // table sets and different ttls. No physical table is shared, so the two
+        // retention policies are independent and must not be rejected.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations_a
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations_b
+        ttl: 7d
+"#
+        ))
+        .expect("two stores with disjoint table sets");
+
+        let mut plans = build_listener_store_plans(&config);
+        validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
+            .expect("disjoint table sets on one database may set independent retention policies");
     }
 }

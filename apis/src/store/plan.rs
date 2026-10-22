@@ -300,6 +300,15 @@ fn connection_key(
 }
 
 /// Inventory table and generated index names for collision checks.
+///
+/// The index names must stay in exact lockstep with the names
+/// `store-backends` `schemas::generate_ddl` emits, including every per-table
+/// `created_at` index, so a configured table that shadows a generated index name
+/// is caught here rather than failing later at `CREATE INDEX`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear inventory: one entry per configured table and every generated table and index name"
+)]
 fn schema_objects(config: &Value) -> Vec<(&'static str, String)> {
     let mut objects = Vec::new();
     for field in ["responses_table", "conversations_table", "items_table"] {
@@ -313,11 +322,24 @@ fn schema_objects(config: &Value) -> Vec<(&'static str, String)> {
                     ),
                     ("responses schema-version table", format!("{table}_schema_version")),
                     ("responses event-log table", format!("{table}_events")),
+                    ("responses created_at index", format!("idx_{table}_created_at")),
+                    (
+                        "responses event-log created_at index",
+                        format!("idx_{table}_events_created_at"),
+                    ),
+                    (
+                        "responses pending-approvals created_at index",
+                        format!("idx_{table}_pending_approvals_created_at"),
+                    ),
                 ]),
-                "conversations_table" => objects.push(("conversations tenant index", format!("idx_{table}_tenant_id"))),
+                "conversations_table" => objects.extend([
+                    ("conversations tenant index", format!("idx_{table}_tenant_id")),
+                    ("conversations created_at index", format!("idx_{table}_created_at")),
+                ]),
                 _ => objects.extend([
                     ("items conversation index", format!("idx_{table}_conversation")),
                     ("items position index", format!("idx_{table}_position")),
+                    ("items created_at index", format!("idx_{table}_created_at")),
                 ]),
             }
         }
@@ -690,6 +712,26 @@ mod tests {
         let plans = vec![vec![response, conversation]];
         validate_cross_store_collisions(&plans, &factories()).expect("incomplete inventory is not newly rejected");
         assert!(validate_sql_namespace_collisions(&plans, &factories()).is_err());
+    }
+
+    #[test]
+    fn cross_store_created_at_index_collides_with_other_store_table() {
+        // Store A's responses_table generates `idx_responses_a_created_at`. Store B,
+        // sharing the same database, configures a table literally named that index.
+        // Cross-store validation must reject this before provisioning fails at the
+        // database with "there is already an index named idx_responses_a_created_at",
+        // even with TTL disabled (the created_at indexes are always generated).
+        let mut first = reference("default", "a");
+        first.config["responses_table"] = json!("responses_a");
+        first.config["conversations_table"] = json!("conversations_a");
+        let mut second = reference("conversations", "a");
+        second.config["responses_table"] = json!("idx_responses_a_created_at");
+        second.config["conversations_table"] = json!("conversations_b");
+        let plans = vec![vec![first, second]];
+        assert!(
+            validate_cross_store_collisions(&plans, &factories()).is_err(),
+            "a table that shadows another store's generated created_at index must be rejected"
+        );
     }
 
     #[test]
