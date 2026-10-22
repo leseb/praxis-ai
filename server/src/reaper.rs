@@ -3,7 +3,9 @@
 
 //! Background TTL reaper tasks for response-store backends.
 //!
-//! One reaper runs per physical store namespace. It wakes on a fixed interval
+//! One reaper runs per distinct backend identity (the factory's effective config
+//! key, which the backend cache also uses to deduplicate cached backends 1:1, so
+//! every backend is swept and none is dropped). It wakes on a fixed interval
 //! and deletes records older than the configured TTL in bounded, per-batch
 //! committed sweeps. The [`StoreProvisionService`] owns the reapers and
 //! reconciles them to the committed generation (see

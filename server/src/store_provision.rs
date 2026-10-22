@@ -33,8 +33,7 @@ use praxis_ai_apis::store::plan::{StoreRefLocation, coalesce_compatible_filter_r
 use praxis_ai_apis::store::{CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME};
 use praxis_ai_apis::store::{ResponseStoreRegistry, plan, store_backend_factories};
 use praxis_ai_store::{
-    BackendError, BackendNamespaceKey, EffectiveConfigKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory,
-    StoreRegistry,
+    BackendError, EffectiveConfigKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory, StoreRegistry,
 };
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
 use praxis_core::config::{Config, FilterEntry};
@@ -354,45 +353,32 @@ fn validate_and_deduplicate_refs(
     Ok(())
 }
 
-/// Conflict-detection key for reaper policy validation.
-///
-/// Two bindings with different reaper policies targeting the same backend must
-/// fail validation. File-backed SQL stores (`PostgreSQL`, `SQLite` with a path) have
-/// a namespace key that identifies the physical database. Namespace-less stores
-/// (in-memory `SQLite` `sqlite::memory:`) share a backend via the effective config
-/// key, so the conflict key falls back to that when no namespace is available.
-#[derive(Clone, Eq, Hash, PartialEq)]
-enum ReaperConflictKey {
-    /// Physical namespace (database) the backend mutates.
-    Namespace(BackendNamespaceKey),
-    /// Effective backend identity when no namespace is available (in-memory).
-    Effective(Arc<str>, EffectiveConfigKey),
-}
-
-/// Reject a configuration whose store filters give one physical database two
+/// Reject a configuration whose store filters give one store backend two
 /// different reaper policies.
 ///
-/// Reaper policy is keyed on physical database identity (the connection target;
-/// table names are NOT part of the namespace key), independent of the pool dedup
-/// key, so two filters that resolve to the same namespace must agree on
-/// `ttl`/`sweep_interval`/`sweep_batch_size`. Letting them disagree would race
-/// two policies over one physical database.
+/// Reaper policy is keyed on backend identity (the factory's [`EffectiveConfigKey`],
+/// which excludes the stripped `ttl`/`sweep_interval`/`sweep_batch_size` fields),
+/// so two filters that resolve to the same effective key -- the same physical
+/// store, including the same table set and pool -- must agree on their policy;
+/// letting them disagree would race two policies over one backend. Two filters with
+/// different table sets resolve to different effective keys, are independent, and
+/// may set different retention policies.
 fn validate_reaper_policy_conflicts(
     plans: &[ListenerStorePlan],
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
 ) -> Result<(), ProvisionError> {
-    let mut seen: HashMap<ReaperConflictKey, ReaperPolicy> = HashMap::new();
+    let mut seen: HashMap<EffectiveConfigKey, ReaperPolicy> = HashMap::new();
     for plan in plans {
         for (store_name, policy) in &plan.reaper_bindings {
-            let key = binding_conflict_key(plan, store_name, factories)?;
+            let key = binding_effective_key(plan, store_name, factories)?;
             match seen.get(&key) {
                 Some(existing) if existing != policy => {
                     return Err(ProvisionError::Backend {
                         name: Arc::clone(store_name),
                         source: BackendError::Config(
                             "conflicting reaper policies target the same store backend; configure one \
-                             ttl/sweep_interval/sweep_batch_size for all filters sharing a backend (table names \
-                             are not part of the reaper conflict key)"
+                             ttl/sweep_interval/sweep_batch_size for all filters sharing a backend (filters with \
+                             different table sets resolve to different backends and may set different policies)"
                                 .to_owned(),
                         ),
                     });
@@ -407,17 +393,22 @@ fn validate_reaper_policy_conflicts(
     Ok(())
 }
 
-/// Resolve the reaper conflict key for one binding.
+/// Resolve the backend-identity key for one reaper binding.
 ///
-/// For file-backed SQL stores, uses the physical namespace key. For namespace-less
-/// stores (in-memory SQLite), falls back to the effective backend configuration key
-/// so two bindings that share an in-memory backend but differ in policy are rejected.
-#[expect(clippy::too_many_lines, reason = "error handling for dual-path resolution")]
-fn binding_conflict_key(
+/// Keys on the factory's [`EffectiveConfigKey`], which [`BackendCache`] also uses
+/// to deduplicate cached backends 1:1. Keying reapers on it therefore yields
+/// exactly one reaper per distinct cached backend -- every backend under the
+/// coordinator is swept with no drops, and two stores on one database with
+/// different table sets (distinct effective keys) each get their own reaper. The
+/// stripped `ttl`/`sweep_interval`/`sweep_batch_size` fields are not part of the
+/// key, so a ttl-only reload keeps the same key (pool reused, policy handed off in
+/// place) while a pool/compression reload changes it (old reaper retired, new one
+/// spawned on the rebuilt backend).
+fn binding_effective_key(
     plan: &ListenerStorePlan,
     store_name: &Arc<str>,
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
-) -> Result<ReaperConflictKey, ProvisionError> {
+) -> Result<EffectiveConfigKey, ProvisionError> {
     let Some(store_ref) = plan.refs.iter().find(|store_ref| store_ref.name == *store_name) else {
         return Err(ProvisionError::Backend {
             name: Arc::clone(store_name),
@@ -430,47 +421,8 @@ fn binding_conflict_key(
             source: BackendError::Config(format!("no factory injected for backend_id {}", store_ref.backend_id)),
         });
     };
-
-    let namespace = factory
-        .namespace_key(&store_ref.config)
-        .map_err(|source| ProvisionError::Backend {
-            name: Arc::clone(&store_ref.name),
-            source,
-        })?;
-
-    if let Some(ns) = namespace {
-        Ok(ReaperConflictKey::Namespace(ns))
-    } else {
-        let effective = factory
-            .effective_key(&store_ref.config)
-            .map_err(|source| ProvisionError::Backend {
-                name: Arc::clone(&store_ref.name),
-                source,
-            })?;
-        Ok(ReaperConflictKey::Effective(
-            Arc::clone(&store_ref.backend_id),
-            effective,
-        ))
-    }
-}
-
-/// Resolve the physical namespace key for one reaper binding.
-///
-/// Returns `None` when the binding has no matching store ref, the backend id has
-/// no injected factory, or the factory reports no namespace (a non-SQL backend).
-fn binding_namespace_key(
-    plan: &ListenerStorePlan,
-    store_name: &Arc<str>,
-    factories: &HashMap<&str, &dyn StoreBackendFactory>,
-) -> Result<Option<BackendNamespaceKey>, ProvisionError> {
-    let Some(store_ref) = plan.refs.iter().find(|store_ref| store_ref.name == *store_name) else {
-        return Ok(None);
-    };
-    let Some(factory) = factories.get(store_ref.backend_id.as_ref()) else {
-        return Ok(None);
-    };
     factory
-        .namespace_key(&store_ref.config)
+        .effective_key(&store_ref.config)
         .map_err(|source| ProvisionError::Backend {
             name: Arc::clone(&store_ref.name),
             source,
@@ -724,31 +676,29 @@ impl StoreProvisionService {
 
     /// Build the desired reaper set for a committed generation.
     ///
-    /// One entry per physical store namespace that declares a `ttl`, carrying the
-    /// committed policy and the backend handle resolved from the generation's
-    /// registry. A store with no registered backend in this generation is
-    /// skipped. A store that HAS a live backend but no physical namespace key
-    /// (e.g. a private in-memory SQLite store at `sqlite::memory:`) is NOT
-    /// skipped: it gets a synthesized per-backend-pointer key so its configured
-    /// `ttl` still runs. Conflicting policies on one namespace are rejected earlier by
-    /// [`validate_reaper_policy_conflicts`], so the first binding per key wins; a
-    /// second binding whose backend differs is dropped with a `warn!` (see the
-    /// table-set limitation in `docs/architecture/response-store.md`).
-    #[expect(
-        clippy::cognitive_complexity,
-        clippy::too_many_lines,
-        reason = "building the desired set, resolving each namespace key, and diagnosing dropped or absent bindings are one reconciliation step"
-    )]
+    /// One entry per distinct backend identity (the factory's
+    /// [`EffectiveConfigKey`]) that declares a `ttl`, carrying the committed policy
+    /// and the backend handle resolved from the generation's registry.
+    /// [`BackendCache`] deduplicates cached backends 1:1 by `effective_key`, so
+    /// keying here on the same value yields exactly one reaper per cached backend:
+    /// every distinct backend is swept, and two stores on one physical database
+    /// with different (non-coalescing) table sets each get their own reaper rather
+    /// than the second being silently dropped.
+    ///
+    /// A store with no registered backend in this generation is skipped.
+    /// Conflicting policies on one `effective_key` are rejected earlier by
+    /// [`validate_reaper_policy_conflicts`], so the first binding per key wins and
+    /// later equal bindings reuse it.
     fn desired_reapers(
         &self,
         plans: &[ListenerStorePlan],
-    ) -> HashMap<BackendNamespaceKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> {
+    ) -> HashMap<EffectiveConfigKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> {
         let factories: HashMap<&str, &dyn StoreBackendFactory> = self
             .factories
             .iter()
             .map(|factory| (factory.backend_id(), factory.as_ref()))
             .collect();
-        let mut desired: HashMap<BackendNamespaceKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> = HashMap::new();
+        let mut desired: HashMap<EffectiveConfigKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> = HashMap::new();
         for plan in plans {
             for (store_name, policy) in &plan.reaper_bindings {
                 let Some(backend) = plan.registry.backend(store_name) else {
@@ -759,47 +709,18 @@ impl StoreProvisionService {
                     );
                     continue;
                 };
-                let key = match binding_namespace_key(plan, store_name, &factories) {
-                    Ok(Some(key)) => key,
-                    // A store with a live backend but no physical namespace key
-                    // (a private in-memory SQLite store at `sqlite::memory:`)
-                    // still has rows to sweep. Synthesize a stable per-backend
-                    // key from the backend allocation address so the coordinator
-                    // runs its reaper instead of silently dropping the ttl. A
-                    // reload that rebuilds the backend mints a new pointer → new
-                    // key → the old reaper goes stale and is cancelled, matching
-                    // the physical-store reload path. Physical-collision
-                    // validation stays on the real namespace key, which an
-                    // in-memory store (with no shared physical identity) does not
-                    // need.
-                    Ok(None) => BackendNamespaceKey::new(format!("backend-ptr\u{1f}{:p}", Arc::as_ptr(&backend))),
+                let key = match binding_effective_key(plan, store_name, &factories) {
+                    Ok(key) => key,
                     Err(error) => {
-                        warn!(%error, listener = %plan.listener, "ttl reaper: cannot compute namespace key; skipping");
+                        warn!(%error, listener = %plan.listener, "ttl reaper: cannot compute effective key; skipping");
                         continue;
                     },
                 };
-                // The reaper namespace key is the physical database identity only
-                // (connection target; table names are NOT part of it). Two
-                // non-coalescing stores on one database resolve to one namespace
-                // but distinct backends, so only the first backend's tables get
-                // swept. Surface the dropped binding so the silent gap is visible;
-                // the limitation is documented in docs/architecture/response-store.md.
-                match desired.entry(key) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert((*policy, backend));
-                    },
-                    std::collections::hash_map::Entry::Occupied(existing) => {
-                        if !Arc::ptr_eq(&existing.get().1, &backend) {
-                            warn!(
-                                listener = %plan.listener,
-                                store = %store_name,
-                                "ttl reaper: a second store shares this physical database with a different \
-                                 (non-coalescing) backend; its tables will NOT be swept — co-locate such stores \
-                                 in one coalesced backend or give them separate databases"
-                            );
-                        }
-                    },
-                }
+                // Accepted narrow edge: two backends that share the same tables but
+                // differ only in pool/compression have distinct effective keys, so
+                // each gets its own reaper sweeping those tables — harmless
+                // (idempotent, bounded) and a bizarre config.
+                desired.entry(key).or_insert((*policy, backend));
             }
         }
         desired
@@ -807,18 +728,21 @@ impl StoreProvisionService {
 
     /// Reconcile running TTL reapers to a committed generation's policies.
     ///
-    /// Stops (cancel + await) any reaper whose namespace left the generation,
-    /// whose policy changed, or whose backend handle was replaced, then spawns a
-    /// reaper for every desired namespace not already running on the live backend.
-    /// Stopping before spawning gives the design's handoff: the outgoing reaper
-    /// finishes its current batch and is acknowledged stopped before the
-    /// replacement sweeps, so two policies never share one physical database.
+    /// Stops (cancel + await) any reaper whose backend identity (`effective_key`)
+    /// left the generation or whose policy changed, then spawns a reaper for every
+    /// desired backend not already running. Stopping before spawning gives the
+    /// design's handoff: the outgoing reaper finishes its current batch and is
+    /// acknowledged stopped before the replacement sweeps, so two policies never
+    /// share one backend.
     ///
-    /// The backend-identity check matters because a reload that changes only
-    /// `pool`/`compression` keeps the policy and namespace but produces a new
-    /// `effective_key`, so [`BackendCache`] builds a fresh backend `Arc` and
-    /// retires (closes) the old one. Without re-spawning on that swap the reaper
-    /// would keep sweeping the closed pool and error on every tick until restart.
+    /// A reload that changes only `pool`/`compression` produces a new
+    /// `effective_key`, so [`BackendCache`] builds a fresh backend `Arc` under a
+    /// new reaper key: the old key is absent from the desired set and its reaper is
+    /// retired, while a new reaper is spawned on the rebuilt backend. A ttl-only
+    /// reload keeps the same `effective_key`, so the same reaper key sees a changed
+    /// policy and hands off in place while the pool is reused. The retained
+    /// `Arc::ptr_eq` backend check stays correct because the same `effective_key`
+    /// resolves to the same cached backend `Arc`.
     ///
     /// Called only for an accepted generation (initial provisioning and
     /// `Commit`), never for a prepared-but-aborted one, so a rejected reload
@@ -829,17 +753,16 @@ impl StoreProvisionService {
     )]
     async fn reconcile_reapers(
         &self,
-        reapers: &mut HashMap<BackendNamespaceKey, ReaperHandle>,
+        reapers: &mut HashMap<EffectiveConfigKey, ReaperHandle>,
         plans: &[ListenerStorePlan],
         shutdown: &ShutdownWatch,
     ) {
         let desired = self.desired_reapers(plans);
 
-        // Stop reapers whose namespace left the committed generation, whose
-        // policy changed, or whose backend was replaced. Any of these hands off:
-        // the outgoing task is cancelled and awaited here before its replacement
-        // is spawned below.
-        let stale: Vec<BackendNamespaceKey> = reapers
+        // Stop reapers whose backend identity left the committed generation or
+        // whose policy changed. Either hands off: the outgoing task is cancelled
+        // and awaited here before its replacement is spawned below.
+        let stale: Vec<EffectiveConfigKey> = reapers
             .iter()
             .filter(|&(key, handle)| match desired.get(key) {
                 Some((policy, backend)) => *policy != handle.policy || !Arc::ptr_eq(backend, &handle.backend),
@@ -854,7 +777,7 @@ impl StoreProvisionService {
             }
         }
 
-        // Spawn a reaper for every desired namespace not already running.
+        // Spawn a reaper for every desired backend not already running.
         for (key, (policy, backend)) in desired {
             if reapers.contains_key(&key) {
                 continue;
@@ -924,7 +847,7 @@ impl StoreProvisionService {
             },
         };
         let mut active_plans = self.plans.clone();
-        let mut reapers: HashMap<BackendNamespaceKey, ReaperHandle> = HashMap::new();
+        let mut reapers: HashMap<EffectiveConfigKey, ReaperHandle> = HashMap::new();
         // Box the reconcile future so the cold reload path does not inflate this
         // long-lived task's stack frame.
         Box::pin(self.reconcile_reapers(&mut reapers, &active_plans, &shutdown)).await;
@@ -1049,9 +972,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use praxis_ai_store::{
-        BackendError, ConversationItemRecord, ConversationItemStore, ConversationRecord, EffectiveConfigKey,
-        EventLogStatus, PendingApprovalRecord, ProvisionedBackend, ResponseEventRecord, ResponseRecord, ResponseStore,
-        RetireBackend, StateOwner, StoreBackendFactory, StoreError, SweepStats, memory::InMemoryStore,
+        BackendError, BackendNamespaceKey, ConversationItemRecord, ConversationItemStore, ConversationRecord,
+        EffectiveConfigKey, EventLogStatus, PendingApprovalRecord, ProvisionedBackend, ResponseEventRecord,
+        ResponseRecord, ResponseStore, RetireBackend, StateOwner, StoreBackendFactory, StoreError, SweepStats,
+        memory::InMemoryStore,
     };
     use praxis_filter::FilterRegistry;
     use serde_json::json;
@@ -3099,6 +3023,47 @@ filter_chains:
         }
     }
 
+    /// A reaper factory whose `effective_key` folds in the table set (so distinct
+    /// table sets are distinct backends) while its `namespace_key` keys only on the
+    /// database path (so distinct table sets share one physical namespace). This is
+    /// the DEFECT 1 shape: keying reapers on the namespace dropped the second
+    /// backend's tables; keying on the effective key covers every backend.
+    struct TableAwareReaperFactory {
+        builds: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for TableAwareReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let field = |name| config.get(name).map_or_else(String::new, serde_json::Value::to_string);
+            Ok(EffectiveConfigKey::new(format!(
+                "{}|{}|{}",
+                field("database_url"),
+                field("responses_table"),
+                field("conversations_table"),
+            )))
+        }
+
+        fn namespace_key(&self, config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            Ok(config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .map(BackendNamespaceKey::new))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(ProvisionedBackend {
+                backend: Arc::new(InMemoryStore::new()),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
     /// A single-listener response-store config that opts into the TTL reaper.
     fn reaper_store_config(database_url: &str, ttl: &str, sweep_interval: &str) -> Config {
         Config::from_yaml(&format!(
@@ -3409,6 +3374,100 @@ filter_chains:
             .await
             .expect("provisioner should stop promptly")
             .expect("provisioner task");
+    }
+
+    #[tokio::test]
+    async fn independent_table_sets_same_db_each_get_a_reaper() {
+        // Two store filters target the SAME file-backed SQLite database with
+        // DIFFERENT, non-coalescing table sets, both with a ttl. They share one
+        // physical namespace — the DEFECT 1 shape that dropped the second backend
+        // when reapers keyed on the namespace — but resolve to DISTINCT effective
+        // keys. Keying reapers on backend identity must yield TWO reapers, one per
+        // cached backend, so neither store's tables are dropped from the sweep.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::clone(&builds),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations_a
+        ttl: 2s
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations_b
+        ttl: 2s
+"#
+        ))
+        .expect("two stores sharing one database with distinct table sets");
+
+        let factories = vec![Arc::clone(&factory)];
+        let mut plans = build_listener_store_plans(&config);
+        // Different table sets → different effective keys → not a policy conflict.
+        validate_and_deduplicate_refs(&mut plans, &factories, None, None)
+            .expect("distinct table sets are independent and must not conflict");
+        assert_eq!(
+            plans.iter().map(|plan| plan.reaper_bindings.len()).sum::<usize>(),
+            2,
+            "both stores declare a ttl, so both contribute a reaper binding"
+        );
+
+        let cache = Arc::new(BackendCache::new(factories.clone()));
+        let mut leases = Vec::new();
+        for plan in &plans {
+            leases.push(
+                cache
+                    .provision_into(&plan.refs, &plan.registry)
+                    .await
+                    .expect("each distinct table set provisions its own backend"),
+            );
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "distinct table sets open two backends"
+        );
+
+        let (readiness, _readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (_commands, command_rx) = mpsc::unbounded_channel();
+        let service = StoreProvisionService {
+            cache,
+            factories,
+            plans: plans.clone(),
+            readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
+        };
+
+        let desired = service.desired_reapers(&plans);
+        assert_eq!(
+            desired.len(),
+            2,
+            "every distinct backend under the coordinator must get its own reaper; \
+             neither store's tables may be dropped from the sweep"
+        );
+
+        for lease in leases {
+            lease.release().await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
