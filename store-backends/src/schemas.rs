@@ -129,6 +129,17 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
     let (r, c) = validate_table_names(tables)?;
     let bytes_type = dialect.bytes_type();
 
+    // Validate the optional items table and derive the internal table names once,
+    // so the generated-index-name collision check sees the complete table set.
+    let items = tables
+        .items
+        .as_deref()
+        .map(|items| validate_items_table(items, r, c))
+        .transpose()?;
+    let e = events_table(r);
+    let a = pending_approvals_table(r);
+    let v = schema_version_table(r);
+
     let mut stmts = vec![
         responses_ddl(r, bytes_type),
         // created_at indexes are additive and idempotent (IF NOT EXISTS), so they apply
@@ -140,22 +151,20 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
         format!("CREATE INDEX IF NOT EXISTS idx_{c}_tenant_id ON {c}(tenant_id)"),
     ];
 
-    if let Some(items) = &tables.items {
-        let i = validate_items_table(items, r, c)?;
+    if let Some(i) = items {
         append_items_ddl(&mut stmts, i);
     }
 
     // The durable SSE event log table is created before the pending-approvals
     // table so the version table stays last and pending-approvals stays
     // second-to-last (both asserted by tests and relied on by callers).
-    let e = events_table(r);
     if e.eq_ignore_ascii_case(c) {
         return Err(StoreError::Database(format!(
             "derived events table name collides with conversation table: {e}"
         )));
     }
-    if let Some(items) = &tables.items
-        && e.eq_ignore_ascii_case(items)
+    if let Some(i) = items
+        && e.eq_ignore_ascii_case(i)
     {
         return Err(StoreError::Database(format!(
             "derived events table name collides with items table: {e}"
@@ -166,14 +175,13 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
         "CREATE INDEX IF NOT EXISTS idx_{e}_created_at ON {e}(created_at)"
     ));
 
-    let a = pending_approvals_table(r);
     if a.eq_ignore_ascii_case(c) {
         return Err(StoreError::Database(format!(
             "derived pending-approvals table name collides with conversation table: {a}"
         )));
     }
-    if let Some(items) = &tables.items
-        && a.eq_ignore_ascii_case(items)
+    if let Some(i) = items
+        && a.eq_ignore_ascii_case(i)
     {
         return Err(StoreError::Database(format!(
             "derived pending-approvals table name collides with items table: {a}"
@@ -184,14 +192,13 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
         "CREATE INDEX IF NOT EXISTS idx_{a}_created_at ON {a}(created_at)"
     ));
 
-    let v = schema_version_table(r);
     if v.eq_ignore_ascii_case(c) {
         return Err(StoreError::Database(format!(
             "derived schema version table name collides with conversation table: {v}"
         )));
     }
-    if let Some(items) = &tables.items
-        && v.eq_ignore_ascii_case(items)
+    if let Some(i) = items
+        && v.eq_ignore_ascii_case(i)
     {
         return Err(StoreError::Database(format!(
             "derived schema version table name collides with items table: {v}"
@@ -201,7 +208,93 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
         "CREATE TABLE IF NOT EXISTS {v} (version BIGINT NOT NULL PRIMARY KEY)"
     ));
 
+    // Table-vs-table collisions are reported above with their own messages; this
+    // runs last so it only catches what those miss: a configured table named
+    // exactly like a generated index name. Without it the table-name checks pass
+    // and `CREATE INDEX` later fails at startup with "there is already an index
+    // named ...". Fail fast with the exact collision instead.
+    validate_index_name_collisions(r, c, items)?;
+
     Ok(stmts)
+}
+
+/// Reject a configured or derived table name that collides with any index name
+/// [`generate_ddl`] emits.
+///
+/// Indexes are created with fixed, table-derived names (e.g.
+/// `idx_<responses>_created_at`). If an operator names a table exactly like one of
+/// those index names, the later `CREATE INDEX` fails at startup with a cryptic
+/// "there is already an index named ..." error -- even with TTL disabled, since
+/// the indexes are always generated. Catching it here lets config validation
+/// report the exact collision. Comparison is case-insensitive to match the
+/// table-name checks and both backends' identifier folding.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] naming the generated index and the table it
+/// collides with, or two generated index names that collide with each other.
+#[expect(
+    clippy::too_many_lines,
+    reason = "enumerating every generated index and table name and cross-checking them is one collision pass"
+)]
+fn validate_index_name_collisions(r: &str, c: &str, items: Option<&str>) -> Result<(), StoreError> {
+    // Derived table names are pure functions of the responses table name.
+    let events = events_table(r);
+    let pending_approvals = pending_approvals_table(r);
+    let schema_version = schema_version_table(r);
+
+    // (generated index name, human description of its origin)
+    let mut indexes = vec![
+        (format!("idx_{r}_created_at"), "responses created_at index"),
+        (format!("idx_{c}_created_at"), "conversations created_at index"),
+        (format!("idx_{c}_tenant_id"), "conversations tenant_id index"),
+        (format!("idx_{events}_created_at"), "events created_at index"),
+        (
+            format!("idx_{pending_approvals}_created_at"),
+            "pending-approvals created_at index",
+        ),
+    ];
+    if let Some(i) = items {
+        indexes.push((format!("idx_{i}_created_at"), "items created_at index"));
+        indexes.push((format!("idx_{i}_conversation"), "items conversation index"));
+        indexes.push((format!("idx_{i}_position"), "items position index"));
+    }
+
+    // (configured or derived table name, human description)
+    let mut tables = vec![
+        (r, "responses table"),
+        (c, "conversations table"),
+        (events.as_str(), "events table"),
+        (pending_approvals.as_str(), "pending-approvals table"),
+        (schema_version.as_str(), "schema version table"),
+    ];
+    if let Some(i) = items {
+        tables.push((i, "items table"));
+    }
+
+    for (index_name, index_desc) in &indexes {
+        for &(table_name, table_desc) in &tables {
+            if index_name.eq_ignore_ascii_case(table_name) {
+                return Err(StoreError::Database(format!(
+                    "generated {index_desc} name '{index_name}' collides with the {table_desc} '{table_name}'; \
+                     rename the offending table"
+                )));
+            }
+        }
+    }
+
+    for (outer, (name, desc)) in indexes.iter().enumerate() {
+        for (other_name, other_desc) in indexes.iter().skip(outer + 1) {
+            if name.eq_ignore_ascii_case(other_name) {
+                return Err(StoreError::Database(format!(
+                    "generated {desc} name '{name}' collides with the generated {other_desc} name '{other_name}'; \
+                     rename the offending table"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Add a repair pointer when legacy duplicate positions prevent index creation.
@@ -2072,6 +2165,40 @@ mod tests {
             "item positions must be unique only within an owner's conversation: {}",
             ddl[8]
         );
+    }
+
+    #[test]
+    fn generate_ddl_rejects_items_colliding_with_generated_index_name() {
+        // The items table is named exactly like the conversations created_at index
+        // (`idx_<conversations>_created_at`). Table-vs-table checks pass, but
+        // `CREATE INDEX` would fail at startup, so validation must reject it here.
+        let tables = TableNames {
+            responses: "responses".to_owned(),
+            conversations: "conversations".to_owned(),
+            items: Some("idx_conversations_created_at".to_owned()),
+        };
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("idx_conversations_created_at"),
+            "error should name the colliding index/table: {message}"
+        );
+        assert!(
+            message.contains("collides with") && message.contains("items table"),
+            "error should describe the collision and name the offending table: {message}"
+        );
+    }
+
+    #[test]
+    fn generate_ddl_accepts_table_set_that_avoids_generated_index_names() {
+        // A normal table set whose names do not shadow any generated index name
+        // must still produce valid DDL.
+        let tables = TableNames {
+            responses: "responses".to_owned(),
+            conversations: "conversations".to_owned(),
+            items: Some("items".to_owned()),
+        };
+        generate_ddl(&tables, SqlDialect::Sqlite).expect("a normal table set must still generate valid DDL");
     }
 
     #[test]
