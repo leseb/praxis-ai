@@ -22,6 +22,7 @@ compression = ["dep:zstd", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
+humantime-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
