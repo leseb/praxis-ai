@@ -75,7 +75,9 @@ filter_chains:
         #   does NOT cascade. A child row (conversation item, event, approval)
         #   created later than its parent can outlive a swept parent and persists
         #   until its own created_at passes the cutoff — possibly much longer than
-        #   one sweep interval. (The delete endpoints DO cascade; the reaper does not.)
+        #   one sweep interval. (DELETE /v1/responses/{id} cascades to its approval
+        #   and event rows; DELETE /v1/conversations/{id} does NOT cascade — item
+        #   rows are preserved by design. The reaper is independent of both.)
         #
         #   ttl: 7d                      # retention period (humantime: 7d, 24h, 30m, etc.)
         #                                # omit or comment out to disable TTL purging

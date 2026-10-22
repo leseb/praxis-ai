@@ -1421,9 +1421,20 @@ impl ResponseStore for PostgresResponseStore {
     async fn sweep_expired(&self, cutoff_secs: i64, batch_size: u32) -> Result<super::SweepStats, StoreError> {
         let mut stats = super::SweepStats::default();
 
+        // Each sweep keys the batch on `(tableoid, ctid)`, not `ctid` alone.
+        // `ctid` is unique only WITHIN a single physical table, so on a
+        // partitioned table a `ctid` chosen from one partition can match an
+        // unexpired row in another partition and delete it. `tableoid`
+        // identifies the owning partition, making the pair globally unique
+        // across partitions; on a plain (non-partitioned) table every row
+        // shares one `tableoid`, so the pair reduces to `ctid` and stays
+        // correct. Schema validation accepts operator-created partitioned
+        // tables (it checks columns and unique indexes only), so this must be
+        // safe regardless of partitioning.
+
         // Sweep responses table
         let responses_sql = format!(
-            "DELETE FROM {} WHERE ctid IN (SELECT ctid FROM {} WHERE created_at < $1 LIMIT $2)",
+            "DELETE FROM {} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {} WHERE created_at < $1 LIMIT $2)",
             self.tables.responses, self.tables.responses
         );
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
@@ -1442,7 +1453,7 @@ impl ResponseStore for PostgresResponseStore {
 
         // Sweep conversations table
         let conversations_sql = format!(
-            "DELETE FROM {} WHERE ctid IN (SELECT ctid FROM {} WHERE created_at < $1 LIMIT $2)",
+            "DELETE FROM {} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {} WHERE created_at < $1 LIMIT $2)",
             self.tables.conversations, self.tables.conversations
         );
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
@@ -1462,7 +1473,7 @@ impl ResponseStore for PostgresResponseStore {
         // Sweep items table if present
         if let Some(items_table) = &self.tables.items {
             let items_sql = format!(
-                "DELETE FROM {items_table} WHERE ctid IN (SELECT ctid FROM {items_table} WHERE created_at < $1 LIMIT $2)"
+                "DELETE FROM {items_table} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {items_table} WHERE created_at < $1 LIMIT $2)"
             );
             let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
             sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
@@ -1482,7 +1493,7 @@ impl ResponseStore for PostgresResponseStore {
         // Sweep pending_approvals table
         let approvals_table = pending_approvals_table(&self.tables.responses);
         let approvals_sql = format!(
-            "DELETE FROM {approvals_table} WHERE ctid IN (SELECT ctid FROM {approvals_table} WHERE created_at < $1 LIMIT $2)"
+            "DELETE FROM {approvals_table} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {approvals_table} WHERE created_at < $1 LIMIT $2)"
         );
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
         sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
@@ -1501,7 +1512,7 @@ impl ResponseStore for PostgresResponseStore {
         // Sweep events table
         let events_table_name = events_table(&self.tables.responses);
         let events_sql = format!(
-            "DELETE FROM {events_table_name} WHERE ctid IN (SELECT ctid FROM {events_table_name} WHERE created_at < $1 LIMIT $2)"
+            "DELETE FROM {events_table_name} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {events_table_name} WHERE created_at < $1 LIMIT $2)"
         );
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
         sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))

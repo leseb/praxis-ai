@@ -665,8 +665,11 @@ impl StoreProvisionService {
     ///
     /// One entry per physical store namespace that declares a `ttl`, carrying the
     /// committed policy and the backend handle resolved from the generation's
-    /// registry. A store without a namespace key, factory, or registered backend
-    /// is skipped. Conflicting policies on one namespace are rejected earlier by
+    /// registry. A store with no registered backend in this generation is
+    /// skipped. A store that HAS a live backend but no physical namespace key
+    /// (e.g. a private in-memory SQLite store at `sqlite::memory:`) is NOT
+    /// skipped: it gets a synthesized per-backend-pointer key so its configured
+    /// `ttl` still runs. Conflicting policies on one namespace are rejected earlier by
     /// [`validate_reaper_policy_conflicts`], so the first binding per key wins; a
     /// second binding whose backend differs is dropped with a `warn!` (see the
     /// table-set limitation in `docs/architecture/response-store.md`).
@@ -687,14 +690,6 @@ impl StoreProvisionService {
         let mut desired: HashMap<BackendNamespaceKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> = HashMap::new();
         for plan in plans {
             for (store_name, policy) in &plan.reaper_bindings {
-                let key = match binding_namespace_key(plan, store_name, &factories) {
-                    Ok(Some(key)) => key,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        warn!(%error, listener = %plan.listener, "ttl reaper: cannot compute namespace key; skipping");
-                        continue;
-                    },
-                };
                 let Some(backend) = plan.registry.backend(store_name) else {
                     debug!(
                         listener = %plan.listener,
@@ -702,6 +697,25 @@ impl StoreProvisionService {
                         "ttl reaper: store declares a ttl but has no registered backend in this generation; skipping"
                     );
                     continue;
+                };
+                let key = match binding_namespace_key(plan, store_name, &factories) {
+                    Ok(Some(key)) => key,
+                    // A store with a live backend but no physical namespace key
+                    // (a private in-memory SQLite store at `sqlite::memory:`)
+                    // still has rows to sweep. Synthesize a stable per-backend
+                    // key from the backend allocation address so the coordinator
+                    // runs its reaper instead of silently dropping the ttl. A
+                    // reload that rebuilds the backend mints a new pointer → new
+                    // key → the old reaper goes stale and is cancelled, matching
+                    // the physical-store reload path. Physical-collision
+                    // validation stays on the real namespace key, which an
+                    // in-memory store (with no shared physical identity) does not
+                    // need.
+                    Ok(None) => BackendNamespaceKey::new(format!("backend-ptr\u{1f}{:p}", Arc::as_ptr(&backend))),
+                    Err(error) => {
+                        warn!(%error, listener = %plan.listener, "ttl reaper: cannot compute namespace key; skipping");
+                        continue;
+                    },
                 };
                 // The reaper namespace key is the physical database identity only
                 // (connection target; table names are NOT part of it). Two
@@ -2938,6 +2952,46 @@ filter_chains:
         }
     }
 
+    /// A reaper factory that provisions a spy-backed store but reports NO
+    /// physical namespace key, mirroring a private in-memory SQLite store at
+    /// `sqlite::memory:`. The coordinator must still run a reaper for its live
+    /// backend instead of silently dropping the configured `ttl`.
+    struct NamespacelessReaperFactory {
+        builds: Arc<AtomicUsize>,
+        spy: Arc<SweepSpy>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for NamespacelessReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let url = config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BackendError::Config("missing database_url".to_owned()))?;
+            Ok(EffectiveConfigKey::new(url))
+        }
+
+        fn namespace_key(&self, _config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            // A private in-memory store has no physical namespace identity.
+            Ok(None)
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(ProvisionedBackend {
+                backend: Arc::new(SpyBackend {
+                    spy: Arc::clone(&self.spy),
+                    gate: None,
+                }),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
     /// A reaper factory that mints a FRESH spy-backed store on every build and
     /// records each spy in order, so a test can tell which backend generation a
     /// reaper is sweeping. Its `effective_key` folds in `pool` (so a pool-only
@@ -3241,6 +3295,53 @@ filter_chains:
             "the reaper must stop sweeping the retired backend after the swap"
         );
         assert!(gen_b.committed() > 0, "the reaper must sweep the freshly built backend");
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespaceless_store_still_gets_reaper() {
+        // A store whose factory reports no physical namespace key (a private
+        // in-memory SQLite store at `sqlite::memory:`) still has a live backend
+        // with rows to sweep. The coordinator must synthesize a per-backend key
+        // and run a reaper for it instead of silently disabling the configured
+        // ttl.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(NamespacelessReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+        });
+        let config = reaper_store_config("sqlite::memory:", "100000s", "50ms");
+        let (service, _handle, mut readiness_rx) = reaper_service(&config, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the namespaceless store opens one backend"
+        );
+
+        // The reaper must run and sweep even though the backend reports no
+        // physical namespace key.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.committed() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a namespaceless store with a ttl must still be swept");
 
         shutdown_tx.send(true).expect("service should receive shutdown");
         tokio::time::timeout(Duration::from_secs(2), running)

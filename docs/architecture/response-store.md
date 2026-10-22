@@ -400,9 +400,13 @@ and can be well after its parent's, a parent (e.g. a response) can be swept whil
 that still falls inside the TTL window survives. That child is then orphaned (its
 `response_id`/parent id points at a deleted row) and persists until ITS OWN `created_at`
 passes the cutoff — a gap that can be much longer than one sweep interval. This is accepted
-under creation-time semantics: a dead parent id's orphaned children are inert. Note this is
-unlike the request-path `delete_response` / `delete_conversation` endpoints, which DO cascade
-to their dependent rows in one operation; the age-based TTL reaper deliberately does not.
+under creation-time semantics: a dead parent id's orphaned children are inert. The request-path
+delete endpoints behave differently per endpoint, and neither matches the reaper: `delete_response`
+DOES cascade, removing the response row together with its dependent pending-approval and event rows
+in one operation; `delete_conversation` does NOT cascade — it deliberately preserves the
+conversation's item rows (see `ConversationItemStore::delete_conversation`) and deletes only the
+conversation row. The age-based TTL reaper is independent of both: it sweeps every table on its own
+`created_at` with no cross-table cascade at all.
 
 **Limitation — a second store sharing one physical database may not be swept.** The reaper
 namespace key is the physical database identity only; table names are not part of it. If two
