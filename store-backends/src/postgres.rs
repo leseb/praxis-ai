@@ -689,6 +689,7 @@ async fn check_schema_version(connection: &mut sqlx::PgConnection, tables: &Tabl
 
 #[expect(
     clippy::too_many_lines,
+    clippy::large_stack_frames,
     reason = "async_trait counts the store method group as one expansion"
 )]
 #[async_trait]
