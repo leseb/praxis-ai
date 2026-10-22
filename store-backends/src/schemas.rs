@@ -131,7 +131,12 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
 
     let mut stmts = vec![
         responses_ddl(r, bytes_type),
+        // created_at indexes are additive and idempotent (IF NOT EXISTS), so they apply
+        // to existing v5 DBs on next startup without requiring a schema version bump.
+        // These non-unique indexes support TTL sweep_expired filtering without full scans.
+        format!("CREATE INDEX IF NOT EXISTS idx_{r}_created_at ON {r}(created_at)"),
         conversations_ddl(c),
+        format!("CREATE INDEX IF NOT EXISTS idx_{c}_created_at ON {c}(created_at)"),
         format!("CREATE INDEX IF NOT EXISTS idx_{c}_tenant_id ON {c}(tenant_id)"),
     ];
 
@@ -157,6 +162,9 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
         )));
     }
     stmts.push(events_ddl(&e, bytes_type));
+    stmts.push(format!(
+        "CREATE INDEX IF NOT EXISTS idx_{e}_created_at ON {e}(created_at)"
+    ));
 
     let a = pending_approvals_table(r);
     if a.eq_ignore_ascii_case(c) {
@@ -172,6 +180,9 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
         )));
     }
     stmts.push(pending_approvals_ddl(&a));
+    stmts.push(format!(
+        "CREATE INDEX IF NOT EXISTS idx_{a}_created_at ON {a}(created_at)"
+    ));
 
     let v = schema_version_table(r);
     if v.eq_ignore_ascii_case(c) {
@@ -346,6 +357,9 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
     stmts.push(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
          ON {i}(tenant_id, owner_issuer, owner_subject, conversation_id, position)"
+    ));
+    stmts.push(format!(
+        "CREATE INDEX IF NOT EXISTS idx_{i}_created_at ON {i}(created_at)"
     ));
 }
 
@@ -1238,13 +1252,34 @@ mod tests {
         let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         assert_eq!(
             ddl.len(),
-            6,
-            "should produce 6 DDL statements (responses, conversations, tenant_id index, events, pending_approvals, \
-             version)"
+            10,
+            "should produce 10 DDL statements (responses, responses created_at index, conversations, \
+             conversations created_at index, tenant_id index, events, events created_at index, \
+             pending_approvals, pending_approvals created_at index, version)"
         );
         assert!(
             ddl[0].contains("test_responses"),
             "first statement should reference responses table"
+        );
+        assert!(
+            ddl[1].contains("idx_test_responses_created_at"),
+            "second statement should create responses created_at index: {}",
+            ddl[1]
+        );
+        assert!(
+            ddl[3].contains("idx_test_conversations_created_at"),
+            "fourth statement should create conversations created_at index: {}",
+            ddl[3]
+        );
+        assert!(
+            ddl[6].contains("idx_test_responses_events_created_at"),
+            "seventh statement should create events created_at index: {}",
+            ddl[6]
+        );
+        assert!(
+            ddl[8].contains("idx_test_responses_pending_approvals_created_at"),
+            "ninth statement should create pending_approvals created_at index: {}",
+            ddl[8]
         );
     }
 
@@ -1281,8 +1316,8 @@ mod tests {
         assert!(ddl[0].contains("messages        BLOB NOT NULL"), "{}", ddl[0]);
         assert!(!ddl[0].contains("BYTEA"), "SQLite must not use BYTEA: {}", ddl[0]);
         // Conversations and items stay TEXT.
-        assert!(ddl[1].contains("messages        TEXT NOT NULL"), "{}", ddl[1]);
-        assert!(ddl[3].contains("item_data         TEXT NOT NULL"), "{}", ddl[3]);
+        assert!(ddl[2].contains("messages        TEXT NOT NULL"), "{}", ddl[2]);
+        assert!(ddl[5].contains("item_data         TEXT NOT NULL"), "{}", ddl[5]);
     }
 
     #[test]
@@ -1302,8 +1337,8 @@ mod tests {
         assert!(ddl[0].contains("messages        BYTEA NOT NULL"), "{}", ddl[0]);
         assert!(!ddl[0].contains("BLOB"), "Postgres must not use BLOB: {}", ddl[0]);
         // Conversations and items stay TEXT.
-        assert!(ddl[1].contains("messages        TEXT NOT NULL"), "{}", ddl[1]);
-        assert!(ddl[3].contains("item_data         TEXT NOT NULL"), "{}", ddl[3]);
+        assert!(ddl[2].contains("messages        TEXT NOT NULL"), "{}", ddl[2]);
+        assert!(ddl[5].contains("item_data         TEXT NOT NULL"), "{}", ddl[5]);
     }
 
     #[test]
@@ -1802,12 +1837,12 @@ mod tests {
             items: None,
         };
         let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
-        // The pending-approvals table is created just before the version
-        // table, which must remain last.
-        let approvals_ddl = &ddl[ddl.len() - 2];
+        // The pending-approvals table is created before its created_at index,
+        // which is before the version table (which must remain last).
+        let approvals_ddl = &ddl[ddl.len() - 3];
         assert!(
             approvals_ddl.contains("test_responses_pending_approvals"),
-            "second-to-last DDL should create the pending-approvals table: {approvals_ddl}"
+            "third-to-last DDL should create the pending-approvals table: {approvals_ddl}"
         );
         // Response IDs are globally owner-immutable, so response_id scopes the
         // approval and the owner columns inherit the issuing response owner.
@@ -1868,12 +1903,12 @@ mod tests {
             items: None,
         };
         let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
-        // The events table is created just before the pending-approvals table,
-        // which is itself just before the version table.
-        let events_ddl = &ddl[ddl.len() - 3];
+        // The events table is created before its created_at index, which is
+        // before the pending-approvals table and its index, all before the version table.
+        let events_ddl = &ddl[ddl.len() - 5];
         assert!(
             events_ddl.contains("test_responses_events"),
-            "third-to-last DDL should create the events table: {events_ddl}"
+            "fifth-to-last DDL should create the events table: {events_ddl}"
         );
         for expected in [
             "response_id     TEXT NOT NULL",
@@ -1898,7 +1933,7 @@ mod tests {
             items: None,
         };
         let ddl = generate_ddl(&tables, SqlDialect::Postgres).expect("valid names should produce DDL");
-        let events_ddl = &ddl[ddl.len() - 3];
+        let events_ddl = &ddl[ddl.len() - 5];
         assert!(
             events_ddl.contains("payload         BYTEA NOT NULL"),
             "Postgres events payload should be BYTEA: {events_ddl}"
@@ -2007,29 +2042,35 @@ mod tests {
         let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names with items should produce DDL");
         assert_eq!(
             ddl.len(),
-            9,
-            "should produce 9 DDL statements (responses, conversations, tenant_id index, items, items indexes, \
-             events, pending_approvals, version)"
+            14,
+            "should produce 14 DDL statements (responses, responses created_at index, conversations, \
+             conversations created_at index, tenant_id index, items, items indexes, items created_at index, \
+             events, events created_at index, pending_approvals, pending_approvals created_at index, version)"
         );
         assert!(
-            ddl[3].contains("test_items"),
-            "fourth statement should create items table: {}",
-            ddl[3]
-        );
-        assert!(
-            ddl[4].contains("idx_test_items_conversation"),
-            "fifth statement should create items index: {}",
-            ddl[4]
-        );
-        assert!(
-            ddl[3].contains("PRIMARY KEY (tenant_id, owner_issuer, owner_subject, item_id)"),
-            "item identity must be owner-scoped: {}",
-            ddl[3]
-        );
-        assert!(
-            ddl[5].contains("(tenant_id, owner_issuer, owner_subject, conversation_id, position)"),
-            "item positions must be unique only within an owner's conversation: {}",
+            ddl[5].contains("test_items"),
+            "sixth statement should create items table: {}",
             ddl[5]
+        );
+        assert!(
+            ddl[6].contains("idx_test_items_conversation"),
+            "seventh statement should create items conversation index: {}",
+            ddl[6]
+        );
+        assert!(
+            ddl[5].contains("PRIMARY KEY (tenant_id, owner_issuer, owner_subject, item_id)"),
+            "item identity must be owner-scoped: {}",
+            ddl[5]
+        );
+        assert!(
+            ddl[7].contains("(tenant_id, owner_issuer, owner_subject, conversation_id, position)"),
+            "item positions must be unique only within an owner's conversation: {}",
+            ddl[7]
+        );
+        assert!(
+            ddl[8].contains("idx_test_items_created_at"),
+            "ninth statement should create items created_at index: {}",
+            ddl[8]
         );
     }
 
