@@ -1922,6 +1922,11 @@ async fn event_log_removed_with_response(backend: &dyn PersistedStateBackend) {
 }
 
 /// Sweep removes expired rows from each table independently based on `created_at`.
+#[expect(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    reason = "linear contract assertions"
+)]
 pub async fn sweep_removes_expired_rows_per_table(backend: &dyn PersistedStateBackend) {
     let o = owner("sweep-all");
 
@@ -2043,6 +2048,7 @@ pub async fn sweep_removes_expired_rows_per_table(backend: &dyn PersistedStateBa
 }
 
 /// Sweep respects the batch size limit per table.
+#[expect(clippy::missing_panics_doc, reason = "linear contract assertions")]
 pub async fn sweep_respects_batch_bound(backend: &dyn PersistedStateBackend) {
     let o = owner("sweep-batch");
 
@@ -2080,6 +2086,11 @@ pub async fn sweep_respects_batch_bound(backend: &dyn PersistedStateBackend) {
 }
 
 /// Sweep is tenant-isolated: only removes rows matching the cutoff.
+#[expect(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    reason = "linear contract assertions"
+)]
 pub async fn sweep_is_tenant_isolated(backend: &dyn PersistedStateBackend) {
     let a = owner("tenant-a");
     let b = owner("tenant-b");
@@ -2134,6 +2145,11 @@ pub async fn sweep_is_tenant_isolated(backend: &dyn PersistedStateBackend) {
 }
 
 /// Sweep leaves newer child rows until their own cutoff is reached.
+#[expect(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    reason = "linear contract assertions"
+)]
 pub async fn sweep_leaves_newer_child_until_its_own_cutoff(backend: &dyn PersistedStateBackend) {
     let o = owner("sweep-child");
 

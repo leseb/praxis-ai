@@ -99,6 +99,8 @@ pub struct ReaperPolicy {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test fixtures")]
+
     use super::*;
 
     #[test]

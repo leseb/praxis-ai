@@ -262,6 +262,7 @@ fn append_events_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, 
 }
 
 #[async_trait]
+#[expect(clippy::too_many_lines, reason = "complete ResponseStore trait impl")]
 impl ResponseStore for InMemoryStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
