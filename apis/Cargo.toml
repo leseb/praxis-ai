@@ -65,6 +65,7 @@ bytes = { workspace = true }
 crc32fast = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+humantime-serde = { workspace = true }
 jsonschema = { workspace = true, optional = true }
 metrics = { workspace = true }
 notify = { workspace = true }

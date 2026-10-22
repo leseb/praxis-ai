@@ -3523,6 +3523,7 @@ dependencies = [
  "criterion",
  "futures",
  "http",
+ "humantime-serde",
  "jsonschema",
  "metrics",
  "metrics-util",

@@ -13,9 +13,10 @@ use std::{collections::HashMap, sync::Arc};
 
 #[cfg(feature = "openai-conversations")]
 use praxis_ai_store::EffectiveConfigKey;
-use praxis_ai_store::{BackendError, StoreBackendFactory};
+use praxis_ai_store::{BackendError, ReaperConfig, ReaperPolicy, StoreBackendFactory};
 use praxis_ai_store_lifecycle::{ProvisionError, StoreRef};
 use praxis_core::config::FilterEntry;
+use praxis_filter::{FilterError, parse_filter_config};
 use serde_json::Value;
 
 #[cfg(feature = "openai-conversations")]
@@ -98,6 +99,51 @@ fn permissive_conversations_ref(config: &serde_yaml::Value) -> Option<StoreRef> 
     }
 }
 
+/// Extract reaper policy from a response-store filter configuration.
+///
+/// Parses the filter config, extracts the TTL fields, and returns a policy
+/// with defaults applied when TTL is configured. Returns `None` when TTL is unset.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the config does not parse as a valid
+/// [`ResponseStoreConfig`].
+pub fn reaper_policy_from_response_store(
+    filter_config: &serde_yaml::Value,
+) -> Result<Option<ReaperPolicy>, FilterError> {
+    use crate::openai::responses::store::config::ResponseStoreConfig;
+    let cfg: ResponseStoreConfig = parse_filter_config(RESPONSE_STORE_FILTER_NAME, filter_config)?;
+    let reaper = ReaperConfig {
+        ttl: cfg.ttl,
+        sweep_interval: cfg.sweep_interval,
+        sweep_batch_size: cfg.sweep_batch_size,
+    };
+    Ok(reaper.policy())
+}
+
+/// Extract reaper policy from a conversations filter configuration.
+///
+/// Parses the filter config, extracts the TTL fields, and returns a policy
+/// with defaults applied when TTL is configured. Returns `None` when TTL is unset.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the config does not parse as a valid
+/// [`ConversationsConfig`].
+#[cfg(feature = "openai-conversations")]
+pub fn reaper_policy_from_conversations(
+    filter_config: &serde_yaml::Value,
+) -> Result<Option<ReaperPolicy>, FilterError> {
+    use crate::openai::conversations::config::ConversationsConfig;
+    let cfg: ConversationsConfig = parse_filter_config(CONVERSATIONS_STORE_FILTER_NAME, filter_config)?;
+    let reaper = ReaperConfig {
+        ttl: cfg.ttl,
+        sweep_interval: cfg.sweep_interval,
+        sweep_batch_size: cfg.sweep_batch_size,
+    };
+    Ok(reaper.policy())
+}
+
 /// Translate backend errors without adding connection material to diagnostics.
 fn backend_error(name: &str, source: BackendError) -> ProvisionError {
     ProvisionError::Backend {
@@ -129,7 +175,14 @@ fn response_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, Pro
             BackendError::Config("response store must be a mapping".to_owned()),
         )
     })?;
-    for field in ["backend", "max_event_count", "max_event_bytes"] {
+    for field in [
+        "backend",
+        "max_event_count",
+        "max_event_bytes",
+        "ttl",
+        "sweep_interval",
+        "sweep_batch_size",
+    ] {
         object.remove(field);
     }
     normalize_sqlite_factory_config(backend, &mut config);
@@ -142,7 +195,7 @@ fn response_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, Pro
 
 /// Let the Conversations API own its table defaults and placeholder table.
 #[cfg(feature = "openai-conversations")]
-fn conversations_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, praxis_filter::FilterError> {
+fn conversations_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, FilterError> {
     let (backend, mut config) = conversations_store_ref_config(filter_config)?;
     normalize_sqlite_factory_config(&backend, &mut config);
     Ok(StoreRef {
@@ -654,11 +707,24 @@ mod tests {
     #[test]
     fn response_options_stay_out_of_backend_config() {
         let filter = serde_yaml::from_str(
-            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nmax_event_count: 10\nmax_event_bytes: 1024",
+            "backend: sqlite\n\
+             database_url: 'sqlite::memory:'\n\
+             max_event_count: 10\n\
+             max_event_bytes: 1024\n\
+             ttl: 7d\n\
+             sweep_interval: 1h\n\
+             sweep_batch_size: 500\n",
         )
         .expect("filter config");
         let store_ref = response_store_ref(&filter).expect("store reference");
-        for field in ["backend", "max_event_count", "max_event_bytes"] {
+        for field in [
+            "backend",
+            "max_event_count",
+            "max_event_bytes",
+            "ttl",
+            "sweep_interval",
+            "sweep_batch_size",
+        ] {
             assert!(store_ref.config.get(field).is_none(), "filter-only option: {field}");
         }
         assert!(response_store_ref(&serde_yaml::from_str("database_url: secret").expect("config")).is_err());
