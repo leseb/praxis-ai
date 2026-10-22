@@ -4161,6 +4161,18 @@ async fn postgres_backend_satisfies_the_store_contract() {
     praxis_ai_store::contract_tests::run_contract_suite(&make_pg_store_with_items().await).await;
 }
 
+/// The `PostgreSQL` backend satisfies the sweep contract suite. Exercises
+/// the four sweep contract test functions against the Postgres store.
+#[tokio::test]
+#[ignore]
+async fn postgres_backend_satisfies_sweep_contract() {
+    let store = make_pg_store_with_items().await;
+    praxis_ai_store::contract_tests::sweep_removes_expired_rows_per_table(&store).await;
+    praxis_ai_store::contract_tests::sweep_respects_batch_bound(&store).await;
+    praxis_ai_store::contract_tests::sweep_is_tenant_isolated(&store).await;
+    praxis_ai_store::contract_tests::sweep_leaves_newer_child_until_its_own_cutoff(&store).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn pg_consume_approval_replay_is_rejected() {

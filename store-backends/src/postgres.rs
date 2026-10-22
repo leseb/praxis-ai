@@ -1416,6 +1416,108 @@ impl ResponseStore for PostgresResponseStore {
             Ok(EventLogStatus::Incomplete { max_sequence })
         }
     }
+
+    async fn sweep_expired(&self, cutoff_secs: i64, batch_size: u32) -> Result<super::SweepStats, StoreError> {
+        let mut stats = super::SweepStats::default();
+
+        // Sweep responses table
+        let responses_sql = format!(
+            "DELETE FROM {} WHERE ctid IN (SELECT ctid FROM {} WHERE created_at < $1 LIMIT $2)",
+            self.tables.responses, self.tables.responses
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(responses_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.responses = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        // Sweep conversations table
+        let conversations_sql = format!(
+            "DELETE FROM {} WHERE ctid IN (SELECT ctid FROM {} WHERE created_at < $1 LIMIT $2)",
+            self.tables.conversations, self.tables.conversations
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(conversations_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.conversations = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        // Sweep items table if present
+        if let Some(items_table) = &self.tables.items {
+            let items_sql = format!(
+                "DELETE FROM {items_table} WHERE ctid IN (SELECT ctid FROM {items_table} WHERE created_at < $1 LIMIT $2)"
+            );
+            let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+            sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+            let result = sqlx::query(AssertSqlSafe(items_sql.as_str()))
+                .bind(cutoff_secs)
+                .bind(i64::from(batch_size))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+            stats.items = result.rows_affected();
+            tx.commit().await.map_err(|e| self.db_err(&e))?;
+        }
+
+        // Sweep pending_approvals table
+        let approvals_table = pending_approvals_table(&self.tables.responses);
+        let approvals_sql = format!(
+            "DELETE FROM {approvals_table} WHERE ctid IN (SELECT ctid FROM {approvals_table} WHERE created_at < $1 LIMIT $2)"
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(approvals_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.pending_approvals = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        // Sweep events table
+        let events_table_name = events_table(&self.tables.responses);
+        let events_sql = format!(
+            "DELETE FROM {events_table_name} WHERE ctid IN (SELECT ctid FROM {events_table_name} WHERE created_at < $1 LIMIT $2)"
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(events_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.events = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        Ok(stats)
+    }
 }
 
 #[expect(
