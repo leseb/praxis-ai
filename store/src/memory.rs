@@ -39,6 +39,8 @@ type OwnerKey = (StateOwner, String);
 struct StoredApproval {
     /// The persisted approval record.
     record: PendingApprovalRecord,
+    /// Epoch-seconds creation time.
+    created_at: i64,
     /// Epoch-ms consumption time; `None` while outstanding.
     consumed_at: Option<i64>,
 }
@@ -211,7 +213,13 @@ fn require_conversation_scope(
 }
 
 /// Record approvals insert-if-absent, so a re-emit never resets a consumed row.
-fn record_approvals_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, records: &[PendingApprovalRecord]) {
+fn record_approvals_into(
+    inner: &mut Inner,
+    owner: &StateOwner,
+    response_id: &str,
+    records: &[PendingApprovalRecord],
+    created_at: i64,
+) {
     if !inner
         .responses
         .get(response_id)
@@ -223,6 +231,7 @@ fn record_approvals_into(inner: &mut Inner, owner: &StateOwner, response_id: &st
         let key = (owner.clone(), response_id.to_owned(), record.approval_id.clone());
         inner.approvals.entry(key).or_insert_with(|| StoredApproval {
             record: record.clone(),
+            created_at,
             consumed_at: None,
         });
     }
@@ -430,10 +439,10 @@ impl ResponseStore for InMemoryStore {
         owner: &StateOwner,
         response_id: &str,
         records: &[PendingApprovalRecord],
-        _created_at: i64,
+        created_at: i64,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
-        record_approvals_into(&mut inner, owner, response_id, records);
+        record_approvals_into(&mut inner, owner, response_id, records, created_at);
         Ok(())
     }
 
@@ -447,7 +456,13 @@ impl ResponseStore for InMemoryStore {
         // sequential impl locks twice and leaves that window open.
         let mut inner = self.lock()?;
         upsert_response_into(&mut inner, record)?;
-        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
+        record_approvals_into(
+            &mut inner,
+            &record.owner,
+            &record.id,
+            pending_approvals,
+            record.created_at,
+        );
         Ok(())
     }
 
@@ -584,6 +599,81 @@ impl ResponseStore for InMemoryStore {
         } else {
             Ok(EventLogStatus::Incomplete { max_sequence })
         }
+    }
+
+    async fn sweep_expired(&self, cutoff_secs: i64, batch_size: u32) -> Result<crate::types::SweepStats, StoreError> {
+        use crate::types::SweepStats;
+        let mut inner = self.lock()?;
+        let batch = batch_size as usize;
+
+        // Sweep responses (independent, no cascade)
+        let mut responses_removed = 0_u64;
+        inner.responses.retain(|_, record| {
+            if responses_removed < batch as u64 && record.created_at < cutoff_secs {
+                responses_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Sweep conversations (independent, no cascade)
+        let mut conversations_removed = 0_u64;
+        inner.conversations.retain(|_, record| {
+            if conversations_removed < batch as u64 && record.created_at < cutoff_secs {
+                conversations_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Sweep items (drain expired elements from vecs, drop empty vecs)
+        let mut items_removed = 0_u64;
+        inner.items.retain(|_, items| {
+            items.retain(|item| {
+                if items_removed < batch as u64 && item.created_at < cutoff_secs {
+                    items_removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            !items.is_empty()
+        });
+
+        // Sweep approvals (independent, no cascade)
+        let mut approvals_removed = 0_u64;
+        inner.approvals.retain(|_, approval| {
+            if approvals_removed < batch as u64 && approval.created_at < cutoff_secs {
+                approvals_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Sweep events (drain expired elements from vecs, drop empty vecs)
+        let mut events_removed = 0_u64;
+        inner.events.retain(|_, events| {
+            events.retain(|event| {
+                if events_removed < batch as u64 && event.created_at < cutoff_secs {
+                    events_removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            !events.is_empty()
+        });
+
+        Ok(SweepStats {
+            responses: responses_removed,
+            conversations: conversations_removed,
+            items: items_removed,
+            pending_approvals: approvals_removed,
+            events: events_removed,
+        })
     }
 }
 

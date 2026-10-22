@@ -122,6 +122,10 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     event_log_requires_owner_matched_response(backend).await;
     event_log_status_gates_on_terminal(backend).await;
     event_log_removed_with_response(backend).await;
+    sweep_removes_expired_rows_per_table(backend).await;
+    sweep_respects_batch_bound(backend).await;
+    sweep_is_tenant_isolated(backend).await;
+    sweep_leaves_newer_child_until_its_own_cutoff(backend).await;
 }
 
 /// A budgeted response read returns the measured charge and rejects a record
