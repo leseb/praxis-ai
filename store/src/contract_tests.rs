@@ -91,6 +91,7 @@ async fn persist_parent_response(backend: &dyn PersistedStateBackend, owner: &St
 #[expect(
     clippy::large_stack_frames,
     clippy::cognitive_complexity,
+    clippy::too_many_lines,
     reason = "sequentially runs the complete backend contract"
 )]
 pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {

@@ -390,6 +390,7 @@ mod reaper_config_tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "store-sqlite")]
     fn validate_rejects_sweep_interval_without_ttl() {
         let yaml = serde_yaml::from_str(
             "backend: sqlite\n\
@@ -403,7 +404,7 @@ mod reaper_config_tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-conversations")]
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
     fn accepts_ttl_with_defaults() {
         use std::time::Duration;
 
