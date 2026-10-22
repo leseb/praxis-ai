@@ -352,6 +352,103 @@ async fn response_store_delete_returns_200_after_post() {
     drop(proxy);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_store_ttl_purges_expired_records() {
+    let backend_guard = Backend::fixed(RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let db = TempSqlite::new("ttl_purge");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
+        .expect("example config should exist");
+
+    // Patch with a very short TTL for testing: 1s ttl and 1s sweep interval
+    // Insert after the pool config section and before PostgreSQL backend comment
+    let yaml_with_ttl = yaml.replace(
+        "        # PostgreSQL backend:",
+        "        ttl: 1s\n        sweep_interval: 1s\n        sweep_batch_size: 100\n        #\n        # PostgreSQL backend:",
+    );
+
+    let patched = patch_yaml(
+        &yaml_with_ttl.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+
+    // Debug: verify TTL config is in the filter block
+    if let Some(filter_idx) = patched.find("- filter: openai_responses_store") {
+        if let Some(next_filter) = patched[filter_idx + 100..].find("- filter:") {
+            let filter_block = &patched[filter_idx..filter_idx + 100 + next_filter];
+            eprintln!(
+                "=== openai_responses_store filter block ===\n{}\n=== end ===",
+                filter_block
+            );
+            if filter_block.contains("ttl: 1s") {
+                eprintln!("✓ TTL config is inside the filter block");
+            } else {
+                eprintln!("✗ TTL config is NOT inside the filter block!");
+            }
+        }
+    }
+
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    // POST a response that will expire
+    let post_raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+    assert_eq!(parse_status(&post_raw), 200, "POST should succeed");
+
+    // Connect to the database
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+
+    // Verify the record was created and check its created_at timestamp
+    let check_sql = format!("SELECT COUNT(*) as count, MAX(created_at) as max_created_at FROM {RESPONSES_TABLE}");
+    let row: sqlx::sqlite::SqliteRow = sqlx::query(sqlx::AssertSqlSafe(check_sql.as_str()))
+        .fetch_one(&pool)
+        .await
+        .expect("check query should succeed");
+    let initial_count: i64 = row.get("count");
+    let created_at: i64 = row.get("max_created_at");
+    assert_eq!(initial_count, 1, "record should be created after POST");
+    eprintln!(
+        "Record created with created_at={} (current time would be ~{})",
+        created_at,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+
+    let mut purged = false;
+    for _ in 0..30 {
+        // Poll for up to ~15 seconds (30 * 500ms)
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let count_sql = format!("SELECT COUNT(*) as count FROM {RESPONSES_TABLE}");
+        let row: sqlx::sqlite::SqliteRow = sqlx::query(sqlx::AssertSqlSafe(count_sql.as_str()))
+            .fetch_one(&pool)
+            .await
+            .expect("count query should succeed");
+        let count: i64 = row.get("count");
+
+        if count == 0 {
+            purged = true;
+            break;
+        }
+    }
+
+    pool.close().await;
+    assert!(purged, "TTL reaper should have purged the expired record within 15s");
+
+    drop(proxy);
+}
+
 #[test]
 fn response_store_delete_nonexistent_returns_404() {
     let backend_guard = Backend::fixed("unused")

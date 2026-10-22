@@ -366,6 +366,40 @@ under 2 MiB). Non-persistable exchanges release chunks
 immediately via `FilterAction::Release` so
 pass-through traffic is not held.
 
+## TTL and Automatic Purging
+
+Store filters accept optional `ttl`, `sweep_interval`, and `sweep_batch_size` configuration
+fields that enable automatic purging of expired records. When `ttl` is set, a background
+reaper coordinator runs one reaper task per physical store (database_url + table namespace),
+sweeping records whose `created_at` is older than `now - ttl` in bounded batches.
+
+**IMPORTANT:** TTL is measured from record CREATION time, not last-accessed time. Activity
+does NOT extend retention. An actively-used conversation or response older than the configured
+`ttl` will be purged even if it was recently accessed. TTL is not a storage-capacity guarantee;
+tenant byte quotas and capacity accounting are tracked separately in #1626.
+
+Configuration:
+- `ttl: <duration>` - retention period (humantime format: `7d`, `24h`, `30m`, etc.). Omit to disable the reaper.
+- `sweep_interval: <duration>` - how often the reaper runs (default: `1h`)
+- `sweep_batch_size: <count>` - maximum records purged per sweep batch (default: `1000`)
+
+The reaper coordinator persists its policy (ttl, sweep_interval, sweep_batch_size) on each
+config commit. Policy changes take effect when the pipeline reloads. The reaper stops
+gracefully on shutdown and across config reloads. One coordinator instance manages all
+reapers for a given server process; each physical store gets its own reaper task that
+sweeps all record types (responses, conversations, conversation items, events, approvals)
+from that store's tables.
+
+The reaper queries for expired records in batches, deletes them in a single transaction,
+and repeats until no expired records remain or the batch size is reached. Deleted records
+are removed atomically with their dependent rows (conversation items are purged when their
+parent conversation is purged, response events are purged when the response is purged).
+
+Future quota accounting (#1626) must credit storage released by TTL purges at the same
+atomic commit that removes the rows, ensuring exactly-once accounting even if a purge
+is interrupted. The TTL reaper is orthogonal to capacity limits; operators may configure
+both a time-based TTL and a future tenant-scoped capacity quota.
+
 ## Key Files
 
 - `apis/src/openai/responses/store/filter.rs`: HTTP filter lifecycle
