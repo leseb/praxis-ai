@@ -41,6 +41,7 @@ for how these are authored and regenerated.
 | [aws-sigv4.yaml](configs/aws-sigv4.yaml) | Signs outbound requests to an AWS service (Bedrock, in this example) using Signature Version 4. Credentials are static, sourced from environment variables — see the module docs on Sigv4SignFilter for the planned OIDC/default-credential-chain follow-up |
 | [azure-ad.yaml](configs/azure-ad.yaml) | Acquires an Entra ID bearer token via the client-credentials grant and injects "Authorization: Bearer <token>" on every proxied request to Azure OpenAI |
 | [credential-injection.yaml](configs/credential-injection.yaml) | Injects per-cluster API credentials into upstream requests and strips client-provided credentials to prevent forwarding |
+| [external-metering-file-key.yaml](configs/external-metering-file-key.yaml) | Same pre-request balance check and post-response usage reporting as external-metering.yaml, but the internal bearer credential used to authenticate the metering callouts is read from a file rather than embedded in the config or image |
 | [external-metering.yaml](configs/external-metering.yaml) | Pre-request balance check and post-response token usage reporting against an external metering service |
 | [file-descriptor-limits.yaml](configs/file-descriptor-limits.yaml) | Size and protect the descriptor budget of a metered gateway: pin the process limit, shed requests with 503 before descriptors run out, cap concurrent requests and metering callouts, and close idle keep-alive clients and pooled upstream connections so they cannot pin descriptors |
 | [gcp-adc.yaml](configs/gcp-adc.yaml) | Acquires an OAuth2 access token from the GCE/GKE metadata server or a service-account key file and injects "Authorization: Bearer <token>" on every proxied request to Vertex AI |
@@ -77,6 +78,7 @@ for how these are authored and regenerated.
 | [token-rate-limit-ip-keys.yaml](configs/token-rate-limit-ip-keys.yaml) | Honor X-Forwarded-For for the IP budget only when a trusted proxy sanitizes it and direct access is blocked; otherwise omit `header` to key on the TCP peer |
 | [token-rate-limit-mixed-algorithms.yaml](configs/token-rate-limit-mixed-algorithms.yaml) | Extends token-rate-limit.yaml with per-rule algorithm choice (ai#789 / praxis#551): each rule in `rules:` independently picks sliding_window or token_bucket, matched by a static header value. team-alpha gets an exact trailing-window budget; team-beta gets a continuously-refilling bucket |
 | [token-rate-limit-model-keys.yaml](configs/token-rate-limit-model-keys.yaml) | Extends token-rate-limit.yaml with M5 model dimensions (ai#123): each distinct model identity gets its own token budget under the same catch-all rule |
+| [token-rate-limit-sentinel.yaml](configs/token-rate-limit-sentinel.yaml) | Sentinel HA example for either official Redis or Red Hat Valkey |
 | [token-rate-limit-soft-enforcement.yaml](configs/token-rate-limit-soft-enforcement.yaml) | Per-rule `enforcement` chooses what happens when the algorithm denies a reservation because the token budget is exhausted |
 | [token-rate-limit-soft-tiers.yaml](configs/token-rate-limit-soft-tiers.yaml) | Extends token-rate-limit.yaml with graduated enforcement tiers (proposal S1, ai#881) |
 | [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
@@ -94,6 +96,7 @@ for how these are authored and regenerated.
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
+| [web-search-file-key.yaml](configs/anthropic/web-search-file-key.yaml) | A minimal Anthropic Messages web-search gateway that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/anthropic/web-search-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml |
 | [web-search-tavily-scoped-credentials.yaml](configs/anthropic/web-search-tavily-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml, over Tavily |
 
@@ -130,6 +133,7 @@ for how these are authored and regenerated.
 | [agentic-loop-guardrails.yaml](configs/openai/responses/agentic-loop-guardrails.yaml) | Screens each newly produced local tool result before it can enter the next inference request |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
 | [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
+| [budget-overflow-streaming.yaml](configs/openai/responses/budget-overflow-streaming.yaml) | Demonstrates the terminal-failure contract when an upstream Responses SSE stream overflows the request-wide retained-payload budget AFTER the client stream is already committed |
 | [client-tool-compat-chat-completions.yaml](configs/openai/responses/client-tool-compat-chat-completions.yaml) | Lets a rich Codex-style Responses client (POST /v1/responses with custom, namespace, local shell, and client-executed tool_search tools) reach a function-only Chat Completions backend (POST /v1/chat/completions) by composing openai_client_tool_compat with openai_responses_to_chat_completions in one iterative-router step (GitHub issue #1206) |
 | [client-tool-compat.yaml](configs/openai/responses/client-tool-compat.yaml) | Lets a rich Codex-style Responses client talk to a function-only Responses backend (for example vLLM at POST /v1/responses) without routing through /v1/chat/completions and without executing client-owned tools in Praxis |
 | [codex-http-chat-translation.yaml](configs/openai/responses/codex-http-chat-translation.yaml) | Release-acceptance configuration for GitHub issue #870. A Codex client speaks the OpenAI Responses API over HTTP while Praxis selects a Chat Completions-only provider, translates both request and streaming response, rewrites the provider path, and replaces the client credential |
@@ -169,6 +173,7 @@ for how these are authored and regenerated.
 | [vllm-agentic-api.yaml](configs/openai/responses/vllm-agentic-api.yaml) | vLLM Agentic API: https://github.com/vllm-project/agentic-api |
 | [web-search-chat-completions-fixture.yaml](configs/openai/responses/web-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses web_search tool |
 | [web-search-chat-completions.yaml](configs/openai/responses/web-search-chat-completions.yaml) | Accepts OpenAI Responses requests with hosted web search while targeting a backend that only implements /v1/chat/completions |
+| [web-search-file-key.yaml](configs/openai/responses/web-search-file-key.yaml) | A variant of web-search-chat-completions.yaml that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
 

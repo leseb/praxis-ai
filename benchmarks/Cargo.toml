@@ -36,3 +36,8 @@ name = "responses_state"
 path = "responses/state_initialization.rs"
 harness = false
 required-features = ["responses-state"]
+
+[[bench]]
+name = "gemini_translation"
+path = "gemini/translation.rs"
+harness = false
