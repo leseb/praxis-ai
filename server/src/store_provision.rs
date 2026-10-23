@@ -383,15 +383,28 @@ const EVENTS_SUFFIX: &str = "_events";
 /// effective-key check, so identical in-memory config with a different ttl (one
 /// shared backend) is still rejected. Both checks must hold. The same policy on a
 /// shared table is idempotent and allowed.
+///
+/// The loop walks **every** provisioned store (`plan.refs`), not just the
+/// TTL-enabled ones in `plan.reaper_bindings`. A store without a `ttl` is recorded
+/// with a `None` policy so a TTL-enabled store cannot quietly reap a physical table
+/// a TTL-disabled store shares: omitting `ttl` is documented to retain rows
+/// indefinitely, so an enabled-vs-disabled overlap is a conflict, rejected before
+/// provisioning. Reaper creation itself stays limited to TTL-enabled stores (see
+/// [`StoreProvisionService::desired_reapers`]).
 fn validate_reaper_policy_conflicts(
     plans: &[ListenerStorePlan],
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
 ) -> Result<(), ProvisionError> {
     let mut by_table = ReaperTableOwners::new();
-    let mut by_effective_key: HashMap<EffectiveConfigKey, ReaperPolicy> = HashMap::new();
+    let mut by_effective_key: HashMap<EffectiveConfigKey, (Option<ReaperPolicy>, Arc<str>)> = HashMap::new();
     for plan in plans {
-        for (store_name, policy) in &plan.reaper_bindings {
-            let store_ref = binding_store_ref(plan, store_name)?;
+        for store_ref in &plan.refs {
+            let store_name = &store_ref.name;
+            let policy = plan
+                .reaper_bindings
+                .iter()
+                .find(|(name, _)| name == store_name)
+                .map(|(_, policy)| *policy);
             let factory = binding_factory(store_ref, factories)?;
             let namespace = factory
                 .namespace_key(&store_ref.config)
@@ -400,9 +413,9 @@ fn validate_reaper_policy_conflicts(
                     source,
                 })?;
             if let Some(namespace) = namespace {
-                check_shared_table_policies(&mut by_table, &namespace, store_ref, store_name, *policy)?;
+                check_shared_table_policies(&mut by_table, &namespace, store_ref, store_name, policy)?;
             } else {
-                check_in_memory_backend_policy(&mut by_effective_key, factory, store_ref, store_name, *policy)?;
+                check_in_memory_backend_policy(&mut by_effective_key, factory, store_ref, store_name, policy)?;
             }
         }
     }
@@ -411,17 +424,19 @@ fn validate_reaper_policy_conflicts(
 
 /// Maps each `(physical database, folded physical table)` to the reaper policy and
 /// the store that first claimed it, so a later binding assigning a different policy
-/// to a shared table can be rejected by name.
-type ReaperTableOwners = HashMap<(BackendNamespaceKey, String), (ReaperPolicy, Arc<str>)>;
+/// to a shared table can be rejected by name. `None` marks a TTL-disabled store, so
+/// an enabled-vs-disabled overlap is caught like any other policy mismatch.
+type ReaperTableOwners = HashMap<(BackendNamespaceKey, String), (Option<ReaperPolicy>, Arc<str>)>;
 
-/// Record a persistent binding's swept tables, rejecting a different policy on any
-/// physical table another store in the same database already claimed.
+/// Record a store's swept tables, rejecting a different policy on any physical table
+/// another store in the same database already claimed. A `None` policy (no `ttl`)
+/// conflicts with any TTL-enabled policy on the same table.
 fn check_shared_table_policies(
     by_table: &mut ReaperTableOwners,
     namespace: &BackendNamespaceKey,
     store_ref: &StoreRef,
     store_name: &Arc<str>,
-    policy: ReaperPolicy,
+    policy: Option<ReaperPolicy>,
 ) -> Result<(), ProvisionError> {
     for table in swept_physical_tables(&store_ref.config) {
         let key = (namespace.clone(), table.to_ascii_lowercase());
@@ -429,10 +444,12 @@ fn check_shared_table_policies(
             Some((existing_policy, existing_store)) if *existing_policy != policy => {
                 return Err(ProvisionError::Backend {
                     name: Arc::clone(store_name),
-                    source: BackendError::Config(format!(
-                        "conflicting reaper policies target the shared physical table '{table}' in one database \
-                         (stores '{existing_store}' and '{store_name}'); configure one \
-                         ttl/sweep_interval/sweep_batch_size for every store that sweeps a shared table"
+                    source: BackendError::Config(reaper_policy_conflict_message(
+                        *existing_policy,
+                        existing_store,
+                        policy,
+                        store_name,
+                        Some(&table),
                     )),
                 });
             },
@@ -445,14 +462,14 @@ fn check_shared_table_policies(
     Ok(())
 }
 
-/// Record an in-memory binding's backend identity, rejecting a different policy on
-/// the same shared in-memory backend (identical config, different ttl).
+/// Record an in-memory store's backend identity, rejecting a different policy on the
+/// same shared in-memory backend (identical config, different or absent ttl).
 fn check_in_memory_backend_policy(
-    by_effective_key: &mut HashMap<EffectiveConfigKey, ReaperPolicy>,
+    by_effective_key: &mut HashMap<EffectiveConfigKey, (Option<ReaperPolicy>, Arc<str>)>,
     factory: &dyn StoreBackendFactory,
     store_ref: &StoreRef,
     store_name: &Arc<str>,
-    policy: ReaperPolicy,
+    policy: Option<ReaperPolicy>,
 ) -> Result<(), ProvisionError> {
     let key = factory
         .effective_key(&store_ref.config)
@@ -461,19 +478,55 @@ fn check_in_memory_backend_policy(
             source,
         })?;
     match by_effective_key.get(&key) {
-        Some(existing) if *existing != policy => Err(ProvisionError::Backend {
+        Some((existing_policy, existing_store)) if *existing_policy != policy => Err(ProvisionError::Backend {
             name: Arc::clone(store_name),
-            source: BackendError::Config(
-                "conflicting reaper policies target the same in-memory store backend; configure one \
-                 ttl/sweep_interval/sweep_batch_size for all filters sharing an in-memory backend"
-                    .to_owned(),
-            ),
+            source: BackendError::Config(reaper_policy_conflict_message(
+                *existing_policy,
+                existing_store,
+                policy,
+                store_name,
+                None,
+            )),
         }),
         Some(_) => Ok(()),
         None => {
-            by_effective_key.insert(key, policy);
+            by_effective_key.insert(key, (policy, Arc::clone(store_name)));
             Ok(())
         },
+    }
+}
+
+/// Build the actionable error for two stores assigning different reaper policies to
+/// a shared target. `table` names the shared physical table for persistent backends;
+/// `None` describes a shared in-memory backend. A `Some`/`None` policy pair (one
+/// store sets a `ttl`, the other does not) is reported as the TTL-disabled store's
+/// rows being at risk; two differing `Some` policies are reported as a ttl mismatch.
+fn reaper_policy_conflict_message(
+    existing_policy: Option<ReaperPolicy>,
+    existing_store: &Arc<str>,
+    policy: Option<ReaperPolicy>,
+    store_name: &Arc<str>,
+    table: Option<&str>,
+) -> String {
+    let target = table.map_or_else(
+        || "the same in-memory store backend".to_owned(),
+        |table| format!("the shared physical table '{table}' in one database"),
+    );
+    if let (Some(_), Some(_)) = (existing_policy, policy) {
+        format!(
+            "conflicting reaper policies target {target} (stores '{existing_store}' and '{store_name}'); \
+             configure one ttl/sweep_interval/sweep_batch_size for every store that shares it"
+        )
+    } else {
+        let (enabled, disabled) = if existing_policy.is_some() {
+            (existing_store, store_name)
+        } else {
+            (store_name, existing_store)
+        };
+        format!(
+            "store '{enabled}' enables a ttl reaper on {target} shared with store '{disabled}', which sets \
+             no ttl and must retain its rows; give both stores the same ttl or stop sharing it"
+        )
     }
 }
 
@@ -3998,5 +4051,61 @@ filter_chains:
         let mut plans = build_listener_store_plans(&config);
         validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
             .expect("disjoint table sets on one database may set independent retention policies");
+    }
+
+    #[test]
+    fn ttl_enabled_store_sharing_table_with_ttl_disabled_store_fails_validation() {
+        // Two response stores on the SAME physical database with DIFFERENT
+        // responses_table but the SAME conversations_table. One sets a ttl; the other
+        // sets none. The enabled store's reaper would sweep the shared conversations
+        // table, deleting the disabled store's rows even though omitting ttl is
+        // documented to retain them indefinitely. The TTL-disabled store is absent
+        // from reaper_bindings, so the overlap must be caught by walking every ref.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations
+"#
+        ))
+        .expect("one ttl store sharing a conversations table with a ttl-less store");
+
+        let mut plans = build_listener_store_plans(&config);
+        let error = validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
+            .expect_err("a ttl reaper sharing a physical table with a ttl-less store must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("must retain its rows"),
+            "the error must explain the ttl-less store's rows are at risk: {message}"
+        );
+        assert!(
+            message.contains("conversations"),
+            "the error must name the shared physical table: {message}"
+        );
     }
 }

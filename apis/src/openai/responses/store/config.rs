@@ -365,8 +365,7 @@ fn sqlite_file_path(database_url: &str) -> Option<&str> {
 
 #[cfg(test)]
 #[cfg(feature = "store-sqlite")]
-#[expect(clippy::allow_attributes, reason = "test-only panic assertions")]
-#[allow(clippy::expect_used, reason = "tests")]
+#[expect(clippy::expect_used, reason = "tests")]
 mod reaper_config_tests {
     use super::*;
 

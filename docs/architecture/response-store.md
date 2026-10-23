@@ -408,15 +408,19 @@ conversation's item rows (see `ConversationItemStore::delete_conversation`) and 
 conversation row. The age-based TTL reaper is independent of both: it sweeps every table on its own
 `created_at` with no cross-table cascade at all.
 
-**Limitation — a second store sharing one physical database may not be swept.** The reaper
-namespace key is the physical database identity only; table names are not part of it. If two
-store filters target the SAME database but with a non-coalescing table set (e.g. a different
-`items_table` or `pool`, so they resolve to distinct backends under one namespace), only the
-first backend's tables are swept — the second store's `ttl` is silently not applied to its
-own tables (the coordinator logs a `warn!` when it drops such a binding). The common case
-where both filters share one coalesced backend (one pool, one table set) is swept correctly.
-To get TTL on both, co-locate the stores in a single coalesced backend or give each its own
-database.
+**Shared databases — every store is swept, and conflicting policies are rejected at
+startup.** Reapers are keyed on backend identity (the factory's `EffectiveConfigKey`), so
+every distinct cached backend gets its own reaper and is swept exactly once — two store
+filters on one database with different table sets (e.g. a different `items_table` or `pool`,
+so they resolve to distinct backends) each get a reaper, with no silently-dropped binding.
+Distinct backends can still overlap on a physical table, though: two stores with different
+`responses_table` but the same `conversations_table` resolve to different keys yet both sweep
+that shared table. To keep a shorter TTL from deleting rows a longer retention — or a store
+with no `ttl` at all — still needs, provisioning validates physical-table ownership: within
+one database, no two stores may assign different policies (including TTL-enabled vs.
+TTL-disabled) to the same physical table, and such a configuration is rejected before serving
+starts. The same policy on a shared table is allowed. To run independent retention policies
+on one database, give each store a fully disjoint table set or its own database.
 
 Future quota accounting (#1626) must credit storage released by TTL purges at the same
 atomic commit that removes the rows, ensuring exactly-once accounting even if a purge

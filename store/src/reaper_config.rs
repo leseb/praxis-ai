@@ -24,11 +24,12 @@ pub const DEFAULT_SWEEP_BATCH_SIZE: NonZeroU32 = match NonZeroU32::new(1000) {
 ///
 /// # YAML
 ///
+/// The fields are flat, top-level filter keys (there is no `reaper:` block):
+///
 /// ```yaml
-/// reaper:
-///   ttl: 7d
-///   sweep_interval: 1h
-///   sweep_batch_size: 1000
+/// ttl: 7d
+/// sweep_interval: 1h
+/// sweep_batch_size: 1000
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,7 +104,7 @@ pub struct ReaperPolicy {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test fixtures")]
+    #![expect(clippy::unwrap_used, clippy::expect_used, reason = "test fixtures")]
 
     use super::*;
 
