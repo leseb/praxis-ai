@@ -370,9 +370,10 @@ pass-through traffic is not held.
 
 Store filters accept optional `ttl`, `sweep_interval`, and `sweep_batch_size` configuration
 fields that enable automatic purging of expired records. When `ttl` is set, a background
-reaper coordinator runs one reaper task per physical database identity (the connection
-target — SQLite path or Postgres host/port/db; table names are NOT part of the namespace
-key), sweeping records whose `created_at` is older than `now - ttl` in bounded batches.
+reaper coordinator runs one reaper task per distinct TTL-enabled store backend (keyed on the
+factory's `EffectiveConfigKey`, so two filters on one physical database with different table
+sets each get their own reaper), sweeping records whose `created_at` is older than
+`now - ttl` in bounded batches.
 
 **IMPORTANT:** TTL is measured from record CREATION time, not last-accessed time. Activity
 does NOT extend retention. An actively-used conversation or response older than the configured
@@ -387,9 +388,9 @@ Configuration:
 The reaper coordinator persists its policy (ttl, sweep_interval, sweep_batch_size) on each
 config commit. Policy changes take effect when the pipeline reloads. The reaper stops
 gracefully on shutdown and across config reloads. One coordinator instance manages all
-reapers for a given server process; each physical database gets its own reaper task that
-sweeps all record types (responses, conversations, conversation items, events, approvals)
-from that database's tables.
+reapers for a given server process; each distinct TTL-enabled store backend gets its own
+reaper task that sweeps all record types (responses, conversations, conversation items,
+events, approvals) from that backend's tables.
 
 **The TTL reaper sweeps each table INDEPENDENTLY — it does NOT cascade.** Every table is
 swept by its OWN `created_at`, in its own bounded, per-batch-committed transaction, with no

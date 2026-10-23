@@ -66,9 +66,9 @@ filter_chains:
         #
         # TTL and automatic purge (optional, off by default):
         #   Time-to-live retention policy that purges records older than the
-        #   specified age. A background coordinator runs one reaper per physical
-        #   database (the connection target; table names are NOT part of the
-        #   namespace key), sweeping expired records in bounded batches at the
+        #   specified age. A background coordinator runs one reaper per distinct
+        #   store backend (so two filters on one database with different table sets
+        #   each get a reaper), sweeping expired records in bounded batches at the
         #   configured interval.
         #
         #   IMPORTANT: TTL is measured from record CREATION time; activity does
