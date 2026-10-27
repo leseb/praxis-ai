@@ -97,6 +97,13 @@ pub(crate) enum CustomInputPatternEncoding {
 /// inside a JSON string (newline → `\n`, i.e. backslash-n; non-newline char → a
 /// literal or a JSON escape). Verified under `XGrammar` 0.2.8 (see the feasibility
 /// gate). `\xNN`/`\u` are regex escapes, not literal control bytes.
+///
+/// Best-effort by design: the `\\u[0-9a-fA-F]{4}` alternative admits `\u000A` (an
+/// encoded newline), which the grammar's `[^\n]` runs exclude. A model would have to
+/// encode a newline *inside* a line to hit it; if it did, [`validate_decoded_input`]
+/// (the authoritative, backend-independent host check against the real-newline host
+/// regex) rejects the decoded patch and the call fails closed. The backend pattern
+/// only guides generation; it never replaces host validation.
 pub(crate) const APPLY_PATCH_BACKEND_PATTERN_BASE: &str = r#"\*\*\* Begin Patch\\n(?:(?:\*\*\* Add File: (?:[^"\\\x00-\x1F]|\\["\\/bfrt]|\\u[0-9a-fA-F]{4})+\\n(?:\+(?:[^"\\\x00-\x1F]|\\["\\/bfrt]|\\u[0-9a-fA-F]{4})*\\n)+|\*\*\* Delete File: (?:[^"\\\x00-\x1F]|\\["\\/bfrt]|\\u[0-9a-fA-F]{4})+\\n|\*\*\* Update File: (?:[^"\\\x00-\x1F]|\\["\\/bfrt]|\\u[0-9a-fA-F]{4})+\\n(?:\*\*\* Move to: (?:[^"\\\x00-\x1F]|\\["\\/bfrt]|\\u[0-9a-fA-F]{4})+\\n)?(?:(?:@@(?: (?:[^"\\\x00-\x1F]|\\["\\/bfrt]|\\u[0-9a-fA-F]{4})+)?\\n|[+\- ](?:[^"\\\x00-\x1F]|\\["\\/bfrt]|\\u[0-9a-fA-F]{4})*\\n)+(?:\*\*\* End of File\\n)?)?))+\*\*\* End Patch(?:\\n)?"#;
 
 /// Escaping-aware `pattern` for the Environment-ID grammar.
@@ -107,7 +114,14 @@ pub(crate) const APPLY_PATCH_BACKEND_PATTERN_ENVID: &str = r#"\*\*\* Begin Patch
 // -----------------------------------------------------------------------------
 
 /// Raw (unanchored) host pattern for the base grammar. Used both to compile the
-/// anchored host validator and as the `Decoded` backend pattern.
+/// anchored host validator (wrapped `\A(?:…)\z`) and, verbatim, as the `Decoded`
+/// backend pattern.
+///
+/// As a backend pattern it is unanchored, so a strictly spec-literal JSON-Schema
+/// backend (`custom_input_pattern_encoding: decoded`) treats it as a substring match
+/// and could under-constrain generation. This never weakens correctness: the default
+/// `JsonString` encoding is full-matched by `XGrammar`, and [`validate_decoded_input`]
+/// anchors (`\A…\z`) and is authoritative on every path regardless of the backend.
 pub(crate) const APPLY_PATCH_HOST_PATTERN_BASE: &str = r"\*\*\* Begin Patch\n(?:(?:\*\*\* Add File: [^\n]+\n(?:\+[^\n]*\n)+|\*\*\* Delete File: [^\n]+\n|\*\*\* Update File: [^\n]+\n(?:\*\*\* Move to: [^\n]+\n)?(?:(?:@@(?: [^\n]+)?\n|[+\- ][^\n]*\n)+(?:\*\*\* End of File\n)?)?))+\*\*\* End Patch\n?";
 
 /// Raw (unanchored) host pattern for the Environment-ID grammar.
