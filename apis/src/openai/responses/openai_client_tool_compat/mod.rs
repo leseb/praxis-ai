@@ -1758,6 +1758,24 @@ impl Lowering {
         }
     }
 
+    /// Push the private `function` a `custom`/`NamespaceCustom` tool lowers to and
+    /// register its restoration recipe under the outbound `wire_name`.
+    fn finish_custom_lowering(
+        &mut self,
+        wire_name: String,
+        recipe: LoweredClientTool,
+        description: &str,
+        lowered: &mut Vec<Value>,
+    ) -> Result<(), FilterAction> {
+        lowered.push(custom_lowered_function(
+            &wire_name,
+            description,
+            recipe.format,
+            self.custom_input_pattern_encoding,
+        ));
+        self.register(wire_name, recipe)
+    }
+
     /// Lower a `custom` tool to a `function` with a single string `input`.
     ///
     /// `source` distinguishes a declared custom from one a `tool_search` discovered:
@@ -1778,21 +1796,14 @@ impl Lowering {
         let name = name.to_owned();
         self.claim_lowered(&name)?;
         self.reclaim_withheld(source, &name);
-        lowered.push(custom_lowered_function(
-            &name,
-            &custom_model_visible_description(tool),
+        let description = custom_model_visible_description(tool);
+        let recipe = LoweredClientTool {
+            original_name: name.clone(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
             format,
-            self.custom_input_pattern_encoding,
-        ));
-        self.register(
-            name.clone(),
-            LoweredClientTool {
-                original_name: name,
-                namespace: None,
-                restore: ClientToolRestore::Custom,
-                format,
-            },
-        )
+        };
+        self.finish_custom_lowering(name, recipe, &description, lowered)
     }
 
     /// Lower a local `shell` tool to the `shell` `function`, folding any declared
@@ -1969,21 +1980,13 @@ impl Lowering {
             namespace.description,
             &custom_model_visible_description(member),
         );
-        lowered.push(custom_lowered_function(
-            &flat,
-            &description,
+        let recipe = LoweredClientTool {
+            original_name: member_name.to_owned(),
+            namespace: Some(namespace.name.to_owned()),
+            restore: ClientToolRestore::NamespaceCustom,
             format,
-            self.custom_input_pattern_encoding,
-        ));
-        self.register(
-            flat,
-            LoweredClientTool {
-                original_name: member_name.to_owned(),
-                namespace: Some(namespace.name.to_owned()),
-                restore: ClientToolRestore::NamespaceCustom,
-                format,
-            },
-        )
+        };
+        self.finish_custom_lowering(flat, recipe, &description, lowered)
     }
 }
 
@@ -2738,20 +2741,11 @@ pub(crate) fn restore_output_item(
         return Ok(());
     };
     match lowered.restore {
-        ClientToolRestore::Custom => {
-            *item = restore_custom_call(item, lowered.format).map_err(|()| "custom_tool_call")?;
+        ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
+            *item = restore_custom_like(item, lowered).map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Namespace => {
             restore_namespace_call(item, &lowered.original_name, lowered.namespace.as_deref());
-        },
-        ClientToolRestore::NamespaceCustom => {
-            *item = restore_namespace_custom_call(
-                item,
-                &lowered.original_name,
-                lowered.namespace.as_deref(),
-                lowered.format,
-            )
-            .map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Shell => {
             *item = restore_shell_call(item).map_err(|()| "shell_call")?;
@@ -2761,6 +2755,35 @@ pub(crate) fn restore_output_item(
         },
     }
     Ok(())
+}
+
+/// Unwrap a lowered custom call's `{"input":...}` envelope and validate the decoded
+/// value against `format`'s grammar. `Err(())` on a malformed envelope or a decoded
+/// patch that violates the grammar — the authoritative, backend-independent guarantee
+/// that malformed backend output never becomes a completed call (`Text` always
+/// validates). Shared by the buffered and streaming restoration paths.
+pub(crate) fn decoded_input(arguments: &str, format: CustomInputFormat) -> Result<String, ()> {
+    let input = input_from_arguments_strict(arguments)?;
+    if custom_input::validate_decoded_input(format, &input) {
+        Ok(input)
+    } else {
+        Err(())
+    }
+}
+
+/// Restore a lowered `function_call` to a (possibly namespaced) `custom_tool_call`,
+/// selecting the restore by the recipe's kind. Shared by the buffered response pass
+/// and the streaming finalizer so both validate the decoded input identically.
+pub(crate) fn restore_custom_like(item: &Value, lowered: &LoweredClientTool) -> Result<Value, ()> {
+    match lowered.restore {
+        ClientToolRestore::NamespaceCustom => restore_namespace_custom_call(
+            item,
+            &lowered.original_name,
+            lowered.namespace.as_deref(),
+            lowered.format,
+        ),
+        _ => restore_custom_call(item, lowered.format),
+    }
 }
 
 /// Restore a lowered `function_call` to a `custom_tool_call`, failing closed when
@@ -2786,15 +2809,7 @@ pub(crate) fn restore_custom_call(item: &Value, format: CustomInputFormat) -> Re
         .and_then(Value::as_str)
         .filter(|call_id| !call_id.trim().is_empty())
         .ok_or(())?;
-    let input = input_from_arguments_strict(arguments)?;
-    // For a recognized grammar format, the decoded patch must satisfy the grammar
-    // before it is exposed as a completed call. `Text` always validates. This is the
-    // authoritative, backend-independent guarantee: malformed backend output fails
-    // closed here (→ HTTP 502 via `reject_lossy_restore`) even if the backend did not
-    // enforce the `input` pattern.
-    if !custom_input::validate_decoded_input(format, &input) {
-        return Err(());
-    }
+    let input = decoded_input(arguments, format)?;
     let mut out = json!({
         "type": "custom_tool_call",
         "id": custom_public_item_id(id),

@@ -22,8 +22,7 @@ use serde_json::Value;
 use crate::openai::{
     responses::{
         openai_client_tool_compat::{
-            custom_input::{self, CustomInputFormat},
-            custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
+            custom_input::CustomInputFormat, custom_public_item_id, decoded_input, restore_custom_like,
             restore_shell_call, restore_snapshot, restore_snapshot_tools, restore_tool_search_call,
         },
         state::{ClientToolEcho, ClientToolRestore, LoweredClientTool},
@@ -467,20 +466,12 @@ fn plan_custom_arguments_done(
         .get("arguments")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let input = input_from_arguments_strict(arguments).map_err(|()| {
-        client_tool_restore_error(
-            &tracked.key,
-            "lowered custom-tool arguments are not a {\"input\":...} envelope",
-        )
+    // Unwrap the envelope and validate the decoded input against the declared grammar
+    // before any canonical custom-input event is emitted; a malformed or grammar-invalid
+    // patch fails the stream closed (`Text` always validates).
+    let input = decoded_input(arguments, tracked.format).map_err(|()| {
+        client_tool_restore_error(&tracked.key, "lowered custom-tool input is not a valid patch envelope")
     })?;
-    // Fail the stream closed if the decoded input violates the declared grammar
-    // (`Text` always validates), before any canonical custom-input event is emitted.
-    if !custom_input::validate_decoded_input(tracked.format, &input) {
-        return Err(client_tool_restore_error(
-            &tracked.key,
-            "lowered custom-tool input violates the declared grammar",
-        ));
-    }
     let raw_id = tracked
         .item_id
         .as_deref()
@@ -630,7 +621,7 @@ fn plan_done_disposition(
         // authoritative done item and splice it back onto the done envelope.
         ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
             Ok(ClientToolDisposition::EmitCustomItemDone {
-                item: build_custom_done_payload(payload, lowered, restore)?,
+                item: build_custom_done_payload(payload, lowered)?,
             })
         },
         // Shell/ToolSearch: rebuild the finalized typed call from the authoritative
@@ -650,28 +641,14 @@ fn plan_done_disposition(
 /// splices it onto a single owned clone of the committed done envelope (the plan
 /// pass only borrows the event — AGENTS.md ownership boundary). Fails closed if the
 /// item cannot be restored (missing `call_id`, un-unwrappable input).
-fn build_custom_done_payload(
-    payload: &Value,
-    lowered: &LoweredClientTool,
-    restore: ClientToolRestore,
-) -> Result<Value, SseParseError> {
+fn build_custom_done_payload(payload: &Value, lowered: &LoweredClientTool) -> Result<Value, SseParseError> {
     let Some(item) = payload.get("item") else {
         return Err(client_tool_restore_error(
             &lowered.original_name,
             "output_item.done carried no item to restore",
         ));
     };
-    let restored = match restore {
-        ClientToolRestore::NamespaceCustom => restore_namespace_custom_call(
-            item,
-            &lowered.original_name,
-            lowered.namespace.as_deref(),
-            lowered.format,
-        ),
-        // Plain Custom keeps the client's own name (the wire name is unobfuscated).
-        _ => restore_custom_call(item, lowered.format),
-    }
-    .map_err(|()| {
+    let restored = restore_custom_like(item, lowered).map_err(|()| {
         client_tool_restore_error(
             &lowered.original_name,
             "lowered custom-tool call could not be restored to custom_tool_call",
