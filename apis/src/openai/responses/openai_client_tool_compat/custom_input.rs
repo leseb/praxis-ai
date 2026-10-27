@@ -389,4 +389,19 @@ mod tests {
             Some(APPLY_PATCH_HOST_PATTERN_ENVID)
         );
     }
+
+    #[test]
+    fn backend_pattern_fixtures_match_consts() {
+        // The committed fixtures are the single source the Python feasibility gate
+        // exercises under the pinned `XGrammar`; they must equal the runtime consts so
+        // the gate proves the exact string the backend receives.
+        assert_eq!(
+            APPLY_PATCH_BACKEND_PATTERN_BASE,
+            include_str!("apply_patch_backend_pattern_base.txt").trim_end_matches('\n'),
+        );
+        assert_eq!(
+            APPLY_PATCH_BACKEND_PATTERN_ENVID,
+            include_str!("apply_patch_backend_pattern_envid.txt").trim_end_matches('\n'),
+        );
+    }
 }
