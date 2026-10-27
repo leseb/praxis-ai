@@ -6730,3 +6730,39 @@ fn rejects_malformed_apply_patch_buffered_with_502() {
         "malformed backend output that cannot be restored losslessly is a 502",
     );
 }
+
+#[test]
+fn apply_patch_history_item_preserves_multiline_patch_bytes() {
+    // A stored apply_patch custom_tool_call carries the raw multi-line patch; history
+    // lowering must re-wrap it into the `{"input":...}` envelope byte-for-byte
+    // (newlines preserved) so a continuation turn replays the exact patch.
+    let mut item = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_1",
+        "name": "apply_patch",
+        "input": VALID_PATCH,
+        "id": "ctc_1",
+        "status": "completed",
+    });
+    assert!(lower_history_item(&mut item, &HashSet::new()));
+    assert_eq!(item["type"], "function_call");
+    assert_eq!(item["name"], "apply_patch");
+    assert_eq!(
+        item["arguments"],
+        json!({"input": VALID_PATCH}).to_string(),
+        "the exact patch bytes (including newlines) survive history lowering",
+    );
+}
+
+#[test]
+fn stored_apply_patch_call_replays_through_existing_canonical_types() {
+    // #1834 rides the existing custom_tool_call path, so a stored apply_patch call and
+    // its output already replay to a function-only backend with no new replay type.
+    use crate::openai::responses::is_canonical_openresponses_replay_type;
+    assert!(is_canonical_openresponses_replay_type(
+        &json!({"type": "custom_tool_call"})
+    ));
+    assert!(is_canonical_openresponses_replay_type(
+        &json!({"type": "custom_tool_call_output"})
+    ));
+}
