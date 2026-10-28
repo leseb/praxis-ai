@@ -116,7 +116,7 @@ pub(crate) const APPLY_PATCH_BACKEND_PATTERN_ENVID: &str = r#"\*\*\* Begin Patch
 /// Raw (unanchored) host pattern for the base grammar: the body the anchored host
 /// validator and the anchored `Decoded` backend pattern are both built from. Not used
 /// as a backend pattern directly — JSON-Schema `pattern` is a substring match, so the
-/// `Decoded` encoding emits the `^(?:…)$`-anchored form ([`APPLY_PATCH_DECODED_PATTERN_BASE`]).
+/// `Decoded` encoding emits the anchored form ([`APPLY_PATCH_DECODED_PATTERN_BASE`]).
 pub(crate) const APPLY_PATCH_HOST_PATTERN_BASE: &str = r"\*\*\* Begin Patch\n(?:(?:\*\*\* Add File: [^\n]+\n(?:\+[^\n]*\n)+|\*\*\* Delete File: [^\n]+\n|\*\*\* Update File: [^\n]+\n(?:\*\*\* Move to: [^\n]+\n)?(?:(?:@@(?: [^\n]+)?\n|[+\- ][^\n]*\n)+(?:\*\*\* End of File\n)?)?))+\*\*\* End Patch\n?";
 
 /// Raw (unanchored) host pattern for the Environment-ID grammar.
@@ -132,15 +132,18 @@ static HOST_RE_ENVID: LazyLock<Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(&format!(r"\A(?:{APPLY_PATCH_HOST_PATTERN_ENVID})\z")));
 
 /// Full-string-anchored `Decoded` backend pattern for the base grammar. JSON-Schema
-/// `pattern` is a substring match, so a spec-compliant backend configured with
-/// `custom_input_pattern_encoding: decoded` must be given the `^(?:…)$` form to
-/// constrain the whole argument rather than accept junk around a valid patch.
+/// `pattern` is a substring match, so a `custom_input_pattern_encoding: decoded`
+/// backend must be given an anchored form. The end anchor is `(?![\s\S])` (no
+/// character follows) rather than `$`: it is a strict end-of-input in every regex
+/// dialect, whereas `$` admits a trailing line terminator under Python/PCRE
+/// semantics, which — combined with the grammar's optional final newline — would let
+/// an extra trailing newline satisfy the constraint.
 static APPLY_PATCH_DECODED_PATTERN_BASE: LazyLock<String> =
-    LazyLock::new(|| format!("^(?:{APPLY_PATCH_HOST_PATTERN_BASE})$"));
+    LazyLock::new(|| format!(r"^(?:{APPLY_PATCH_HOST_PATTERN_BASE})(?![\s\S])"));
 
 /// Full-string-anchored `Decoded` backend pattern for the Environment-ID grammar.
 static APPLY_PATCH_DECODED_PATTERN_ENVID: LazyLock<String> =
-    LazyLock::new(|| format!("^(?:{APPLY_PATCH_HOST_PATTERN_ENVID})$"));
+    LazyLock::new(|| format!(r"^(?:{APPLY_PATCH_HOST_PATTERN_ENVID})(?![\s\S])"));
 
 // -----------------------------------------------------------------------------
 // API
@@ -402,15 +405,16 @@ mod tests {
             backend_input_pattern(ApplyPatchEnvId, JsonString),
             Some(APPLY_PATCH_BACKEND_PATTERN_ENVID)
         );
-        // The Decoded encoding is the host pattern, anchored for full-string match
-        // (JSON-Schema `pattern` is otherwise a substring match).
+        // The Decoded encoding is the host pattern, anchored for full-string match with
+        // a dialect-portable end-of-input assertion (JSON-Schema `pattern` is otherwise a
+        // substring match, and `$` admits a trailing newline under Python/PCRE).
         assert_eq!(
             backend_input_pattern(ApplyPatch, Decoded),
-            Some(format!("^(?:{APPLY_PATCH_HOST_PATTERN_BASE})$").as_str())
+            Some(format!(r"^(?:{APPLY_PATCH_HOST_PATTERN_BASE})(?![\s\S])").as_str())
         );
         assert_eq!(
             backend_input_pattern(ApplyPatchEnvId, Decoded),
-            Some(format!("^(?:{APPLY_PATCH_HOST_PATTERN_ENVID})$").as_str())
+            Some(format!(r"^(?:{APPLY_PATCH_HOST_PATTERN_ENVID})(?![\s\S])").as_str())
         );
     }
 
