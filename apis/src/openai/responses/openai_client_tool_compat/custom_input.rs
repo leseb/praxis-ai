@@ -113,15 +113,10 @@ pub(crate) const APPLY_PATCH_BACKEND_PATTERN_ENVID: &str = r#"\*\*\* Begin Patch
 // Host patterns (raw — matched against the DECODED patch, real newlines)
 // -----------------------------------------------------------------------------
 
-/// Raw (unanchored) host pattern for the base grammar. Used both to compile the
-/// anchored host validator (wrapped `\A(?:…)\z`) and, verbatim, as the `Decoded`
-/// backend pattern.
-///
-/// As a backend pattern it is unanchored, so a strictly spec-literal JSON-Schema
-/// backend (`custom_input_pattern_encoding: decoded`) treats it as a substring match
-/// and could under-constrain generation. This never weakens correctness: the default
-/// `JsonString` encoding is full-matched by `XGrammar`, and [`validate_decoded_input`]
-/// anchors (`\A…\z`) and is authoritative on every path regardless of the backend.
+/// Raw (unanchored) host pattern for the base grammar: the body the anchored host
+/// validator and the anchored `Decoded` backend pattern are both built from. Not used
+/// as a backend pattern directly — JSON-Schema `pattern` is a substring match, so the
+/// `Decoded` encoding emits the `^(?:…)$`-anchored form ([`APPLY_PATCH_DECODED_PATTERN_BASE`]).
 pub(crate) const APPLY_PATCH_HOST_PATTERN_BASE: &str = r"\*\*\* Begin Patch\n(?:(?:\*\*\* Add File: [^\n]+\n(?:\+[^\n]*\n)+|\*\*\* Delete File: [^\n]+\n|\*\*\* Update File: [^\n]+\n(?:\*\*\* Move to: [^\n]+\n)?(?:(?:@@(?: [^\n]+)?\n|[+\- ][^\n]*\n)+(?:\*\*\* End of File\n)?)?))+\*\*\* End Patch\n?";
 
 /// Raw (unanchored) host pattern for the Environment-ID grammar.
@@ -135,6 +130,17 @@ static HOST_RE_BASE: LazyLock<Result<Regex, regex::Error>> =
 /// Anchored full-string host validator for the Environment-ID grammar.
 static HOST_RE_ENVID: LazyLock<Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(&format!(r"\A(?:{APPLY_PATCH_HOST_PATTERN_ENVID})\z")));
+
+/// Full-string-anchored `Decoded` backend pattern for the base grammar. JSON-Schema
+/// `pattern` is a substring match, so a spec-compliant backend configured with
+/// `custom_input_pattern_encoding: decoded` must be given the `^(?:…)$` form to
+/// constrain the whole argument rather than accept junk around a valid patch.
+static APPLY_PATCH_DECODED_PATTERN_BASE: LazyLock<String> =
+    LazyLock::new(|| format!("^(?:{APPLY_PATCH_HOST_PATTERN_BASE})$"));
+
+/// Full-string-anchored `Decoded` backend pattern for the Environment-ID grammar.
+static APPLY_PATCH_DECODED_PATTERN_ENVID: LazyLock<String> =
+    LazyLock::new(|| format!("^(?:{APPLY_PATCH_HOST_PATTERN_ENVID})$"));
 
 // -----------------------------------------------------------------------------
 // API
@@ -196,9 +202,11 @@ pub(crate) fn backend_input_pattern(
         (CustomInputFormat::ApplyPatchEnvId, CustomInputPatternEncoding::JsonString) => {
             Some(APPLY_PATCH_BACKEND_PATTERN_ENVID)
         },
-        (CustomInputFormat::ApplyPatch, CustomInputPatternEncoding::Decoded) => Some(APPLY_PATCH_HOST_PATTERN_BASE),
+        (CustomInputFormat::ApplyPatch, CustomInputPatternEncoding::Decoded) => {
+            Some(APPLY_PATCH_DECODED_PATTERN_BASE.as_str())
+        },
         (CustomInputFormat::ApplyPatchEnvId, CustomInputPatternEncoding::Decoded) => {
-            Some(APPLY_PATCH_HOST_PATTERN_ENVID)
+            Some(APPLY_PATCH_DECODED_PATTERN_ENVID.as_str())
         },
     }
 }
@@ -394,13 +402,15 @@ mod tests {
             backend_input_pattern(ApplyPatchEnvId, JsonString),
             Some(APPLY_PATCH_BACKEND_PATTERN_ENVID)
         );
+        // The Decoded encoding is the host pattern, anchored for full-string match
+        // (JSON-Schema `pattern` is otherwise a substring match).
         assert_eq!(
             backend_input_pattern(ApplyPatch, Decoded),
-            Some(APPLY_PATCH_HOST_PATTERN_BASE)
+            Some(format!("^(?:{APPLY_PATCH_HOST_PATTERN_BASE})$").as_str())
         );
         assert_eq!(
             backend_input_pattern(ApplyPatchEnvId, Decoded),
-            Some(APPLY_PATCH_HOST_PATTERN_ENVID)
+            Some(format!("^(?:{APPLY_PATCH_HOST_PATTERN_ENVID})$").as_str())
         );
     }
 
